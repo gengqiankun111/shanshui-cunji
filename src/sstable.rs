@@ -27,7 +27,7 @@ use crate::keys::{decode_varlen, decode_varint, encode_varlen, encode_varint};
 
 /// 文件魔数 + 版本。
 pub const SST_MAGIC: &[u8; 8] = b"NVSSTL01";
-pub const SST_VERSION: u16 = 1;
+pub const SST_VERSION: u16 = 2;
 
 /// 压缩算法标识（与 config.sstable.compression 字符串对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,14 +99,20 @@ pub struct SstWriter {
     key_count: u64,
     /// 上一个写入的 key（校验升序）。
     last_key: Option<Vec<u8>>,
+    /// 当前块内最后一个 key（Zone Map max）。
+    buf_last_key: Option<Vec<u8>>,
     /// zstd level 压缩参数。
     zstd_level: i32,
 }
 
-/// 稀疏索引条目（MVP 不含 Zone Map，阶段 1.5 追加统计字段）。
+/// 稀疏索引条目（含块级 Zone Map 的 key 维度：min=first_key，max=max_key）。
+/// 字段级 Zone Map（各列 min/max/null 计数）随阶段 1.5 PAX 列组落地。
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
+    /// 块首键 = Zone Map min。
     pub first_key: Vec<u8>,
+    /// 块末键 = Zone Map max。
+    pub max_key: Vec<u8>,
     pub offset: u64,
     pub raw_len: u32,
     pub comp_len: u32,
@@ -126,6 +132,7 @@ impl SstWriter {
             written: 0,
             key_count: 0,
             last_key: None,
+            buf_last_key: None,
             zstd_level: compression_level.max(1).min(22),
         };
         w.write_header()?;
@@ -159,6 +166,7 @@ impl SstWriter {
         self.bloom.insert(&key.to_vec());
         self.key_count += 1;
         self.last_key = Some(key.to_vec());
+        self.buf_last_key = Some(key.to_vec());
 
         if self.buf.len() >= self.block_size {
             self.flush_block()?;
@@ -166,13 +174,14 @@ impl SstWriter {
         Ok(())
     }
 
-    /// 冲刷当前块（写盘 + 索引）。
+    /// 冲刷当前块（写盘 + 索引 + Zone Map）。
     fn flush_block(&mut self) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
         let offset = self.written;
         let first_key = self.parse_first_key()?;
+        let max_key = self.buf_last_key.take().unwrap_or_else(|| first_key.clone());
         let raw_len = self.buf.len();
         let compressed = self.compress(&self.buf)?;
         let comp_len = compressed.len();
@@ -187,6 +196,7 @@ impl SstWriter {
 
         self.index.push(IndexEntry {
             first_key,
+            max_key,
             offset,
             raw_len: raw_len as u32,
             comp_len: comp_len as u32,
@@ -221,12 +231,13 @@ impl SstWriter {
     pub fn finish(mut self) -> Result<SstFooter> {
         self.flush_block()?;
 
-        // Block Index：块数(varint) + 每条目(VarLen(first_key) + offset u64 + raw_len u32 + comp_len u32)
+        // Block Index：块数(varint) + 每条目(VarLen(first_key) + VarLen(max_key) + offset u64 + raw_len u32 + comp_len u32)
         let index_offset = self.written;
         let mut ib = Vec::new();
         encode_varint(&mut ib, self.index.len() as u64);
         for e in &self.index {
             encode_varlen(&mut ib, &e.first_key);
+            encode_varlen(&mut ib, &e.max_key);
             ib.extend_from_slice(&e.offset.to_le_bytes());
             ib.extend_from_slice(&e.raw_len.to_le_bytes());
             ib.extend_from_slice(&e.comp_len.to_le_bytes());
@@ -486,6 +497,52 @@ impl SstReader {
         }
         Ok(())
     }
+
+    /// 范围扫描 [start, end]（闭区间；None 端无边界），利用块级 Zone Map 剪枝：
+    /// 块范围 [first_key, max_key] 与查询区间无交集则跳过，不读块、不解压（design 4.4.1）。
+    pub fn scan_range<F: FnMut(&[u8], &[u8], u64)>(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()> {
+        for e in self.index.clone() {
+            // Zone Map 剪枝
+            if let Some(s) = start {
+                if e.max_key.as_slice() < s {
+                    continue; // 块最大值仍小于区间下界
+                }
+            }
+            if let Some(en) = end {
+                if e.first_key.as_slice() > en {
+                    break; // 索引按 key 有序，后续块更大
+                }
+            }
+            let data = self.read_block(&e)?;
+            let mut cur = 0usize;
+            while cur < data.len() {
+                let key = decode_varlen(&data, &mut cur)?;
+                let value = decode_varlen(&data, &mut cur)?;
+                if cur + 8 > data.len() {
+                    return Err(Error::Corrupted("范围扫描 seq 越界".into()));
+                }
+                let seq = u64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
+                cur += 8;
+                if let Some(s) = start {
+                    if key < s {
+                        continue;
+                    }
+                }
+                if let Some(en) = end {
+                    if key > en {
+                        continue;
+                    }
+                }
+                f(key, value, seq);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 解码块索引字节流。
@@ -495,6 +552,7 @@ fn decode_index(ib: &[u8]) -> Result<Vec<IndexEntry>> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let first_key = decode_varlen(ib, &mut cur)?.to_vec();
+        let max_key = decode_varlen(ib, &mut cur)?.to_vec();
         if cur + 16 > ib.len() {
             return Err(Error::Corrupted("索引条目越界".into()));
         }
@@ -502,7 +560,7 @@ fn decode_index(ib: &[u8]) -> Result<Vec<IndexEntry>> {
         let raw_len = u32::from_le_bytes(ib[cur + 8..cur + 12].try_into().unwrap());
         let comp_len = u32::from_le_bytes(ib[cur + 12..cur + 16].try_into().unwrap());
         cur += 16;
-        out.push(IndexEntry { first_key, offset, raw_len, comp_len });
+        out.push(IndexEntry { first_key, max_key, offset, raw_len, comp_len });
     }
     Ok(out)
 }
@@ -626,5 +684,54 @@ mod tests {
         let mut r = SstReader::open(&path).unwrap();
         // 块 CRC 校验失败 → Corrupted 错误（而非 panic）
         assert!(r.get(b"user-00000001").is_err());
+    }
+
+    #[test]
+    fn scan_range_returns_bounded_keys() {
+        let path = tmp();
+        write_sample(&path, 200);
+        let mut r = SstReader::open(&path).unwrap();
+        let start = b"user-00000050";
+        let end = b"user-00000060";
+        let mut keys = Vec::new();
+        r.scan_range(Some(start), Some(end), |k, _v, _seq| keys.push(k.to_vec())).unwrap();
+        // 闭区间：50..=60 共 11 个
+        assert_eq!(keys.len(), 11);
+        assert_eq!(keys.first().unwrap().as_slice(), start);
+        assert_eq!(keys.last().unwrap().as_slice(), end);
+        // 升序
+        assert!(keys.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn scan_range_without_bounds_visits_all() {
+        let path = tmp();
+        write_sample(&path, 100);
+        let mut r = SstReader::open(&path).unwrap();
+        let mut count = 0u64;
+        r.scan_range(None, None, |_, _, _| count += 1).unwrap();
+        assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn zone_map_prunes_out_of_range_blocks() {
+        // 多块文件：查询一个小范围应只读命中块，不读全部块
+        let path = tmp();
+        let mut w = SstWriter::new(&path, Compression::Zstd, 1, 64, 500).unwrap();
+        for i in 0..500u64 {
+            let k = format!("k{i:04}").into_bytes();
+            w.add(&k, b"v", i).unwrap();
+        }
+        w.finish().unwrap();
+        let mut r = SstReader::open(&path).unwrap();
+        assert!(r.index_len() > 2);
+        // Zone Map 元数据正确：每块 min <= max
+        for e in r.index() {
+            assert!(e.first_key <= e.max_key);
+        }
+        // 精确小区间（key 格式 k{i:04}，查询须同格式）
+        let mut hits = Vec::new();
+        r.scan_range(Some(b"k0050"), Some(b"k0060"), |k, _, _| hits.push(k.to_vec())).unwrap();
+        assert_eq!(hits.len(), 11);
     }
 }

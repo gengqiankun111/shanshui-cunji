@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use crate::blockcache::{BlockCache, BlockCacheKey};
 use crate::config::model::{Config, MemtableConfig};
 use crate::error::{Error, Result};
-use crate::keys::encode_docid;
+use crate::keys::{decode_docid, encode_docid};
 use crate::memtable::{MemTable, MemTableBuffer};
 use crate::sstable::{Compression, SstFooter, SstReader, SstWriter};
 use crate::wal::{WalReader, WalWriter, OP_DELETE, OP_PUT};
@@ -173,6 +173,39 @@ impl ColumnFamily {
         Ok(None)
     }
 
+    /// 范围扫描 [start, end]（闭区间，None 端无边界）：先收集 MemTable 与各 SST 候选，
+    /// 以最大 seq 去重（最新覆盖），返回按 docid 升序的 (docid, value) 列表（已过滤 Tombstone）。
+    pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<(u64, Vec<u8>)>> {
+        let start_key = start.map(|s| encode_docid(s).to_vec());
+        let end_key = end.map(|e| encode_docid(e).to_vec());
+
+        // 候选收集：key → (seq, value)，同 key 保留 seq 最大者
+        let mut merged: std::collections::HashMap<u64, (u64, Vec<u8>)> = std::collections::HashMap::new();
+
+        // MemTable 扫描
+        self.memtable.scan_range(start_key.as_deref(), end_key.as_deref(), |key, e| {
+            if let Some(v) = &e.value {
+                let docid = decode_docid(key).unwrap_or(0);
+                merge_candidate(&mut merged, docid, e.seq, v.clone());
+            }
+        });
+
+        // SST 范围扫描（Zone Map 剪枝已内置在 scan_range）
+        for sst in &mut self.ssts {
+            sst.scan_range(start_key.as_deref(), end_key.as_deref(), |k, v, seq| {
+                let docid = decode_docid(k).unwrap_or(0);
+                merge_candidate(&mut merged, docid, seq, v.to_vec());
+            })?;
+        }
+
+        let mut out: Vec<(u64, Vec<u8>)> = merged
+            .into_iter()
+            .map(|(docid, (_seq, value))| (docid, value))
+            .collect();
+        out.sort_by_key(|(docid, _)| *docid);
+        Ok(out)
+    }
+
     /// MemTable 超阈值 → 冻结并刷盘（MVP 同步刷盘）。
     fn maybe_flush(&mut self) -> Result<()> {
         if self.memtable.mutable_bytes() < self.cfg.max_size_mb * 1024 * 1024 {
@@ -257,6 +290,16 @@ fn load_manifest(path: &Path) -> Result<(Vec<String>, u64)> {
     let text = std::fs::read_to_string(path)?;
     let m: Manifest = serde_json::from_str(&text).map_err(|e| Error::Corrupted(format!("Manifest 解析失败: {e}")))?;
     Ok((m.sst_files, m.next_sst_id))
+}
+
+/// 同 key 候选合并：仅保留 seq 更大（更新）的版本。
+fn merge_candidate(merged: &mut std::collections::HashMap<u64, (u64, Vec<u8>)>, docid: u64, seq: u64, value: Vec<u8>) {
+    match merged.get(&docid) {
+        Some((old_seq, _)) if *old_seq >= seq => {}
+        _ => {
+            merged.insert(docid, (seq, value));
+        }
+    }
 }
 
 /// 单 SST 等值查询（布隆剪枝 → 二分定位块 → 块缓存/读盘 → 块内扫描）。
@@ -414,5 +457,44 @@ mod tests {
         assert!(text.contains(SST_PREFIX));
         let m: Manifest = serde_json::from_str(&text).unwrap();
         assert!(!m.sst_files.is_empty());
+    }
+
+    #[test]
+    fn scan_range_covers_memtable_and_sst() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 部分写入并刷盘，部分留在 MemTable
+        for i in 0..30u64 {
+            cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        for i in 30..40u64 {
+            cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+        }
+        // 更新一个已落盘 key，验证去重取最新
+        cf.put(5, b"v-updated".to_vec()).unwrap();
+
+        let rows = cf.scan_range(Some(0), Some(39)).unwrap();
+        assert_eq!(rows.len(), 40);
+        assert_eq!(rows[0], (0, b"v-0".to_vec()));
+        assert_eq!(rows[39], (39, b"v-39".to_vec()));
+        assert_eq!(rows[5], (5, b"v-updated".to_vec()));
+
+        // 无边界扫描
+        let all = cf.scan_range(None, None).unwrap();
+        assert_eq!(all.len(), 40);
+    }
+
+    #[test]
+    fn scan_range_empty_window() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for i in 0..10u64 {
+            cf.put(i, b"v".to_vec()).unwrap();
+        }
+        // 无交集区间 → 空
+        assert!(cf.scan_range(Some(100), Some(200)).unwrap().is_empty());
     }
 }

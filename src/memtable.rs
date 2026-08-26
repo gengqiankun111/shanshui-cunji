@@ -164,6 +164,19 @@ impl MemTableBuffer {
         self.immutable.as_ref()
     }
 
+    /// 范围扫描：遍历 Immutable 与 Mutable 两表（同 key 以 seq 去重由调用方负责）。
+    pub fn scan_range<F: FnMut(&[u8], &MemTableEntry)>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        mut f: F,
+    ) {
+        if let Some(imm) = &self.immutable {
+            imm.scan_range(start, end, &mut f);
+        }
+        self.mutable.scan_range(start, end, &mut f);
+    }
+
     pub fn mutable_bytes(&self) -> usize {
         self.mutable.approx_bytes()
     }
