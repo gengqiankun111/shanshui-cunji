@@ -4,6 +4,7 @@ pub mod blockcache;
 pub mod bloom;
 pub mod column_family;
 pub mod config;
+pub mod engine;
 pub mod error;
 pub mod hotcache;
 pub mod inverted;
