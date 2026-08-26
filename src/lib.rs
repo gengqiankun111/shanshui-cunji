@@ -5,6 +5,7 @@ pub mod bloom;
 pub mod column_family;
 pub mod config;
 pub mod error;
+pub mod hotcache;
 pub mod inverted;
 pub mod keys;
 pub mod memtable;
