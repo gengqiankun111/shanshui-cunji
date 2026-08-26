@@ -139,9 +139,13 @@ impl ColumnFamily {
         Ok(())
     }
 
-    /// 写入（主键点写）。
+    /// 写入（主键点写，便捷封装）。
     pub fn put(&mut self, docid: u64, value: Vec<u8>) -> Result<u64> {
-        let key = encode_docid(docid).to_vec();
+        self.put_bytes(encode_docid(docid).to_vec(), value)
+    }
+
+    /// 写入原始字节键（组合索引等任意 key 使用）。
+    pub fn put_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
         let seq = self.wal.append(OP_PUT, &key, Some(&value))?;
         self.wal.sync()?;
         self.memtable.put(key, seq, value);
@@ -149,24 +153,32 @@ impl ColumnFamily {
         Ok(seq)
     }
 
-    /// 删除（Tombstone，MVP 只保证 WAL/MemTable 生命周期内一致）。
+    /// 删除（Tombstone，跨 flush/重启一致，见步骤 9）。
     pub fn delete(&mut self, docid: u64) -> Result<u64> {
-        let key = encode_docid(docid).to_vec();
+        self.delete_bytes(encode_docid(docid).to_vec())
+    }
+
+    /// 删除原始字节键。
+    pub fn delete_bytes(&mut self, key: Vec<u8>) -> Result<u64> {
         let seq = self.wal.append(OP_DELETE, &key, None)?;
         self.wal.sync()?;
         self.memtable.delete(key, seq);
         Ok(seq)
     }
 
-    /// 查询：MemTable → SST（新→旧）。返回 (value, seq)，已过滤 Tombstone。
+    /// 查询（主键点查，便捷封装）。返回 (value, seq)，已过滤 Tombstone。
     pub fn get(&mut self, docid: u64) -> Result<Option<(Vec<u8>, u64)>> {
-        let key = encode_docid(docid).to_vec();
-        if let Some(e) = self.memtable.get(&key) {
+        self.get_bytes(&encode_docid(docid))
+    }
+
+    /// 查询原始字节键。返回 (value, seq)，已过滤 Tombstone。
+    pub fn get_bytes(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+        if let Some(e) = self.memtable.get(key) {
             return Ok(e.value.map(|v| (v, e.seq)));
         }
         let cache = Arc::clone(&self.block_cache);
         for sst in &mut self.ssts {
-            match get_from_sst(sst, &cache, &key)? {
+            match get_from_sst(sst, &cache, key)? {
                 // 命中：最新版本。value=None 为 Tombstone → 视为不存在
                 Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
                 None => continue, // 未命中该 SST，继续查更旧的
@@ -180,29 +192,36 @@ impl ColumnFamily {
     pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<(u64, Vec<u8>)>> {
         let start_key = start.map(|s| encode_docid(s).to_vec());
         let end_key = end.map(|e| encode_docid(e).to_vec());
+        let rows = self.scan_raw_range(start_key.as_deref(), end_key.as_deref())?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (k, v) in rows {
+            out.push((decode_docid(&k).map_err(|_| Error::Corrupted("docid 解码失败".into()))?, v));
+        }
+        Ok(out)
+    }
 
-        // 候选收集：docid → (seq, value)，value=None 表示 Tombstone
-        let mut merged: std::collections::HashMap<u64, (u64, Option<Vec<u8>>)> = std::collections::HashMap::new();
+    /// 原始字节键范围扫描（组合索引前缀查询使用）。返回升序 (key, value) 列表，Tombstone 已过滤。
+    pub fn scan_raw_range(&mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // 候选收集：key → (seq, value)，value=None 表示 Tombstone
+        let mut merged: std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)> = std::collections::HashMap::new();
 
         // MemTable 扫描（含 Tombstone 覆盖）
-        self.memtable.scan_range(start_key.as_deref(), end_key.as_deref(), |key, e| {
-            let docid = decode_docid(key).unwrap_or(0);
-            merge_candidate(&mut merged, docid, e.seq, e.value.clone());
+        self.memtable.scan_range(start, end, |key, e| {
+            merge_candidate_bytes(&mut merged, key.to_vec(), e.seq, e.value.clone());
         });
 
         // SST 范围扫描（Zone Map 剪枝已内置在 scan_range）
         for sst in &mut self.ssts {
-            sst.scan_range(start_key.as_deref(), end_key.as_deref(), |k, v, seq| {
-                let docid = decode_docid(k).unwrap_or(0);
-                merge_candidate(&mut merged, docid, seq, v.map(|x| x.to_vec()));
+            sst.scan_range(start, end, |k, v, seq| {
+                merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
             })?;
         }
 
-        let mut out: Vec<(u64, Vec<u8>)> = merged
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = merged
             .into_iter()
-            .filter_map(|(docid, (_seq, value))| value.map(|v| (docid, v)))
+            .filter_map(|(key, (_seq, value))| value.map(|v| (key, v)))
             .collect();
-        out.sort_by_key(|(docid, _)| *docid);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 
@@ -293,11 +312,11 @@ fn load_manifest(path: &Path) -> Result<(Vec<String>, u64)> {
 }
 
 /// 同 key 候选合并：仅保留 seq 更大（更新）的版本；value=None 的 Tombstone 可覆盖旧值。
-fn merge_candidate(merged: &mut std::collections::HashMap<u64, (u64, Option<Vec<u8>>)>, docid: u64, seq: u64, value: Option<Vec<u8>>) {
-    match merged.get(&docid) {
+fn merge_candidate_bytes(merged: &mut std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)>, key: Vec<u8>, seq: u64, value: Option<Vec<u8>>) {
+    match merged.get(&key) {
         Some((old_seq, _)) if *old_seq >= seq => {}
         _ => {
-            merged.insert(docid, (seq, value));
+            merged.insert(key, (seq, value));
         }
     }
 }
@@ -539,5 +558,35 @@ mod tests {
         }
         // 无交集区间 → 空
         assert!(cf.scan_range(Some(100), Some(200)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn composite_index_prefix_query() {
+        // 步骤 10：组合索引 = ColumnFamily + encode_composite_key(fields, docid)
+        use crate::keys::{decode_composite_key, encode_composite_key};
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("cidx", &dir, &cfg).unwrap();
+        // 写入 (status=active, type=click, docid)
+        for docid in [1u64, 5, 9, 20] {
+            let key = encode_composite_key(&[b"active", b"click"], docid);
+            cf.put_bytes(key, docid.to_le_bytes().to_vec()).unwrap();
+        }
+        // 干扰项：status=active 但 type=view
+        let key = encode_composite_key(&[b"active", b"view"], 100);
+        cf.put_bytes(key, 100u64.to_le_bytes().to_vec()).unwrap();
+
+        // 前缀查询 active/click：组合键有序，范围 [active/click/0, active/click/FFFF]
+        let start = encode_composite_key(&[b"active", b"click"], 0);
+        let end = encode_composite_key(&[b"active", b"click"], u64::MAX);
+        let mut hits = Vec::new();
+        let rows = cf.scan_raw_range(Some(&start), Some(&end)).unwrap();
+        for (k, _v) in rows {
+            let (fields, docid) = decode_composite_key(&k).unwrap();
+            assert_eq!(fields, vec![b"active".to_vec(), b"click".to_vec()]);
+            hits.push(docid);
+        }
+        hits.sort();
+        assert_eq!(hits, vec![1, 5, 9, 20]);
     }
 }

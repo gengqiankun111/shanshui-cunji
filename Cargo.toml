@@ -17,6 +17,7 @@ dashmap = "6"
 crossbeam-skiplist = "0.1"
 zstd = "0.13"
 lru = "0.12"
+roaring = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
