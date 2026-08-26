@@ -41,11 +41,16 @@ pub type QueryRow = (u64, Vec<u8>);
 impl Engine {
     /// 打开（或创建）引擎。倒排刷盘阈值取自内存预算的比例（MVP 固定 1M posting）。
     pub fn open(data_dir: &Path, cfg: &Config) -> Result<Self> {
+        Self::open_with_timeout(data_dir, cfg, DEFAULT_QUERY_TIMEOUT)
+    }
+
+    /// 打开引擎并指定查询超时（压测/大结果集场景需放宽熔断阈值）。
+    pub fn open_with_timeout(data_dir: &Path, cfg: &Config, query_timeout: std::time::Duration) -> Result<Self> {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
         let inverted = InvertedIndex::open(&data_dir.join("inverted"), 1_000_000)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let hotcache = HotCache::new(cfg.hotcache.clone());
-        let watchdog = Watchdog::new(cfg, DEFAULT_QUERY_TIMEOUT);
+        let watchdog = Watchdog::new(cfg, query_timeout);
         Ok(Self { primary, cidx, inverted, hotcache, watchdog, mem_ratio: 0.0 })
     }
 

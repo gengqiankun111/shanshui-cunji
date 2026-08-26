@@ -125,8 +125,8 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
         }
     }
 
-    // 临时数据目录（进程级，避免污染仓库）
-    let data_dir = std::env::temp_dir().join(format!("novosdb-demo-{}", std::process::id()));
+    // 临时数据目录（D 盘，避免撑爆 C 盘系统盘）
+    let data_dir = std::path::PathBuf::from("D:\\novosdb-tmp").join(format!("demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("创建临时数据目录失败");
 

@@ -137,7 +137,8 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
 
     // ---------- 2. 批量插入（WAL 攒批 + 定期倒排刷盘） ----------
     let engine_dir = data_dir.join("engine");
-    let mut engine = Engine::open(&engine_dir, cfg)?;
+    // 大结果集回表（如 125 万条 beijing）需放宽查询超时，避免看门狗熔断
+    let mut engine = Engine::open_with_timeout(&engine_dir, cfg, std::time::Duration::from_secs(300))?;
     let t = Instant::now();
     let mut put_ok = 0u64;
     for (docid, doc, terms) in &docs {
