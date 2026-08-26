@@ -76,6 +76,18 @@ impl ShardedEngine {
         self.shards[s].put(docid, value, terms)
     }
 
+    fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
+        let s = self.shard_of(docid);
+        self.shards[s].put_nosync(docid, value, terms)
+    }
+
+    fn flush_wal(&mut self) -> Result<()> {
+        for s in &mut self.shards {
+            s.flush_wal()?;
+        }
+        Ok(())
+    }
+
     fn get(&mut self, docid: u64) -> Result<Option<Vec<u8>>> {
         let s = self.shard_of(docid);
         self.shards[s].get(docid)
@@ -92,42 +104,71 @@ impl ShardedEngine {
     }
 }
 
+/// 仅构造测试数据：将 N 条文档以 JSON Lines 写入 `path`，返回条数。
+/// 供 gen_data 脚本使用（与测试解耦，数据可复用于外部工具）。
+pub fn generate(scale: u64, path: &std::path::Path) -> Result<u64> {
+    use std::io::Write;
+    let docs = build_docs(scale);
+    let mut out = std::fs::File::create(path)?;
+    for (docid, doc, terms) in &docs {
+        let terms_json = terms.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(",");
+        writeln!(out, "{{\"docid\":{docid},\"doc\":{},\"terms\":[{terms_json}]}}", String::from_utf8_lossy(doc))?;
+    }
+    Ok(docs.len() as u64)
+}
+
 /// 运行完整 demo 测试，返回各测试结果。
-pub fn run(data_dir: &PathBuf, cfg: &Config) -> Result<Vec<TestResult>> {
+/// `scale`：构造文档条数（10 万 ~ 1 亿）。
+pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
+    // 抽样查询量：小规模全查，大规模固定上限（避免结果集过大）
+    let sample = scale.min(1000);
+    let pk_sample = sample.min(100);
 
     // ---------- 1. 构造测试数据 ----------
     let t = Instant::now();
-    let docs = build_docs(1000);
+    let docs = build_docs(scale);
     results.push(TestResult::new(
         "构造测试数据",
         true,
-        "生成 1000 条文档（status/city/amount 字段，city 写入倒排）".to_string(),
+        format!("生成 {scale} 条文档（status/city/amount 字段，city 写入倒排）"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
-    // ---------- 2. 插入（主数据 + 倒排） ----------
+    // ---------- 2. 批量插入（WAL 攒批 + 定期倒排刷盘） ----------
     let engine_dir = data_dir.join("engine");
     let mut engine = Engine::open(&engine_dir, cfg)?;
     let t = Instant::now();
     let mut put_ok = 0u64;
     for (docid, doc, terms) in &docs {
-        engine.put(*docid, doc.clone(), terms)?;
+        engine.put_nosync(*docid, doc.clone(), terms)?;
         put_ok += 1;
+        // 定期刷倒排段，防内存字典无界增长
+        if engine.inverted_mem_docids() >= 1_000_000 {
+            engine.flush_inverted()?;
+        }
     }
+    engine.flush_wal()?; // 统一提交 WAL
+    engine.flush_inverted()?; // 收尾刷盘倒排
+    let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
     results.push(TestResult::new(
-        "插入",
+        "批量插入",
         put_ok == docs.len() as u64,
-        format!("写入 {} / {} 条（WAL fsync + MemTable + 倒排字典）", put_ok, docs.len()),
-        t.elapsed().as_secs_f64() * 1000.0,
+        format!(
+            "写入 {put_ok} / {} 条，{:.0} ms（{:.0} 条/s；WAL 攒批 + 定期倒排刷盘）",
+            docs.len(),
+            insert_ms,
+            put_ok as f64 / insert_ms * 1000.0
+        ),
+        insert_ms,
     ));
 
-    // ---------- 3. 主键查询（首次 → LSM，无缓存命中） ----------
+    // ---------- 3. 主键查询（首次 → LSM） ----------
     let t = Instant::now();
     let mut pk_hits = 0u64;
     let mut pk_miss = 0u64;
-    for i in 0..50u64 {
-        let docid = (i * 13 % 1000) + 1;
+    for i in 0..pk_sample {
+        let docid = (i * 13 % scale) + 1;
         match engine.get(docid)? {
             Some(_) => pk_hits += 1,
             None => pk_miss += 1,
@@ -135,45 +176,51 @@ pub fn run(data_dir: &PathBuf, cfg: &Config) -> Result<Vec<TestResult>> {
     }
     results.push(TestResult::new(
         "查询 · 主键",
-        pk_miss == 0 && pk_hits == 50,
-        format!("50 次主键点查，命中 {pk_hits}，未命中 {pk_miss}（稀疏索引→布隆→Zone Map→块缓存）"),
+        pk_miss == 0 && pk_hits == pk_sample,
+        format!("{pk_sample} 次主键点查，命中 {pk_hits}，未命中 {pk_miss}（稀疏索引→布隆→Zone Map→块缓存）"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
     // ---------- 4. 缓存查询（同一批 docid 再查 → HotCache 命中） ----------
     let t = Instant::now();
     let mut cache_hits = 0u64;
-    for i in 0..50u64 {
-        let docid = (i * 13 % 1000) + 1;
+    for i in 0..pk_sample {
+        let docid = (i * 13 % scale) + 1;
         if engine.get(docid)?.is_some() {
             cache_hits += 1;
         }
     }
     results.push(TestResult::new(
         "查询 · HotCache",
-        cache_hits == 50,
-        format!("50 次重复查询，HotCache 命中 {cache_hits} / 50（写后回填 + 读后回填）"),
+        cache_hits == pk_sample,
+        format!("{pk_sample} 次重复查询，HotCache 命中 {cache_hits} / {pk_sample}（写后回填 + 读后回填）"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
     // ---------- 5. 组合索引查询（status=active 前缀） ----------
     let t = Instant::now();
     let mut cidx = ColumnFamily::open("cidx-demo", &data_dir.join("cidx-demo"), cfg)?;
-    let mut active_count = 0usize;
-    for (docid, _doc, _terms) in &docs {
+    let mut active_count = 0u64;
+    // 组合索引条目数 = scale/3；全部写入内存索引内存较大，抽样写 10 万条用于验证语义
+    let idx_budget = 100_000.min(scale / 3);
+    for docid in 1..=scale {
         if docid % 3 == 0 {
-            let key = encode_composite_key(&[b"active"], *docid);
-            cidx.put_bytes(key, docid.to_le_bytes().to_vec())?;
+            if active_count >= idx_budget {
+                break;
+            }
+            let key = encode_composite_key(&[b"active"], docid);
+            cidx.put_bytes_nosync(key, docid.to_le_bytes().to_vec())?;
             active_count += 1;
         }
     }
+    cidx.sync_wal()?;
     let start = encode_composite_key(&[b"active"], 0);
     let end = encode_composite_key(&[b"active"], u64::MAX);
     let hits = cidx.scan_raw_range(Some(&start), Some(&end))?;
     results.push(TestResult::new(
         "查询 · 组合索引",
-        hits.len() == active_count,
-        format!("status=active 前缀查询命中 {} 条（预期 {active_count}）", hits.len()),
+        hits.len() == active_count as usize,
+        format!("status=active 前缀查询命中 {} 条（写入索引 {active_count} 条）", hits.len()),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
@@ -194,18 +241,19 @@ pub fn run(data_dir: &PathBuf, cfg: &Config) -> Result<Vec<TestResult>> {
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
-    // ---------- 7. 分片路由（ShardedEngine 模拟） ----------
+    // ---------- 7. 分片路由（ShardedEngine 模拟，4 分片全量写入） ----------
     let t = Instant::now();
     let shard_dir = data_dir.join("sharded");
     let mut se = ShardedEngine::open(&shard_dir, cfg, 4)?;
     for (docid, doc, terms) in &docs {
-        se.put(*docid, doc.clone(), terms)?;
+        se.put_nosync(*docid, doc.clone(), terms)?;
     }
+    se.flush_wal()?;
     let dist = se.distribution();
     let total: usize = dist.iter().map(|(_, c)| *c).sum();
     let mut shard_ok = 0u64;
-    for i in 0..40u64 {
-        let docid = (i * 17 % 1000) + 1;
+    for i in 0..pk_sample {
+        let docid = (i * 17 % scale) + 1;
         if se.get(docid)?.is_some() {
             shard_ok += 1;
         }
@@ -213,16 +261,17 @@ pub fn run(data_dir: &PathBuf, cfg: &Config) -> Result<Vec<TestResult>> {
     let dist_str = dist.iter().map(|(s, c)| format!("shard{s}={c}")).collect::<Vec<_>>().join(", ");
     results.push(TestResult::new(
         "分片路由",
-        total == docs.len() && shard_ok == 40,
-        format!("4 分片分布：{dist_str}（合计 {total}）；分片点查命中 {shard_ok}/40"),
+        total == docs.len() as usize && shard_ok == pk_sample,
+        format!("4 分片分布：{dist_str}（合计 {total}）；分片点查命中 {shard_ok}/{pk_sample}"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
     // ---------- 8. 删除 ----------
     let t = Instant::now();
     let mut del_ok = 0u64;
-    for i in 0..20u64 {
-        let docid = (i * 11 % 1000) + 1;
+    let del_sample = sample.min(100);
+    for i in 0..del_sample {
+        let docid = (i * 11 % scale) + 1;
         engine.delete(docid)?;
         if engine.get(docid)?.is_none() {
             del_ok += 1;
@@ -230,8 +279,8 @@ pub fn run(data_dir: &PathBuf, cfg: &Config) -> Result<Vec<TestResult>> {
     }
     results.push(TestResult::new(
         "删除",
-        del_ok == 20,
-        format!("删除 20 条并验证不可见（Tombstone 落盘 + HotCache 失效）：{del_ok}/20"),
+        del_ok == del_sample,
+        format!("删除 {del_sample} 条并验证不可见（Tombstone 落盘 + HotCache 失效）：{del_ok}/{del_sample}"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 

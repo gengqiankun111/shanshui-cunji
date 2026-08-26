@@ -15,6 +15,7 @@ use crate::config::model::Config;
 use crate::error::Result;
 use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
+use crate::keys::encode_docid;
 use crate::optimizer::{route, AccessPath, QuerySpec};
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
@@ -59,16 +60,28 @@ impl Engine {
     pub fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // 内存限流：软水位返回限流信号（MVP 仍放行，记录计数）；硬水位直接拒绝
         let _status = self.watchdog.memory_check(self.mem_ratio)?;
+        self.put_nosync(docid, value, terms)?;
+        self.flush_wal()
+    }
+
+    /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
+    pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // ① 失效 HotCache 该 docid
         self.hotcache.invalidate(docid);
-        // ② 主数据（权威源）
-        self.primary.put(docid, value.clone())?;
+        // ② 主数据（权威源，WAL 攒批不逐条 fsync）
+        self.primary.put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）
         for t in terms {
             self.inverted.add(t, docid);
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中）
         self.hotcache.put(docid, value);
+        Ok(())
+    }
+
+    /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
+    pub fn flush_wal(&mut self) -> Result<()> {
+        self.primary.sync_wal()?;
         Ok(())
     }
 

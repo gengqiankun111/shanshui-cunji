@@ -146,11 +146,23 @@ impl ColumnFamily {
 
     /// 写入原始字节键（组合索引等任意 key 使用）。
     pub fn put_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
-        let seq = self.wal.append(OP_PUT, &key, Some(&value))?;
+        let seq = self.put_bytes_nosync(key, value)?;
         self.wal.sync()?;
+        Ok(seq)
+    }
+
+    /// 批量写入（不逐条 fsync，由调用方最终 `sync_wal` 统一提交）。
+    /// 供亿级数据压测/导入使用；强安全模式逐条写请用 `put_bytes`。
+    pub fn put_bytes_nosync(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
+        let seq = self.wal.append(OP_PUT, &key, Some(&value))?;
         self.memtable.put(key, seq, value);
         self.maybe_flush()?;
         Ok(seq)
+    }
+
+    /// 统一提交 WAL 缓冲（批量写入结束时调用）。
+    pub fn sync_wal(&mut self) -> Result<()> {
+        self.wal.sync()
     }
 
     /// 删除（Tombstone，跨 flush/重启一致，见步骤 9）。

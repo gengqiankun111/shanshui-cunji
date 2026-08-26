@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-gnu]
+linker = "D:\\w64devkit\\bin\\gcc.exe"
+
+[build]
+target-dir = "D:\\novosdb-target"

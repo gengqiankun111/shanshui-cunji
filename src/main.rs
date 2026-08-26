@@ -18,8 +18,12 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut config_path = PathBuf::from("config.toml");
+    // demo 子命令参数：--scale <条数>（默认 10 万） / --out <输出目录> / --gen-only
+    let mut scale: u64 = 100_000;
+    let mut out_dir = PathBuf::from("images");
+    let mut gen_only = false;
 
-    // 解析 `--config <path>`（允许出现在任意位置）
+    // 解析 `--config <path>` / `--scale <n>` / `--out <dir>` / `--gen-only`（允许出现在任意位置）
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -28,6 +32,21 @@ fn main() {
                 if i < args.len() {
                     config_path = PathBuf::from(&args[i]);
                 }
+            }
+            "--scale" | "-s" => {
+                i += 1;
+                if i < args.len() {
+                    scale = args[i].parse().unwrap_or(100_000);
+                }
+            }
+            "--out" | "-o" => {
+                i += 1;
+                if i < args.len() {
+                    out_dir = PathBuf::from(&args[i]);
+                }
+            }
+            "--gen-only" => {
+                gen_only = true;
             }
             _ => {}
         }
@@ -42,7 +61,7 @@ fn main() {
 
     match subcommand {
         "check" => run_check(&config_path),
-        "demo" => run_demo(&config_path),
+        "demo" => run_demo(&config_path, scale, &out_dir, gen_only),
         "version" | "-V" | "--version" => {
             println!("novosdb {VERSION}");
         }
@@ -79,8 +98,9 @@ fn run_check(config_path: &PathBuf) {
     }
 }
 
-/// 功能冒烟测试：运行 demo 并输出终端表格 + HTML 报告（images/report.html）。
-fn run_demo(config_path: &PathBuf) {
+/// 功能冒烟测试：运行 demo 并输出终端表格 + HTML 报告（输出目录由 `out_dir` 指定）。
+/// `--gen-only` 时仅构造数据到 `out_dir/data.jsonl`，不执行测试。
+fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool) {
     let cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -88,14 +108,30 @@ fn run_demo(config_path: &PathBuf) {
             std::process::exit(1);
         }
     };
+    std::fs::create_dir_all(out_dir).expect("创建输出目录失败");
+
+    if gen_only {
+        let path = out_dir.join("data.jsonl");
+        let t = std::time::Instant::now();
+        match novosdb::demo::generate(scale, &path) {
+            Ok(n) => {
+                println!("✅ 构造数据完成：{n} 条 → {}（{:.1} ms）", path.display(), t.elapsed().as_secs_f64() * 1000.0);
+                return;
+            }
+            Err(e) => {
+                eprintln!("❌ 构造数据失败: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // 临时数据目录（进程级，避免污染仓库）
     let data_dir = std::env::temp_dir().join(format!("novosdb-demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("创建临时数据目录失败");
 
-    println!("\n═══ novosdb {VERSION} 功能冒烟测试 ═══\n");
-    let results = match novosdb::demo::run(&data_dir, &cfg) {
+    println!("\n═══ novosdb {VERSION} 功能冒烟测试（scale={scale}）═══\n");
+    let results = match novosdb::demo::run(&data_dir, &cfg, scale) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("❌ demo 运行失败: {e}");
@@ -115,32 +151,24 @@ fn run_demo(config_path: &PathBuf) {
     println!("总计：{passed_total}/{} 通过", results.len());
 
     // HTML 报告（按功能归类，供截图）
-    let html = build_html_report(&results);
-    let images_dir = std::path::Path::new("images");
-    std::fs::create_dir_all(images_dir).expect("创建 images 目录失败");
-    let report_path = images_dir.join("report.html");
+    let html = build_html_report(&results, scale);
+    let report_path = out_dir.join("report.html");
     std::fs::write(&report_path, html).expect("写 HTML 报告失败");
     println!("\n📄 HTML 报告已生成: {}", report_path.display());
 }
 
 /// 生成按功能归类的 HTML 报告（每个功能一个独立 section，供逐块截图）。
-fn build_html_report(results: &[novosdb::demo::TestResult]) -> String {
+fn build_html_report(results: &[novosdb::demo::TestResult], scale: u64) -> String {
     let mut sections = String::new();
+    // 固定 slug（按功能顺序），与截图脚本一一对应
+    const SLUGS: [&str; 9] = [
+        "01-data", "02-insert", "03-query-primary", "04-query-cache",
+        "05-query-composite", "06-query-inverted", "07-sharding", "08-delete", "09-optimizer",
+    ];
     for (i, r) in results.iter().enumerate() {
         let cls = if r.passed { "pass" } else { "fail" };
         let badge = if r.passed { "通过" } else { "失败" };
-        let slug = match r.name {
-            "构造测试数据" => "01-data",
-            "插入" => "02-insert",
-            "查询 · 主键" => "03-query-primary",
-            "查询 · HotCache" => "04-query-cache",
-            "查询 · 组合索引" => "05-query-composite",
-            "查询 · 倒排词条" => "06-query-inverted",
-            "分片路由" => "07-sharding",
-            "删除" => "08-delete",
-            "优化器路由" => "09-optimizer",
-            _ => "other",
-        };
+        let slug = SLUGS.get(i).copied().unwrap_or("other");
         sections.push_str(&format!(
             r#"<section class="card {cls}" id="{slug}">
                 <div class="head">
@@ -185,14 +213,15 @@ fn build_html_report(results: &[novosdb::demo::TestResult]) -> String {
   .meta b {{ color:#e2e8f0; }}
 </style></head><body><div class="wrap">
   <h1>novosdb v{VERSION} 功能冒烟测试报告</h1>
-  <div class="sub">LSM-Tree 单机内核 · 2026-08-27 · 按功能归类</div>
-  <div class="summary">
-    <span class="big">{passed}/{total}</span> 项通过
-    <div class="bar"><i></i></div>
-  </div>
-  {sections}
-</div></body></html>"#,
+   <div class="sub">LSM-Tree 单机内核 · 2026-08-27 · 数据量 {scale} 条 · 按功能归类</div>
+   <div class="summary">
+     <span class="big">{passed}/{total}</span> 项通过
+     <div class="bar"><i></i></div>
+   </div>
+   {sections}
+ </div></body></html>"#,
         VERSION = VERSION,
+        scale = scale,
         passed = passed,
         total = total,
         bar_pct = bar_pct,
