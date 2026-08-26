@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
 use crate::optimizer::{route, AccessPath, QuerySpec};
+use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
 /// 引擎：组合主数据 + 组合索引 + 倒排 + HotCache。
 pub struct Engine {
@@ -27,6 +28,10 @@ pub struct Engine {
     inverted: InvertedIndex,
     /// 文档热缓存。
     hotcache: HotCache,
+    /// 看门狗（OOM 限流 + 查询超时熔断）。
+    watchdog: Watchdog,
+    /// 内存使用率估算（0~1，由上层注入或监控更新）。
+    mem_ratio: f64,
 }
 
 /// 查询结果行：docid + 文档字节。
@@ -39,12 +44,21 @@ impl Engine {
         let inverted = InvertedIndex::open(&data_dir.join("inverted"), 1_000_000)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let hotcache = HotCache::new(cfg.hotcache.clone());
-        Ok(Self { primary, cidx, inverted, hotcache })
+        let watchdog = Watchdog::new(cfg, DEFAULT_QUERY_TIMEOUT);
+        Ok(Self { primary, cidx, inverted, hotcache, watchdog, mem_ratio: 0.0 })
+    }
+
+    /// 更新内存使用率估算（OOM Guardian 输入，由监控/统计层刷新）。
+    pub fn set_mem_ratio(&mut self, ratio: f64) {
+        self.mem_ratio = ratio.clamp(0.0, 1.0);
     }
 
     /// 写入文档（docid + 序列化字节 + 该文档涉及的倒排词条）。
     /// 写失效链：先失效 HotCache 与组合索引旧条目，最后写 LSM（design 6.6）。
+    /// OOM Guardian：写入前按水位限流/熔断（design 14.1.1）。
     pub fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
+        // 内存限流：软水位返回限流信号（MVP 仍放行，记录计数）；硬水位直接拒绝
+        let _status = self.watchdog.memory_check(self.mem_ratio)?;
         // ① 失效 HotCache 该 docid
         self.hotcache.invalidate(docid);
         // ② 主数据（权威源）
@@ -114,20 +128,40 @@ impl Engine {
     }
 
     /// 查询执行器：按 QuerySpec 静态路由到访问路径并执行（design 7.1 最小集枚举）。
+    /// 看门狗：查询超时熔断（逐行检查 QueryGuard，超时返回 QueryTooExpensive）。
     pub fn execute(&mut self, spec: &QuerySpec) -> Result<Vec<QueryRow>> {
-        match route(spec) {
+        let guard = self.watchdog.begin_query();
+        let rows = match route(spec) {
             AccessPath::PrimaryPoint => {
                 let docid = spec.primary_eq.as_ref().map(|k| crate::keys::decode_docid(k)).transpose()?.unwrap_or(0);
-                Ok(self.get(docid)?.into_iter().map(|v| (docid, v)).collect())
+                self.get(docid)?.into_iter().map(|v| (docid, v)).collect()
             }
-            AccessPath::PrimaryRange => self.scan_range(None, None),
+            AccessPath::PrimaryRange => self.scan_range(None, None)?,
             AccessPath::CompositeIndex { fields } => {
                 let fs: Vec<&[u8]> = fields.iter().map(|s| s.as_bytes()).collect();
-                self.query_by_composite_prefix(&fs)
+                self.query_by_composite_prefix(&fs)?
             }
-            AccessPath::Inverted { term } => self.search_term(&term),
-            AccessPath::FullScan => self.scan_range(None, None),
-        }
+            AccessPath::Inverted { term } => {
+                // 倒排回表：逐行熔断检查
+                let bitmap = self.inverted.search(&term)?;
+                let mut out = Vec::new();
+                for docid in bitmap {
+                    if guard.is_expired() {
+                        return Err(crate::error::Error::QueryTooExpensive(format!(
+                            "查询超时（guard #{} > {}ms），熔断中止",
+                            guard.query_id(),
+                            guard.timeout().as_millis()
+                        )));
+                    }
+                    if let Some(v) = self.get(docid as u64)? {
+                        out.push((docid as u64, v));
+                    }
+                }
+                out
+            }
+            AccessPath::FullScan => self.scan_range(None, None)?,
+        };
+        Ok(rows)
     }
 
     /// 倒排内存累积条数（供后台刷盘决策）。
@@ -259,5 +293,29 @@ mod tests {
         let mut ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
         ids.sort();
         assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn oom_guardian_blocks_writes_at_stall() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.set_mem_ratio(0.5);
+        e.put(1, b"ok".to_vec(), &[]).unwrap(); // 正常写入
+
+        e.set_mem_ratio(1.0); // 模拟 RSS 打满
+        let err = e.put(2, b"blocked".to_vec(), &[]).unwrap_err();
+        assert!(matches!(err, crate::error::Error::MemoryOverload(_)));
+        // 被拒写入不生效
+        assert!(e.get(2).unwrap().is_none());
+        assert!(e.get(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn oom_guardian_throttles_in_soft_range() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.set_mem_ratio(0.9); // 软水位区间
+        e.put(1, b"throttled-but-allowed".to_vec(), &[]).unwrap();
+        assert!(e.get(1).unwrap().is_some());
+        // 限流计数已记录
+        assert!(e.watchdog.memory().throttled_count() >= 1);
     }
 }

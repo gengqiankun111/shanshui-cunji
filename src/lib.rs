@@ -15,5 +15,6 @@ pub mod schema;
 pub mod sstable;
 pub mod value;
 pub mod wal;
+pub mod watchdog;
 
 pub use error::{Error, Result};
