@@ -1,0 +1,28 @@
+[package]
+name = "novosdb"
+version = "0.1.0"
+edition = "2021"
+description = "高性能海量文档数据库：LSM-Tree 高吞吐写入 + 倒排检索 + 文档模型 + 运维体系"
+license = "Apache-2.0"
+repository = ""
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "6"
+crossbeam-skiplist = "0.1"
+zstd = "0.13"
+lru = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+
+[profile.release]
+lto = "fat"           # 链接时优化，提升性能、减小体积（编译时间更长）
+codegen-units = 1     # 提高优化效果
+strip = "symbols"     # 移除调试符号，大幅减小二进制体积
