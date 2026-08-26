@@ -166,41 +166,41 @@ impl ColumnFamily {
         }
         let cache = Arc::clone(&self.block_cache);
         for sst in &mut self.ssts {
-            if let Some(found) = get_from_sst(sst, &cache, &key)? {
-                return Ok(Some(found));
+            match get_from_sst(sst, &cache, &key)? {
+                // 命中：最新版本。value=None 为 Tombstone → 视为不存在
+                Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
+                None => continue, // 未命中该 SST，继续查更旧的
             }
         }
         Ok(None)
     }
 
     /// 范围扫描 [start, end]（闭区间，None 端无边界）：先收集 MemTable 与各 SST 候选，
-    /// 以最大 seq 去重（最新覆盖），返回按 docid 升序的 (docid, value) 列表（已过滤 Tombstone）。
+    /// 以最大 seq 去重（最新覆盖，Tombstone 覆盖旧值），返回按 docid 升序的 (docid, value) 列表。
     pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<(u64, Vec<u8>)>> {
         let start_key = start.map(|s| encode_docid(s).to_vec());
         let end_key = end.map(|e| encode_docid(e).to_vec());
 
-        // 候选收集：key → (seq, value)，同 key 保留 seq 最大者
-        let mut merged: std::collections::HashMap<u64, (u64, Vec<u8>)> = std::collections::HashMap::new();
+        // 候选收集：docid → (seq, value)，value=None 表示 Tombstone
+        let mut merged: std::collections::HashMap<u64, (u64, Option<Vec<u8>>)> = std::collections::HashMap::new();
 
-        // MemTable 扫描
+        // MemTable 扫描（含 Tombstone 覆盖）
         self.memtable.scan_range(start_key.as_deref(), end_key.as_deref(), |key, e| {
-            if let Some(v) = &e.value {
-                let docid = decode_docid(key).unwrap_or(0);
-                merge_candidate(&mut merged, docid, e.seq, v.clone());
-            }
+            let docid = decode_docid(key).unwrap_or(0);
+            merge_candidate(&mut merged, docid, e.seq, e.value.clone());
         });
 
         // SST 范围扫描（Zone Map 剪枝已内置在 scan_range）
         for sst in &mut self.ssts {
             sst.scan_range(start_key.as_deref(), end_key.as_deref(), |k, v, seq| {
                 let docid = decode_docid(k).unwrap_or(0);
-                merge_candidate(&mut merged, docid, seq, v.to_vec());
+                merge_candidate(&mut merged, docid, seq, v.map(|x| x.to_vec()));
             })?;
         }
 
         let mut out: Vec<(u64, Vec<u8>)> = merged
             .into_iter()
-            .map(|(docid, (_seq, value))| (docid, value))
+            .filter_map(|(docid, (_seq, value))| value.map(|v| (docid, v)))
             .collect();
         out.sort_by_key(|(docid, _)| *docid);
         Ok(out)
@@ -233,13 +233,13 @@ impl ColumnFamily {
         Ok(())
     }
 
-    /// 将 Immutable 落盘为 SST。
+    /// 将 Immutable 落盘为 SST（Put 与 Tombstone 均落盘，保证跨 flush 删除一致）。
     fn write_sst(&self, path: &Path, imm: &MemTable) -> Result<SstFooter> {
         let mut w = SstWriter::new(path, self.compression, self.compression_level, self.block_size, imm.len())?;
         imm.scan(|k, e| {
-            // MVP：跳过 Tombstone（步骤 9 引入 SST 内删除标记）
-            if let Some(v) = &e.value {
-                w.add(k, v, e.seq).expect("SST 写入失败");
+            match &e.value {
+                Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
+                None => w.add_tombstone(k, e.seq).expect("SST Tombstone 写入失败"),
             }
         });
         w.finish()
@@ -292,8 +292,8 @@ fn load_manifest(path: &Path) -> Result<(Vec<String>, u64)> {
     Ok((m.sst_files, m.next_sst_id))
 }
 
-/// 同 key 候选合并：仅保留 seq 更大（更新）的版本。
-fn merge_candidate(merged: &mut std::collections::HashMap<u64, (u64, Vec<u8>)>, docid: u64, seq: u64, value: Vec<u8>) {
+/// 同 key 候选合并：仅保留 seq 更大（更新）的版本；value=None 的 Tombstone 可覆盖旧值。
+fn merge_candidate(merged: &mut std::collections::HashMap<u64, (u64, Option<Vec<u8>>)>, docid: u64, seq: u64, value: Option<Vec<u8>>) {
     match merged.get(&docid) {
         Some((old_seq, _)) if *old_seq >= seq => {}
         _ => {
@@ -303,7 +303,8 @@ fn merge_candidate(merged: &mut std::collections::HashMap<u64, (u64, Vec<u8>)>, 
 }
 
 /// 单 SST 等值查询（布隆剪枝 → 二分定位块 → 块缓存/读盘 → 块内扫描）。
-fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+/// 返回 `(value, seq)`：value=None 表示 Tombstone；整体 None 表示该 SST 无此 key。
+fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
     if !sst.bloom().maybe_contains(&key.to_vec()) {
         return Ok(None);
     }
@@ -335,19 +336,22 @@ fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<O
 }
 
 /// 块内等值扫描（与 sstable::scan_block_for_key 相同逻辑，独立维护避免跨模块私有）。
-fn scan_block(block: &[u8], key: &[u8]) -> Option<(Vec<u8>, u64)> {
+/// 返回 `(value, seq)`：value=None 表示 Tombstone；整体 None 表示块内无此 key。
+fn scan_block(block: &[u8], key: &[u8]) -> Option<(Option<Vec<u8>>, u64)> {
     let mut cur = 0usize;
     while cur < block.len() {
         let Ok(k) = crate::keys::decode_varlen(block, &mut cur) else { return None };
         let Ok(v) = crate::keys::decode_varlen(block, &mut cur) else { return None };
-        if cur + 8 > block.len() {
+        if cur + 9 > block.len() {
             return None;
         }
-        let seq = u64::from_le_bytes(block[cur..cur + 8].try_into().ok()?);
+        let flag = block[cur];
+        let seq = u64::from_le_bytes(block[cur + 1..cur + 9].try_into().ok()?);
         if k == key {
-            return Some((v.to_vec(), seq));
+            let value = (flag == crate::sstable::FLAG_PUT).then(|| v.to_vec());
+            return Some((value, seq));
         }
-        cur += 8;
+        cur += 9;
     }
     None
 }
@@ -402,6 +406,45 @@ mod tests {
         cf.put(3, b"x".to_vec()).unwrap();
         cf.delete(3).unwrap();
         assert!(cf.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_survives_flush_and_restart() {
+        // 步骤 9：Tombstone 必须落盘——删除后刷盘 + 重启，key 依然不存在
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            cf.put(1, b"v1".to_vec()).unwrap();
+            cf.put(2, b"v2".to_vec()).unwrap();
+            cf.put(3, b"v3".to_vec()).unwrap();
+            cf.switch_and_flush().unwrap(); // 全部落盘
+            cf.delete(2).unwrap();
+            cf.delete(3).unwrap();
+            cf.switch_and_flush().unwrap(); // Tombstone 落盘
+        }
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.get(1).unwrap().unwrap().0, b"v1");
+        assert!(cf2.get(2).unwrap().is_none(), "删除后重启应不存在");
+        assert!(cf2.get(3).unwrap().is_none(), "删除后重启应不存在");
+        // 范围扫描同样过滤
+        let rows = cf2.scan_range(None, None).unwrap();
+        assert_eq!(rows, vec![(1, b"v1".to_vec())]);
+    }
+
+    #[test]
+    fn delete_overrides_older_sst_value() {
+        // 旧 SST 有值、新 SST 有 Tombstone：读路径按新→旧应命中 Tombstone → 不存在
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.put(9, b"old-value".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap();
+        // 模拟"删除发生在更晚的时刻"：直接写 tombstone 到新 memtable 并刷盘
+        cf.delete(9).unwrap();
+        cf.switch_and_flush().unwrap();
+        assert!(cf.get(9).unwrap().is_none());
+        assert!(cf.scan_range(None, None).unwrap().is_empty());
     }
 
     #[test]

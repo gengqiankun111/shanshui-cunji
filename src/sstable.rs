@@ -27,7 +27,13 @@ use crate::keys::{decode_varlen, decode_varint, encode_varlen, encode_varint};
 
 /// 文件魔数 + 版本。
 pub const SST_MAGIC: &[u8; 8] = b"NVSSTL01";
-pub const SST_VERSION: u16 = 2;
+/// v3：数据块条目加入 Flags 字节（0=Put，1=Tombstone）。
+pub const SST_VERSION: u16 = 3;
+
+/// 条目 Flags：Put。
+pub const FLAG_PUT: u8 = 0;
+/// 条目 Flags：Tombstone（删除标记）。
+pub const FLAG_DELETE: u8 = 1;
 
 /// 压缩算法标识（与 config.sstable.compression 字符串对应）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +156,15 @@ impl SstWriter {
 
     /// 追加一条 (key, value, seq)。要求 key 升序。
     pub fn add(&mut self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
+        self.add_inner(key, Some(value), FLAG_PUT, seq)
+    }
+
+    /// 追加删除标记（Tombstone）。要求 key 升序。
+    pub fn add_tombstone(&mut self, key: &[u8], seq: u64) -> Result<()> {
+        self.add_inner(key, None, FLAG_DELETE, seq)
+    }
+
+    fn add_inner(&mut self, key: &[u8], value: Option<&[u8]>, flag: u8, seq: u64) -> Result<()> {
         if let Some(last) = &self.last_key {
             if key <= last.as_slice() {
                 return Err(Error::Corrupted(format!(
@@ -158,9 +173,13 @@ impl SstWriter {
                 )));
             }
         }
-        // 数据块格式：Key(VarLen) ++ Value(VarLen) ++ Seq(u64)
+        // 数据块格式：Key(VarLen) ++ Value(VarLen) ++ Flags(u8) ++ Seq(u64)
         encode_varlen(&mut self.buf, key);
-        encode_varlen(&mut self.buf, value);
+        match value {
+            Some(v) => encode_varlen(&mut self.buf, v),
+            None => encode_varlen(&mut self.buf, &[]),
+        }
+        self.buf.push(flag);
         self.buf.extend_from_slice(&seq.to_le_bytes());
         self.buf_keys += 1;
         self.bloom.insert(&key.to_vec());
@@ -418,7 +437,8 @@ impl SstReader {
     }
 
     /// 等值查询：布隆剪枝 → 二分定位块 → 读块 → 块内扫描。
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+    /// 返回 `(value, seq)`：`value=None` 表示 Tombstone（已删除），`None` 整体表示不存在。
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         if !self.bloom.maybe_contains(&key.to_vec()) {
             return Ok(None);
         }
@@ -478,21 +498,22 @@ impl SstReader {
         }
     }
 
-    /// 迭代：按块顺序扫描全部 (key, seq)。MVP 不提供跨块游标，先提供全量。
-    pub fn iterate<F: FnMut(&[u8], u64)>(&mut self, mut f: F) -> Result<()> {
+    /// 迭代：按块顺序扫描全部条目。回调 `f(key, value, seq)`，`value=None` 表示 Tombstone。
+    pub fn iterate<F: FnMut(&[u8], Option<&[u8]>, u64)>(&mut self, mut f: F) -> Result<()> {
         let entries: Vec<IndexEntry> = self.index.clone();
         for e in entries {
             let data = self.read_block(&e)?;
             let mut cur = 0usize;
             while cur < data.len() {
                 let key = decode_varlen(&data, &mut cur)?;
-                let _value = decode_varlen(&data, &mut cur)?;
-                if cur + 8 > data.len() {
-                    return Err(Error::Corrupted("迭代 seq 越界".into()));
+                let value = decode_varlen(&data, &mut cur)?;
+                if cur + 9 > data.len() {
+                    return Err(Error::Corrupted("迭代 flags/seq 越界".into()));
                 }
-                let seq = u64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
-                f(key, seq);
-                cur += 8;
+                let flag = data[cur];
+                let seq = u64::from_le_bytes(data[cur + 1..cur + 9].try_into().unwrap());
+                f(key, (flag == FLAG_PUT).then_some(value), seq);
+                cur += 9;
             }
         }
         Ok(())
@@ -500,7 +521,8 @@ impl SstReader {
 
     /// 范围扫描 [start, end]（闭区间；None 端无边界），利用块级 Zone Map 剪枝：
     /// 块范围 [first_key, max_key] 与查询区间无交集则跳过，不读块、不解压（design 4.4.1）。
-    pub fn scan_range<F: FnMut(&[u8], &[u8], u64)>(
+    /// 回调 `f(key, value, seq)`，`value=None` 表示 Tombstone。
+    pub fn scan_range<F: FnMut(&[u8], Option<&[u8]>, u64)>(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -523,11 +545,12 @@ impl SstReader {
             while cur < data.len() {
                 let key = decode_varlen(&data, &mut cur)?;
                 let value = decode_varlen(&data, &mut cur)?;
-                if cur + 8 > data.len() {
-                    return Err(Error::Corrupted("范围扫描 seq 越界".into()));
+                if cur + 9 > data.len() {
+                    return Err(Error::Corrupted("范围扫描 flags/seq 越界".into()));
                 }
-                let seq = u64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
-                cur += 8;
+                let flag = data[cur];
+                let seq = u64::from_le_bytes(data[cur + 1..cur + 9].try_into().unwrap());
+                cur += 9;
                 if let Some(s) = start {
                     if key < s {
                         continue;
@@ -538,7 +561,7 @@ impl SstReader {
                         continue;
                     }
                 }
-                f(key, value, seq);
+                f(key, (flag == FLAG_PUT).then_some(value), seq);
             }
         }
         Ok(())
@@ -565,20 +588,22 @@ fn decode_index(ib: &[u8]) -> Result<Vec<IndexEntry>> {
     Ok(out)
 }
 
-/// 块内顺序扫描等值 key；命中返回 (value, seq)。
-fn scan_block_for_key(data: &[u8], key: &[u8]) -> Option<(Vec<u8>, u64)> {
+/// 块内顺序扫描等值 key；命中返回 `(value, seq)`（value=None 表示 Tombstone）。
+fn scan_block_for_key(data: &[u8], key: &[u8]) -> Option<(Option<Vec<u8>>, u64)> {
     let mut cur = 0usize;
     while cur < data.len() {
         let k = decode_varlen(data, &mut cur).ok()?;
         let v = decode_varlen(data, &mut cur).ok()?;
-        if cur + 8 > data.len() {
+        if cur + 9 > data.len() {
             return None;
         }
-        let seq = u64::from_le_bytes(data[cur..cur + 8].try_into().ok()?);
+        let flag = data[cur];
+        let seq = u64::from_le_bytes(data[cur + 1..cur + 9].try_into().ok()?);
         if k == key {
-            return Some((v.to_vec(), seq));
+            let value = (flag == FLAG_PUT).then(|| v.to_vec());
+            return Some((value, seq));
         }
-        cur += 8;
+        cur += 9;
     }
     None
 }
@@ -615,7 +640,7 @@ mod tests {
         for i in (0..100u64).step_by(7) {
             let k = format!("user-{i:08}").into_bytes();
             let (v, seq) = r.get(&k).unwrap().unwrap();
-            assert_eq!(v, format!("value-of-{i}").into_bytes());
+            assert_eq!(v.unwrap(), format!("value-of-{i}").into_bytes());
             assert_eq!(seq, i);
         }
     }
@@ -643,7 +668,7 @@ mod tests {
         let mut r = SstReader::open(&path).unwrap();
         let mut last: Option<Vec<u8>> = None;
         let mut count = 0u64;
-        r.iterate(|k, _| {
+        r.iterate(|k, _v, _seq| {
             if let Some(l) = &last {
                 assert!(k > l.as_slice());
             }
@@ -733,5 +758,34 @@ mod tests {
         let mut hits = Vec::new();
         r.scan_range(Some(b"k0050"), Some(b"k0060"), |k, _, _| hits.push(k.to_vec())).unwrap();
         assert_eq!(hits.len(), 11);
+    }
+
+    #[test]
+    fn tombstone_roundtrip() {
+        let path = tmp();
+        let mut w = SstWriter::new(&path, Compression::Zstd, 1, 4096, 10).unwrap();
+        w.add(b"a", b"va", 1).unwrap();
+        w.add_tombstone(b"b", 2).unwrap();
+        w.add(b"c", b"vc", 3).unwrap();
+        w.finish().unwrap();
+
+        let mut r = SstReader::open(&path).unwrap();
+        let (va, _) = r.get(b"a").unwrap().unwrap();
+        assert_eq!(va.unwrap(), b"va");
+        let (vb, seq_b) = r.get(b"b").unwrap().unwrap();
+        assert!(vb.is_none(), "b 应为 Tombstone");
+        assert_eq!(seq_b, 2);
+        let (vc, _) = r.get(b"c").unwrap().unwrap();
+        assert_eq!(vc.unwrap(), b"vc");
+        assert!(r.get(b"zzz").unwrap().is_none());
+
+        // 范围扫描同样携带删除语义
+        let mut found = Vec::new();
+        r.scan_range(None, None, |k, v, _| found.push((k.to_vec(), v.is_some()))).unwrap();
+        assert_eq!(found, vec![
+            (b"a".to_vec(), true),
+            (b"b".to_vec(), false),
+            (b"c".to_vec(), true),
+        ]);
     }
 }
