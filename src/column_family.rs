@@ -27,7 +27,7 @@ use crate::config::model::{Config, MemtableConfig};
 use crate::error::{Error, Result};
 use crate::keys::{decode_docid, encode_docid};
 use crate::memtable::{MemTable, MemTableBuffer};
-use crate::sstable::{Compression, SstFooter, SstReader, SstWriter};
+use crate::sstable::{Compression, FLAG_DELETE, FLAG_PUT, SstFooter, SstReader, SstWriter};
 use crate::wal::{WalReader, WalWriter, OP_DELETE, OP_PUT};
 
 /// SST 文件前缀。
@@ -52,6 +52,12 @@ pub struct ColumnFamily {
     compression: Compression,
     compression_level: i32,
     block_size: usize,
+    /// PAX 热字段白名单（阶段 1.5，来自 [storage] hot_fields；空 = 行式）。
+    pax_hot_fields: Vec<String>,
+    /// TTL 天数（None = 关闭；开启后 SST 按文档 ttl_field 分天桶，过期整文件删除）。
+    ttl_days: Option<u32>,
+    /// TTL 时间字段名（文档 JSON 内数值秒级时间戳）。
+    ttl_field: String,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 文件（新→旧）。
@@ -70,8 +76,35 @@ impl ColumnFamily {
     /// 打开（或创建）一个列族：加载 Manifest/SST、回放 WAL。
     pub fn open(name: &str, dir: &Path, cfg: &Config) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        if cfg.storage.time_bucket != "day" {
+            return Err(Error::Config(format!(
+                "storage.time_bucket 仅支持 day（当前: {}）",
+                cfg.storage.time_bucket
+            )));
+        }
         let manifest_path = dir.join(MANIFEST_FILE);
-        let (sst_names, next_sst_id) = load_manifest(&manifest_path)?;
+        let (mut sst_names, next_sst_id) = load_manifest(&manifest_path)?;
+
+        // TTL 过期桶清理：按天整文件删除（删除成本 O(1)，无墓碑；design 5.4）
+        if let Some(ttl_days) = cfg.storage.ttl_days {
+            let cutoff = today_epoch_days() - ttl_days as i64;
+            let mut removed = 0usize;
+            for f in &sst_names {
+                if let Some(days) = parse_sst_date(f) {
+                    if days < cutoff {
+                        let p = dir.join(f);
+                        if p.exists() {
+                            std::fs::remove_file(&p).map_err(|e| Error::Io(e))?;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+            if removed > 0 {
+                sst_names.retain(|f| parse_sst_date(f).map_or(true, |d| d >= cutoff));
+                info!("列族 [{name}] TTL 过期桶清理: 删除 {removed} 个 SST");
+            }
+        }
 
         // 打开全部 SST（新→旧）
         let mut ssts = Vec::new();
@@ -105,6 +138,9 @@ impl ColumnFamily {
             compression,
             compression_level,
             block_size: cfg.blockcache.block_size_kb * 1024,
+            pax_hot_fields: cfg.storage.hot_fields.clone(),
+            ttl_days: cfg.storage.ttl_days,
+            ttl_field: cfg.storage.ttl_field.clone(),
             memtable: MemTableBuffer::new(),
             ssts,
             block_cache,
@@ -121,6 +157,7 @@ impl ColumnFamily {
     }
 
     /// 回放 WAL：重建 MemTable 并推进 seq。返回已回放的最大 seq（无记录为 0）。
+    /// TTL 启用时，已过期的记录（按文档 ttl_field 判断）不回放入 MemTable。
     fn replay_wal(&mut self, wal_path: &Path) -> Result<u64> {
         let recs = WalReader::recover(wal_path)?;
         let mut max_seq = 0u64;
@@ -128,7 +165,9 @@ impl ColumnFamily {
             match r.op {
                 OP_PUT => {
                     if let Some(v) = &r.value {
-                        self.memtable.put(r.key.clone(), r.seq, v.clone());
+                        if !self.is_ttl_expired(v) {
+                            self.memtable.put(r.key.clone(), r.seq, v.clone());
+                        }
                     }
                 }
                 OP_DELETE => self.memtable.delete(r.key.clone(), r.seq),
@@ -141,6 +180,15 @@ impl ColumnFamily {
             info!("列族 [{}] WAL 回放 {} 条，seq 推进至 {}", self.name, recs.len(), max_seq + 1);
         }
         Ok(max_seq)
+    }
+
+    /// TTL 过期判断：文档 ttl_field 对应桶天数早于截止天数（默认桶/不可解析永不过期）。
+    fn is_ttl_expired(&self, value: &[u8]) -> bool {
+        let Some(days) = self.document_bucket_days(value) else {
+            return false;
+        };
+        let cutoff = today_epoch_days() - self.ttl_days.unwrap_or(0) as i64;
+        days < cutoff
     }
 
     /// 写入（主键点写，便捷封装）。
@@ -180,6 +228,22 @@ impl ColumnFamily {
         self.wal.sync()?;
         self.memtable.delete(key, seq);
         Ok(seq)
+    }
+
+    /// 删除指定前缀的全部记录（阶段 1.5 Delta CF：全量 put 覆盖后清空该 docid 的增量）。
+    /// 前缀上界 = prefix ++ [0xFF;4]（字段名长度前缀上限），闭区间扫描后逐条墓碑。
+    pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
+        let mut end = prefix.to_vec();
+        end.extend_from_slice(&[0xFF; 4]);
+        let rows = self.scan_raw_range(Some(prefix), Some(&end))?;
+        let mut deleted = 0u64;
+        for (k, _) in rows {
+            if k.starts_with(prefix) {
+                self.delete_bytes(k)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// 查询（主键点查，便捷封装）。返回 (value, seq)，已过滤 Tombstone。
@@ -255,10 +319,18 @@ impl ColumnFamily {
         let Some(imm) = self.memtable.take_immutable() else {
             return Ok(());
         };
+        if self.ttl_days.is_none() {
+            return self.flush_single(&imm);
+        }
+        self.flush_buckets(&imm)
+    }
+
+    /// 原逻辑：整个 Immutable 落盘为单个 SST。
+    fn flush_single(&mut self, imm: &MemTable) -> Result<()> {
         let sst_id = self.next_sst_id;
         self.next_sst_id += 1;
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
-        self.write_sst(&path, &imm)?;
+        self.write_sst(&path, imm)?;
 
         // 新文件插到最前（读路径优先命中）
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
@@ -268,9 +340,76 @@ impl ColumnFamily {
         Ok(())
     }
 
+    /// TTL 分桶 flush：按文档 ttl_field 提取的 UTC 天分桶，每个桶一个 SST 文件；
+    /// 无时间字段 / 非 JSON 值落入默认桶（无日期前缀，永不过期）。桶内 key 保持升序。
+    fn flush_buckets(&mut self, imm: &MemTable) -> Result<()> {
+        let mut buckets: std::collections::BTreeMap<Option<i64>, Vec<(Vec<u8>, Option<Vec<u8>>, u8, u64)>> =
+            std::collections::BTreeMap::new();
+        imm.scan(|k, e| {
+            let days = match &e.value {
+                Some(v) => self.document_bucket_days(v),
+                None => None, // Tombstone 无时间 → 默认桶（随对应 key 的桶删除语义由数据决定）
+            };
+            let flag = if e.value.is_some() { FLAG_PUT } else { FLAG_DELETE };
+            buckets
+                .entry(days)
+                .or_default()
+                .push((k.to_vec(), e.value.clone(), flag, e.seq));
+        });
+        let bucket_count = buckets.len();
+        for (days, rows) in buckets {
+            let sst_id = self.next_sst_id;
+            self.next_sst_id += 1;
+            let fname = match days {
+                Some(d) => format!("{SST_PREFIX}{d:08}-{sst_id:08}.sst"),
+                None => format!("{SST_PREFIX}{sst_id:08}.sst"),
+            };
+            let path = self.dir.join(&fname);
+            self.write_rows(&path, &rows)?;
+            self.ssts.insert(0, SstReader::open(&path)?);
+        }
+        self.persist_manifest()?;
+        info!("列族 [{}] TTL 分桶刷盘完成: {} 个桶", self.name, bucket_count);
+        Ok(())
+    }
+
+    /// 从文档 JSON 提取 ttl_field（数值秒级时间戳）→ UTC 纪元天数；无法解析返回 None。
+    fn document_bucket_days(&self, value: &[u8]) -> Option<i64> {
+        let v: serde_json::Value = serde_json::from_slice(value).ok()?;
+        let secs = v.get(&self.ttl_field)?.as_i64()?;
+        Some(epoch_days(secs))
+    }
+
+    /// 按行序列写一个 SST（TTL 分桶用；行内 key 已升序）。
+    fn write_rows(&self, path: &Path, rows: &[(Vec<u8>, Option<Vec<u8>>, u8, u64)]) -> Result<SstFooter> {
+        let mut w = SstWriter::new_with_pax(
+            path,
+            self.compression,
+            self.compression_level,
+            self.block_size,
+            rows.len(),
+            &self.pax_hot_fields,
+        )?;
+        for (k, v, flag, seq) in rows {
+            if *flag == FLAG_DELETE {
+                w.add_tombstone(k, *seq).expect("SST Tombstone 写入失败");
+            } else {
+                w.add(k, v.as_deref().unwrap_or(&[]), *seq).expect("SST 写入失败");
+            }
+        }
+        w.finish()
+    }
+
     /// 将 Immutable 落盘为 SST（Put 与 Tombstone 均落盘，保证跨 flush 删除一致）。
     fn write_sst(&self, path: &Path, imm: &MemTable) -> Result<SstFooter> {
-        let mut w = SstWriter::new(path, self.compression, self.compression_level, self.block_size, imm.len())?;
+        let mut w = SstWriter::new_with_pax(
+            path,
+            self.compression,
+            self.compression_level,
+            self.block_size,
+            imm.len(),
+            &self.pax_hot_fields,
+        )?;
         imm.scan(|k, e| {
             match &e.value {
                 Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
@@ -317,6 +456,32 @@ impl ColumnFamily {
 // ---------------------------------------------------------------------------
 // 内部辅助
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// TTL 时间分桶辅助（design 5.4，无 chrono 依赖的 civil calendar 天数计算）
+// ---------------------------------------------------------------------------
+
+/// 秒级时间戳 → UTC 纪元天数（整数除法，UTC 基准）。
+fn epoch_days(secs: i64) -> i64 {
+    secs.div_euclid(86_400)
+}
+
+/// 当前 UTC 纪元天数。
+fn today_epoch_days() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    epoch_days(secs)
+}
+
+/// 解析 TTL 桶 SST 文件名 `sst-{days:08}-{id:08}.sst` → 纪元天数；
+/// 默认桶（无日期前缀 `sst-{id:08}.sst`）返回 None（永不过期）。
+fn parse_sst_date(fname: &str) -> Option<i64> {
+    let rest = fname.strip_prefix(SST_PREFIX)?;
+    let (days_str, _rest) = rest.split_once('-')?;
+    days_str.parse::<i64>().ok()
+}
 
 fn load_manifest(path: &Path) -> Result<(Vec<String>, u64)> {
     if !path.exists() {
@@ -367,28 +532,7 @@ fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<O
         cache.put(ck, b.clone());
         b
     };
-    Ok(scan_block(&block, key))
-}
-
-/// 块内等值扫描（与 sstable::scan_block_for_key 相同逻辑，独立维护避免跨模块私有）。
-/// 返回 `(value, seq)`：value=None 表示 Tombstone；整体 None 表示块内无此 key。
-fn scan_block(block: &[u8], key: &[u8]) -> Option<(Option<Vec<u8>>, u64)> {
-    let mut cur = 0usize;
-    while cur < block.len() {
-        let Ok(k) = crate::keys::decode_varlen(block, &mut cur) else { return None };
-        let Ok(v) = crate::keys::decode_varlen(block, &mut cur) else { return None };
-        if cur + 9 > block.len() {
-            return None;
-        }
-        let flag = block[cur];
-        let seq = u64::from_le_bytes(block[cur + 1..cur + 9].try_into().ok()?);
-        if k == key {
-            let value = (flag == crate::sstable::FLAG_PUT).then(|| v.to_vec());
-            return Some((value, seq));
-        }
-        cur += 9;
-    }
-    None
+    Ok(sst.scan_block_for_key(&block, key)?)
 }
 
 #[cfg(test)]
@@ -552,6 +696,87 @@ mod tests {
             assert_eq!(cf3.get(5).unwrap().unwrap().0, b"v-5");
             assert_eq!(cf3.get(1).unwrap().unwrap().0, b"v-1");
         }
+    }
+
+    #[test]
+    fn ttl_helpers() {
+        assert_eq!(epoch_days(0), 0);
+        assert_eq!(epoch_days(86_400), 1);
+        assert_eq!(epoch_days(-1), -1); // div_euclid 向负无穷取整
+        assert_eq!(parse_sst_date("sst-00020697-00000001.sst"), Some(20_697));
+        assert_eq!(parse_sst_date("sst-00000001.sst"), None);
+        assert_eq!(parse_sst_date("manifest.json"), None);
+    }
+
+    #[test]
+    fn ttl_buckets_and_expiry() {
+        // 阶段 1.5 TTL：按天分桶写 SST；重启时过期桶整文件删除，默认桶永不过期
+        let dir = tmp();
+        let mut cfg = small_cfg(256);
+        cfg.storage.ttl_days = Some(2);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            let today = format!(r#"{{"v":"t","timestamp":{now}}}"#).into_bytes();
+            let yesterday = format!(r#"{{"v":"y","timestamp":{}}}"#, now - 86_400).into_bytes();
+            let old = format!(r#"{{"v":"o","timestamp":{}}}"#, now - 86_400 * 10).into_bytes();
+            cf.put(1, today).unwrap();
+            cf.put(2, yesterday).unwrap();
+            cf.put(3, old).unwrap();
+            cf.put(4, b"no-timestamp-raw".to_vec()).unwrap();
+            cf.switch_and_flush().unwrap();
+            assert!(cf.sst_count() >= 4, "应分 4 个桶，实际 {}", cf.sst_count());
+            // 未过期前全部可读
+            assert!(cf.get(1).unwrap().is_some());
+            assert!(cf.get(3).unwrap().is_some());
+        }
+        // 重启：10 天前的桶过期删除
+        {
+            let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            assert!(cf2.get(1).unwrap().is_some(), "今天桶应保留");
+            assert!(cf2.get(2).unwrap().is_some(), "昨天桶应保留");
+            assert!(cf2.get(3).unwrap().is_none(), "10 天前的桶应过期删除");
+            assert!(cf2.get(4).unwrap().is_some(), "默认桶（无时间字段）永不过期");
+            // 过期文件已物理删除
+            let names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|f| f.starts_with(SST_PREFIX))
+                .collect();
+            assert!(
+                names.iter().any(|f| parse_sst_date(f).map_or(true, |d| d >= today_epoch_days() - 2)),
+                "过期 SST 应已删除，剩余: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pax_cf_flush_read_roundtrip() {
+        // 阶段 1.5 PAX：配置 hot_fields 后 flush 落盘列式块，读回语义等值；非 JSON 值回退行式
+        let dir = tmp();
+        let mut cfg = small_cfg(256);
+        cfg.storage.hot_fields = vec!["status".to_string(), "city".to_string()];
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.put(1, br#"{"status":"active","city":"beijing","amount":10}"#.to_vec()).unwrap();
+        cf.put(2, br#"{"status":"inactive","city":"shanghai"}"#.to_vec()).unwrap();
+        cf.switch_and_flush().unwrap();
+        assert!(cf.sst_count() >= 1);
+        assert_eq!(
+            String::from_utf8_lossy(&cf.get(1).unwrap().unwrap().0),
+            r#"{"status":"active","city":"beijing","amount":10}"#
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&cf.get(2).unwrap().unwrap().0),
+            r#"{"status":"inactive","city":"shanghai"}"#
+        );
+        // 非 JSON 值 → 行式块（同一 v4 文件体系，Reader 兼容）
+        cf.put(3, b"raw-bytes".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.get(3).unwrap().unwrap().0, b"raw-bytes");
     }
 
     #[test]

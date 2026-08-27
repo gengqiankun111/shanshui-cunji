@@ -15,16 +15,18 @@ use crate::config::model::Config;
 use crate::error::Result;
 use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
-use crate::keys::encode_docid;
+use crate::keys::{encode_docid, encode_varlen};
 use crate::optimizer::{route, AccessPath, QuerySpec};
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
-/// 引擎：组合主数据 + 组合索引 + 倒排 + HotCache。
+/// 引擎：组合主数据 + 组合索引 + Delta 增量 + 倒排 + HotCache。
 pub struct Engine {
     /// 主数据列族（value = 序列化文档字节）。
     primary: ColumnFamily,
     /// 组合索引列族（key = encode_composite_key）。
     cidx: Option<ColumnFamily>,
+    /// Delta 增量列族（阶段 1.5，key = encode_docid ++ VarLen(field)，Merge-on-Read 覆盖 Base）。
+    delta: ColumnFamily,
     /// 倒排索引。
     inverted: InvertedIndex,
     /// 文档热缓存。
@@ -49,9 +51,10 @@ impl Engine {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
         let inverted = InvertedIndex::open(&data_dir.join("inverted"), 1_000_000)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
+        let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
-        Ok(Self { primary, cidx, inverted, hotcache, watchdog, mem_ratio: 0.0 })
+        Ok(Self { primary, cidx, inverted, delta, hotcache, watchdog, mem_ratio: 0.0 })
     }
 
     /// 更新内存使用率估算（OOM Guardian 输入，由监控/统计层刷新）。
@@ -73,8 +76,9 @@ impl Engine {
     pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // ① 失效 HotCache 该 docid
         self.hotcache.invalidate(docid);
-        // ② 主数据（权威源，WAL 攒批不逐条 fsync）
+        // ② 主数据（权威源，WAL 攒批不逐条 fsync）；全量覆盖 → 清空该 docid 的增量（避免旧 patch 覆盖新数据）
         self.primary.put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
+        self.delta.delete_prefix(&encode_docid(docid))?;
         // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）
         for t in terms {
             self.inverted.add(t, docid);
@@ -87,27 +91,70 @@ impl Engine {
     /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
     pub fn flush_wal(&mut self) -> Result<()> {
         self.primary.sync_wal()?;
+        self.delta.sync_wal()?;
         Ok(())
     }
 
-    /// 删除文档：主数据 Tombstone + 失效 HotCache（倒排残留 docid 由回表过滤）。
+    /// 删除文档：主数据 Tombstone + 失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.hotcache.invalidate(docid);
         self.primary.delete(docid)?;
+        self.delta.delete_prefix(&encode_docid(docid))?;
         Ok(())
     }
 
-    /// 点查文档：HotCache 命中直达，否则主数据 LSM。
+    /// 部分更新（阶段 1.5，design 4.7）：仅写入变更字段到 Delta CF（几十字节小记录），
+    /// 读取时 Merge-on-Read 覆盖 Base；`null` 值表示删除该字段。替代全量 PUT，写入 IO 放大趋近 1。
+    pub fn patch(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
+        self.hotcache.invalidate(docid);
+        for (f, v) in fields {
+            let mut key = encode_docid(docid).to_vec();
+            encode_varlen(&mut key, f.as_bytes());
+            let val = serde_json::to_vec(v).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+            self.delta.put_bytes_nosync(key, val)?;
+        }
+        self.flush_wal()
+    }
+
+    /// 点查文档：HotCache 命中直达，否则主数据 LSM + Delta Merge-on-Read。
     pub fn get(&mut self, docid: u64) -> Result<Option<Vec<u8>>> {
         if let Some(v) = self.hotcache.get(docid) {
             return Ok(Some(v));
         }
         let found = self.primary.get(docid)?;
-        if let Some((v, _)) = found {
-            self.hotcache.put(docid, v.clone());
-            return Ok(Some(v));
+        let Some((bv, _)) = found else {
+            return Ok(None);
+        };
+        // Delta 覆盖（对象合并；null 删除字段）；非 JSON / 非对象文档直接返回 Base（raw 字节场景）
+        let obj: serde_json::Value = match serde_json::from_slice(&bv) {
+            Ok(v) => v,
+            Err(_) => return Ok(Some(bv)),
+        };
+        let mut map = match obj {
+            serde_json::Value::Object(m) => m,
+            _ => return Ok(Some(bv)),
+        };
+        let start = encode_docid(docid).to_vec();
+        let mut end = start.clone();
+        end.extend_from_slice(&[0xFF; 4]);
+        let rows = self.delta.scan_raw_range(Some(&start), Some(&end))?;
+        for (k, v) in rows {
+            if !k.starts_with(&start) || k.len() < 12 {
+                continue;
+            }
+            let field = String::from_utf8(k[12..].to_vec())
+                .map_err(|_| crate::error::Error::Corrupted("Delta 字段名非法 UTF-8".into()))?;
+            let val: serde_json::Value = serde_json::from_slice(&v)
+                .map_err(|e| crate::error::Error::Corrupted(format!("Delta 值解析失败: {e}")))?;
+            if val.is_null() {
+                map.shift_remove(&field);
+            } else {
+                map.insert(field, val);
+            }
         }
-        Ok(None)
+        let merged = serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+        self.hotcache.put(docid, merged.clone());
+        Ok(Some(merged))
     }
 
     /// 倒排词条查询：合并 posting（RoaringBitmap）→ 回表取文档。
@@ -342,6 +389,55 @@ mod tests {
         // 被拒写入不生效
         assert!(e.get(2).unwrap().is_none());
         assert!(e.get(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn patch_merge_on_read() {
+        // 阶段 1.5 Delta CF：patch 部分更新 → get 合并覆盖；重启后 WAL 恢复仍生效
+        let dir = tmp();
+        let mut e = Engine::open(&dir, &cfg()).unwrap();
+        e.put(1, br#"{"status":"active","amount":100,"device":"android"}"#.to_vec(), &[]).unwrap();
+        e.patch(1, &[
+            ("status", serde_json::json!("inactive")),
+            ("note", serde_json::json!("updated")),
+            ("amount", serde_json::Value::Null), // null = 删除字段
+        ])
+        .unwrap();
+        let v = e.get(1).unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&v).unwrap();
+        assert_eq!(obj["status"], serde_json::json!("inactive"), "patch 应覆盖");
+        assert_eq!(obj["note"], serde_json::json!("updated"), "patch 应新增");
+        assert!(obj.get("amount").is_none(), "null patch 应删除字段");
+        assert_eq!(obj["device"], serde_json::json!("android"), "未 patch 字段保留");
+        // 重启后 Delta 仍生效（WAL 恢复）
+        drop(e);
+        let mut e2 = Engine::open(&dir, &cfg()).unwrap();
+        let obj2: serde_json::Value = serde_json::from_slice(&e2.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(obj2["status"], serde_json::json!("inactive"));
+        assert_eq!(obj2["note"], serde_json::json!("updated"));
+    }
+
+    #[test]
+    fn full_put_clears_delta() {
+        // 全量 put 覆盖 → 清空该 docid 增量，避免旧 patch 覆盖新数据
+        let dir = tmp();
+        let mut e = Engine::open(&dir, &cfg()).unwrap();
+        e.put(1, br#"{"status":"active","amount":100}"#.to_vec(), &[]).unwrap();
+        e.patch(1, &[("status", serde_json::json!("patched"))]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&e.get(1).unwrap().unwrap()), r#"{"status":"patched","amount":100}"#);
+        e.put(1, br#"{"status":"fresh","amount":200}"#.to_vec(), &[]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&e.get(1).unwrap().unwrap()), r#"{"status":"fresh","amount":200}"#);
+    }
+
+    #[test]
+    fn delete_clears_delta() {
+        // 删除文档 → Delta 清空，避免复活
+        let dir = tmp();
+        let mut e = Engine::open(&dir, &cfg()).unwrap();
+        e.put(1, br#"{"status":"active"}"#.to_vec(), &[]).unwrap();
+        e.patch(1, &[("note", serde_json::json!("x"))]).unwrap();
+        e.delete(1).unwrap();
+        assert!(e.get(1).unwrap().is_none(), "删除后 Delta 不应复活文档");
     }
 
     #[test]
