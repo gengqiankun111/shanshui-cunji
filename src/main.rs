@@ -264,6 +264,7 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
 
     // HTML 报告（按功能归类，供截图）
     let html = build_html_report(&results, scale);
+    std::fs::create_dir_all(&out_dir).expect("创建报告目录失败");
     let report_path = out_dir.join("report.html");
     std::fs::write(&report_path, html).expect("写 HTML 报告失败");
     println!("\n📄 HTML 报告已生成: {}", report_path.display());

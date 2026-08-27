@@ -284,6 +284,10 @@ pub struct StorageConfig {
     pub data_dir: String,
     /// 热字段白名单（阶段 1.5 PAX 列式块）：高频查询字段进热列组（块头），其余进冷列组（块尾）。
     pub hot_fields: Vec<String>,
+    /// TTL 时间分桶粒度：`day`（MVP）/ `hour`（预留，阶段 1.5 仅 day）。
+    pub time_bucket: String,
+    /// TTL 时间字段名（文档 JSON 内，数值秒级时间戳）。
+    pub ttl_field: String,
 }
 
 impl Default for StorageConfig {
@@ -293,6 +297,8 @@ impl Default for StorageConfig {
             ttl_days: None,
             data_dir: "./data".into(),
             hot_fields: Vec::new(),
+            time_bucket: "day".into(),
+            ttl_field: "timestamp".into(),
         }
     }
 }
