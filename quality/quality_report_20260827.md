@@ -54,13 +54,24 @@
 > CLI 壳（main.rs/demo.rs）的 0% 是工具口径——tarpaulin 默认只统计 lib 目标；
 > 其功能正确性由 demo 冒烟 10/10 与 CLI/HTTP 端到端测试保障。
 
-## 四、已知问题 / 挂起
+## 四、unsafe 统计（cargo-geiger 0.13.0 正式报告）
 
-- `cargo geiger` 报告：当前 unsafe=0（grep 已确认），正式 geiger 统计待里程碑执行
+| 口径 | 函数 | 表达式 | Impl | Trait | 方法 |
+| --- | --- | --- | --- | --- | --- |
+| shanshui-cunji 自身 | 0/958 | 0/64881 | 0/771 | 0/66 | 0/3302 |
+| 依赖合计（crc32fast/crossbeam/lru/roaring/zstd 等） | 105/1093 | 14073/89644 | 360/1159 | 29/95 | 474/3894 |
+
+- **项目自身 unsafe = 0**；源码已加 `#![forbid(unsafe_code)]`，任何未来 unsafe 在编译期即被拒绝
+- 依赖的 unsafe 属生态库内部实现（roaring 位图、crossbeam 无锁结构、zstd 压缩、hashbrown 等），不进入本项目代码
+- 完整逐依赖明细：`quality/geiger_report.txt`
+
+## 五、已知问题 / 挂起
+
+- ~~`cargo geiger` 报告~~：已完成，项目自身 unsafe = 0（2026-08-27）
 - 覆盖率 HTML 报告（含依赖的全量版）体量过大（88MB），未入库；以 lcov 机器可读版入库
 - CLI 壳覆盖率缺口：后续可抽 `build_html_report` 等纯逻辑到 lib 补测
 
-## 五、下一里程碑目标
+## 六、下一里程碑目标
 
 - 覆盖率 HTML 展示版（tarpaulin `--out Html --include-files` 修复 glob 后产出）
 - Gitee CodeCheck 开通并亮牌
