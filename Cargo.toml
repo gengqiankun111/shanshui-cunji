@@ -18,6 +18,7 @@ crossbeam-skiplist = "0.1"
 zstd = "0.13"
 lru = "0.12"
 roaring = "0.10"
+crc32fast = "1"
 
 [dev-dependencies]
 tempfile = "3"
