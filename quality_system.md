@@ -43,7 +43,8 @@ cargo fmt --all -- --check \
 ```
 
 > 现状：`cargo fmt --check` 与 `cargo clippy -- -D warnings` 已在开发机常态化执行；
-> `audit / deny / geiger / tarpaulin` 由 CI / 里程碑节点执行（见 quality_system_process.md）。
+> `cargo audit`（99 依赖 0 漏洞）与 `cargo deny check`（许可证/重复依赖全 ok）已在本机执行通过；
+> `geiger / tarpaulin` 由 CI / 里程碑节点执行（见 quality_system_process.md）。
 
 ### 第 2 层 · 架构评审（AI 大模型评估）
 
