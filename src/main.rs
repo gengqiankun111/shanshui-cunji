@@ -107,6 +107,7 @@ fn main() {
         "restore" => run_restore(&config_path, &backup_file),
         "put" => run_cli_put(&config_path, id, &data),
         "get" => run_cli_get(&config_path, id),
+        "patch" => run_cli_patch(&config_path, id, &data),
         "search" => run_cli_search(&config_path, &filter),
         "range" => run_cli_range(&config_path, start, end),
         "delete" => run_cli_delete(&config_path, id),
@@ -412,6 +413,37 @@ fn run_cli_put(config_path: &PathBuf, id: u64, data: &str) {
         }
         Err(e) => {
             eprintln!("❌ 写入失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `patch --id 1001 --data '{"status":"inactive","note":null}'`（null = 删除字段，阶段 1.5 Delta CF）
+fn run_cli_patch(config_path: &PathBuf, id: u64, data: &str) {
+    if id == 0 {
+        eprintln!("❌ patch 需要 --id <docid>（>0）");
+        std::process::exit(1);
+    }
+    let val: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("❌ --data 不是合法 JSON: {e}");
+            std::process::exit(1);
+        }
+    };
+    let Some(obj) = val.as_object() else {
+        eprintln!("❌ --data 必须是 JSON 对象（如 '{{\"status\":\"inactive\"}}'）");
+        std::process::exit(1);
+    };
+    let fields: Vec<(&str, serde_json::Value)> = obj
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    let mut engine = open_engine(config_path);
+    match engine.patch(id, &fields) {
+        Ok(()) => println!("✅ 已更新 docid={id}（字段 {} 个）", fields.len()),
+        Err(e) => {
+            eprintln!("❌ 更新失败: {e}");
             std::process::exit(1);
         }
     }

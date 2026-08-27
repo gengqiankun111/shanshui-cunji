@@ -230,6 +230,22 @@ impl ColumnFamily {
         Ok(seq)
     }
 
+    /// 删除指定前缀的全部记录（阶段 1.5 Delta CF：全量 put 覆盖后清空该 docid 的增量）。
+    /// 前缀上界 = prefix ++ [0xFF;4]（字段名长度前缀上限），闭区间扫描后逐条墓碑。
+    pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
+        let mut end = prefix.to_vec();
+        end.extend_from_slice(&[0xFF; 4]);
+        let rows = self.scan_raw_range(Some(prefix), Some(&end))?;
+        let mut deleted = 0u64;
+        for (k, _) in rows {
+            if k.starts_with(prefix) {
+                self.delete_bytes(k)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// 查询（主键点查，便捷封装）。返回 (value, seq)，已过滤 Tombstone。
     pub fn get(&mut self, docid: u64) -> Result<Option<(Vec<u8>, u64)>> {
         self.get_bytes(&encode_docid(docid))
