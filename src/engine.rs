@@ -196,6 +196,23 @@ impl Engine {
     pub fn inverted_posting(&self, term: &str) -> Result<RoaringBitmap> {
         self.inverted.search(term)
     }
+
+    /// 备份前一致性准备（development 5.11 冷备份第 1-2 步）：
+    /// 刷 WAL → 全部 MemTable 落盘为 SST → 倒排内存字典刷盘为 `.seg` 段，
+    /// 保证数据目录磁盘态自包含（含倒排段清单 Manifest、字段注册表等随目录整体打包）。
+    pub fn prepare_backup(&mut self) -> Result<()> {
+        self.flush_wal()?;
+        if self.primary.memtable_bytes() > 0 {
+            self.primary.switch_and_flush()?;
+        }
+        if let Some(cidx) = &mut self.cidx {
+            if cidx.memtable_bytes() > 0 {
+                cidx.switch_and_flush()?;
+            }
+        }
+        self.flush_inverted()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

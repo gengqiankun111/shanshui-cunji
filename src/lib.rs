@@ -14,6 +14,7 @@ pub mod memtable;
 pub mod optimizer;
 pub mod schema;
 pub mod sstable;
+pub mod storage;
 pub mod value;
 pub mod wal;
 pub mod watchdog;

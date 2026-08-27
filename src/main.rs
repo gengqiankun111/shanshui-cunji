@@ -53,15 +53,19 @@ fn main() {
         i += 1;
     }
 
-    let subcommand = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(|s| s.as_str())
-        .unwrap_or("server");
+    // 位置参数：第一个为子命令，第二个为备份文件路径（backup/restore 使用）
+    let positionals: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let subcommand = positionals.first().map(|s| s.as_str()).unwrap_or("server");
+    let backup_file = positionals
+        .get(1)
+        .map(|s| PathBuf::from(s.as_str()))
+        .unwrap_or_else(|| PathBuf::from("shanshui-cunji.bak"));
 
     match subcommand {
         "check" => run_check(&config_path),
         "demo" => run_demo(&config_path, scale, &out_dir, gen_only),
+        "backup" => run_backup(&config_path, &backup_file),
+        "restore" => run_restore(&config_path, &backup_file),
         "version" | "-V" | "--version" => {
             println!("shanshui-cunji {VERSION}");
         }
@@ -93,6 +97,65 @@ fn run_check(config_path: &PathBuf) {
         }
         Err(e) => {
             eprintln!("❌ 配置校验失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 备份：打开引擎做一致性准备（刷 WAL + MemTable + 倒排）→ 打包数据目录为单个备份文件。
+fn run_backup(config_path: &PathBuf, backup_file: &PathBuf) {
+    let cfg = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ 配置加载失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let data_dir = PathBuf::from(&cfg.storage.data_dir);
+
+    // 打开引擎执行 prepare_backup：保证 WAL/MemTable/倒排内存全部落盘，磁盘态自包含
+    let mut engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("❌ 打开引擎失败（备份前一致性准备需要）: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = engine.prepare_backup() {
+        eprintln!("❌ 备份前一致性准备失败: {e}");
+        std::process::exit(1);
+    }
+    drop(engine);
+
+    match shanshui_cunji::storage::backup(&data_dir, backup_file) {
+        Ok(rep) => {
+            println!("✅ 备份完成: {}", backup_file.display());
+            println!("   {} 个文件，{} 字节（{:.0} ms）", rep.entry_count, rep.total_bytes, rep.elapsed_ms);
+        }
+        Err(e) => {
+            eprintln!("❌ 备份失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 还原：停止服务后执行——清空数据目录 → 校验魔数/版本/CRC → 解压全部文件。
+fn run_restore(config_path: &PathBuf, backup_file: &PathBuf) {
+    let cfg = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ 配置加载失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let data_dir = PathBuf::from(&cfg.storage.data_dir);
+    match shanshui_cunji::storage::restore(backup_file, &data_dir) {
+        Ok(rep) => {
+            println!("✅ 还原完成: {} 个文件，{} 字节（{:.0} ms）", rep.entry_count, rep.total_bytes, rep.elapsed_ms);
+            println!("   数据目录: {}（重启 server 即可加载还原的数据）", data_dir.display());
+        }
+        Err(e) => {
+            eprintln!("❌ 还原失败: {e}");
             std::process::exit(1);
         }
     }
@@ -161,9 +224,10 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
 fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -> String {
     let mut sections = String::new();
     // 固定 slug（按功能顺序），与截图脚本一一对应
-    const SLUGS: [&str; 9] = [
+    const SLUGS: [&str; 10] = [
         "01-data", "02-insert", "03-query-primary", "04-query-cache",
         "05-query-composite", "06-query-inverted", "07-sharding", "08-delete", "09-optimizer",
+        "10-backup",
     ];
     for (i, r) in results.iter().enumerate() {
         let cls = if r.passed { "pass" } else { "fail" };
