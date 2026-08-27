@@ -96,7 +96,8 @@ impl ColumnFamily {
         let compression_level = cfg.sstable.compression_level as i32;
 
         let wal_path = dir.join(WAL_FILE);
-        let wal = WalWriter::create(&wal_path, false)?;
+        // 以追加模式打开（不截断旧 WAL）：先回放恢复 MemTable，再继续写入
+        let wal = WalWriter::open_append(&wal_path, 1, false)?;
         let mut cf = Self {
             name: name.to_string(),
             dir: dir.to_path_buf(),
@@ -113,13 +114,16 @@ impl ColumnFamily {
         };
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
-        cf.replay_wal(&wal_path)?;
+        let max_seq = cf.replay_wal(&wal_path)?;
+        // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）
+        cf.wal.resume_seq(max_seq + 1);
         Ok(cf)
     }
 
-    /// 回放 WAL：重建 MemTable 并推进 seq。
-    fn replay_wal(&mut self, wal_path: &Path) -> Result<()> {
+    /// 回放 WAL：重建 MemTable 并推进 seq。返回已回放的最大 seq（无记录为 0）。
+    fn replay_wal(&mut self, wal_path: &Path) -> Result<u64> {
         let recs = WalReader::recover(wal_path)?;
+        let mut max_seq = 0u64;
         for r in &recs {
             match r.op {
                 OP_PUT => {
@@ -130,13 +134,13 @@ impl ColumnFamily {
                 OP_DELETE => self.memtable.delete(r.key.clone(), r.seq),
                 other => return Err(Error::Corrupted(format!("WAL 未知 op {other}"))),
             }
+            max_seq = max_seq.max(r.seq);
         }
         if !recs.is_empty() {
-            let max_seq = recs.iter().map(|r| r.seq).max().unwrap();
             self.seq.store(max_seq + 1, Ordering::Relaxed);
             info!("列族 [{}] WAL 回放 {} 条，seq 推进至 {}", self.name, recs.len(), max_seq + 1);
         }
-        Ok(())
+        Ok(max_seq)
     }
 
     /// 写入（主键点写，便捷封装）。
@@ -517,6 +521,40 @@ mod tests {
     }
 
     #[test]
+    fn reopen_preserves_wal_only_data() {
+        // 步骤 15 暴露的预存 bug：reopen 不得截断 WAL，未刷盘数据必须经回放恢复
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 1..=5u64 {
+                cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+            }
+            // 不刷盘：数据仅存在于 WAL + MemTable
+        }
+        {
+            let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 1..=5u64 {
+                assert_eq!(
+                    cf2.get(i).unwrap().unwrap().0,
+                    format!("v-{i}").into_bytes(),
+                    "key {i} 丢失（WAL 被截断？）"
+                );
+            }
+            // 新写入 seq 接续，同 key 覆盖正确
+            cf2.put(3, b"v-3-updated".to_vec()).unwrap();
+            assert_eq!(cf2.get(3).unwrap().unwrap().0, b"v-3-updated");
+        }
+        // 再次重开：追加写入与覆盖均正确
+        {
+            let mut cf3 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            assert_eq!(cf3.get(3).unwrap().unwrap().0, b"v-3-updated");
+            assert_eq!(cf3.get(5).unwrap().unwrap().0, b"v-5");
+            assert_eq!(cf3.get(1).unwrap().unwrap().0, b"v-1");
+        }
+    }
+
+    #[test]
     fn manifest_persists_sst_list() {
         let dir = tmp();
         let cfg = small_cfg(256);
@@ -532,7 +570,6 @@ mod tests {
         let m: Manifest = serde_json::from_str(&text).unwrap();
         assert!(!m.sst_files.is_empty());
     }
-
     #[test]
     fn scan_range_covers_memtable_and_sst() {
         let dir = tmp();
