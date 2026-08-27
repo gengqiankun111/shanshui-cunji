@@ -38,13 +38,22 @@ impl MemTable {
 
     /// 写入（覆盖语义）。返回被覆盖的旧值（若有），供调用方做差值计数修正。
     pub fn put(&self, key: Vec<u8>, seq: u64, value: Vec<u8>) {
-        let entry = MemTableEntry { seq, value: Some(value) };
+        let entry = MemTableEntry {
+            seq,
+            value: Some(value),
+        };
         if let Some(prev) = self.inner.get(&key) {
-            self.approx_bytes.fetch_sub(prev.value().value.as_ref().map_or(0, |v| v.len()), Ordering::Relaxed);
+            self.approx_bytes.fetch_sub(
+                prev.value().value.as_ref().map_or(0, |v| v.len()),
+                Ordering::Relaxed,
+            );
         } else {
             self.len.fetch_add(1, Ordering::Relaxed);
         }
-        self.approx_bytes.fetch_add(entry.value.as_ref().map_or(0, |v| v.len()), Ordering::Relaxed);
+        self.approx_bytes.fetch_add(
+            entry.value.as_ref().map_or(0, |v| v.len()),
+            Ordering::Relaxed,
+        );
         self.inner.insert(key, entry);
     }
 
@@ -98,18 +107,22 @@ impl MemTable {
     ) {
         use std::ops::Bound;
         let mut iter = match start {
-            Some(s) => self.inner.range::<[u8], _>((Bound::Included(s), Bound::Unbounded)),
-            None => self.inner.range::<[u8], _>((Bound::Unbounded, Bound::Unbounded)),
+            Some(s) => self
+                .inner
+                .range::<[u8], _>((Bound::Included(s), Bound::Unbounded)),
+            None => self
+                .inner
+                .range::<[u8], _>((Bound::Unbounded, Bound::Unbounded)),
         };
         if let Some(e) = end {
-            while let Some(entry) = iter.next() {
+            for entry in iter.by_ref() {
                 if entry.key().as_slice() > e {
                     break;
                 }
                 f(entry.key(), entry.value());
             }
         } else {
-            while let Some(entry) = iter.next() {
+            for entry in iter {
                 f(entry.key(), entry.value());
             }
         }
@@ -130,7 +143,10 @@ pub struct MemTableBuffer {
 
 impl MemTableBuffer {
     pub fn new() -> Self {
-        Self { mutable: MemTable::new(), immutable: None }
+        Self {
+            mutable: MemTable::new(),
+            immutable: None,
+        }
     }
 
     /// 写入当前 Mutable 表。
@@ -144,14 +160,16 @@ impl MemTableBuffer {
 
     /// 读路径：先查 Mutable，再查 Immutable（Immutable 冻结期间仍可读，保证内存一致性）。
     pub fn get(&self, key: &[u8]) -> Option<MemTableEntry> {
-        self.mutable.get(key).or_else(|| self.immutable.as_ref().and_then(|m| m.get(key)))
+        self.mutable
+            .get(key)
+            .or_else(|| self.immutable.as_ref().and_then(|m| m.get(key)))
     }
 
     /// 冻结切换：当前 Mutable 变为 Immutable，新建空 Mutable 承接写入。
     /// 前提：上一轮 Immutable 已被取走（刷盘完成），否则 debug 断言失败。
     pub fn switch(&mut self) {
         debug_assert!(self.immutable.is_none(), "上一轮 Immutable 尚未刷盘完成");
-        self.immutable = Some(std::mem::replace(&mut self.mutable, MemTable::new()));
+        self.immutable = Some(std::mem::take(&mut self.mutable));
     }
 
     /// 取走 Immutable（刷盘完成后调用），释放内存。
@@ -260,7 +278,7 @@ mod tests {
         // 新写入只进 Mutable，不可见 frozen
         assert_eq!(buf.get(b"x").unwrap().value.unwrap(), b"1"); // Immutable 仍可读
         assert_eq!(buf.get(b"y").unwrap().value.unwrap(), b"2");
-        assert_eq!(buf.mutable_bytes() as usize, 1); // 新表仅 y
+        assert_eq!(buf.mutable_bytes(), 1); // 新表仅 y
         assert!(buf.immutable_bytes() >= 1);
 
         let taken = buf.take_immutable().unwrap();

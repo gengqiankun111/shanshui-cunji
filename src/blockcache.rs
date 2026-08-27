@@ -68,7 +68,10 @@ mod tests {
     use super::*;
 
     fn key(i: u64) -> BlockCacheKey {
-        BlockCacheKey { file: PathBuf::from(format!("f{i}.sst")), offset: i * 100 }
+        BlockCacheKey {
+            file: PathBuf::from(format!("f{i}.sst")),
+            offset: i * 100,
+        }
     }
 
     #[test]

@@ -37,7 +37,10 @@ impl FieldRegistry {
             return id;
         }
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).expect("字段数超过 u16 上限 65535");
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("字段数超过 u16 上限 65535");
         self.by_name.insert(name.to_string(), id);
         self.by_id.insert(id, name.to_string());
         id
@@ -67,8 +70,7 @@ impl FieldRegistry {
     /// 格式：`MAGIC(6) ++ Version(u16) ++ Count(u32) ++ (ID(u16) ++ VarLen(name))*`
     pub fn persist(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(e))?;
+            std::fs::create_dir_all(parent).map_err(Error::Io)?;
         }
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
@@ -102,7 +104,9 @@ impl FieldRegistry {
         }
         let version = u16::from_le_bytes(buf[6..8].try_into().unwrap());
         if version != VERSION {
-            return Err(Error::Unsupported(format!("fields.idx 版本 {version} 不受支持")));
+            return Err(Error::Unsupported(format!(
+                "fields.idx 版本 {version} 不受支持"
+            )));
         }
         let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
         let mut pos = 12usize;

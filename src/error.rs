@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn io_error_converts() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "disk full");
+        let io_err = io::Error::other("disk full");
         let e: Error = io_err.into();
         assert!(e.to_string().starts_with("io error:"));
     }

@@ -8,7 +8,7 @@
 //! - `demo`：功能冒烟测试（构造数据/插入/查询主键/缓存/组合索引/倒排/分片/删除/备份还原）并输出 HTML 报告；
 //! - `version`：版本信息。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use shanshui_cunji::config::Config;
@@ -127,18 +127,23 @@ fn init_tracing() {
         .init();
 }
 
-fn run_check(config_path: &PathBuf) {
+fn run_check(config_path: &Path) {
     println!("shanshui-cunji {VERSION} 配置检查");
     match Config::load(config_path) {
         Ok(cfg) => {
             println!("✅ 配置校验通过");
             println!("   监听地址: {}", cfg.server.listen_addr);
             println!("   数据目录: {}", cfg.storage.data_dir);
-            println!("   HotCache: {}MB ({}), BlockCache: {}MB",
-                cfg.hotcache.max_memory_mb, cfg.hotcache.eviction_policy,
-                cfg.blockcache.max_memory_mb);
-            println!("   倒排引擎: {}, SST 压缩: {}",
-                cfg.inverted.engine, cfg.sstable.compression);
+            println!(
+                "   HotCache: {}MB ({}), BlockCache: {}MB",
+                cfg.hotcache.max_memory_mb,
+                cfg.hotcache.eviction_policy,
+                cfg.blockcache.max_memory_mb
+            );
+            println!(
+                "   倒排引擎: {}, SST 压缩: {}",
+                cfg.inverted.engine, cfg.sstable.compression
+            );
         }
         Err(e) => {
             eprintln!("❌ 配置校验失败: {e}");
@@ -148,7 +153,7 @@ fn run_check(config_path: &PathBuf) {
 }
 
 /// 备份：打开引擎做一致性准备（刷 WAL + MemTable + 倒排）→ 打包数据目录为单个备份文件。
-fn run_backup(config_path: &PathBuf, backup_file: &PathBuf) {
+fn run_backup(config_path: &Path, backup_file: &Path) {
     let cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -175,7 +180,10 @@ fn run_backup(config_path: &PathBuf, backup_file: &PathBuf) {
     match shanshui_cunji::storage::backup(&data_dir, backup_file) {
         Ok(rep) => {
             println!("✅ 备份完成: {}", backup_file.display());
-            println!("   {} 个文件，{} 字节（{:.0} ms）", rep.entry_count, rep.total_bytes, rep.elapsed_ms);
+            println!(
+                "   {} 个文件，{} 字节（{:.0} ms）",
+                rep.entry_count, rep.total_bytes, rep.elapsed_ms
+            );
         }
         Err(e) => {
             eprintln!("❌ 备份失败: {e}");
@@ -185,7 +193,7 @@ fn run_backup(config_path: &PathBuf, backup_file: &PathBuf) {
 }
 
 /// 还原：停止服务后执行——清空数据目录 → 校验魔数/版本/CRC → 解压全部文件。
-fn run_restore(config_path: &PathBuf, backup_file: &PathBuf) {
+fn run_restore(config_path: &Path, backup_file: &Path) {
     let cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -196,8 +204,14 @@ fn run_restore(config_path: &PathBuf, backup_file: &PathBuf) {
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
     match shanshui_cunji::storage::restore(backup_file, &data_dir) {
         Ok(rep) => {
-            println!("✅ 还原完成: {} 个文件，{} 字节（{:.0} ms）", rep.entry_count, rep.total_bytes, rep.elapsed_ms);
-            println!("   数据目录: {}（重启 server 即可加载还原的数据）", data_dir.display());
+            println!(
+                "✅ 还原完成: {} 个文件，{} 字节（{:.0} ms）",
+                rep.entry_count, rep.total_bytes, rep.elapsed_ms
+            );
+            println!(
+                "   数据目录: {}（重启 server 即可加载还原的数据）",
+                data_dir.display()
+            );
         }
         Err(e) => {
             eprintln!("❌ 还原失败: {e}");
@@ -208,7 +222,7 @@ fn run_restore(config_path: &PathBuf, backup_file: &PathBuf) {
 
 /// 功能冒烟测试：运行 demo 并输出终端表格 + HTML 报告（输出目录由 `out_dir` 指定）。
 /// `--gen-only` 时仅构造数据到 `out_dir/data.jsonl`，不执行测试。
-fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool) {
+fn run_demo(config_path: &Path, scale: u64, out_dir: &Path, gen_only: bool) {
     let cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -223,7 +237,11 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
         let t = std::time::Instant::now();
         match shanshui_cunji::demo::generate(scale, &path) {
             Ok(n) => {
-                println!("✅ 构造数据完成：{n} 条 → {}（{:.1} ms）", path.display(), t.elapsed().as_secs_f64() * 1000.0);
+                println!(
+                    "✅ 构造数据完成：{n} 条 → {}（{:.1} ms）",
+                    path.display(),
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
                 return;
             }
             Err(e) => {
@@ -254,18 +272,21 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
 
     // 终端表格
     let passed_total = results.iter().filter(|r| r.passed).count();
-    println!("{:<16} {:<4} {:>10}  {}", "功能", "结果", "耗时(ms)", "说明");
+    println!("{:<16} {:<4} {:>10}  说明", "功能", "结果", "耗时(ms)");
     println!("{}", "-".repeat(100));
     for r in &results {
         let mark = if r.passed { "✅" } else { "❌" };
-        println!("{:<16} {:<4} {:>10.2}  {}", r.name, mark, r.elapsed_ms, r.detail);
+        println!(
+            "{:<16} {:<4} {:>10.2}  {}",
+            r.name, mark, r.elapsed_ms, r.detail
+        );
     }
     println!("{}", "-".repeat(100));
     println!("总计：{passed_total}/{} 通过", results.len());
 
     // HTML 报告（按功能归类，供截图）
     let html = build_html_report(&results, scale);
-    std::fs::create_dir_all(&out_dir).expect("创建报告目录失败");
+    std::fs::create_dir_all(out_dir).expect("创建报告目录失败");
     let report_path = out_dir.join("report.html");
     std::fs::write(&report_path, html).expect("写 HTML 报告失败");
     println!("\n📄 HTML 报告已生成: {}", report_path.display());
@@ -276,8 +297,15 @@ fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -
     let mut sections = String::new();
     // 固定 slug（按功能顺序），与截图脚本一一对应
     const SLUGS: [&str; 10] = [
-        "01-data", "02-insert", "03-query-primary", "04-query-cache",
-        "05-query-composite", "06-query-inverted", "07-sharding", "08-delete", "09-optimizer",
+        "01-data",
+        "02-insert",
+        "03-query-primary",
+        "04-query-cache",
+        "05-query-composite",
+        "06-query-inverted",
+        "07-sharding",
+        "08-delete",
+        "09-optimizer",
         "10-backup",
     ];
     for (i, r) in results.iter().enumerate() {
@@ -294,7 +322,11 @@ fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -
                 <p class="detail">{}</p>
                 <div class="meta">耗时 <b>{:.2}</b> ms</div>
             </section>"#,
-            i + 1, r.name, badge, r.detail, r.elapsed_ms
+            i + 1,
+            r.name,
+            badge,
+            r.detail,
+            r.elapsed_ms
         ));
     }
     let passed = results.iter().filter(|r| r.passed).count();
@@ -348,7 +380,7 @@ fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -
 // CLI 数据操作（与 HTTP 共享同一内核调用路径；本地引擎直连，勿与 server 同目录并发）
 // ---------------------------------------------------------------------------
 
-fn load_config(config_path: &PathBuf) -> Config {
+fn load_config(config_path: &Path) -> Config {
     match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -359,7 +391,7 @@ fn load_config(config_path: &PathBuf) -> Config {
 }
 
 /// 打开本地引擎（数据目录取自配置）。
-fn open_engine(config_path: &PathBuf) -> shanshui_cunji::engine::Engine {
+fn open_engine(config_path: &Path) -> shanshui_cunji::engine::Engine {
     let cfg = load_config(config_path);
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
     match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
@@ -372,7 +404,7 @@ fn open_engine(config_path: &PathBuf) -> shanshui_cunji::engine::Engine {
 }
 
 /// `put --id 1001 --data '{"status":"active","type":"order"}'`
-fn run_cli_put(config_path: &PathBuf, id: u64, data: &str) {
+fn run_cli_put(config_path: &Path, id: u64, data: &str) {
     if id == 0 {
         eprintln!("❌ put 需要 --id <docid>（>0）");
         std::process::exit(1);
@@ -419,7 +451,7 @@ fn run_cli_put(config_path: &PathBuf, id: u64, data: &str) {
 }
 
 /// `patch --id 1001 --data '{"status":"inactive","note":null}'`（null = 删除字段，阶段 1.5 Delta CF）
-fn run_cli_patch(config_path: &PathBuf, id: u64, data: &str) {
+fn run_cli_patch(config_path: &Path, id: u64, data: &str) {
     if id == 0 {
         eprintln!("❌ patch 需要 --id <docid>（>0）");
         std::process::exit(1);
@@ -435,10 +467,8 @@ fn run_cli_patch(config_path: &PathBuf, id: u64, data: &str) {
         eprintln!("❌ --data 必须是 JSON 对象（如 '{{\"status\":\"inactive\"}}'）");
         std::process::exit(1);
     };
-    let fields: Vec<(&str, serde_json::Value)> = obj
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.clone()))
-        .collect();
+    let fields: Vec<(&str, serde_json::Value)> =
+        obj.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let mut engine = open_engine(config_path);
     match engine.patch(id, &fields) {
         Ok(()) => println!("✅ 已更新 docid={id}（字段 {} 个）", fields.len()),
@@ -450,7 +480,7 @@ fn run_cli_patch(config_path: &PathBuf, id: u64, data: &str) {
 }
 
 /// `get --id 1001`
-fn run_cli_get(config_path: &PathBuf, id: u64) {
+fn run_cli_get(config_path: &Path, id: u64) {
     if id == 0 {
         eprintln!("❌ get 需要 --id <docid>（>0）");
         std::process::exit(1);
@@ -467,7 +497,7 @@ fn run_cli_get(config_path: &PathBuf, id: u64) {
 }
 
 /// `search --filter 'status=active AND type=order'`
-fn run_cli_search(config_path: &PathBuf, filter: &str) {
+fn run_cli_search(config_path: &Path, filter: &str) {
     if filter.is_empty() {
         eprintln!("❌ search 需要 --filter 'field=value [AND field2=value2]'");
         std::process::exit(1);
@@ -488,7 +518,7 @@ fn run_cli_search(config_path: &PathBuf, filter: &str) {
 }
 
 /// `range --start 1000 --end 2000`
-fn run_cli_range(config_path: &PathBuf, start: Option<u64>, end: Option<u64>) {
+fn run_cli_range(config_path: &Path, start: Option<u64>, end: Option<u64>) {
     let mut engine = open_engine(config_path);
     let desc = match (start, end) {
         (Some(s), Some(e)) => format!("[{s}..{e}]"),
@@ -511,7 +541,7 @@ fn run_cli_range(config_path: &PathBuf, start: Option<u64>, end: Option<u64>) {
 }
 
 /// `delete --id 1001`
-fn run_cli_delete(config_path: &PathBuf, id: u64) {
+fn run_cli_delete(config_path: &Path, id: u64) {
     if id == 0 {
         eprintln!("❌ delete 需要 --id <docid>（>0）");
         std::process::exit(1);
@@ -527,7 +557,7 @@ fn run_cli_delete(config_path: &PathBuf, id: u64) {
 }
 
 /// 启动 HTTP-JSON 服务（development 步骤 15）。
-fn run_server(config_path: &PathBuf) {
+fn run_server(config_path: &Path) {
     let cfg = load_config(config_path);
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
     let mut engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
@@ -537,7 +567,10 @@ fn run_server(config_path: &PathBuf) {
             std::process::exit(1);
         }
     };
-    info!("shanshui-cunji {VERSION} 启动: data_dir={}", data_dir.display());
+    info!(
+        "shanshui-cunji {VERSION} 启动: data_dir={}",
+        data_dir.display()
+    );
     if let Err(e) = shanshui_cunji::server::serve(&mut engine, &cfg.server.listen_addr) {
         eprintln!("❌ 服务异常退出: {e}");
         std::process::exit(1);

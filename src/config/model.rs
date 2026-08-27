@@ -18,6 +18,7 @@ pub const MEMORY_BUDGET_RATIO: f64 = 0.7;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub memory: MemoryConfig,
@@ -28,22 +29,6 @@ pub struct Config {
     pub sstable: SstableConfig,
     pub storage: StorageConfig,
     pub inverted: InvertedConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            memory: MemoryConfig::default(),
-            memtable: MemtableConfig::default(),
-            hotcache: HotCacheConfig::default(),
-            blockcache: BlockCacheConfig::default(),
-            runtime: RuntimeConfig::default(),
-            sstable: SstableConfig::default(),
-            storage: StorageConfig::default(),
-            inverted: InvertedConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -71,12 +56,20 @@ impl Config {
             let parts: Vec<&str> = rest.split("__").collect();
             let val = value.trim().to_string();
             match parts.as_slice() {
-                ["HOTCACHE", "MAX_MEMORY_MB"] => self.hotcache.max_memory_mb = parse_override("hotcache.max_memory_mb", &val),
+                ["HOTCACHE", "MAX_MEMORY_MB"] => {
+                    self.hotcache.max_memory_mb = parse_override("hotcache.max_memory_mb", &val)
+                }
                 ["HOTCACHE", "EVICTION_POLICY"] => self.hotcache.eviction_policy = val,
-                ["BLOCKCACHE", "MAX_MEMORY_MB"] => self.blockcache.max_memory_mb = parse_override("blockcache.max_memory_mb", &val),
+                ["BLOCKCACHE", "MAX_MEMORY_MB"] => {
+                    self.blockcache.max_memory_mb = parse_override("blockcache.max_memory_mb", &val)
+                }
                 ["SERVER", "LISTEN_ADDR"] => self.server.listen_addr = val,
-                ["MEMORY", "WATERMARK_HIGH"] => self.memory.watermark_high = parse_override_f64("memory.watermark_high", &val),
-                ["MEMORY", "WATERMARK_STALL"] => self.memory.watermark_stall = parse_override_f64("memory.watermark_stall", &val),
+                ["MEMORY", "WATERMARK_HIGH"] => {
+                    self.memory.watermark_high = parse_override_f64("memory.watermark_high", &val)
+                }
+                ["MEMORY", "WATERMARK_STALL"] => {
+                    self.memory.watermark_stall = parse_override_f64("memory.watermark_stall", &val)
+                }
                 _ => {
                     warn!("未知环境变量覆盖: {key}");
                 }
@@ -99,7 +92,9 @@ impl Config {
             self.blockcache.max_memory_mb = (self.blockcache.max_memory_mb as f64 * ratio) as usize;
             self.hotcache.max_memory_mb = (self.hotcache.max_memory_mb as f64 * ratio) as usize;
         }
-        if self.memory.watermark_high <= 0.0 || self.memory.watermark_stall < self.memory.watermark_high {
+        if self.memory.watermark_high <= 0.0
+            || self.memory.watermark_stall < self.memory.watermark_high
+        {
             return Err(Error::Config(
                 "memory.watermark_high 须 > 0，且 watermark_stall 须 >= watermark_high".into(),
             ));
@@ -108,7 +103,10 @@ impl Config {
             return Err(Error::Config("memtable.max_size_mb 必须 > 0".into()));
         }
         if !matches!(self.inverted.engine.as_str(), "hash" | "fst") {
-            return Err(Error::Config(format!("inverted.engine 非法: {}", self.inverted.engine)));
+            return Err(Error::Config(format!(
+                "inverted.engine 非法: {}",
+                self.inverted.engine
+            )));
         }
         Ok(())
     }
@@ -136,7 +134,9 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { listen_addr: "0.0.0.0:8080".into() }
+        Self {
+            listen_addr: "0.0.0.0:8080".into(),
+        }
     }
 }
 
@@ -151,7 +151,10 @@ pub struct MemoryConfig {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { watermark_high: 0.85, watermark_stall: 1.0 }
+        Self {
+            watermark_high: 0.85,
+            watermark_stall: 1.0,
+        }
     }
 }
 

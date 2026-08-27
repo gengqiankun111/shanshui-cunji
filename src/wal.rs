@@ -63,7 +63,10 @@ impl WalWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         Ok(Self {
             file: Some(file),
             path: path.to_path_buf(),
@@ -95,7 +98,8 @@ impl WalWriter {
         }
 
         let crc = crc32(&payload);
-        self.buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(&crc.to_le_bytes());
         self.buf.extend_from_slice(&payload);
         self.pending_bytes += 8 + payload.len();
@@ -210,7 +214,12 @@ fn decode_payload(payload: &[u8]) -> Result<WalRecord> {
     } else {
         Some(val_raw.to_vec())
     };
-    Ok(WalRecord { seq, op, key, value })
+    Ok(WalRecord {
+        seq,
+        op,
+        key,
+        value,
+    })
 }
 
 /// CRC32（IEEE 多项式，简单可靠的完整性校验）。
@@ -237,7 +246,9 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let name = format!("wal-{}.log", SEQ.fetch_add(1, Ordering::Relaxed));
-        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name)
+        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name)
     }
 
     #[test]
@@ -265,7 +276,8 @@ mod tests {
         let mut w = WalWriter::create(&path, false).unwrap();
         // 写入 100 条，只 fsync 前 50 条，然后 drop 不 flush（模拟断电）
         for i in 0..100u64 {
-            w.append(OP_PUT, format!("key_{i}").as_bytes(), Some(b"v")).unwrap();
+            w.append(OP_PUT, format!("key_{i}").as_bytes(), Some(b"v"))
+                .unwrap();
             if i == 49 {
                 w.sync().unwrap();
             }
@@ -285,7 +297,8 @@ mod tests {
         let path = tmp();
         let mut w = WalWriter::create(&path, false).unwrap();
         for i in 0..10u64 {
-            w.append(OP_PUT, format!("k{i}").as_bytes(), Some(b"v")).unwrap();
+            w.append(OP_PUT, format!("k{i}").as_bytes(), Some(b"v"))
+                .unwrap();
         }
         w.sync().unwrap();
         drop(w);
@@ -305,7 +318,8 @@ mod tests {
         let path = tmp();
         let mut w = WalWriter::create(&path, false).unwrap();
         for i in 0..10u64 {
-            w.append(OP_PUT, format!("k{i}").as_bytes(), Some(b"v")).unwrap();
+            w.append(OP_PUT, format!("k{i}").as_bytes(), Some(b"v"))
+                .unwrap();
         }
         w.sync().unwrap();
         drop(w);
@@ -337,7 +351,8 @@ mod tests {
         let path = tmp();
         let mut w = WalWriter::create(&path, false).unwrap();
         for i in 0..100u64 {
-            w.append(OP_PUT, format!("k{i}").as_bytes(), Some(b"v")).unwrap();
+            w.append(OP_PUT, format!("k{i}").as_bytes(), Some(b"v"))
+                .unwrap();
         }
         w.sync().unwrap();
         let recs = WalReader::recover(&path).unwrap();

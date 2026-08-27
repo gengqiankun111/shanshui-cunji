@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bloom::BloomFilter;
 use crate::error::{Error, Result};
-use crate::keys::{decode_varlen, decode_varint, encode_varlen, encode_varint};
+use crate::keys::{decode_varint, decode_varlen, encode_varint, encode_varlen};
 
 /// 文件魔数 + 版本。
 pub const SST_MAGIC: &[u8; 8] = b"NVSSTL01";
@@ -57,16 +57,6 @@ pub enum Compression {
 }
 
 impl Compression {
-    pub fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "none" => Ok(Self::None),
-            "zstd" => Ok(Self::Zstd),
-            "lz4" => Ok(Self::Lz4),
-            "snappy" => Ok(Self::Snappy),
-            other => Err(Error::Config(format!("sstable.compression 非法: {other}"))),
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::None => "none",
@@ -92,6 +82,21 @@ impl Compression {
             2 => Ok(Self::Lz4),
             3 => Ok(Self::Snappy),
             _ => Err(Error::Corrupted(format!("未知压缩算法码 {c}"))),
+        }
+    }
+}
+
+/// 压缩算法从配置字符串解析（实现标准 trait，供 `Compression::from_str` 调用）。
+impl std::str::FromStr for Compression {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "none" => Ok(Self::None),
+            "zstd" => Ok(Self::Zstd),
+            "lz4" => Ok(Self::Lz4),
+            "snappy" => Ok(Self::Snappy),
+            other => Err(Error::Config(format!("sstable.compression 非法: {other}"))),
         }
     }
 }
@@ -168,7 +173,14 @@ impl SstWriter {
         block_size: usize,
         expected_keys: usize,
     ) -> Result<Self> {
-        Self::new_with_pax(path, compression, compression_level, block_size, expected_keys, &[])
+        Self::new_with_pax(
+            path,
+            compression,
+            compression_level,
+            block_size,
+            expected_keys,
+            &[],
+        )
     }
 
     /// 带 PAX 热字段白名单的构造器：`hot_fields` 为空时行为与 MVP 行式完全一致。
@@ -180,7 +192,7 @@ impl SstWriter {
         expected_keys: usize,
         hot_fields: &[String],
     ) -> Result<Self> {
-        let out = std::fs::File::create(path).map_err(|e| Error::Io(e))?;
+        let out = std::fs::File::create(path).map_err(Error::Io)?;
         let mut w = Self {
             out,
             compression,
@@ -192,7 +204,7 @@ impl SstWriter {
             key_count: 0,
             last_key: None,
             buf_last_key: None,
-            zstd_level: compression_level.max(1).min(22),
+            zstd_level: compression_level.clamp(1, 22),
             pax_hot_fields: hot_fields.to_vec(),
         };
         w.write_header()?;
@@ -259,7 +271,10 @@ impl SstWriter {
         }
         let offset = self.written;
         let first_key = self.buf[0].key.clone();
-        let max_key = self.buf_last_key.take().unwrap_or_else(|| first_key.clone());
+        let max_key = self
+            .buf_last_key
+            .take()
+            .unwrap_or_else(|| first_key.clone());
 
         // 尝试 PAX 列式编码；非 JSON 值 / Tombstone / 无字段时回退行式
         let (raw, zones) = if self.pax_hot_fields.is_empty() {
@@ -297,14 +312,16 @@ impl SstWriter {
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
         match self.compression {
             Compression::None => Ok(data.to_vec()),
-            Compression::Zstd => zstd::bulk::compress(data, self.zstd_level).map_err(|e| Error::Io(std::io::Error::other(format!("zstd 压缩失败: {e}")))),
+            Compression::Zstd => zstd::bulk::compress(data, self.zstd_level)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("zstd 压缩失败: {e}")))),
             // MVP 先统一走 zstd；lz4/snappy 留待阶段 1.5 引入，此处映射到 zstd 以便配置兼容
-            Compression::Lz4 | Compression::Snappy => zstd::bulk::compress(data, self.zstd_level).map_err(|e| Error::Io(std::io::Error::other(format!("压缩失败: {e}")))),
+            Compression::Lz4 | Compression::Snappy => zstd::bulk::compress(data, self.zstd_level)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("压缩失败: {e}")))),
         }
     }
 
     fn write_all(&mut self, data: &[u8]) -> Result<()> {
-        self.out.write_all(data).map_err(|e| Error::Io(e))?;
+        self.out.write_all(data).map_err(Error::Io)?;
         self.written += data.len() as u64;
         Ok(())
     }
@@ -360,7 +377,7 @@ impl SstWriter {
         // 文件尾 8 字节指针：定位 Footer 起始偏移（Reader 先读此指针）
         self.write_all(&footer_offset.to_le_bytes())?;
 
-        self.out.sync_all().map_err(|e| Error::Io(e))?;
+        self.out.sync_all().map_err(Error::Io)?;
         Ok(SstFooter {
             index_offset,
             index_len: index_len as usize,
@@ -404,16 +421,23 @@ fn json_object(value: &[u8]) -> Option<serde_json::Map<String, serde_json::Value
 /// ColTable((VarLen(field)+IsHot(u8)+Offset(u32)+Len(u32))*) ++
 /// 热列数据 ++ 冷列数据 ++ Seqs(u64)*`；列内条目 `Present(u8)+ValLen(VarLen)+Val`。
 /// 仅当全部行可解析为 JSON 对象且字段数 > 0 时返回 Ok，否则由调用方回退行式。
-fn encode_pax_block(rows: &[PendingRow], hot_fields: &[String]) -> Result<(Vec<u8>, Vec<FieldZone>)> {
+fn encode_pax_block(
+    rows: &[PendingRow],
+    hot_fields: &[String],
+) -> Result<(Vec<u8>, Vec<FieldZone>)> {
     use serde_json::Value;
 
     // 1. 解析全部行
-    let mut parsed: Vec<(Vec<u8>, serde_json::Map<String, Value>, u64)> = Vec::with_capacity(rows.len());
+    let mut parsed: Vec<(Vec<u8>, serde_json::Map<String, Value>, u64)> =
+        Vec::with_capacity(rows.len());
     for r in rows {
         if r.flag != FLAG_PUT {
             return Err(Error::Corrupted("PAX 块不支持 Tombstone".into()));
         }
-        let v = r.value.as_ref().ok_or_else(|| Error::Corrupted("PAX 块缺少值".into()))?;
+        let v = r
+            .value
+            .as_ref()
+            .ok_or_else(|| Error::Corrupted("PAX 块缺少值".into()))?;
         let obj = json_object(v).ok_or_else(|| Error::Corrupted("PAX 值非 JSON 对象".into()))?;
         parsed.push((r.key.clone(), obj, r.seq));
     }
@@ -479,15 +503,16 @@ fn encode_pax_block(rows: &[PendingRow], hot_fields: &[String]) -> Result<(Vec<u
                     null_count += 1;
                 }
                 Some(v) => {
-                    let s = serde_json::to_vec(v).map_err(|e| Error::Corrupted(format!("字段序列化失败: {e}")))?;
+                    let s = serde_json::to_vec(v)
+                        .map_err(|e| Error::Corrupted(format!("字段序列化失败: {e}")))?;
                     out.push(1);
                     encode_varint(&mut out, s.len() as u64);
                     out.extend_from_slice(&s);
                     present_count += 1;
-                    if min.as_ref().map_or(true, |m| s.as_slice() < m.as_slice()) {
+                    if min.as_ref().is_none_or(|m| s.as_slice() < m.as_slice()) {
                         min = Some(s.clone());
                     }
-                    if max.as_ref().map_or(true, |m| s.as_slice() > m.as_slice()) {
+                    if max.as_ref().is_none_or(|m| s.as_slice() > m.as_slice()) {
                         max = Some(s.clone());
                     }
                 }
@@ -547,21 +572,22 @@ pub struct SstReader {
 
 impl SstReader {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = std::fs::File::open(path).map_err(|e| Error::Io(e))?;
-        let fsize = file.metadata().map_err(|e| Error::Io(e))?.len();
+        let mut file = std::fs::File::open(path).map_err(Error::Io)?;
+        let fsize = file.metadata().map_err(Error::Io)?.len();
         if fsize < 8 + 54 {
             return Err(Error::Corrupted("SST 文件过小".into()));
         }
         // 文件尾 8 字节：Footer 起始偏移指针
         let mut ptr = [0u8; 8];
-        file.seek(std::io::SeekFrom::End(-8)).map_err(|e| Error::Io(e))?;
-        file.read_exact(&mut ptr).map_err(|e| Error::Io(e))?;
+        file.seek(std::io::SeekFrom::End(-8)).map_err(Error::Io)?;
+        file.read_exact(&mut ptr).map_err(Error::Io)?;
         let footer_offset = u64::from_le_bytes(ptr);
 
         // 读 Footer 主体（固定 54 字节）
         let mut fb = vec![0u8; 54];
-        file.seek(std::io::SeekFrom::Start(footer_offset)).map_err(|e| Error::Io(e))?;
-        file.read_exact(&mut fb).map_err(|e| Error::Io(e))?;
+        file.seek(std::io::SeekFrom::Start(footer_offset))
+            .map_err(Error::Io)?;
+        file.read_exact(&mut fb).map_err(Error::Io)?;
 
         if &fb[0..8] != SST_MAGIC {
             return Err(Error::Corrupted("SST Footer 魔数错误".into()));
@@ -590,14 +616,16 @@ impl SstReader {
 
         // 读 Block Index（v3 无字段级 Zone Map，v4 有）
         let mut ib = vec![0u8; index_len];
-        file.seek(std::io::SeekFrom::Start(index_offset)).map_err(|e| Error::Io(e))?;
-        file.read_exact(&mut ib).map_err(|e| Error::Io(e))?;
+        file.seek(std::io::SeekFrom::Start(index_offset))
+            .map_err(Error::Io)?;
+        file.read_exact(&mut ib).map_err(Error::Io)?;
         let index = decode_index(&ib, version)?;
 
         // 读 Bloom
         let mut bb = vec![0u8; bloom_len];
-        file.seek(std::io::SeekFrom::Start(bloom_offset)).map_err(|e| Error::Io(e))?;
-        file.read_exact(&mut bb).map_err(|e| Error::Io(e))?;
+        file.seek(std::io::SeekFrom::Start(bloom_offset))
+            .map_err(Error::Io)?;
+        file.read_exact(&mut bb).map_err(Error::Io)?;
         let bloom_len_u32 = u32::from_le_bytes(bb[0..4].try_into().unwrap()) as usize;
         if 4 + bloom_len_u32 != bb.len() {
             return Err(Error::Corrupted("Bloom 长度不一致".into()));
@@ -607,8 +635,8 @@ impl SstReader {
 
         // 读取 Header 获取压缩与块大小
         let mut hb = vec![0u8; 15];
-        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| Error::Io(e))?;
-        file.read_exact(&mut hb).map_err(|e| Error::Io(e))?;
+        file.seek(std::io::SeekFrom::Start(0)).map_err(Error::Io)?;
+        file.read_exact(&mut hb).map_err(Error::Io)?;
         if &hb[0..8] != SST_MAGIC {
             return Err(Error::Corrupted("SST Header 魔数错误".into()));
         }
@@ -667,7 +695,11 @@ impl SstReader {
     }
 
     /// 块内等值扫描（按文件格式版本正确处理行式 / PAX 块）。供块缓存命中路径复用。
-    pub fn scan_block_for_key(&self, block: &[u8], key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    pub fn scan_block_for_key(
+        &self,
+        block: &[u8],
+        key: &[u8],
+    ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         for (k, v, seq) in decode_data_block(block, self.format)? {
             if k == key {
                 return Ok(Some((v, seq)));
@@ -698,12 +730,14 @@ impl SstReader {
     /// 读取并解压数据块，校验 CRC。
     pub fn read_block(&mut self, e: &IndexEntry) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; e.comp_len as usize];
-        self.file.seek(std::io::SeekFrom::Start(e.offset)).map_err(|e| Error::Io(e))?;
-        self.file.read_exact(&mut comp).map_err(|e| Error::Io(e))?;
+        self.file
+            .seek(std::io::SeekFrom::Start(e.offset))
+            .map_err(Error::Io)?;
+        self.file.read_exact(&mut comp).map_err(Error::Io)?;
 
         // 读 Trailer 校验
         let mut trailer = vec![0u8; TRAILER_LEN];
-        self.file.read_exact(&mut trailer).map_err(|e| Error::Io(e))?;
+        self.file.read_exact(&mut trailer).map_err(Error::Io)?;
         let raw_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as usize;
         let comp_len = u32::from_le_bytes(trailer[4..8].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(trailer[8..12].try_into().unwrap());
@@ -720,7 +754,8 @@ impl SstReader {
         match self.compression {
             Compression::None => Ok(data.to_vec()),
             Compression::Zstd | Compression::Lz4 | Compression::Snappy => {
-                zstd::bulk::decompress(data, raw_len.max(64)).map_err(|e| Error::Io(std::io::Error::other(format!("解压失败: {e}"))))
+                zstd::bulk::decompress(data, raw_len.max(64))
+                    .map_err(|e| Error::Io(std::io::Error::other(format!("解压失败: {e}"))))
             }
         }
     }
@@ -810,17 +845,32 @@ fn decode_index(ib: &[u8], version: u16) -> Result<Vec<IndexEntry>> {
                 let present_count = u32::from_le_bytes(ib[cur..cur + 4].try_into().unwrap());
                 let null_count = u32::from_le_bytes(ib[cur + 4..cur + 8].try_into().unwrap());
                 cur += 8;
-                zones.push(FieldZone { field, min, max, present_count, null_count });
+                zones.push(FieldZone {
+                    field,
+                    min,
+                    max,
+                    present_count,
+                    null_count,
+                });
             }
         }
-        out.push(IndexEntry { first_key, max_key, offset, raw_len, comp_len, zones });
+        out.push(IndexEntry {
+            first_key,
+            max_key,
+            offset,
+            raw_len,
+            comp_len,
+            zones,
+        });
     }
     Ok(out)
 }
 
 /// 统一数据块解码：按文件格式版本 + 块 kind 分发（v3=行式，v4=行式/PAX）。
 /// 返回 `(key, value, seq)` 行序列，`value=None` 表示 Tombstone。
-pub fn decode_data_block(data: &[u8], format: u16) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, u64)>> {
+pub type DecodedRow = (Vec<u8>, Option<Vec<u8>>, u64);
+
+pub fn decode_data_block(data: &[u8], format: u16) -> Result<Vec<DecodedRow>> {
     if format >= SST_VERSION {
         match data.first() {
             Some(&BLOCK_KIND_PAX) => return decode_pax_block(data),
@@ -847,7 +897,7 @@ pub fn decode_data_block(data: &[u8], format: u16) -> Result<Vec<(Vec<u8>, Optio
 }
 
 /// PAX 列式块解码：按列偏移量表重组每行 JSON 对象（保序，与写入字节一致）。
-fn decode_pax_block(data: &[u8]) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, u64)>> {
+fn decode_pax_block(data: &[u8]) -> Result<Vec<DecodedRow>> {
     let mut cur = 1usize; // 跳过 kind
     if cur + 4 > data.len() {
         return Err(Error::Corrupted("PAX 块行数越界".into()));
@@ -937,7 +987,11 @@ fn decode_pax_block(data: &[u8]) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, u64)>>
         }
         let value = serde_json::to_vec(&map)
             .map_err(|e| Error::Corrupted(format!("PAX 值重组失败: {e}")))?;
-        let seq = u64::from_le_bytes(data[seqs_start + i * 8..seqs_start + (i + 1) * 8].try_into().unwrap());
+        let seq = u64::from_le_bytes(
+            data[seqs_start + i * 8..seqs_start + (i + 1) * 8]
+                .try_into()
+                .unwrap(),
+        );
         rows.push((keys[i].clone(), Some(value), seq));
     }
     Ok(rows)
@@ -950,8 +1004,13 @@ mod tests {
     fn tmp() -> std::path::PathBuf {
         static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let name = format!("sst-{}.sst", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name)
+        let name = format!(
+            "sst-{}.sst",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name)
     }
 
     fn write_sample(path: &Path, n: u64) -> SstFooter {
@@ -1009,7 +1068,8 @@ mod tests {
             }
             last = Some(k.to_vec());
             count += 1;
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(count, 1000);
     }
 
@@ -1052,9 +1112,16 @@ mod tests {
         let path = tmp();
         let hot = vec!["status".to_string(), "city".to_string()];
         let mut w = SstWriter::new_with_pax(&path, Compression::None, 0, 1024, 10, &hot).unwrap();
-        w.add(b"k1", br#"{"status":"active","city":"beijing","amount":100}"#, 1).unwrap();
-        w.add(b"k2", br#"{"status":"inactive","city":"shanghai"}"#, 2).unwrap();
-        w.add(b"k3", br#"{"status":"active","city":null,"extra":1}"#, 3).unwrap();
+        w.add(
+            b"k1",
+            br#"{"status":"active","city":"beijing","amount":100}"#,
+            1,
+        )
+        .unwrap();
+        w.add(b"k2", br#"{"status":"inactive","city":"shanghai"}"#, 2)
+            .unwrap();
+        w.add(b"k3", br#"{"status":"active","city":null,"extra":1}"#, 3)
+            .unwrap();
         w.finish().unwrap();
 
         let mut r = SstReader::open(&path).unwrap();
@@ -1100,8 +1167,15 @@ mod tests {
             String::from_utf8_lossy(&r.get(b"k1").unwrap().unwrap().0.unwrap()),
             r#"{"a":1,"b":2}"#
         );
-        assert_eq!(r.get(b"k2").unwrap().unwrap().0.as_deref(), Some(&b"not-json-bytes"[..]));
-        assert_eq!(r.get(b"k3").unwrap().unwrap().0, None, "Tombstone 读回应为 None");
+        assert_eq!(
+            r.get(b"k2").unwrap().unwrap().0.as_deref(),
+            Some(&b"not-json-bytes"[..])
+        );
+        assert_eq!(
+            r.get(b"k3").unwrap().unwrap().0,
+            None,
+            "Tombstone 读回应为 None"
+        );
         // 非 PAX → 无字段级 Zone Map
         assert!(r.index()[0].zones.is_empty());
     }
@@ -1123,7 +1197,10 @@ mod tests {
             String::from_utf8_lossy(&r.get(b"k1").unwrap().unwrap().0.unwrap()),
             r#"{"a":1,"b":2}"#
         );
-        assert_eq!(r.get(b"k2").unwrap().unwrap().0.as_deref(), Some(&b"not-json"[..]));
+        assert_eq!(
+            r.get(b"k2").unwrap().unwrap().0.as_deref(),
+            Some(&b"not-json"[..])
+        );
         assert_eq!(
             String::from_utf8_lossy(&r.get(b"k3").unwrap().unwrap().0.unwrap()),
             r#"{"a":3}"#
@@ -1162,7 +1239,8 @@ mod tests {
         let start = b"user-00000050";
         let end = b"user-00000060";
         let mut keys = Vec::new();
-        r.scan_range(Some(start), Some(end), |k, _v, _seq| keys.push(k.to_vec())).unwrap();
+        r.scan_range(Some(start), Some(end), |k, _v, _seq| keys.push(k.to_vec()))
+            .unwrap();
         // 闭区间：50..=60 共 11 个
         assert_eq!(keys.len(), 11);
         assert_eq!(keys.first().unwrap().as_slice(), start);
@@ -1199,7 +1277,10 @@ mod tests {
         }
         // 精确小区间（key 格式 k{i:04}，查询须同格式）
         let mut hits = Vec::new();
-        r.scan_range(Some(b"k0050"), Some(b"k0060"), |k, _, _| hits.push(k.to_vec())).unwrap();
+        r.scan_range(Some(b"k0050"), Some(b"k0060"), |k, _, _| {
+            hits.push(k.to_vec())
+        })
+        .unwrap();
         assert_eq!(hits.len(), 11);
     }
 
@@ -1224,11 +1305,15 @@ mod tests {
 
         // 范围扫描同样携带删除语义
         let mut found = Vec::new();
-        r.scan_range(None, None, |k, v, _| found.push((k.to_vec(), v.is_some()))).unwrap();
-        assert_eq!(found, vec![
-            (b"a".to_vec(), true),
-            (b"b".to_vec(), false),
-            (b"c".to_vec(), true),
-        ]);
+        r.scan_range(None, None, |k, v, _| found.push((k.to_vec(), v.is_some())))
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (b"a".to_vec(), true),
+                (b"b".to_vec(), false),
+                (b"c".to_vec(), true),
+            ]
+        );
     }
 }
