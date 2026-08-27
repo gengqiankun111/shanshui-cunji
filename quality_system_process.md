@@ -191,8 +191,8 @@ steps:
 | unsafe 统计 | ✅ 全代码 0 处 unsafe（`grep -c unsafe src` = 0） |
 | cargo audit | ✅ **99 个依赖，0 漏洞、0 警告**（2026-08-27 执行） |
 | cargo deny check | ✅ **advisories / bans / licenses / sources 全 ok**（2026-08-27 执行） |
-| cargo tarpaulin | ⏳ Linux 环境执行（Windows 不支持） |
-| 覆盖率 | ⏳ 待 tarpaulin（Linux）产出报告 |
+| cargo tarpaulin | ✅ **核心引擎 89.01%**（2026-08-27 阿里云 Debian 执行，见 quality_report_20260827.md） |
+| 覆盖率 | ✅ 核心 lib 89.01%（含 CLI 壳 70.55%）；报告 lcov 存档 quality/coverage/ |
 
 **本轮修复闭环**：clippy 52 处警告清零（P18）、check.ps1 PS 5.1 stderr 误判修复（P17）、
 lru 0.12→0.18 升级消除 2 个 unsound 警告（P19）、deny.toml schema 适配 0.20（P20）——详见 [problem_solving.md](problem_solving.md)。
