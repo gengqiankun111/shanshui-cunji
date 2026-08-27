@@ -232,8 +232,13 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
         }
     }
 
-    // 临时数据目录（D 盘，避免撑爆 C 盘系统盘）
-    let data_dir = std::path::PathBuf::from("D:\\shanshui-cunji-tmp").join(format!("demo-{}", std::process::id()));
+    // 临时数据目录：默认系统临时目录；可用 SHANSHUI_CUNJI_TMP 覆盖
+    // （Windows 上 C 盘空间紧张时可指向 D 盘，如 D:\shanshui-cunji-tmp）
+    let data_dir = std::env::var("SHANSHUI_CUNJI_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::temp_dir().join(format!("shanshui-cunji-demo-{}", std::process::id()))
+        });
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("创建临时数据目录失败");
 
