@@ -282,6 +282,8 @@ pub struct StorageConfig {
     pub ttl_days: Option<u32>,
     /// 数据目录。
     pub data_dir: String,
+    /// 热字段白名单（阶段 1.5 PAX 列式块）：高频查询字段进热列组（块头），其余进冷列组（块尾）。
+    pub hot_fields: Vec<String>,
 }
 
 impl Default for StorageConfig {
@@ -290,6 +292,7 @@ impl Default for StorageConfig {
             l0_stall_threshold: 8,
             ttl_days: None,
             data_dir: "./data".into(),
+            hot_fields: Vec::new(),
         }
     }
 }

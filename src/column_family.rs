@@ -52,6 +52,8 @@ pub struct ColumnFamily {
     compression: Compression,
     compression_level: i32,
     block_size: usize,
+    /// PAX 热字段白名单（阶段 1.5，来自 [storage] hot_fields；空 = 行式）。
+    pax_hot_fields: Vec<String>,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 文件（新→旧）。
@@ -105,6 +107,7 @@ impl ColumnFamily {
             compression,
             compression_level,
             block_size: cfg.blockcache.block_size_kb * 1024,
+            pax_hot_fields: cfg.storage.hot_fields.clone(),
             memtable: MemTableBuffer::new(),
             ssts,
             block_cache,
@@ -270,7 +273,14 @@ impl ColumnFamily {
 
     /// 将 Immutable 落盘为 SST（Put 与 Tombstone 均落盘，保证跨 flush 删除一致）。
     fn write_sst(&self, path: &Path, imm: &MemTable) -> Result<SstFooter> {
-        let mut w = SstWriter::new(path, self.compression, self.compression_level, self.block_size, imm.len())?;
+        let mut w = SstWriter::new_with_pax(
+            path,
+            self.compression,
+            self.compression_level,
+            self.block_size,
+            imm.len(),
+            &self.pax_hot_fields,
+        )?;
         imm.scan(|k, e| {
             match &e.value {
                 Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
@@ -367,28 +377,7 @@ fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<O
         cache.put(ck, b.clone());
         b
     };
-    Ok(scan_block(&block, key))
-}
-
-/// 块内等值扫描（与 sstable::scan_block_for_key 相同逻辑，独立维护避免跨模块私有）。
-/// 返回 `(value, seq)`：value=None 表示 Tombstone；整体 None 表示块内无此 key。
-fn scan_block(block: &[u8], key: &[u8]) -> Option<(Option<Vec<u8>>, u64)> {
-    let mut cur = 0usize;
-    while cur < block.len() {
-        let Ok(k) = crate::keys::decode_varlen(block, &mut cur) else { return None };
-        let Ok(v) = crate::keys::decode_varlen(block, &mut cur) else { return None };
-        if cur + 9 > block.len() {
-            return None;
-        }
-        let flag = block[cur];
-        let seq = u64::from_le_bytes(block[cur + 1..cur + 9].try_into().ok()?);
-        if k == key {
-            let value = (flag == crate::sstable::FLAG_PUT).then(|| v.to_vec());
-            return Some((value, seq));
-        }
-        cur += 9;
-    }
-    None
+    Ok(sst.scan_block_for_key(&block, key)?)
 }
 
 #[cfg(test)]
@@ -552,6 +541,31 @@ mod tests {
             assert_eq!(cf3.get(5).unwrap().unwrap().0, b"v-5");
             assert_eq!(cf3.get(1).unwrap().unwrap().0, b"v-1");
         }
+    }
+
+    #[test]
+    fn pax_cf_flush_read_roundtrip() {
+        // 阶段 1.5 PAX：配置 hot_fields 后 flush 落盘列式块，读回语义等值；非 JSON 值回退行式
+        let dir = tmp();
+        let mut cfg = small_cfg(256);
+        cfg.storage.hot_fields = vec!["status".to_string(), "city".to_string()];
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.put(1, br#"{"status":"active","city":"beijing","amount":10}"#.to_vec()).unwrap();
+        cf.put(2, br#"{"status":"inactive","city":"shanghai"}"#.to_vec()).unwrap();
+        cf.switch_and_flush().unwrap();
+        assert!(cf.sst_count() >= 1);
+        assert_eq!(
+            String::from_utf8_lossy(&cf.get(1).unwrap().unwrap().0),
+            r#"{"status":"active","city":"beijing","amount":10}"#
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&cf.get(2).unwrap().unwrap().0),
+            r#"{"status":"inactive","city":"shanghai"}"#
+        );
+        // 非 JSON 值 → 行式块（同一 v4 文件体系，Reader 兼容）
+        cf.put(3, b"raw-bytes".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.get(3).unwrap().unwrap().0, b"raw-bytes");
     }
 
     #[test]
