@@ -86,7 +86,10 @@ impl HotCache {
         }
         // 软水位主动淘汰：达 85% 淘汰至 75%（防突发卡顿，design 6.5）
         if self.used_bytes > high {
-            warn!("HotCache 达软水位 {}/{}，主动淘汰冷数据", self.used_bytes, hard);
+            warn!(
+                "HotCache 达软水位 {}/{}，主动淘汰冷数据",
+                self.used_bytes, hard
+            );
             while self.used_bytes > low {
                 if !self.evict_one() {
                     break;
@@ -127,6 +130,10 @@ impl HotCache {
         self.cache.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
     pub fn used_bytes(&self) -> usize {
         self.used_bytes
     }
@@ -149,10 +156,11 @@ mod tests {
     use super::*;
 
     fn small_cfg(max_mb: usize) -> HotCacheConfig {
-        let mut c = HotCacheConfig::default();
-        c.max_memory_mb = max_mb;
-        c.eviction_policy = "lru".into();
-        c
+        HotCacheConfig {
+            max_memory_mb: max_mb,
+            eviction_policy: "lru".into(),
+            ..Default::default()
+        }
     }
 
     #[test]

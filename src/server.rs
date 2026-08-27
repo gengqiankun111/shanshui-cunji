@@ -4,11 +4,11 @@
 //! 单机 MVP：串行处理连接、无鉴权/多租户；CLI 与 HTTP 共享同一内核调用路径。
 //!
 //! 接口（对齐 Readme「HTTP-JSON 接口」）：
-//! - `POST /put`     `{"docid":1001,"status":"active","type":"order",...}` → 写入
-//!                   （文档原样存储；字符串字段值自动作为倒排词条）
-//! - `GET  /get?docid=1001`            → `{"docid":1001,"value":{...}}`
-//! - `GET  /search?filter=...`         → `{"total":N,"rows":[{"docid":D,"value":{...}},...]}`
-//! - `GET  /range?start=S&end=E`       → 同上（主键范围）
+//! - `POST /put` `{"docid":1001,"status":"active","type":"order",...}` → 写入
+//!   （文档原样存储；字符串字段值自动作为倒排词条）
+//! - `GET /get?docid=1001` → `{"docid":1001,"value":{...}}`
+//! - `GET /search?filter=...` → `{"total":N,"rows":[{"docid":D,"value":{...}},...]}`
+//! - `GET /range?start=S&end=E` → 同上（主键范围）
 //! - `POST /delete` `{"docid":1001}` 或 `GET /delete?docid=1001` → `{"ok":true}`
 //!
 //! filter 语法（MVP 子集）：`field=value`，多条件用 ` AND ` 连接（位图交集）；
@@ -216,7 +216,13 @@ fn collect_strings(val: &Value, out: &mut Vec<String>) {
 // 路由与处理器
 // ---------------------------------------------------------------------------
 
-fn route_request(engine: &mut Engine, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, String) {
+fn route_request(
+    engine: &mut Engine,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> (u16, String) {
     match (method, path) {
         ("POST", "/put") => handle_put(engine, body),
         ("POST", "/patch") => handle_patch(engine, body),
@@ -225,7 +231,10 @@ fn route_request(engine: &mut Engine, method: &str, path: &str, query: &str, bod
         ("GET", "/range") => handle_range(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
-        _ => (404, json!({"error": format!("接口不存在: {method} {path}")}).to_string()),
+        _ => (
+            404,
+            json!({"error": format!("接口不存在: {method} {path}")}).to_string(),
+        ),
     }
 }
 
@@ -234,7 +243,12 @@ fn route_request(engine: &mut Engine, method: &str, path: &str, query: &str, bod
 fn handle_patch(engine: &mut Engine, body: &[u8]) -> (u16, String) {
     let val: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return (400, json!({"error": format!("JSON 解析失败: {e}")}).to_string()),
+        Err(e) => {
+            return (
+                400,
+                json!({"error": format!("JSON 解析失败: {e}")}).to_string(),
+            )
+        }
     };
     let Some(docid) = val.get("docid").and_then(|d| d.as_u64()) else {
         return (400, json!({"error": "缺少 docid 字段"}).to_string());
@@ -242,8 +256,10 @@ fn handle_patch(engine: &mut Engine, body: &[u8]) -> (u16, String) {
     let Some(fields_obj) = val.get("fields").and_then(|f| f.as_object()) else {
         return (400, json!({"error": "缺少 fields 对象"}).to_string());
     };
-    let fields: Vec<(&str, serde_json::Value)> =
-        fields_obj.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let fields: Vec<(&str, serde_json::Value)> = fields_obj
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
     match engine.patch(docid, &fields) {
         Ok(()) => (200, json!({"ok": true, "docid": docid}).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
@@ -253,25 +269,40 @@ fn handle_patch(engine: &mut Engine, body: &[u8]) -> (u16, String) {
 fn handle_put(engine: &mut Engine, body: &[u8]) -> (u16, String) {
     let val: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return (400, json!({"error": format!("JSON 解析失败: {e}")}).to_string()),
+        Err(e) => {
+            return (
+                400,
+                json!({"error": format!("JSON 解析失败: {e}")}).to_string(),
+            )
+        }
     };
     let Some(docid) = val.get("docid").and_then(|d| d.as_u64()) else {
         return (400, json!({"error": "缺少 docid 字段"}).to_string());
     };
     if docid >= u32::MAX as u64 {
-        return (400, json!({"error": "docid 超出倒排索引支持范围（< 2^32）"}).to_string());
+        return (
+            400,
+            json!({"error": "docid 超出倒排索引支持范围（< 2^32）"}).to_string(),
+        );
     }
     let terms = extract_terms(&val);
     let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
     match engine.put(docid, body.to_vec(), &term_refs) {
-        Ok(()) => (200, json!({"ok": true, "docid": docid, "terms": terms.len()}).to_string()),
+        Ok(()) => (
+            200,
+            json!({"ok": true, "docid": docid, "terms": terms.len()}).to_string(),
+        ),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
 
 fn handle_get(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);
-    let Some(docid) = params.iter().find(|(k, _)| k == "docid").and_then(|(_, v)| v.parse::<u64>().ok()) else {
+    let Some(docid) = params
+        .iter()
+        .find(|(k, _)| k == "docid")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+    else {
         return (400, json!({"error": "缺少 docid 参数"}).to_string());
     };
     match engine.get(docid) {
@@ -283,7 +314,11 @@ fn handle_get(engine: &mut Engine, query: &str) -> (u16, String) {
 
 fn handle_search(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);
-    let Some(filter) = params.iter().find(|(k, _)| k == "filter").map(|(_, v)| v.clone()) else {
+    let Some(filter) = params
+        .iter()
+        .find(|(k, _)| k == "filter")
+        .map(|(_, v)| v.clone())
+    else {
         return (400, json!({"error": "缺少 filter 参数"}).to_string());
     };
     match execute_filter(engine, &filter) {
@@ -294,8 +329,14 @@ fn handle_search(engine: &mut Engine, query: &str) -> (u16, String) {
 
 fn handle_range(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);
-    let start = params.iter().find(|(k, _)| k == "start").and_then(|(_, v)| v.parse::<u64>().ok());
-    let end = params.iter().find(|(k, _)| k == "end").and_then(|(_, v)| v.parse::<u64>().ok());
+    let start = params
+        .iter()
+        .find(|(k, _)| k == "start")
+        .and_then(|(_, v)| v.parse::<u64>().ok());
+    let end = params
+        .iter()
+        .find(|(k, _)| k == "end")
+        .and_then(|(_, v)| v.parse::<u64>().ok());
     match engine.scan_range(start, end) {
         Ok(rows) => (200, rows_payload(&rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
@@ -305,9 +346,14 @@ fn handle_range(engine: &mut Engine, query: &str) -> (u16, String) {
 fn handle_delete(engine: &mut Engine, body: &[u8], query: &str) -> (u16, String) {
     // 支持 POST body {"docid":N} 或 GET ?docid=N
     let docid: Option<u64> = if !body.is_empty() {
-        serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("docid").and_then(|d| d.as_u64()))
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("docid").and_then(|d| d.as_u64()))
     } else {
-        parse_query(query).iter().find(|(k, _)| k == "docid").and_then(|(_, v)| v.parse().ok())
+        parse_query(query)
+            .iter()
+            .find(|(k, _)| k == "docid")
+            .and_then(|(_, v)| v.parse().ok())
     };
     let Some(docid) = docid else {
         return (400, json!({"error": "缺少 docid"}).to_string());
@@ -350,7 +396,11 @@ pub fn execute_filter(engine: &mut Engine, filter: &str) -> Result<Vec<(u64, Vec
         let docid: u64 = v
             .parse()
             .map_err(|_| Error::Unsupported(format!("docid 非法: {v}")))?;
-        return Ok(engine.get(docid)?.map(|val| (docid, val)).into_iter().collect());
+        return Ok(engine
+            .get(docid)?
+            .map(|val| (docid, val))
+            .into_iter()
+            .collect());
     }
     let values: Vec<&str> = conds.iter().map(|(_, v)| v.as_str()).collect();
     if values.len() == 1 {
@@ -412,7 +462,10 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let name = format!("srv-{}", SEQ.fetch_add(1, Ordering::Relaxed));
-        let p = DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name);
+        let p = DIR
+            .get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -435,7 +488,12 @@ mod tests {
     }
 
     /// 极简 HTTP 客户端：发送请求并返回 (状态码, body)。
-    fn http_req(addr: std::net::SocketAddr, method: &str, target: &str, body: &[u8]) -> (u16, String) {
+    fn http_req(
+        addr: std::net::SocketAddr,
+        method: &str,
+        target: &str,
+        body: &[u8],
+    ) -> (u16, String) {
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write!(
@@ -461,23 +519,35 @@ mod tests {
     fn parse_filter_basic() {
         assert_eq!(
             parse_filter("status=active AND type=order"),
-            vec![("status".to_string(), "active".to_string()), ("type".to_string(), "order".to_string())]
+            vec![
+                ("status".to_string(), "active".to_string()),
+                ("type".to_string(), "order".to_string())
+            ]
         );
-        assert_eq!(parse_filter("city=beijing"), vec![("city".to_string(), "beijing".to_string())]);
+        assert_eq!(
+            parse_filter("city=beijing"),
+            vec![("city".to_string(), "beijing".to_string())]
+        );
         assert!(parse_filter("").is_empty());
         assert!(parse_filter("no-equals-here").is_empty());
     }
 
     #[test]
     fn url_decode_handles_percent_and_plus() {
-        assert_eq!(url_decode("status%3Dactive%20AND%20type%3Dorder"), "status=active AND type=order");
+        assert_eq!(
+            url_decode("status%3Dactive%20AND%20type%3Dorder"),
+            "status=active AND type=order"
+        );
         assert_eq!(url_decode("a+b"), "a b");
         assert_eq!(url_decode("100%"), "100%");
     }
 
     #[test]
     fn extract_terms_collects_string_values() {
-        let v: Value = serde_json::from_str(r#"{"docid":1,"status":"active","n":3,"fields":{"type":"click","flag":true}}"#).unwrap();
+        let v: Value = serde_json::from_str(
+            r#"{"docid":1,"status":"active","n":3,"fields":{"type":"click","flag":true}}"#,
+        )
+        .unwrap();
         let terms = extract_terms(&v);
         assert!(terms.contains(&"active".to_string()));
         assert!(terms.contains(&"click".to_string()));
@@ -492,12 +562,22 @@ mod tests {
         let addr = spawn_server(engine);
 
         // PUT
-        let (st, body) = http_req(addr, "POST", "/put", br#"{"docid":1001,"status":"active","type":"order","device":"android"}"#);
+        let (st, body) = http_req(
+            addr,
+            "POST",
+            "/put",
+            br#"{"docid":1001,"status":"active","type":"order","device":"android"}"#,
+        );
         assert_eq!(st, 200, "put 失败: {body}");
         assert!(body.contains("\"ok\":true"));
 
         // PUT 第二条
-        http_req(addr, "POST", "/put", br#"{"docid":2002,"status":"active","type":"view","device":"ios"}"#);
+        http_req(
+            addr,
+            "POST",
+            "/put",
+            br#"{"docid":2002,"status":"active","type":"view","device":"ios"}"#,
+        );
 
         // GET
         let (st, body) = http_req(addr, "GET", "/get?docid=1001", b"");
@@ -514,7 +594,12 @@ mod tests {
         assert!(body.contains("\"total\":2"), "应为 2 条: {body}");
 
         // SEARCH 多条件 AND（位图交集）
-        let (st, body) = http_req(addr, "GET", "/search?filter=status%3Dactive%20AND%20type%3Dorder", b"");
+        let (st, body) = http_req(
+            addr,
+            "GET",
+            "/search?filter=status%3Dactive%20AND%20type%3Dorder",
+            b"",
+        );
         assert_eq!(st, 200, "search-and 失败: {body}");
         assert!(body.contains("\"total\":1"), "交集应为 1 条: {body}");
         assert!(body.contains("1001"));
@@ -525,7 +610,12 @@ mod tests {
         assert!(body.contains("\"total\":1"), "范围应命中 1 条: {body}");
 
         // PATCH（阶段 1.5 部分更新）：覆盖 device + 新增 note
-        let (st, body) = http_req(addr, "POST", "/patch", br#"{"docid":2002,"fields":{"device":"linux","note":"patched"}}"#);
+        let (st, body) = http_req(
+            addr,
+            "POST",
+            "/patch",
+            br#"{"docid":2002,"fields":{"device":"linux","note":"patched"}}"#,
+        );
         assert_eq!(st, 200, "patch 失败: {body}");
         let (st, body) = http_req(addr, "GET", "/get?docid=2002", b"");
         assert_eq!(st, 200, "patch 后 get 失败: {body}");
