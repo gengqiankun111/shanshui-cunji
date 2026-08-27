@@ -47,14 +47,26 @@ impl Engine {
     }
 
     /// 打开引擎并指定查询超时（压测/大结果集场景需放宽熔断阈值）。
-    pub fn open_with_timeout(data_dir: &Path, cfg: &Config, query_timeout: std::time::Duration) -> Result<Self> {
+    pub fn open_with_timeout(
+        data_dir: &Path,
+        cfg: &Config,
+        query_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
         let inverted = InvertedIndex::open(&data_dir.join("inverted"), 1_000_000)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
-        Ok(Self { primary, cidx, inverted, delta, hotcache, watchdog, mem_ratio: 0.0 })
+        Ok(Self {
+            primary,
+            cidx,
+            inverted,
+            delta,
+            hotcache,
+            watchdog,
+            mem_ratio: 0.0,
+        })
     }
 
     /// 更新内存使用率估算（OOM Guardian 输入，由监控/统计层刷新）。
@@ -77,7 +89,8 @@ impl Engine {
         // ① 失效 HotCache 该 docid
         self.hotcache.invalidate(docid);
         // ② 主数据（权威源，WAL 攒批不逐条 fsync）；全量覆盖 → 清空该 docid 的增量（避免旧 patch 覆盖新数据）
-        self.primary.put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
+        self.primary
+            .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         self.delta.delete_prefix(&encode_docid(docid))?;
         // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）
         for t in terms {
@@ -110,7 +123,8 @@ impl Engine {
         for (f, v) in fields {
             let mut key = encode_docid(docid).to_vec();
             encode_varlen(&mut key, f.as_bytes());
-            let val = serde_json::to_vec(v).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+            let val =
+                serde_json::to_vec(v).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
             self.delta.put_bytes_nosync(key, val)?;
         }
         self.flush_wal()
@@ -152,7 +166,8 @@ impl Engine {
                 map.insert(field, val);
             }
         }
-        let merged = serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+        let merged =
+            serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         self.hotcache.put(docid, merged.clone());
         Ok(Some(merged))
     }
@@ -198,7 +213,12 @@ impl Engine {
         let guard = self.watchdog.begin_query();
         let rows = match route(spec) {
             AccessPath::PrimaryPoint => {
-                let docid = spec.primary_eq.as_ref().map(|k| crate::keys::decode_docid(k)).transpose()?.unwrap_or(0);
+                let docid = spec
+                    .primary_eq
+                    .as_ref()
+                    .map(|k| crate::keys::decode_docid(k))
+                    .transpose()?
+                    .unwrap_or(0);
                 self.get(docid)?.into_iter().map(|v| (docid, v)).collect()
             }
             AccessPath::PrimaryRange => self.scan_range(None, None)?,
@@ -272,7 +292,9 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let name = format!("eng-{}", SEQ.fetch_add(1, Ordering::Relaxed));
-        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name)
+        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name)
     }
 
     fn cfg() -> Config {
@@ -396,19 +418,31 @@ mod tests {
         // 阶段 1.5 Delta CF：patch 部分更新 → get 合并覆盖；重启后 WAL 恢复仍生效
         let dir = tmp();
         let mut e = Engine::open(&dir, &cfg()).unwrap();
-        e.put(1, br#"{"status":"active","amount":100,"device":"android"}"#.to_vec(), &[]).unwrap();
-        e.patch(1, &[
-            ("status", serde_json::json!("inactive")),
-            ("note", serde_json::json!("updated")),
-            ("amount", serde_json::Value::Null), // null = 删除字段
-        ])
+        e.put(
+            1,
+            br#"{"status":"active","amount":100,"device":"android"}"#.to_vec(),
+            &[],
+        )
+        .unwrap();
+        e.patch(
+            1,
+            &[
+                ("status", serde_json::json!("inactive")),
+                ("note", serde_json::json!("updated")),
+                ("amount", serde_json::Value::Null), // null = 删除字段
+            ],
+        )
         .unwrap();
         let v = e.get(1).unwrap().unwrap();
         let obj: serde_json::Value = serde_json::from_slice(&v).unwrap();
         assert_eq!(obj["status"], serde_json::json!("inactive"), "patch 应覆盖");
         assert_eq!(obj["note"], serde_json::json!("updated"), "patch 应新增");
         assert!(obj.get("amount").is_none(), "null patch 应删除字段");
-        assert_eq!(obj["device"], serde_json::json!("android"), "未 patch 字段保留");
+        assert_eq!(
+            obj["device"],
+            serde_json::json!("android"),
+            "未 patch 字段保留"
+        );
         // 重启后 Delta 仍生效（WAL 恢复）
         drop(e);
         let mut e2 = Engine::open(&dir, &cfg()).unwrap();
@@ -422,11 +456,20 @@ mod tests {
         // 全量 put 覆盖 → 清空该 docid 增量，避免旧 patch 覆盖新数据
         let dir = tmp();
         let mut e = Engine::open(&dir, &cfg()).unwrap();
-        e.put(1, br#"{"status":"active","amount":100}"#.to_vec(), &[]).unwrap();
-        e.patch(1, &[("status", serde_json::json!("patched"))]).unwrap();
-        assert_eq!(String::from_utf8_lossy(&e.get(1).unwrap().unwrap()), r#"{"status":"patched","amount":100}"#);
-        e.put(1, br#"{"status":"fresh","amount":200}"#.to_vec(), &[]).unwrap();
-        assert_eq!(String::from_utf8_lossy(&e.get(1).unwrap().unwrap()), r#"{"status":"fresh","amount":200}"#);
+        e.put(1, br#"{"status":"active","amount":100}"#.to_vec(), &[])
+            .unwrap();
+        e.patch(1, &[("status", serde_json::json!("patched"))])
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&e.get(1).unwrap().unwrap()),
+            r#"{"status":"patched","amount":100}"#
+        );
+        e.put(1, br#"{"status":"fresh","amount":200}"#.to_vec(), &[])
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&e.get(1).unwrap().unwrap()),
+            r#"{"status":"fresh","amount":200}"#
+        );
     }
 
     #[test]

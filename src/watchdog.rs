@@ -50,7 +50,8 @@ impl MemoryGuardian {
     /// - `>= stall` → Err(MemoryOverload)（紧急止损，拒绝新写入）
     pub fn check(&self, usage_ratio: f64) -> Result<MemoryStatus> {
         if usage_ratio >= self.stall_water {
-            self.stalled_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.stalled_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(Error::MemoryOverload(format!(
                 "内存使用率 {:.1}% 达硬水位 {:.1}%，拒绝新写入",
                 usage_ratio * 100.0,
@@ -58,18 +59,21 @@ impl MemoryGuardian {
             )));
         }
         if usage_ratio >= self.high_water {
-            self.throttled_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.throttled_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(MemoryStatus::Throttled);
         }
         Ok(MemoryStatus::Normal)
     }
 
     pub fn throttled_count(&self) -> u64 {
-        self.throttled_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.throttled_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn stalled_count(&self) -> u64 {
-        self.stalled_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.stalled_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -82,7 +86,11 @@ pub struct QueryGuard {
 
 impl QueryGuard {
     fn new(query_id: u64, timeout: Duration) -> Self {
-        Self { deadline: Instant::now() + timeout, query_id, timeout }
+        Self {
+            deadline: Instant::now() + timeout,
+            query_id,
+            timeout,
+        }
     }
 
     pub fn query_id(&self) -> u64 {
@@ -122,7 +130,9 @@ impl Watchdog {
 
     /// 开始一个查询，返回超时守卫。
     pub fn begin_query(&self) -> QueryGuard {
-        let id = self.next_query_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_query_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         QueryGuard::new(id, self.query_timeout)
     }
 
@@ -196,6 +206,9 @@ mod tests {
         c.memory.watermark_stall = 0.6;
         let w = Watchdog::new(&c, DEFAULT_QUERY_TIMEOUT);
         assert_eq!(w.memory_check(0.55).unwrap(), MemoryStatus::Throttled);
-        assert!(matches!(w.memory_check(0.65), Err(Error::MemoryOverload(_))));
+        assert!(matches!(
+            w.memory_check(0.65),
+            Err(Error::MemoryOverload(_))
+        ));
     }
 }

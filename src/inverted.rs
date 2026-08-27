@@ -63,7 +63,10 @@ impl InvertedIndex {
         } else {
             (Vec::new(), 1)
         };
-        info!("倒排索引打开: {} 个段，下一个 id={next_seg_id}", segments.len());
+        info!(
+            "倒排索引打开: {} 个段，下一个 id={next_seg_id}",
+            segments.len()
+        );
         Ok(Self {
             dir: dir.to_path_buf(),
             mem: DashMap::new(),
@@ -142,7 +145,10 @@ impl InvertedIndex {
     }
 
     fn persist_manifest(&self) -> Result<()> {
-        let m = SegmentManifest { segments: self.segments.clone(), next_seg_id: self.next_seg_id };
+        let m = SegmentManifest {
+            segments: self.segments.clone(),
+            next_seg_id: self.next_seg_id,
+        };
         let text = serde_json::to_string_pretty(&m)
             .map_err(|e| Error::Serialize(format!("倒排 Manifest 序列化失败: {e}")))?;
         let tmp = self.dir.join("manifest.json.tmp");
@@ -210,7 +216,9 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let name = format!("inv-{}", SEQ.fetch_add(1, Ordering::Relaxed));
-        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name)
+        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name)
     }
 
     #[test]

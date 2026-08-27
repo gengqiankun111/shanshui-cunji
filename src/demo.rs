@@ -4,7 +4,7 @@
 //! 构造测试数据 → 插入 → 主键查询 → 缓存查询 → 组合索引查询 → 倒排词条 → 分片路由 → 删除。
 //! 输出结构化结果，供 HTML 报告与截图使用（dev 阶段交付物）。
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 use crate::column_family::ColumnFamily;
@@ -24,14 +24,23 @@ pub struct TestResult {
 
 impl TestResult {
     fn new(name: &'static str, passed: bool, detail: String, elapsed_ms: f64) -> Self {
-        Self { name, passed, detail, elapsed_ms }
+        Self {
+            name,
+            passed,
+            detail,
+            elapsed_ms,
+        }
     }
 }
 
 /// 构造单条测试文档（流式生成用，避免亿级数据全量驻留内存）。
 fn make_doc(docid: u64) -> (Vec<u8>, Vec<&'static str>) {
     let i = docid - 1;
-    let status = if i % 3 == 0 { "active" } else { "inactive" };
+    let status = if i.is_multiple_of(3) {
+        "active"
+    } else {
+        "inactive"
+    };
     let city = match i % 4 {
         0 => "beijing",
         1 => "shanghai",
@@ -63,22 +72,20 @@ struct ShardedEngine {
 }
 
 impl ShardedEngine {
-    fn open(data_dir: &PathBuf, cfg: &Config, shard_count: usize) -> Result<Self> {
+    fn open(data_dir: &Path, cfg: &Config, shard_count: usize) -> Result<Self> {
         let mut shards = Vec::with_capacity(shard_count);
         for s in 0..shard_count {
             let dir = data_dir.join(format!("shard-{s}"));
             shards.push(Engine::open(&dir, cfg)?);
         }
-        Ok(Self { shards, shard_count })
+        Ok(Self {
+            shards,
+            shard_count,
+        })
     }
 
     fn shard_of(&self, docid: u64) -> usize {
         (docid % self.shard_count as u64) as usize
-    }
-
-    fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
-        let s = self.shard_of(docid);
-        self.shards[s].put(docid, value, terms)
     }
 
     fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
@@ -116,15 +123,23 @@ pub fn generate(scale: u64, path: &std::path::Path) -> Result<u64> {
     let docs = build_docs(scale);
     let mut out = std::fs::File::create(path)?;
     for (docid, doc, terms) in &docs {
-        let terms_json = terms.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(",");
-        writeln!(out, "{{\"docid\":{docid},\"doc\":{},\"terms\":[{terms_json}]}}", String::from_utf8_lossy(doc))?;
+        let terms_json = terms
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            out,
+            "{{\"docid\":{docid},\"doc\":{},\"terms\":[{terms_json}]}}",
+            String::from_utf8_lossy(doc)
+        )?;
     }
     Ok(docs.len() as u64)
 }
 
 /// 运行完整 demo 测试，返回各测试结果。
 /// `scale`：构造文档条数（10 万 ~ 1 亿）。
-pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResult>> {
+pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
     // 抽样查询量：小规模全查，大规模固定上限（避免结果集过大）
     let sample = scale.min(1000);
@@ -150,7 +165,8 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     // ---------- 2. 批量插入（流式 + WAL 攒批 + 定期倒排刷盘） ----------
     let engine_dir = data_dir.join("engine");
     // 大结果集回表（如千万级 beijing）需放宽查询超时，避免看门狗熔断
-    let mut engine = Engine::open_with_timeout(&engine_dir, cfg, std::time::Duration::from_secs(3600))?;
+    let mut engine =
+        Engine::open_with_timeout(&engine_dir, cfg, std::time::Duration::from_secs(3600))?;
     let t = Instant::now();
     let mut put_ok = 0u64;
     for docid in 1..=scale {
@@ -233,7 +249,10 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     results.push(TestResult::new(
         "查询 · 组合索引",
         hits.len() == active_count as usize,
-        format!("status=active 前缀查询命中 {} 条（写入索引 {active_count} 条）", hits.len()),
+        format!(
+            "status=active 前缀查询命中 {} 条（写入索引 {active_count} 条）",
+            hits.len()
+        ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
@@ -243,7 +262,7 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     // 再抽样回表验证正确性（MVP 逐条回表对亿级结果集慢，批量预取优化在阶段 1.5）
     let expected_beijing = scale / 4;
     let bitmap = engine.inverted_posting("beijing")?;
-    let total_hits = bitmap.len() as u64;
+    let total_hits = bitmap.len();
     // 抽样回表：最多 20 万条
     let fetch_budget = 200_000.min(total_hits);
     let mut fetched = 0u64;
@@ -281,7 +300,11 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
             shard_ok += 1;
         }
     }
-    let dist_str = dist.iter().map(|(s, c)| format!("shard{s}={c}")).collect::<Vec<_>>().join(", ");
+    let dist_str = dist
+        .iter()
+        .map(|(s, c)| format!("shard{s}={c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     results.push(TestResult::new(
         "分片路由",
         total == scale as usize && shard_ok == pk_sample,
@@ -358,10 +381,12 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     let non_deleted = (0..verify_n)
         .filter(|i| !deleted.contains(&((i * 13 % scale) + 1)))
         .count() as u64;
-    let deleted_in_verify = verify_n as u64 - non_deleted;
-    let bj = restored.inverted_posting("beijing")?.len() as u64;
-    let passed =
-        missing == 0 && present == non_deleted && del_ok == deleted_in_verify && bj == expected_beijing;
+    let deleted_in_verify = verify_n - non_deleted;
+    let bj = restored.inverted_posting("beijing")?.len();
+    let passed = missing == 0
+        && present == non_deleted
+        && del_ok == deleted_in_verify
+        && bj == expected_beijing;
     results.push(TestResult::new(
         "备份 · 还原",
         passed,

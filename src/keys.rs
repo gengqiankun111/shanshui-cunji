@@ -129,10 +129,14 @@ mod tests {
     #[test]
     fn docid_byte_order_matches_numeric_order() {
         // 大端：字节序 == 数值序，范围扫描 / Zone Map 剪枝的前提
-        let mut ids = vec![0u64, 1, 255, 256, 1001, 2000, 65_536, u64::MAX];
+        let mut ids = [0u64, 1, 255, 256, 1001, 2000, 65_536, u64::MAX];
         ids.sort();
         for w in ids.windows(2) {
-            assert!(encode_docid(w[0]) < encode_docid(w[1]), "docid {} 的编码序错乱", w[0]);
+            assert!(
+                encode_docid(w[0]) < encode_docid(w[1]),
+                "docid {} 的编码序错乱",
+                w[0]
+            );
         }
         // 组合索引同前缀下按 docid 数值序排列
         let a = encode_composite_key(&[b"active"], 1001);
@@ -200,7 +204,16 @@ mod tests {
 
     #[test]
     fn zigzag_roundtrip() {
-        for v in [0i64, 1, -1, 63, -64, i32::MAX as i64, i32::MIN as i64, i64::MIN] {
+        for v in [
+            0i64,
+            1,
+            -1,
+            63,
+            -64,
+            i32::MAX as i64,
+            i32::MIN as i64,
+            i64::MIN,
+        ] {
             assert_eq!(zigzag_decode(zigzag_encode(v)), v);
         }
     }

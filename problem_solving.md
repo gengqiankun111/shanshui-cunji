@@ -107,6 +107,18 @@
 - **修复**：写报告前 `create_dir_all`。
 - **提交**：`18d3f41`（随 TTL 一并）
 
+### P17. check.ps1 在 PS 5.1 下因 stderr 进度误判失败
+- **现象**：`quality/check.ps1` 第 4 步 `cargo test 2>&1 | Select-String` 报 `NativeCommandError`，脚本以失败退出。
+- **根因**：PS 5.1 在 `$ErrorActionPreference="Stop"` 下，把 cargo 写到 stderr 的编译进度视为致命错误。
+- **修复**：第 4 步临时切到 `"Continue"`，取 `$LASTEXITCODE` 判定测试结果后再恢复 `"Stop"`。
+- **提交**：随质量体系文档提交（本轮）
+
+### P18. clippy 初始 43 条 lib + 9 条 bin 警告清零
+- **现象**：质量体系引入 `cargo clippy -- -D warnings` 后首次执行报 52 处警告。
+- **根因**：历史代码未按 clippy 严格标准（ptr_arg、type_complexity、should_implement_trait、io_other_error、approx_constant、field_reassign_with_default 等）。
+- **修复**：`clippy --fix` 自动修复 32 处；手动修复其余：`&PathBuf → &Path`、`FromStr` trait 化、类型别名（DecodedRow/BucketRow）、`hotcache.is_empty`、clamp、io_other_error、approx_constant 等。
+- **提交**：随质量体系文档提交（本轮，`cargo fmt --check` 与 `clippy -D warnings` 双零通过，133 测试全绿）
+
 ---
 
 ## 环境备忘（不入库）

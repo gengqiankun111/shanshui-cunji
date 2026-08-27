@@ -51,7 +51,10 @@ fn crc32(data: &[u8]) -> u32 {
 /// 将 `data_dir` 递归打包为单个备份文件（确定性顺序：按相对路径排序）。
 pub fn backup(data_dir: &Path, backup_path: &Path) -> Result<BackupReport> {
     if !data_dir.is_dir() {
-        return Err(Error::NotFound(format!("数据目录不存在: {}", data_dir.display())));
+        return Err(Error::NotFound(format!(
+            "数据目录不存在: {}",
+            data_dir.display()
+        )));
     }
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_files(data_dir, &mut files)?;
@@ -221,7 +224,10 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let name = format!("bak-{}", SEQ.fetch_add(1, Ordering::Relaxed));
-        let p = DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name);
+        let p = DIR
+            .get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -229,10 +235,18 @@ mod tests {
     fn make_tree(dir: &Path) {
         std::fs::create_dir_all(dir.join("primary")).unwrap();
         std::fs::create_dir_all(dir.join("inverted")).unwrap();
-        std::fs::write(dir.join("primary/manifest.json"), r#"{"sst_files":[],"next_sst_id":1}"#).unwrap();
+        std::fs::write(
+            dir.join("primary/manifest.json"),
+            r#"{"sst_files":[],"next_sst_id":1}"#,
+        )
+        .unwrap();
         std::fs::write(dir.join("primary/wal.log"), b"WAL-DATA").unwrap();
         std::fs::write(dir.join("primary/sst-00000001.sst"), b"SST-1").unwrap();
-        std::fs::write(dir.join("inverted/inverted-manifest.json"), "{\"segments\":[]}".as_bytes()).unwrap();
+        std::fs::write(
+            dir.join("inverted/inverted-manifest.json"),
+            "{\"segments\":[]}".as_bytes(),
+        )
+        .unwrap();
         std::fs::write(dir.join("inverted/inverted-00000001.seg"), b"SEG-1").unwrap();
         // 临时文件应被跳过
         std::fs::write(dir.join("primary/manifest.json.tmp"), b"stale").unwrap();
@@ -250,11 +264,23 @@ mod tests {
         assert_eq!(rep.entry_count, 5);
 
         restore(&bak, &dst).unwrap();
-        assert_eq!(std::fs::read(dst.join("primary/wal.log")).unwrap(), b"WAL-DATA");
-        assert_eq!(std::fs::read(dst.join("primary/sst-00000001.sst")).unwrap(), b"SST-1");
-        assert_eq!(std::fs::read(dst.join("inverted/inverted-00000001.seg")).unwrap(), b"SEG-1");
+        assert_eq!(
+            std::fs::read(dst.join("primary/wal.log")).unwrap(),
+            b"WAL-DATA"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("primary/sst-00000001.sst")).unwrap(),
+            b"SST-1"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("inverted/inverted-00000001.seg")).unwrap(),
+            b"SEG-1"
+        );
         assert!(std::fs::read(dst.join("primary/manifest.json")).is_ok());
-        assert!(!dst.join("primary/manifest.json.tmp").exists(), ".tmp 不应入备份");
+        assert!(
+            !dst.join("primary/manifest.json.tmp").exists(),
+            ".tmp 不应入备份"
+        );
     }
 
     #[test]

@@ -44,7 +44,9 @@ pub fn route(spec: &QuerySpec) -> AccessPath {
     } else if spec.primary_range {
         AccessPath::PrimaryRange
     } else if !spec.index_prefix.is_empty() {
-        AccessPath::CompositeIndex { fields: spec.index_prefix.clone() }
+        AccessPath::CompositeIndex {
+            fields: spec.index_prefix.clone(),
+        }
     } else if let Some(t) = &spec.term {
         AccessPath::Inverted { term: t.clone() }
     } else {
@@ -86,7 +88,12 @@ mod tests {
             index_prefix: vec!["status".into()],
             term: None,
         };
-        assert_eq!(route(&spec), AccessPath::CompositeIndex { fields: vec!["status".into()] });
+        assert_eq!(
+            route(&spec),
+            AccessPath::CompositeIndex {
+                fields: vec!["status".into()]
+            }
+        );
     }
 
     #[test]
@@ -97,7 +104,12 @@ mod tests {
             index_prefix: vec![],
             term: Some("click".into()),
         };
-        assert_eq!(route(&spec), AccessPath::Inverted { term: "click".into() });
+        assert_eq!(
+            route(&spec),
+            AccessPath::Inverted {
+                term: "click".into()
+            }
+        );
     }
 
     #[test]

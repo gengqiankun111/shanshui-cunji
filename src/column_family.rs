@@ -16,6 +16,7 @@
 //! 删除标记只存在于 WAL/MemTable 生命周期内；跨 flush 的删除一致性由步骤 9 补齐。
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use crate::config::model::{Config, MemtableConfig};
 use crate::error::{Error, Result};
 use crate::keys::{decode_docid, encode_docid};
 use crate::memtable::{MemTable, MemTableBuffer};
-use crate::sstable::{Compression, FLAG_DELETE, FLAG_PUT, SstFooter, SstReader, SstWriter};
+use crate::sstable::{Compression, SstFooter, SstReader, SstWriter, FLAG_DELETE, FLAG_PUT};
 use crate::wal::{WalReader, WalWriter, OP_DELETE, OP_PUT};
 
 /// SST 文件前缀。
@@ -94,14 +95,14 @@ impl ColumnFamily {
                     if days < cutoff {
                         let p = dir.join(f);
                         if p.exists() {
-                            std::fs::remove_file(&p).map_err(|e| Error::Io(e))?;
+                            std::fs::remove_file(&p).map_err(Error::Io)?;
                             removed += 1;
                         }
                     }
                 }
             }
             if removed > 0 {
-                sst_names.retain(|f| parse_sst_date(f).map_or(true, |d| d >= cutoff));
+                sst_names.retain(|f| parse_sst_date(f).is_none_or(|d| d >= cutoff));
                 info!("列族 [{name}] TTL 过期桶清理: 删除 {removed} 个 SST");
             }
         }
@@ -116,10 +117,18 @@ impl ColumnFamily {
             }
             match SstReader::open(&p) {
                 Ok(r) => ssts.push(r),
-                Err(e) => return Err(Error::Corrupted(format!("SST 加载失败 {}: {e}", p.display()))),
+                Err(e) => {
+                    return Err(Error::Corrupted(format!(
+                        "SST 加载失败 {}: {e}",
+                        p.display()
+                    )))
+                }
             }
         }
-        info!("列族 [{name}] 加载 {} 个 SST，下一个 id={next_sst_id}", ssts.len());
+        info!(
+            "列族 [{name}] 加载 {} 个 SST，下一个 id={next_sst_id}",
+            ssts.len()
+        );
 
         let block_cache = Arc::new(BlockCache::new(
             cfg.blockcache.max_memory_mb * 1024 * 1024,
@@ -177,7 +186,12 @@ impl ColumnFamily {
         }
         if !recs.is_empty() {
             self.seq.store(max_seq + 1, Ordering::Relaxed);
-            info!("列族 [{}] WAL 回放 {} 条，seq 推进至 {}", self.name, recs.len(), max_seq + 1);
+            info!(
+                "列族 [{}] WAL 回放 {} 条，seq 推进至 {}",
+                self.name,
+                recs.len(),
+                max_seq + 1
+            );
         }
         Ok(max_seq)
     }
@@ -269,21 +283,33 @@ impl ColumnFamily {
 
     /// 范围扫描 [start, end]（闭区间，None 端无边界）：先收集 MemTable 与各 SST 候选，
     /// 以最大 seq 去重（最新覆盖，Tombstone 覆盖旧值），返回按 docid 升序的 (docid, value) 列表。
-    pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<(u64, Vec<u8>)>> {
+    pub fn scan_range(
+        &mut self,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
         let start_key = start.map(|s| encode_docid(s).to_vec());
         let end_key = end.map(|e| encode_docid(e).to_vec());
         let rows = self.scan_raw_range(start_key.as_deref(), end_key.as_deref())?;
         let mut out = Vec::with_capacity(rows.len());
         for (k, v) in rows {
-            out.push((decode_docid(&k).map_err(|_| Error::Corrupted("docid 解码失败".into()))?, v));
+            out.push((
+                decode_docid(&k).map_err(|_| Error::Corrupted("docid 解码失败".into()))?,
+                v,
+            ));
         }
         Ok(out)
     }
 
     /// 原始字节键范围扫描（组合索引前缀查询使用）。返回升序 (key, value) 列表，Tombstone 已过滤。
-    pub fn scan_raw_range(&mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan_raw_range(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // 候选收集：key → (seq, value)，value=None 表示 Tombstone
-        let mut merged: std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)> = std::collections::HashMap::new();
+        let mut merged: std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)> =
+            std::collections::HashMap::new();
 
         // MemTable 扫描（含 Tombstone 覆盖）
         self.memtable.scan_range(start, end, |key, e| {
@@ -336,21 +362,30 @@ impl ColumnFamily {
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
         self.ssts.insert(0, SstReader::open(&path)?);
         self.persist_manifest()?;
-        info!("列族 [{}] 刷盘完成: {} ({} 条)", self.name, fname, imm.len());
+        info!(
+            "列族 [{}] 刷盘完成: {} ({} 条)",
+            self.name,
+            fname,
+            imm.len()
+        );
         Ok(())
     }
 
     /// TTL 分桶 flush：按文档 ttl_field 提取的 UTC 天分桶，每个桶一个 SST 文件；
     /// 无时间字段 / 非 JSON 值落入默认桶（无日期前缀，永不过期）。桶内 key 保持升序。
     fn flush_buckets(&mut self, imm: &MemTable) -> Result<()> {
-        let mut buckets: std::collections::BTreeMap<Option<i64>, Vec<(Vec<u8>, Option<Vec<u8>>, u8, u64)>> =
+        let mut buckets: std::collections::BTreeMap<Option<i64>, Vec<BucketRow>> =
             std::collections::BTreeMap::new();
         imm.scan(|k, e| {
             let days = match &e.value {
                 Some(v) => self.document_bucket_days(v),
                 None => None, // Tombstone 无时间 → 默认桶（随对应 key 的桶删除语义由数据决定）
             };
-            let flag = if e.value.is_some() { FLAG_PUT } else { FLAG_DELETE };
+            let flag = if e.value.is_some() {
+                FLAG_PUT
+            } else {
+                FLAG_DELETE
+            };
             buckets
                 .entry(days)
                 .or_default()
@@ -369,7 +404,10 @@ impl ColumnFamily {
             self.ssts.insert(0, SstReader::open(&path)?);
         }
         self.persist_manifest()?;
-        info!("列族 [{}] TTL 分桶刷盘完成: {} 个桶", self.name, bucket_count);
+        info!(
+            "列族 [{}] TTL 分桶刷盘完成: {} 个桶",
+            self.name, bucket_count
+        );
         Ok(())
     }
 
@@ -381,7 +419,7 @@ impl ColumnFamily {
     }
 
     /// 按行序列写一个 SST（TTL 分桶用；行内 key 已升序）。
-    fn write_rows(&self, path: &Path, rows: &[(Vec<u8>, Option<Vec<u8>>, u8, u64)]) -> Result<SstFooter> {
+    fn write_rows(&self, path: &Path, rows: &[BucketRow]) -> Result<SstFooter> {
         let mut w = SstWriter::new_with_pax(
             path,
             self.compression,
@@ -394,7 +432,8 @@ impl ColumnFamily {
             if *flag == FLAG_DELETE {
                 w.add_tombstone(k, *seq).expect("SST Tombstone 写入失败");
             } else {
-                w.add(k, v.as_deref().unwrap_or(&[]), *seq).expect("SST 写入失败");
+                w.add(k, v.as_deref().unwrap_or(&[]), *seq)
+                    .expect("SST 写入失败");
             }
         }
         w.finish()
@@ -410,11 +449,9 @@ impl ColumnFamily {
             imm.len(),
             &self.pax_hot_fields,
         )?;
-        imm.scan(|k, e| {
-            match &e.value {
-                Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
-                None => w.add_tombstone(k, e.seq).expect("SST Tombstone 写入失败"),
-            }
+        imm.scan(|k, e| match &e.value {
+            Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
+            None => w.add_tombstone(k, e.seq).expect("SST Tombstone 写入失败"),
         });
         w.finish()
     }
@@ -430,7 +467,10 @@ impl ColumnFamily {
             }
         }
         files.sort_by(|a, b| b.cmp(a));
-        let m = Manifest { sst_files: files, next_sst_id: self.next_sst_id };
+        let m = Manifest {
+            sst_files: files,
+            next_sst_id: self.next_sst_id,
+        };
         let text = serde_json::to_string_pretty(&m)
             .map_err(|e| Error::Serialize(format!("Manifest 序列化失败: {e}")))?;
         let tmp = self.dir.join("manifest.json.tmp");
@@ -456,6 +496,9 @@ impl ColumnFamily {
 // ---------------------------------------------------------------------------
 // 内部辅助
 // ---------------------------------------------------------------------------
+
+/// TTL 分桶行（key + 值 + flag + seq），flush_buckets / write_rows 使用。
+type BucketRow = (Vec<u8>, Option<Vec<u8>>, u8, u64);
 
 // ---------------------------------------------------------------------------
 // TTL 时间分桶辅助（design 5.4，无 chrono 依赖的 civil calendar 天数计算）
@@ -488,12 +531,18 @@ fn load_manifest(path: &Path) -> Result<(Vec<String>, u64)> {
         return Ok((Vec::new(), 1));
     }
     let text = std::fs::read_to_string(path)?;
-    let m: Manifest = serde_json::from_str(&text).map_err(|e| Error::Corrupted(format!("Manifest 解析失败: {e}")))?;
+    let m: Manifest = serde_json::from_str(&text)
+        .map_err(|e| Error::Corrupted(format!("Manifest 解析失败: {e}")))?;
     Ok((m.sst_files, m.next_sst_id))
 }
 
 /// 同 key 候选合并：仅保留 seq 更大（更新）的版本；value=None 的 Tombstone 可覆盖旧值。
-fn merge_candidate_bytes(merged: &mut std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)>, key: Vec<u8>, seq: u64, value: Option<Vec<u8>>) {
+fn merge_candidate_bytes(
+    merged: &mut std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)>,
+    key: Vec<u8>,
+    seq: u64,
+    value: Option<Vec<u8>>,
+) {
     match merged.get(&key) {
         Some((old_seq, _)) if *old_seq >= seq => {}
         _ => {
@@ -504,7 +553,11 @@ fn merge_candidate_bytes(merged: &mut std::collections::HashMap<Vec<u8>, (u64, O
 
 /// 单 SST 等值查询（布隆剪枝 → 二分定位块 → 块缓存/读盘 → 块内扫描）。
 /// 返回 `(value, seq)`：value=None 表示 Tombstone；整体 None 表示该 SST 无此 key。
-fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+fn get_from_sst(
+    sst: &mut SstReader,
+    cache: &BlockCache,
+    key: &[u8],
+) -> Result<Option<(Option<Vec<u8>>, u64)>> {
     if !sst.bloom().maybe_contains(&key.to_vec()) {
         return Ok(None);
     }
@@ -524,7 +577,10 @@ fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<O
     let Some(entry) = index.get(lo.wrapping_sub(1)).cloned() else {
         return Ok(None);
     };
-    let ck = BlockCacheKey { file: sst.path().to_path_buf(), offset: entry.offset };
+    let ck = BlockCacheKey {
+        file: sst.path().to_path_buf(),
+        offset: entry.offset,
+    };
     let block = if let Some(b) = cache.get(&ck) {
         b
     } else {
@@ -532,7 +588,7 @@ fn get_from_sst(sst: &mut SstReader, cache: &BlockCache, key: &[u8]) -> Result<O
         cache.put(ck, b.clone());
         b
     };
-    Ok(sst.scan_block_for_key(&block, key)?)
+    sst.scan_block_for_key(&block, key)
 }
 
 #[cfg(test)]
@@ -544,7 +600,9 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let name = format!("cf-{}", SEQ.fetch_add(1, Ordering::Relaxed));
-        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().join(name)
+        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name)
     }
 
     fn small_cfg(max_mb: usize) -> Config {
@@ -660,7 +718,11 @@ mod tests {
         // 重启：manifest 加载 SST + WAL 回放
         let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
         for i in 0..150u64 {
-            assert_eq!(cf2.get(i).unwrap().unwrap().0, format!("v-{i}").into_bytes(), "key {i} 丢失");
+            assert_eq!(
+                cf2.get(i).unwrap().unwrap().0,
+                format!("v-{i}").into_bytes(),
+                "key {i} 丢失"
+            );
         }
     }
 
@@ -739,7 +801,10 @@ mod tests {
             assert!(cf2.get(1).unwrap().is_some(), "今天桶应保留");
             assert!(cf2.get(2).unwrap().is_some(), "昨天桶应保留");
             assert!(cf2.get(3).unwrap().is_none(), "10 天前的桶应过期删除");
-            assert!(cf2.get(4).unwrap().is_some(), "默认桶（无时间字段）永不过期");
+            assert!(
+                cf2.get(4).unwrap().is_some(),
+                "默认桶（无时间字段）永不过期"
+            );
             // 过期文件已物理删除
             let names: Vec<String> = std::fs::read_dir(&dir)
                 .unwrap()
@@ -748,7 +813,9 @@ mod tests {
                 .filter(|f| f.starts_with(SST_PREFIX))
                 .collect();
             assert!(
-                names.iter().any(|f| parse_sst_date(f).map_or(true, |d| d >= today_epoch_days() - 2)),
+                names
+                    .iter()
+                    .any(|f| parse_sst_date(f).is_none_or(|d| d >= today_epoch_days() - 2)),
                 "过期 SST 应已删除，剩余: {names:?}"
             );
         }
@@ -761,8 +828,13 @@ mod tests {
         let mut cfg = small_cfg(256);
         cfg.storage.hot_fields = vec!["status".to_string(), "city".to_string()];
         let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
-        cf.put(1, br#"{"status":"active","city":"beijing","amount":10}"#.to_vec()).unwrap();
-        cf.put(2, br#"{"status":"inactive","city":"shanghai"}"#.to_vec()).unwrap();
+        cf.put(
+            1,
+            br#"{"status":"active","city":"beijing","amount":10}"#.to_vec(),
+        )
+        .unwrap();
+        cf.put(2, br#"{"status":"inactive","city":"shanghai"}"#.to_vec())
+            .unwrap();
         cf.switch_and_flush().unwrap();
         assert!(cf.sst_count() >= 1);
         assert_eq!(
@@ -818,7 +890,10 @@ mod tests {
             Ok(_) => panic!("损坏 SST 应打开失败"),
             Err(e) => e,
         };
-        assert!(matches!(err, Error::Corrupted(_)), "损坏 SST 应报 Corrupted，实际 {err:?}");
+        assert!(
+            matches!(err, Error::Corrupted(_)),
+            "损坏 SST 应报 Corrupted，实际 {err:?}"
+        );
     }
 
     #[test]

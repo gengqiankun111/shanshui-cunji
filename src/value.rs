@@ -5,7 +5,9 @@
 //! - 标量负载：Bool=1B、Int/Timestamp=ZigZag Varint、Float=8B 定长、Str/Bytes=VarLen、Null=空。
 
 use crate::error::{Error, Result};
-use crate::keys::{decode_varint, decode_varlen, encode_varint, encode_varlen, zigzag_decode, zigzag_encode};
+use crate::keys::{
+    decode_varint, decode_varlen, encode_varint, encode_varlen, zigzag_decode, zigzag_encode,
+};
 
 /// 类型标签（TypeTag）。
 pub mod tag {
@@ -60,7 +62,9 @@ impl Value {
         Ok(match tag {
             tag::NULL => Value::Null,
             tag::BOOL => {
-                let b = buf.get(*pos).ok_or_else(|| Error::Corrupted("Bool 负载缺失".into()))?;
+                let b = buf
+                    .get(*pos)
+                    .ok_or_else(|| Error::Corrupted("Bool 负载缺失".into()))?;
                 *pos += 1;
                 Value::Bool(*b != 0)
             }
@@ -154,7 +158,7 @@ mod tests {
             (4, Value::Int(-42)),
             (5, Value::Int(i64::MAX)),
             (6, Value::Int(i64::MIN)),
-            (7, Value::Float(3.1415926)),
+            (7, Value::Float(std::f64::consts::PI)),
             (8, Value::Str("status=active".into())),
             (9, Value::Str("中文 & emoji 🎉".into())),
             (10, Value::Str(String::new())),

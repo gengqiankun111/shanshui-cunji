@@ -89,7 +89,11 @@ impl BloomFilter {
             let off = 16 + i * 8;
             *w = u64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
         }
-        Some(Self { bits, num_bits, inserted })
+        Some(Self {
+            bits,
+            num_bits,
+            inserted,
+        })
     }
 }
 
