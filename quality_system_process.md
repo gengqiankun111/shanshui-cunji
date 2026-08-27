@@ -191,6 +191,7 @@ steps:
 | unsafe 统计 | ✅ 全代码 0 处 unsafe（`grep -c unsafe src` = 0） |
 | cargo audit | ✅ **99 个依赖，0 漏洞、0 警告**（2026-08-27 执行） |
 | cargo deny check | ✅ **advisories / bans / licenses / sources 全 ok**（2026-08-27 执行） |
+| cargo geiger | ✅ **项目自身 unsafe = 0**（0/958 函数，0/64881 表达式；报告 quality/geiger_report.txt） |
 | cargo tarpaulin | ✅ **核心引擎 89.01%**（2026-08-27 阿里云 Debian 执行，见 quality_report_20260827.md） |
 | 覆盖率 | ✅ 核心 lib 89.01%（含 CLI 壳 70.55%）；报告 lcov 存档 quality/coverage/ |
 

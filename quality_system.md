@@ -173,7 +173,7 @@ cargo fmt --all -- --check \
 
 | 体系层 | 项目落地 |
 | --- | --- |
-| 静态分析 | `cargo fmt --check` + `cargo clippy -D warnings`（开发机常态化） |
+| 静态分析 | `cargo fmt --check` + `cargo clippy -D warnings`（开发机常态化）；`cargo geiger` 正式报告：**项目自身 unsafe = 0**，源码已加 `#![forbid(unsafe_code)]` 编译期强制 |
 | 架构评审 | design.md / development.md 双文档 + 每里程碑 AI 评审（quality/） |
 | 代码审查 | problem_solving.md（P1~P16 问题闭环）+ 提交前自检清单 |
 | 单元/集成测试 | **133 测试全绿** + demo 冒烟 10/10 + HTTP 端到端 |
