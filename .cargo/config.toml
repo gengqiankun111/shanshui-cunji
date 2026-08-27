@@ -2,4 +2,4 @@
 linker = "D:\\w64devkit\\bin\\gcc.exe"
 
 [build]
-target-dir = "D:\\novosdb-target"
+target-dir = "D:\\shanshui-cunji-target"
