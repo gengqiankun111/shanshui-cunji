@@ -353,4 +353,31 @@ mod tests {
         // 限流计数已记录
         assert!(e.watchdog.memory().throttled_count() >= 1);
     }
+
+    #[test]
+    fn restart_preserves_data_and_inverted() {
+        // 崩溃恢复全链路：写入（未强制刷盘）→ 进程退出 → 重开 → 主数据与倒排均完好
+        let dir = tmp();
+        let cfg = cfg();
+        {
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            e.put(1, b"doc-1".to_vec(), &["rust"]).unwrap();
+            e.put(2, b"doc-2".to_vec(), &["go"]).unwrap();
+            e.put(3, b"doc-3".to_vec(), &["rust", "async"]).unwrap();
+            e.flush_inverted().unwrap();
+        } // 模拟进程退出
+        {
+            let mut e2 = Engine::open(&dir, &cfg).unwrap();
+            // 主数据（WAL 回放恢复）
+            assert_eq!(e2.get(1).unwrap().unwrap(), b"doc-1");
+            assert_eq!(e2.get(2).unwrap().unwrap(), b"doc-2");
+            assert_eq!(e2.get(3).unwrap().unwrap(), b"doc-3");
+            // 倒排跨重启可查（段文件 + Manifest）
+            let rows = e2.search_term("rust").unwrap();
+            let mut ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
+            ids.sort();
+            assert_eq!(ids, vec![1, 3]);
+            assert_eq!(e2.search_term("go").unwrap().len(), 1);
+        }
+    }
 }
