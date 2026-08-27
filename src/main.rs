@@ -2,7 +2,8 @@
 //!
 //! 子命令：
 //! - `server`：启动 HTTP-JSON 服务（默认，步骤 15）；
-//! - `put / get / search / range / delete`：数据操作（本地引擎直连，与 HTTP 共享内核路径）；
+//! - `put / get / search / range / delete / patch`：数据操作（本地引擎直连，与 HTTP 共享内核路径）；
+//! - `count / groupby`：倒排统计聚合（COUNT / GROUP BY，阶段 1.5 M4）；
 //! - `backup / restore`：备份还原（步骤 14）；
 //! - `check`：校验配置与数据目录；
 //! - `demo`：功能冒烟测试（构造数据/插入/查询主键/缓存/组合索引/倒排/分片/删除/备份还原）并输出 HTML 报告；
@@ -25,12 +26,14 @@ fn main() {
     let mut scale: u64 = 100_000;
     let mut out_dir = PathBuf::from("images");
     let mut gen_only = false;
-    // 数据操作子命令参数：--id / --data / --filter / --start / --end
+    // 数据操作子命令参数：--id / --data / --filter / --start / --end / --field / --value
     let mut id: u64 = 0;
     let mut data = String::new();
     let mut filter = String::new();
     let mut start: Option<u64> = None;
     let mut end: Option<u64> = None;
+    let mut field = String::new();
+    let mut value = String::new();
 
     // 解析 `--config <path>` 与各子命令参数（允许出现在任意位置）
     let mut i = 0;
@@ -87,6 +90,18 @@ fn main() {
                     end = args[i].parse().ok();
                 }
             }
+            "--field" => {
+                i += 1;
+                if i < args.len() {
+                    field = args[i].clone();
+                }
+            }
+            "--value" => {
+                i += 1;
+                if i < args.len() {
+                    value = args[i].clone();
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -110,6 +125,8 @@ fn main() {
         "patch" => run_cli_patch(&config_path, id, &data),
         "search" => run_cli_search(&config_path, &filter),
         "range" => run_cli_range(&config_path, start, end),
+        "count" => run_cli_count(&config_path, &field, &value),
+        "groupby" => run_cli_group_by(&config_path, &field),
         "delete" => run_cli_delete(&config_path, id),
         "version" | "-V" | "--version" => {
             println!("shanshui-cunji {VERSION}");
@@ -551,6 +568,44 @@ fn run_cli_delete(config_path: &Path, id: u64) {
         Ok(()) => println!("✅ 已删除 docid={id}"),
         Err(e) => {
             eprintln!("❌ 删除失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `count --field status --value active`（倒排 doc_count，development 5.17 COUNT）
+fn run_cli_count(config_path: &Path, field: &str, value: &str) {
+    if field.is_empty() || value.is_empty() {
+        eprintln!("❌ count 需要 --field <字段> --value <值>");
+        std::process::exit(1);
+    }
+    let mut engine = open_engine(config_path);
+    match shanshui_cunji::server::execute_count(&mut engine, field, value) {
+        Ok(n) => println!("{field}={value} → {n} 条"),
+        Err(e) => {
+            eprintln!("❌ 计数失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `groupby --field status`（遍历字段倒排 Term 集合构造分组，development 5.17 GROUP BY）
+fn run_cli_group_by(config_path: &Path, field: &str) {
+    if field.is_empty() {
+        eprintln!("❌ groupby 需要 --field <字段>");
+        std::process::exit(1);
+    }
+    let mut engine = open_engine(config_path);
+    match shanshui_cunji::server::execute_group_by(&mut engine, field) {
+        Ok(groups) => {
+            println!("字段 {field} 分组（{} 组）：", groups.len());
+            for (term, count) in &groups {
+                let val = term.split_once('=').map(|(_, v)| v).unwrap_or(term);
+                println!("  {val:<24} {count}");
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ 分组失败: {e}");
             std::process::exit(1);
         }
     }

@@ -181,31 +181,41 @@ pub fn parse_filter(filter: &str) -> Vec<(String, String)> {
     out
 }
 
-/// 提取 JSON 中全部字符串字段值作为倒排词条（递归，含顶层与嵌套对象）。
+/// 提取 JSON 中全部字符串字段值作为倒排词条（递归，含顶层与嵌套对象/数组）。
+/// term 编码：`{字段路径}={值}`（如 `status=active`、`meta.device=ios`），
+/// 路径用 `.` 连接——带字段维度，供 COUNT / GROUP BY 按字段聚合（development 5.17）。
 pub fn extract_terms(val: &Value) -> Vec<String> {
     let mut terms = Vec::new();
-    collect_strings(val, &mut terms);
+    collect_strings(val, &mut terms, &[]);
     terms
 }
 
-fn collect_strings(val: &Value, out: &mut Vec<String>) {
+fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
     match val {
-        Value::String(s) => out.push(s.clone()),
+        Value::String(s) => {
+            // 数组元素等叶子字符串：用完整路径生成 term
+            out.push(format!("{}={}", path.join("."), s));
+        }
         Value::Object(map) => {
             for (k, v) in map {
-                if k == "docid" {
+                if path.is_empty() && k == "docid" {
                     continue; // 主键不作为词条
                 }
+                let mut p = path.to_vec();
+                p.push(k.as_str());
                 if let Value::String(s) = v {
-                    out.push(s.clone());
-                } else if v.is_object() || v.is_array() {
-                    collect_strings(v, out);
+                    out.push(format!("{}={}", p.join("."), s));
+                } else {
+                    collect_strings(v, out, &p);
                 }
             }
         }
         Value::Array(arr) => {
-            for v in arr {
-                collect_strings(v, out);
+            for (i, v) in arr.iter().enumerate() {
+                let mut p = path.to_vec();
+                let idx = i.to_string();
+                p.push(&idx);
+                collect_strings(v, out, &p);
             }
         }
         _ => {}
@@ -229,12 +239,63 @@ fn route_request(
         ("GET", "/get") => handle_get(engine, query),
         ("GET", "/search") => handle_search(engine, query),
         ("GET", "/range") => handle_range(engine, query),
+        ("GET", "/count") => handle_count(engine, query),
+        ("GET", "/groupby") => handle_group_by(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
         _ => (
             404,
             json!({"error": format!("接口不存在: {method} {path}")}).to_string(),
         ),
+    }
+}
+
+/// COUNT(field=value)：`GET /count?field=status&value=active` → `{"count":N}`。
+fn handle_count(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let (Some(field), Some(value)) = (
+        params
+            .iter()
+            .find(|(k, _)| k == "field")
+            .map(|(_, v)| v.clone()),
+        params
+            .iter()
+            .find(|(k, _)| k == "value")
+            .map(|(_, v)| v.clone()),
+    ) else {
+        return (400, json!({"error": "缺少 field/value 参数"}).to_string());
+    };
+    match execute_count(engine, &field, &value) {
+        Ok(count) => (
+            200,
+            json!({"field": field, "value": value, "count": count}).to_string(),
+        ),
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// GROUP BY field：`GET /groupby?field=status` → `{"field":"status","groups":[{"value":"active","count":2},...]}`。
+fn handle_group_by(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let Some(field) = params
+        .iter()
+        .find(|(k, _)| k == "field")
+        .map(|(_, v)| v.clone())
+    else {
+        return (400, json!({"error": "缺少 field 参数"}).to_string());
+    };
+    match execute_group_by(engine, &field) {
+        Ok(groups) => {
+            let arr: Vec<Value> = groups
+                .iter()
+                .map(|(term, count)| {
+                    let value = term.split_once('=').map(|(_, v)| v).unwrap_or(term);
+                    json!({"value": value, "count": count})
+                })
+                .collect();
+            (200, json!({"field": field, "groups": arr}).to_string())
+        }
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
 
@@ -384,7 +445,7 @@ fn rows_payload(rows: &[(u64, Vec<u8>)]) -> Value {
 
 /// 按 filter 执行查询：
 /// - `docid=N` → 主键点查；
-/// - 单条件 → 倒排词条查询；
+/// - 单条件 → 倒排词条查询（term 编码 `field=value`，与 extract_terms 一致）；
 /// - 多条件（AND）→ 各词条位图交集后回表。
 pub fn execute_filter(engine: &mut Engine, filter: &str) -> Result<Vec<(u64, Vec<u8>)>> {
     let conds = parse_filter(filter);
@@ -402,14 +463,15 @@ pub fn execute_filter(engine: &mut Engine, filter: &str) -> Result<Vec<(u64, Vec
             .into_iter()
             .collect());
     }
-    let values: Vec<&str> = conds.iter().map(|(_, v)| v.as_str()).collect();
-    if values.len() == 1 {
-        return engine.search_term(values[0]);
+    // field=value 编码成倒排 term
+    let terms: Vec<String> = conds.iter().map(|(f, v)| format!("{f}={v}")).collect();
+    if terms.len() == 1 {
+        return engine.search_term(&terms[0]);
     }
     // 多条件 AND：位图交集（RoaringBitmap）→ 回表
-    let mut bitmap = engine.inverted_posting(values[0])?;
-    for v in &values[1..] {
-        bitmap &= engine.inverted_posting(v)?;
+    let mut bitmap = engine.inverted_posting(&terms[0])?;
+    for t in &terms[1..] {
+        bitmap &= engine.inverted_posting(t)?;
     }
     let mut out = Vec::new();
     for docid in bitmap {
@@ -418,6 +480,17 @@ pub fn execute_filter(engine: &mut Engine, filter: &str) -> Result<Vec<(u64, Vec
         }
     }
     Ok(out)
+}
+
+/// COUNT(field=value)：读倒排 term 的 doc_count 直接返回（<0.1ms，development 5.17）。
+pub fn execute_count(engine: &mut Engine, field: &str, value: &str) -> Result<u64> {
+    engine.inverted_doc_count(&format!("{field}={value}"))
+}
+
+/// GROUP BY field：遍历该字段倒排 Term 集合，取各 value 的 doc_count 构造分组（不访问文档数据）。
+/// 返回 (term, count) 列表，term 为 `field=value` 编码。
+pub fn execute_group_by(engine: &mut Engine, field: &str) -> Result<Vec<(String, u64)>> {
+    engine.inverted_group_by(field)
 }
 
 /// 按 QuerySpec 执行（保留给协议层使用，与 execute_filter 同源）。
@@ -549,10 +622,20 @@ mod tests {
         )
         .unwrap();
         let terms = extract_terms(&v);
-        assert!(terms.contains(&"active".to_string()));
-        assert!(terms.contains(&"click".to_string()));
+        // term 编码为 field=value（development 5.17 字段维度）
+        assert!(terms.contains(&"status=active".to_string()));
+        assert!(terms.contains(&"fields.type=click".to_string()));
         assert!(!terms.contains(&"1".to_string()));
         assert!(!terms.contains(&"true".to_string()));
+        assert!(!terms.iter().any(|t| t == "active"), "裸值不应作为词条");
+    }
+
+    #[test]
+    fn extract_terms_array_path() {
+        let v: Value = serde_json::from_str(r#"{"docid":1,"tags":["hot","new"]}"#).unwrap();
+        let terms = extract_terms(&v);
+        assert!(terms.contains(&"tags.0=hot".to_string()));
+        assert!(terms.contains(&"tags.1=new".to_string()));
     }
 
     #[test]
@@ -603,6 +686,26 @@ mod tests {
         assert_eq!(st, 200, "search-and 失败: {body}");
         assert!(body.contains("\"total\":1"), "交集应为 1 条: {body}");
         assert!(body.contains("1001"));
+
+        // COUNT（阶段 1.5 M4 聚合：status=active 共 2 条）
+        let (st, body) = http_req(addr, "GET", "/count?field=status&value=active", b"");
+        assert_eq!(st, 200, "count 失败: {body}");
+        assert!(body.contains("\"count\":2"), "count 应为 2: {body}");
+
+        // GROUP BY（阶段 1.5 M4 聚合：status 分组 active=2 / view? —— 2002 为 active）
+        let (st, body) = http_req(addr, "GET", "/groupby?field=status", b"");
+        assert_eq!(st, 200, "groupby 失败: {body}");
+        assert!(
+            body.contains("\"value\":\"active\""),
+            "groupby 缺 active 组: {body}"
+        );
+        assert!(body.contains("\"count\":2"), "active 组应为 2: {body}");
+
+        // 缺失参数 → 400
+        let (st, _) = http_req(addr, "GET", "/count?field=status", b"");
+        assert_eq!(st, 400);
+        let (st, _) = http_req(addr, "GET", "/groupby", b"");
+        assert_eq!(st, 400);
 
         // RANGE（[1000,2000] 仅含 1001；2002 在外）
         let (st, body) = http_req(addr, "GET", "/range?start=1000&end=2000", b"");
