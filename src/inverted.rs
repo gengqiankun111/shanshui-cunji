@@ -22,8 +22,8 @@ use crate::keys::{decode_varlen, encode_varlen};
 
 /// 段文件魔数。
 const SEG_MAGIC: &[u8; 8] = b"NVINV001";
-/// 段文件版本。
-const SEG_VERSION: u16 = 1;
+/// 段文件版本：v2 = term 带字段前缀（`field=value`，供 COUNT/GROUP BY 聚合）。
+const SEG_VERSION: u16 = 2;
 /// 段文件前缀。
 const SEG_PREFIX: &str = "inverted-";
 const MANIFEST_FILE: &str = "inverted-manifest.json";
@@ -196,6 +196,64 @@ impl InvertedIndex {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
+
+    /// 某 term 命中的文档数（COUNT 原子操作，<0.1ms，design 5.17）。
+    pub fn doc_count(&self, term: &str) -> Result<u64> {
+        Ok(self.search(term)?.len())
+    }
+
+    /// 遍历全部 term（内存 + 各段），合并出每个 term 的完整 posting 位图。
+    /// 供聚合执行器（GROUP BY）与字典浏览使用；内存 term 合并天然去重。
+    pub fn iter_terms(&self) -> Result<Vec<(String, RoaringBitmap)>> {
+        let mut map: std::collections::BTreeMap<String, RoaringBitmap> =
+            std::collections::BTreeMap::new();
+        // 内存（最新）
+        for entry in self.mem.iter() {
+            let bitmap: RoaringBitmap = entry.value().iter().map(|d| *d as u32).collect();
+            let e = map.entry(entry.key().clone()).or_default();
+            *e |= bitmap;
+        }
+        // 各段（新→旧）
+        for seg in &self.segments {
+            for (term, posting) in self.read_segment_terms(seg)? {
+                let e = map.entry(term).or_default();
+                *e |= posting;
+            }
+        }
+        Ok(map.into_iter().collect())
+    }
+
+    /// 读取段内全部 term 及其 posting（供遍历）。
+    fn read_segment_terms(&self, seg: &str) -> Result<Vec<(String, RoaringBitmap)>> {
+        let path = self.dir.join(seg);
+        let data = std::fs::read(&path)?;
+        if data.len() < 10 || &data[0..8] != SEG_MAGIC {
+            return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
+        }
+        let mut cur = 10usize;
+        let count = decode_varint(&data, &mut cur)?;
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let t = decode_varlen(&data, &mut cur)?.to_vec();
+            let p = decode_varlen(&data, &mut cur)?.to_vec();
+            let bitmap = RoaringBitmap::deserialize_from(&p[..])
+                .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))?;
+            out.push((String::from_utf8_lossy(&t).into_owned(), bitmap));
+        }
+        Ok(out)
+    }
+
+    /// 按字段前缀分组（GROUP BY）：遍历全部 term，取 `{field}=` 开头的各 value 及其 doc_count。
+    pub fn group_by(&self, field: &str) -> Result<Vec<(String, u64)>> {
+        let prefix = format!("{field}=");
+        let mut out = Vec::new();
+        for (term, posting) in self.iter_terms()? {
+            if term.starts_with(&prefix) {
+                out.push((term, posting.len()));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// 解码段文件计数 / term 条目数（LEB128）。
@@ -316,5 +374,56 @@ mod tests {
         // 正常段不受影响；孤儿段内容不参与查询
         assert!(idx2.search("term-a").unwrap().contains(1));
         assert!(idx2.search("orphan-garbage").unwrap().is_empty());
+    }
+
+    #[test]
+    fn doc_count_counts_unique_docs() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+        idx.add("status=active", 1);
+        idx.add("status=active", 2);
+        idx.flush_segment().unwrap(); // 段 1
+        idx.add("status=active", 2); // 重复 docid（更新）→ 跨段合并去重
+        idx.add("status=pending", 3);
+        idx.flush_segment().unwrap(); // 段 2
+        assert_eq!(idx.doc_count("status=active").unwrap(), 2, "跨段合并去重");
+        assert_eq!(idx.doc_count("status=pending").unwrap(), 1);
+        assert_eq!(idx.doc_count("status=absent").unwrap(), 0);
+    }
+
+    #[test]
+    fn group_by_aggregates_by_field_prefix() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+        idx.add("status=active", 1);
+        idx.add("status=active", 2);
+        idx.add("status=pending", 3);
+        idx.flush_segment().unwrap();
+        idx.add("status=active", 4); // 内存态
+        idx.add("type=order", 1);
+
+        let groups = idx.group_by("status").unwrap();
+        let map: std::collections::HashMap<String, u64> = groups.into_iter().collect();
+        assert_eq!(map.get("status=active").copied(), Some(3), "内存+段合并");
+        assert_eq!(map.get("status=pending").copied(), Some(1));
+        assert!(!map.contains_key("type=order"), "只返回指定字段分组");
+        assert_eq!(idx.group_by("type").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn iter_terms_merges_memory_and_segments() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+        idx.add("a=1", 1);
+        idx.flush_segment().unwrap();
+        idx.add("b=2", 2);
+        idx.add("a=1", 3);
+        let terms = idx.iter_terms().unwrap();
+        let map: std::collections::BTreeMap<String, u64> = terms
+            .into_iter()
+            .map(|(t, b)| (t, b.len() as u64))
+            .collect();
+        assert_eq!(map.get("a=1").copied(), Some(2), "跨段+内存合并");
+        assert_eq!(map.get("b=2").copied(), Some(1));
     }
 }
