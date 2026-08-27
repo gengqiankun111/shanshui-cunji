@@ -16,7 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "6"
 crossbeam-skiplist = "0.1"
 zstd = "0.13"
-lru = "0.12"
+lru = "0.18"
 roaring = "0.10"
 crc32fast = "1"
 

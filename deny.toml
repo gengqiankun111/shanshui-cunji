@@ -1,0 +1,26 @@
+# 山水存迹数据库 · cargo-deny 合规配置
+# 命令：cargo deny check（CI / release 节点执行）
+# advisories（依赖漏洞，默认已启用）：与 cargo audit 互补
+
+[licenses]
+# 许可证合规：仅允许如下白名单，其余一律拒绝
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+# 未在 allow 中明确列出的许可证一律拒绝
+confidence-threshold = 0.8
+
+[bans]
+# 重复依赖检测：同一依赖多版本（例外：工具链常见多版本，按需追加）
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# 依赖来源：只允许 crates.io 官方源
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
