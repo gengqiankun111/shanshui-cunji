@@ -570,6 +570,61 @@ mod tests {
         let m: Manifest = serde_json::from_str(&text).unwrap();
         assert!(!m.sst_files.is_empty());
     }
+
+    #[test]
+    fn corrupted_sst_rejected_on_open() {
+        // 损坏注入：SST 头部魔数被破坏 → 启动必须报 Corrupted 而非 panic（development 9.3）
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 0..100u64 {
+                cf.put(i, b"v".to_vec()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+        }
+        let sst_path = dir.join(format!("{SST_PREFIX}00000001.sst"));
+        assert!(sst_path.exists(), "SST 文件应已生成");
+        let mut data = std::fs::read(&sst_path).unwrap();
+        data[0..8].copy_from_slice(&[0xFF; 8]); // 破坏魔数
+        std::fs::write(&sst_path, &data).unwrap();
+
+        let err = match ColumnFamily::open("primary", &dir, &cfg) {
+            Ok(_) => panic!("损坏 SST 应打开失败"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::Corrupted(_)), "损坏 SST 应报 Corrupted，实际 {err:?}");
+    }
+
+    #[test]
+    fn wal_partial_tail_recovers_cleanly() {
+        // 崩溃恢复：WAL 尾部半条记录（模拟断电时只写入一半）→ 重启只恢复完整记录、不 panic
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 1..=10u64 {
+                cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+            }
+        }
+        // 截断 WAL 至一半字节（人为制造半条尾部记录）
+        let wal_path = dir.join(WAL_FILE);
+        let mut data = std::fs::read(&wal_path).unwrap();
+        assert!(data.len() > 40);
+        data.truncate(data.len() / 2);
+        std::fs::write(&wal_path, &data).unwrap();
+
+        // 回放：完整记录应恢复，半条记录被丢弃，不 panic
+        let recs = WalReader::recover(&wal_path).unwrap();
+        assert!(!recs.is_empty(), "至少应恢复一条完整记录");
+        assert!(recs.len() <= 10);
+
+        // reopen 全链路可用
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for r in &recs {
+            assert!(cf2.get_bytes(&r.key).unwrap().is_some(), "恢复的记录应可读");
+        }
+    }
     #[test]
     fn scan_range_covers_memtable_and_sst() {
         let dir = tmp();

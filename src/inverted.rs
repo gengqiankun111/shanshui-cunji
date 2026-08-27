@@ -289,4 +289,24 @@ mod tests {
         idx.add("t", 3);
         assert!(idx.needs_flush());
     }
+
+    #[test]
+    fn orphan_segment_not_loaded_after_restart() {
+        // 崩溃恢复：GC 中途崩溃可能残留"孤儿段"（不在 Manifest 中）——
+        // 启动只按 Manifest 加载，孤儿段不得污染查询结果（development 4.5）
+        let dir = tmp();
+        {
+            let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+            idx.add("term-a", 1);
+            idx.flush_segment().unwrap();
+        }
+        // 制造孤儿段：直接写一个 .seg 文件，但不更新 Manifest
+        std::fs::write(dir.join("inverted-99999999.seg"), b"orphan-garbage").unwrap();
+
+        let idx2 = InvertedIndex::open(&dir, 1).unwrap();
+        assert_eq!(idx2.segment_count(), 1, "只应加载 Manifest 记录的段");
+        // 正常段不受影响；孤儿段内容不参与查询
+        assert!(idx2.search("term-a").unwrap().contains(1));
+        assert!(idx2.search("orphan-garbage").unwrap().is_empty());
+    }
 }
