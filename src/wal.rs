@@ -57,6 +57,28 @@ impl WalWriter {
         })
     }
 
+    /// 以追加模式打开 WAL（**不截断**），用于重启恢复：回放旧记录后继续写入。
+    /// `next_seq` 为接续序列号（= 已回放最大 seq + 1），避免同 key 新版本 seq 冲突。
+    pub fn open_append(path: &Path, next_seq: u64, perf_mode: bool) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            file: Some(file),
+            path: path.to_path_buf(),
+            next_seq,
+            buf: Vec::new(),
+            perf_mode,
+            pending_bytes: 0,
+        })
+    }
+
+    /// 接续序列号（WAL 回放完成后调用，保证新写入 seq 单调递增且不冲突）。
+    pub fn resume_seq(&mut self, next_seq: u64) {
+        self.next_seq = next_seq;
+    }
+
     /// 追加一条记录并返回分配的 Seq（尚未落盘，由 sync / group_commit 统一提交）。
     pub fn append(&mut self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
         let seq = self.next_seq;

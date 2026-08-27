@@ -150,7 +150,7 @@ data/
 
 | 键空间 | 格式 | 说明 |
 | --- | --- | --- |
-| 主键 | `DocId`（u64 小端，8 字节定长） | 内存 / 磁盘统一 |
+| 主键 | `DocId`（u64 大端，8 字节定长） | 内存 / 磁盘统一；大端保证字节序 == 数值序（LSM 范围扫描 / Zone Map 剪枝依赖） |
 | 组合索引 | `VarLen(field1) ++ VarLen(field2) ++ ... ++ DocId(u64)` | 先字段值有序，再按 DocId 有序 |
 | 倒排索引 | `TermData := Term ++ RoaringBitmap(DocId 列表)` | 追加式倒排文件（design 5.2），不走 LSM 键 |
 

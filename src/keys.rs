@@ -1,14 +1,15 @@
 //! 键编码规范（development 4.1，对齐 design 3.4 / 4.4.2）。
 //!
-//! - 主键：`DocId`（u64 小端，8 字节定长）；
+//! - 主键：`DocId`（u64 大端，8 字节定长）——大端保证**字节序 == 数值序**，
+//!   LSM 范围扫描 / Zone Map 剪枝依赖键的字节序比较（小端在 docid>255 时序错乱）；
 //! - 组合索引：`VarLen(field1) ++ VarLen(field2) ++ ... ++ DocId(u64)`；
 //! - Varint（LEB128）：DocId / 长度字段的变长编码（design 4.4.2）。
 
 use crate::error::{Error, Result};
 
-/// 主键编码：DocId 为 u64 小端定长 8 字节。
+/// 主键编码：DocId 为 u64 大端定长 8 字节（字节序 == 数值序）。
 pub fn encode_docid(docid: u64) -> [u8; 8] {
-    docid.to_le_bytes()
+    docid.to_be_bytes()
 }
 
 /// 主键解码：输入必须恰好 8 字节。
@@ -16,7 +17,7 @@ pub fn decode_docid(bytes: &[u8]) -> Result<u64> {
     let arr: [u8; 8] = bytes
         .try_into()
         .map_err(|_| Error::Corrupted("DocId 必须为 8 字节定长".into()))?;
-    Ok(u64::from_le_bytes(arr))
+    Ok(u64::from_be_bytes(arr))
 }
 
 /// VarLen 编码：4 字节长度前缀（LE）+ 原始字节。
@@ -41,12 +42,13 @@ pub fn decode_varlen<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
 }
 
 /// 组合索引键：`VarLen(field1) ++ VarLen(field2) ++ ... ++ DocId(u64)`。
+/// 尾部 DocId 用大端，保证同前缀下按 docid 数值序排列（前缀范围扫描的正确性）。
 pub fn encode_composite_key(fields: &[&[u8]], docid: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     for f in fields {
         encode_varlen(&mut buf, f);
     }
-    buf.extend_from_slice(&docid.to_le_bytes());
+    buf.extend_from_slice(&docid.to_be_bytes());
     buf
 }
 
@@ -62,7 +64,7 @@ pub fn decode_composite_key(buf: &[u8]) -> Result<(Vec<Vec<u8>>, u64)> {
         let v = decode_varlen(buf, &mut pos)?.to_vec();
         fields.push(v);
     }
-    let docid = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+    let docid = u64::from_be_bytes(buf[pos..pos + 8].try_into().unwrap());
     Ok((fields, docid))
 }
 
@@ -122,6 +124,20 @@ mod tests {
             let enc = encode_docid(id);
             assert_eq!(decode_docid(&enc).unwrap(), id);
         }
+    }
+
+    #[test]
+    fn docid_byte_order_matches_numeric_order() {
+        // 大端：字节序 == 数值序，范围扫描 / Zone Map 剪枝的前提
+        let mut ids = vec![0u64, 1, 255, 256, 1001, 2000, 65_536, u64::MAX];
+        ids.sort();
+        for w in ids.windows(2) {
+            assert!(encode_docid(w[0]) < encode_docid(w[1]), "docid {} 的编码序错乱", w[0]);
+        }
+        // 组合索引同前缀下按 docid 数值序排列
+        let a = encode_composite_key(&[b"active"], 1001);
+        let b = encode_composite_key(&[b"active"], 2000);
+        assert!(a < b);
     }
 
     #[test]
