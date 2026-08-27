@@ -1,13 +1,16 @@
 //! shanshui-cunji 二进制入口：子命令分发（development 步骤 1 / 5.13）。
 //!
 //! 子命令：
-//! - `server`：启动存储服务（默认，暂未实现，见步骤 15）；
+//! - `server`：启动 HTTP-JSON 服务（默认，步骤 15）；
+//! - `put / get / search / range / delete`：数据操作（本地引擎直连，与 HTTP 共享内核路径）；
+//! - `backup / restore`：备份还原（步骤 14）；
 //! - `check`：校验配置与数据目录；
-//! - `demo`：功能冒烟测试（构造数据/插入/查询主键/缓存/组合索引/倒排/分片/删除）并输出 HTML 报告；
+//! - `demo`：功能冒烟测试（构造数据/插入/查询主键/缓存/组合索引/倒排/分片/删除/备份还原）并输出 HTML 报告；
 //! - `version`：版本信息。
 
 use std::path::PathBuf;
 
+use serde_json::{json, Value};
 use shanshui_cunji::config::Config;
 use tracing::info;
 
@@ -22,8 +25,14 @@ fn main() {
     let mut scale: u64 = 100_000;
     let mut out_dir = PathBuf::from("images");
     let mut gen_only = false;
+    // 数据操作子命令参数：--id / --data / --filter / --start / --end
+    let mut id: u64 = 0;
+    let mut data = String::new();
+    let mut filter = String::new();
+    let mut start: Option<u64> = None;
+    let mut end: Option<u64> = None;
 
-    // 解析 `--config <path>` / `--scale <n>` / `--out <dir>` / `--gen-only`（允许出现在任意位置）
+    // 解析 `--config <path>` 与各子命令参数（允许出现在任意位置）
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -48,6 +57,36 @@ fn main() {
             "--gen-only" => {
                 gen_only = true;
             }
+            "--id" => {
+                i += 1;
+                if i < args.len() {
+                    id = args[i].parse().unwrap_or(0);
+                }
+            }
+            "--data" | "-d" => {
+                i += 1;
+                if i < args.len() {
+                    data = args[i].clone();
+                }
+            }
+            "--filter" | "-f" => {
+                i += 1;
+                if i < args.len() {
+                    filter = args[i].clone();
+                }
+            }
+            "--start" => {
+                i += 1;
+                if i < args.len() {
+                    start = args[i].parse().ok();
+                }
+            }
+            "--end" => {
+                i += 1;
+                if i < args.len() {
+                    end = args[i].parse().ok();
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -66,6 +105,11 @@ fn main() {
         "demo" => run_demo(&config_path, scale, &out_dir, gen_only),
         "backup" => run_backup(&config_path, &backup_file),
         "restore" => run_restore(&config_path, &backup_file),
+        "put" => run_cli_put(&config_path, id, &data),
+        "get" => run_cli_get(&config_path, id),
+        "search" => run_cli_search(&config_path, &filter),
+        "range" => run_cli_range(&config_path, start, end),
+        "delete" => run_cli_delete(&config_path, id),
         "version" | "-V" | "--version" => {
             println!("shanshui-cunji {VERSION}");
         }
@@ -293,20 +337,171 @@ fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -
     )
 }
 
-fn run_server(config_path: &PathBuf) {
-    // 阶段 1 步骤 15 实现 HTTP/TCP 服务；当前仅加载配置并提示
+// ---------------------------------------------------------------------------
+// CLI 数据操作（与 HTTP 共享同一内核调用路径；本地引擎直连，勿与 server 同目录并发）
+// ---------------------------------------------------------------------------
+
+fn load_config(config_path: &PathBuf) -> Config {
     match Config::load(config_path) {
-        Ok(cfg) => {
-            info!(
-                "shanshui-cunji {} 启动（服务层将在阶段 1 步骤 15 实现）: listen={}, data_dir={}",
-                VERSION,
-                cfg.server.listen_addr,
-                cfg.storage.data_dir
-            );
-        }
+        Ok(c) => c,
         Err(e) => {
             eprintln!("❌ 配置加载失败: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// 打开本地引擎（数据目录取自配置）。
+fn open_engine(config_path: &PathBuf) -> shanshui_cunji::engine::Engine {
+    let cfg = load_config(config_path);
+    let data_dir = PathBuf::from(&cfg.storage.data_dir);
+    match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("❌ 打开引擎失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `put --id 1001 --data '{"status":"active","type":"order"}'`
+fn run_cli_put(config_path: &PathBuf, id: u64, data: &str) {
+    if id == 0 {
+        eprintln!("❌ put 需要 --id <docid>（>0）");
+        std::process::exit(1);
+    }
+    if id >= u32::MAX as u64 {
+        eprintln!("❌ docid 超出倒排索引支持范围（< 2^32）");
+        std::process::exit(1);
+    }
+    let mut val: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("❌ --data 不是合法 JSON: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !val.is_object() {
+        eprintln!("❌ --data 必须是 JSON 对象（如 '{{\"status\":\"active\"}}'）");
+        std::process::exit(1);
+    }
+    // 与 HTTP /put 同构：文档对象含 docid，字符串字段值自动建倒排词条
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("docid".into(), json!(id));
+    }
+    let terms = shanshui_cunji::server::extract_terms(&val);
+    let bytes = val.to_string().into_bytes();
+    let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+    let mut engine = open_engine(config_path);
+    match engine.put(id, bytes, &term_refs) {
+        Ok(()) => {
+            // 倒排词条刷盘落盘：CLI 为独立进程，不刷盘则后续进程查不到（长驻 server 无需）
+            if engine.inverted_mem_docids() > 0 {
+                if let Err(e) = engine.flush_inverted() {
+                    eprintln!("❌ 倒排刷盘失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+            println!("✅ 已写入 docid={id}（倒排词条 {} 个）", terms.len());
+        }
+        Err(e) => {
+            eprintln!("❌ 写入失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `get --id 1001`
+fn run_cli_get(config_path: &PathBuf, id: u64) {
+    if id == 0 {
+        eprintln!("❌ get 需要 --id <docid>（>0）");
+        std::process::exit(1);
+    }
+    let mut engine = open_engine(config_path);
+    match engine.get(id) {
+        Ok(Some(v)) => println!("{}", String::from_utf8_lossy(&v)),
+        Ok(None) => println!("（未找到 docid={id}）"),
+        Err(e) => {
+            eprintln!("❌ 查询失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `search --filter 'status=active AND type=order'`
+fn run_cli_search(config_path: &PathBuf, filter: &str) {
+    if filter.is_empty() {
+        eprintln!("❌ search 需要 --filter 'field=value [AND field2=value2]'");
+        std::process::exit(1);
+    }
+    let mut engine = open_engine(config_path);
+    match shanshui_cunji::server::execute_filter(&mut engine, filter) {
+        Ok(rows) => {
+            println!("命中 {} 条：", rows.len());
+            for (docid, v) in &rows {
+                println!("  docid={docid}  {}", String::from_utf8_lossy(v));
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ 查询失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `range --start 1000 --end 2000`
+fn run_cli_range(config_path: &PathBuf, start: Option<u64>, end: Option<u64>) {
+    let mut engine = open_engine(config_path);
+    let desc = match (start, end) {
+        (Some(s), Some(e)) => format!("[{s}..{e}]"),
+        (Some(s), None) => format!("[{s}..]"),
+        (None, Some(e)) => format!("[..{e}]"),
+        (None, None) => "[全量]".into(),
+    };
+    match engine.scan_range(start, end) {
+        Ok(rows) => {
+            println!("范围 {desc} 命中 {} 条：", rows.len());
+            for (docid, v) in &rows {
+                println!("  docid={docid}  {}", String::from_utf8_lossy(v));
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ 查询失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `delete --id 1001`
+fn run_cli_delete(config_path: &PathBuf, id: u64) {
+    if id == 0 {
+        eprintln!("❌ delete 需要 --id <docid>（>0）");
+        std::process::exit(1);
+    }
+    let mut engine = open_engine(config_path);
+    match engine.delete(id) {
+        Ok(()) => println!("✅ 已删除 docid={id}"),
+        Err(e) => {
+            eprintln!("❌ 删除失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 启动 HTTP-JSON 服务（development 步骤 15）。
+fn run_server(config_path: &PathBuf) {
+    let cfg = load_config(config_path);
+    let data_dir = PathBuf::from(&cfg.storage.data_dir);
+    let mut engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("❌ 打开引擎失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    info!("shanshui-cunji {VERSION} 启动: data_dir={}", data_dir.display());
+    if let Err(e) = shanshui_cunji::server::serve(&mut engine, &cfg.server.listen_addr) {
+        eprintln!("❌ 服务异常退出: {e}");
+        std::process::exit(1);
     }
 }

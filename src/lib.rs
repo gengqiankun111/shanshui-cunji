@@ -13,6 +13,7 @@ pub mod keys;
 pub mod memtable;
 pub mod optimizer;
 pub mod schema;
+pub mod server;
 pub mod sstable;
 pub mod storage;
 pub mod value;
