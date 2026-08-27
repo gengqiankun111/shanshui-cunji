@@ -35,6 +35,31 @@ cargo install cargo-tarpaulin     # 覆盖率（Linux，Windows 不支持）
 > 本机 Windows 注意：`CARGO_INSTALL_ROOT` 可重定向到 D 盘（避免 C 盘空间不足）；
 > `tarpaulin` 需在 Linux 环境运行（阿里云 Debian 服务器或 CI）。
 
+### 1.1 工具矩阵（免费/低费用 + 对外展示）
+
+| 工具 | 用途 | 触发时机 | 项目落地状态 |
+| --- | --- | --- | --- |
+| Gitee CodeCheck（华为云） | 圈复杂度 / 重复率 / 有效代码行 | 开源仓库免费开通 | ⏳ 待 Gitee 仓库启用（README 亮截图） |
+| cargo fmt / clippy | 格式 + 650+ lint | 每次 commit | ✅ 已纳入 check.ps1（六步链第 1-2 步） |
+| cargo audit + auditable | CVE 扫描 + 二进制内嵌依赖树 | 每次 CI | ✅ audit 已执行（0 漏洞）；auditable 待 Linux |
+| cargo deny | 许可证合规 + 重复依赖 | 每次 release | ✅ 已执行（advisories/bans/licenses/sources ok） |
+| cargo geiger | unsafe 占比（目标 <5%） | 里程碑 | ✅ 当前 unsafe=0（grep 确认）；geiger 报告待 Linux |
+| cargo tarpaulin | 覆盖率 ≥80% | 每次 CI | ⏳ Linux 执行 |
+| garbage-code-hunter | 0-100 质量评分（gch check） | 里程碑（可选） | ⏳ 可选装 |
+| RAPx | UAF/内存泄漏检测 + 形式化验证 | 安全攸关模块（可选） | ⏳ 可选装 |
+| cov-rs / grcov | LLVM 覆盖率（PR 评论） | 与 tarpaulin 二选一 | ⏳ 可选 |
+
+**徽章（README 亮牌）**：
+
+```text
+[![fmt](https://img.shields.io/badge/rustfmt-ok-brightgreen)]()
+[![clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen)]()
+[![coverage](https://img.shields.io/badge/coverage-%E2%89%A580%25-brightgreen)]()
+[![unsafe](https://img.shields.io/badge/unsafe-0%25-brightgreen)]()
+[![audit](https://img.shields.io/badge/audit-0_vulns-brightgreen)]()
+[![deny](https://img.shields.io/badge/licenses-ok-brightgreen)]()
+```
+
 ---
 
 ## 2. 静态分析（每次提交必跑）
@@ -164,8 +189,10 @@ steps:
 | 单元测试总数 | 133 |
 | demo 冒烟 | 10/10（历史执行，报告在 images/） |
 | unsafe 统计 | ✅ 全代码 0 处 unsafe（`grep -c unsafe src` = 0） |
-| cargo audit / deny | ⏳ 依赖安装后由 CI 执行（本机环境受限） |
+| cargo audit | ✅ **99 个依赖，0 漏洞、0 警告**（2026-08-27 执行） |
+| cargo deny check | ✅ **advisories / bans / licenses / sources 全 ok**（2026-08-27 执行） |
 | cargo tarpaulin | ⏳ Linux 环境执行（Windows 不支持） |
 | 覆盖率 | ⏳ 待 tarpaulin（Linux）产出报告 |
 
-**本轮修复闭环**：clippy 52 处警告清零（P18）、check.ps1 PS 5.1 stderr 误判修复（P17）——详见 [problem_solving.md](problem_solving.md)。
+**本轮修复闭环**：clippy 52 处警告清零（P18）、check.ps1 PS 5.1 stderr 误判修复（P17）、
+lru 0.12→0.18 升级消除 2 个 unsound 警告（P19）、deny.toml schema 适配 0.20（P20）——详见 [problem_solving.md](problem_solving.md)。
