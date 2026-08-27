@@ -627,7 +627,10 @@ impl RuntimePools {
 2. Zone Maps 强化；
 3. **TTL 时间分区**；
 4. **Delta CF 部分更新**；
-5. **倒排统计载荷 + 聚合执行器**（COUNT / GROUP BY）；
+5. ~~**倒排统计载荷 + 聚合执行器**（COUNT / GROUP BY）~~ ✅（2026-08-28）：
+   倒排 term 升级为 `field=value` 字段维度编码（段格式 v2），`InvertedIndex::doc_count` /
+   `iter_terms` / `group_by`，HTTP `GET /count`、`GET /groupby`，CLI `count` / `groupby`；
+   测试：137 全绿（含聚合 4 项 + 端到端断言），CLI 冒烟验证（design 5.17 / quality 报告）；
 6. **FST + Mmap 字典**（与 Checkpoint 共存，无缝过渡）；
 7. **迁移工具基础版（shanshui-cunji-migrate）**（解决 G2）：支持 mysqldump / CSV 全量导入；
 8. **数据关联基础（design 19）**：SDK `queryAndJoin` 二次查询 + 写入 Enrich 预连接；

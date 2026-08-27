@@ -12,5 +12,8 @@ proptest-regressions/
 # 运行时数据目录
 data/
 
+# cargo vendor 离线包（服务器构建用，本机临时产物不入库）
+vendor/
+
 # Cargo.lock 是二进制项目的一部分，必须入库以锁定依赖版本
 # Cargo.lock

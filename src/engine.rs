@@ -264,6 +264,16 @@ impl Engine {
         self.inverted.search(term)
     }
 
+    /// 倒排某词条命中的文档数（COUNT 聚合，<0.1ms）。
+    pub fn inverted_doc_count(&self, term: &str) -> Result<u64> {
+        self.inverted.doc_count(term)
+    }
+
+    /// 按字段前缀分组（GROUP BY 聚合）：返回 `field=value` 各分组的文档数。
+    pub fn inverted_group_by(&self, field: &str) -> Result<Vec<(String, u64)>> {
+        self.inverted.group_by(field)
+    }
+
     /// 备份前一致性准备（development 5.11 冷备份第 1-2 步）：
     /// 刷 WAL → 全部 MemTable 落盘为 SST → 倒排内存字典刷盘为 `.seg` 段，
     /// 保证数据目录磁盘态自包含（含倒排段清单 Manifest、字段注册表等随目录整体打包）。
