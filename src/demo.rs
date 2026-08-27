@@ -324,5 +324,52 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
+    // ---------- 10. 备份 · 还原（development 步骤 14） ----------
+    let t = Instant::now();
+    // 一致性准备（刷 WAL + MemTable + 倒排）→ 打包 → 还原到全新目录 → 重开引擎验证
+    let backup_file = data_dir.join("backup.bak");
+    let restore_dir = data_dir.join("engine-restored");
+    engine.prepare_backup()?;
+    drop(engine);
+    crate::storage::backup(&engine_dir, &backup_file)?;
+    crate::storage::restore(&backup_file, &restore_dir)?;
+    let mut restored = Engine::open(&restore_dir, cfg)?;
+
+    // 验证：① 未删除文档可读 ② 步骤 8 已删除文档仍不可见（Tombstone 随备份/还原）③ 倒排词条计数一致（含落盘段）
+    // 注意：验证集合与删除集合存在同余重叠，须按删除集合动态计算期望
+    let deleted: std::collections::HashSet<u64> =
+        (0..del_sample).map(|i| (i * 11 % scale) + 1).collect();
+    let verify_n = pk_sample.min(50);
+    let mut present = 0u64;
+    let mut missing = 0u64;
+    let mut del_ok = 0u64;
+    for i in 0..verify_n {
+        let docid = (i * 13 % scale) + 1;
+        if deleted.contains(&docid) {
+            if restored.get(docid)?.is_none() {
+                del_ok += 1; // 已删除文档还原后仍不可见
+            }
+        } else if restored.get(docid)?.is_some() {
+            present += 1;
+        } else {
+            missing += 1;
+        }
+    }
+    let non_deleted = (0..verify_n)
+        .filter(|i| !deleted.contains(&((i * 13 % scale) + 1)))
+        .count() as u64;
+    let deleted_in_verify = verify_n as u64 - non_deleted;
+    let bj = restored.inverted_posting("beijing")?.len() as u64;
+    let passed =
+        missing == 0 && present == non_deleted && del_ok == deleted_in_verify && bj == expected_beijing;
+    results.push(TestResult::new(
+        "备份 · 还原",
+        passed,
+        format!(
+            "备份 {scale} 条库 → 还原重开：未删可读 {present}/{non_deleted}（缺失 {missing}），已删仍不可见 {del_ok}/{deleted_in_verify}，city=beijing 计数 {bj}（预期 {expected_beijing}）"
+        ),
+        t.elapsed().as_secs_f64() * 1000.0,
+    ));
+
     Ok(results)
 }

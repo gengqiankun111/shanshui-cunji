@@ -33,7 +33,7 @@
     <tr><th>项目</th><th>观测值</th></tr>
     <tr><td>运行命令</td><td><code>shanshui-cunji.exe demo --scale 100000000 --out images/1亿</code></td></tr>
     <tr><td>运行时长</td><td>启动 ~07:44 → 停止 ~15:40（约 8 小时）</td></tr>
-    <tr><td>实际数据产出</td><td><code>D:\novosdb-tmp\demo-6420\engine</code> = <span class="bad">705.8 MB</span></td></tr>
+    <tr><td>实际数据产出</td><td><code>D:\shanshui-cunji-tmp\demo-6420\engine</code> = <span class="bad">705.8 MB</span></td></tr>
     <tr><td>完成阶段</td><td>仅主引擎批量插入（步骤 2），未进入分片路由</td></tr>
     <tr><td>估算写入量</td><td>约 800 万 ~ 1200 万条（按单条 60~80B + 压缩估算，远低于 1 亿）</td></tr>
     <tr><td>对照：5000 万</td><td class="ok">119k 条/s，约 30 分钟完成（9/9 通过）</td></tr>
