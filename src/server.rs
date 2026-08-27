@@ -219,12 +219,34 @@ fn collect_strings(val: &Value, out: &mut Vec<String>) {
 fn route_request(engine: &mut Engine, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, String) {
     match (method, path) {
         ("POST", "/put") => handle_put(engine, body),
+        ("POST", "/patch") => handle_patch(engine, body),
         ("GET", "/get") => handle_get(engine, query),
         ("GET", "/search") => handle_search(engine, query),
         ("GET", "/range") => handle_range(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
         _ => (404, json!({"error": format!("接口不存在: {method} {path}")}).to_string()),
+    }
+}
+
+/// 部分更新（阶段 1.5 Delta CF）：body `{"docid":N,"fields":{"status":"inactive","note":null}}`，
+/// null 值删除字段，Merge-on-Read 覆盖。
+fn handle_patch(engine: &mut Engine, body: &[u8]) -> (u16, String) {
+    let val: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({"error": format!("JSON 解析失败: {e}")}).to_string()),
+    };
+    let Some(docid) = val.get("docid").and_then(|d| d.as_u64()) else {
+        return (400, json!({"error": "缺少 docid 字段"}).to_string());
+    };
+    let Some(fields_obj) = val.get("fields").and_then(|f| f.as_object()) else {
+        return (400, json!({"error": "缺少 fields 对象"}).to_string());
+    };
+    let fields: Vec<(&str, serde_json::Value)> =
+        fields_obj.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    match engine.patch(docid, &fields) {
+        Ok(()) => (200, json!({"ok": true, "docid": docid}).to_string()),
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
 
@@ -501,6 +523,15 @@ mod tests {
         let (st, body) = http_req(addr, "GET", "/range?start=1000&end=2000", b"");
         assert_eq!(st, 200, "range 失败: {body}");
         assert!(body.contains("\"total\":1"), "范围应命中 1 条: {body}");
+
+        // PATCH（阶段 1.5 部分更新）：覆盖 device + 新增 note
+        let (st, body) = http_req(addr, "POST", "/patch", br#"{"docid":2002,"fields":{"device":"linux","note":"patched"}}"#);
+        assert_eq!(st, 200, "patch 失败: {body}");
+        let (st, body) = http_req(addr, "GET", "/get?docid=2002", b"");
+        assert_eq!(st, 200, "patch 后 get 失败: {body}");
+        assert!(body.contains("linux"), "device 应被覆盖: {body}");
+        assert!(body.contains("patched"), "note 应新增: {body}");
+        assert!(!body.contains("ios"), "旧 device 不应残留: {body}");
 
         // DELETE
         let (st, body) = http_req(addr, "POST", "/delete", br#"{"docid":1001}"#);
