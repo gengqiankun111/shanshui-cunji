@@ -1,4 +1,4 @@
-//! novosdb 库入口：内核各模块对外暴露，供二进制与集成测试使用。
+//! shanshui-cunji 库入口：内核各模块对外暴露，供二进制与集成测试使用。
 
 pub mod blockcache;
 pub mod bloom;

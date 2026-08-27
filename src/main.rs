@@ -1,4 +1,4 @@
-//! novosdb 二进制入口：子命令分发（development 步骤 1 / 5.13）。
+//! shanshui-cunji 二进制入口：子命令分发（development 步骤 1 / 5.13）。
 //!
 //! 子命令：
 //! - `server`：启动存储服务（默认，暂未实现，见步骤 15）；
@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use novosdb::config::Config;
+use shanshui_cunji::config::Config;
 use tracing::info;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,7 +63,7 @@ fn main() {
         "check" => run_check(&config_path),
         "demo" => run_demo(&config_path, scale, &out_dir, gen_only),
         "version" | "-V" | "--version" => {
-            println!("novosdb {VERSION}");
+            println!("shanshui-cunji {VERSION}");
         }
         _ => run_server(&config_path),
     }
@@ -73,13 +73,13 @@ fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "novosdb=info".into()),
+                .unwrap_or_else(|_| "shanshui_cunji=info".into()),
         )
         .init();
 }
 
 fn run_check(config_path: &PathBuf) {
-    println!("novosdb {VERSION} 配置检查");
+    println!("shanshui-cunji {VERSION} 配置检查");
     match Config::load(config_path) {
         Ok(cfg) => {
             println!("✅ 配置校验通过");
@@ -113,7 +113,7 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
     if gen_only {
         let path = out_dir.join("data.jsonl");
         let t = std::time::Instant::now();
-        match novosdb::demo::generate(scale, &path) {
+        match shanshui_cunji::demo::generate(scale, &path) {
             Ok(n) => {
                 println!("✅ 构造数据完成：{n} 条 → {}（{:.1} ms）", path.display(), t.elapsed().as_secs_f64() * 1000.0);
                 return;
@@ -126,12 +126,12 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
     }
 
     // 临时数据目录（D 盘，避免撑爆 C 盘系统盘）
-    let data_dir = std::path::PathBuf::from("D:\\novosdb-tmp").join(format!("demo-{}", std::process::id()));
+    let data_dir = std::path::PathBuf::from("D:\\shanshui-cunji-tmp").join(format!("demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).expect("创建临时数据目录失败");
 
-    println!("\n═══ novosdb {VERSION} 功能冒烟测试（scale={scale}）═══\n");
-    let results = match novosdb::demo::run(&data_dir, &cfg, scale) {
+    println!("\n═══ shanshui-cunji {VERSION} 功能冒烟测试（scale={scale}）═══\n");
+    let results = match shanshui_cunji::demo::run(&data_dir, &cfg, scale) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("❌ demo 运行失败: {e}");
@@ -158,7 +158,7 @@ fn run_demo(config_path: &PathBuf, scale: u64, out_dir: &PathBuf, gen_only: bool
 }
 
 /// 生成按功能归类的 HTML 报告（每个功能一个独立 section，供逐块截图）。
-fn build_html_report(results: &[novosdb::demo::TestResult], scale: u64) -> String {
+fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -> String {
     let mut sections = String::new();
     // 固定 slug（按功能顺序），与截图脚本一一对应
     const SLUGS: [&str; 9] = [
@@ -187,7 +187,7 @@ fn build_html_report(results: &[novosdb::demo::TestResult], scale: u64) -> Strin
     let bar_pct = (passed as f64 / total as f64) * 100.0;
     format!(
         r#"<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>novosdb v{VERSION} 功能测试报告</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>山水存迹数据库（shanshui-cunji）v{VERSION} 功能测试报告</title>
 <style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
   body {{ font-family:'Segoe UI','Microsoft YaHei',sans-serif; background:#0f172a; color:#e2e8f0; padding:32px; }}
@@ -212,7 +212,7 @@ fn build_html_report(results: &[novosdb::demo::TestResult], scale: u64) -> Strin
   .meta {{ margin-top:10px; font-size:12px; color:#64748b; }}
   .meta b {{ color:#e2e8f0; }}
 </style></head><body><div class="wrap">
-  <h1>novosdb v{VERSION} 功能冒烟测试报告</h1>
+  <h1>山水存迹数据库（shanshui-cunji）v{VERSION} 功能冒烟测试报告</h1>
    <div class="sub">LSM-Tree 单机内核 · 2026-08-27 · 数据量 {scale} 条 · 按功能归类</div>
    <div class="summary">
      <span class="big">{passed}/{total}</span> 项通过
@@ -234,7 +234,7 @@ fn run_server(config_path: &PathBuf) {
     match Config::load(config_path) {
         Ok(cfg) => {
             info!(
-                "novosdb {} 启动（服务层将在阶段 1 步骤 15 实现）: listen={}, data_dir={}",
+                "shanshui-cunji {} 启动（服务层将在阶段 1 步骤 15 实现）: listen={}, data_dir={}",
                 VERSION,
                 cfg.server.listen_addr,
                 cfg.storage.data_dir

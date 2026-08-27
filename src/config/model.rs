@@ -373,9 +373,9 @@ engine = "fst"
     fn load_from_toml_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[storage]\ndata_dir = \"/tmp/novosdb\"\n").unwrap();
+        std::fs::write(&path, "[storage]\ndata_dir = \"/tmp/shanshui-cunji\"\n").unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.storage.data_dir, "/tmp/novosdb");
+        assert_eq!(cfg.storage.data_dir, "/tmp/shanshui-cunji");
     }
 
     #[test]

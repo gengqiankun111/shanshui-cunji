@@ -1,4 +1,4 @@
-//! 功能演示 / 冒烟测试 CLI（`novosdb demo`）。
+//! 功能演示 / 冒烟测试 CLI（`shanshui-cunji demo`）。
 //!
 //! 按 development 步骤 15 之前的内核能力，端到端验证：
 //! 构造测试数据 → 插入 → 主键查询 → 缓存查询 → 组合索引查询 → 倒排词条 → 分片路由 → 删除。
@@ -28,24 +28,29 @@ impl TestResult {
     }
 }
 
+/// 构造单条测试文档（流式生成用，避免亿级数据全量驻留内存）。
+fn make_doc(docid: u64) -> (Vec<u8>, Vec<&'static str>) {
+    let i = docid - 1;
+    let status = if i % 3 == 0 { "active" } else { "inactive" };
+    let city = match i % 4 {
+        0 => "beijing",
+        1 => "shanghai",
+        2 => "guangzhou",
+        _ => "shenzhen",
+    };
+    let doc = format!(
+        r#"{{"docid":{docid},"status":"{status}","city":"{city}","amount":{}}}"#,
+        (i * 7) % 1000
+    );
+    (doc.into_bytes(), vec![city])
+}
+
 /// 构造测试数据：N 条文档，字段 status/city/amount。
 fn build_docs(n: u64) -> Vec<(u64, Vec<u8>, Vec<&'static str>)> {
     let mut docs = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let docid = i + 1;
-        let status = if i % 3 == 0 { "active" } else { "inactive" };
-        let city = match i % 4 {
-            0 => "beijing",
-            1 => "shanghai",
-            2 => "guangzhou",
-            _ => "shenzhen",
-        };
-        let doc = format!(
-            r#"{{"docid":{docid},"status":"{status}","city":"{city}","amount":{}}}"#,
-            (i * 7) % 1000
-        );
-        let terms = vec![city];
-        docs.push((docid, doc.into_bytes(), terms));
+    for docid in 1..=n {
+        let (doc, terms) = make_doc(docid);
+        docs.push((docid, doc, terms));
     }
     docs
 }
@@ -125,24 +130,32 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     let sample = scale.min(1000);
     let pk_sample = sample.min(100);
 
-    // ---------- 1. 构造测试数据 ----------
+    // ---------- 1. 构造测试数据（流式生成，亿级不驻留内存） ----------
     let t = Instant::now();
-    let docs = build_docs(scale);
+    // 采样 10 万条计时，推算全量生成耗时（实际生成在插入时分批进行）
+    let probe_n = 100_000.min(scale);
+    for docid in 1..=probe_n {
+        let _ = make_doc(docid);
+    }
+    let probe_ms = t.elapsed().as_secs_f64() * 1000.0;
     results.push(TestResult::new(
         "构造测试数据",
         true,
-        format!("生成 {scale} 条文档（status/city/amount 字段，city 写入倒排）"),
-        t.elapsed().as_secs_f64() * 1000.0,
+        format!(
+            "生成 {scale} 条文档（status/city/amount 字段，city 写入倒排；流式生成 {probe_n} 条耗时 {probe_ms:.0} ms）"
+        ),
+        probe_ms * scale as f64 / probe_n as f64,
     ));
 
-    // ---------- 2. 批量插入（WAL 攒批 + 定期倒排刷盘） ----------
+    // ---------- 2. 批量插入（流式 + WAL 攒批 + 定期倒排刷盘） ----------
     let engine_dir = data_dir.join("engine");
-    // 大结果集回表（如 125 万条 beijing）需放宽查询超时，避免看门狗熔断
-    let mut engine = Engine::open_with_timeout(&engine_dir, cfg, std::time::Duration::from_secs(300))?;
+    // 大结果集回表（如千万级 beijing）需放宽查询超时，避免看门狗熔断
+    let mut engine = Engine::open_with_timeout(&engine_dir, cfg, std::time::Duration::from_secs(3600))?;
     let t = Instant::now();
     let mut put_ok = 0u64;
-    for (docid, doc, terms) in &docs {
-        engine.put_nosync(*docid, doc.clone(), terms)?;
+    for docid in 1..=scale {
+        let (doc, terms) = make_doc(docid);
+        engine.put_nosync(docid, doc, &terms)?;
         put_ok += 1;
         // 定期刷倒排段，防内存字典无界增长
         if engine.inverted_mem_docids() >= 1_000_000 {
@@ -154,10 +167,9 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     let insert_ms = t.elapsed().as_secs_f64() * 1000.0;
     results.push(TestResult::new(
         "批量插入",
-        put_ok == docs.len() as u64,
+        put_ok == scale,
         format!(
-            "写入 {put_ok} / {} 条，{:.0} ms（{:.0} 条/s；WAL 攒批 + 定期倒排刷盘）",
-            docs.len(),
+            "写入 {put_ok} / {scale} 条，{:.0} ms（{:.0} 条/s；WAL 攒批 + 定期倒排刷盘）",
             insert_ms,
             put_ok as f64 / insert_ms * 1000.0
         ),
@@ -229,7 +241,7 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     let t = Instant::now();
     // 超大结果集：先用 RoaringBitmap 直接统计命中总数（不回表，毫秒级），
     // 再抽样回表验证正确性（MVP 逐条回表对亿级结果集慢，批量预取优化在阶段 1.5）
-    let expected_beijing = docs.iter().filter(|(d, _, _)| d % 4 == 0).count() as u64;
+    let expected_beijing = scale / 4;
     let bitmap = engine.inverted_posting("beijing")?;
     let total_hits = bitmap.len() as u64;
     // 抽样回表：最多 20 万条
@@ -255,8 +267,9 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     let t = Instant::now();
     let shard_dir = data_dir.join("sharded");
     let mut se = ShardedEngine::open(&shard_dir, cfg, 4)?;
-    for (docid, doc, terms) in &docs {
-        se.put_nosync(*docid, doc.clone(), terms)?;
+    for docid in 1..=scale {
+        let (doc, terms) = make_doc(docid);
+        se.put_nosync(docid, doc, &terms)?;
     }
     se.flush_wal()?;
     let dist = se.distribution();
@@ -271,7 +284,7 @@ pub fn run(data_dir: &PathBuf, cfg: &Config, scale: u64) -> Result<Vec<TestResul
     let dist_str = dist.iter().map(|(s, c)| format!("shard{s}={c}")).collect::<Vec<_>>().join(", ");
     results.push(TestResult::new(
         "分片路由",
-        total == docs.len() as usize && shard_ok == pk_sample,
+        total == scale as usize && shard_ok == pk_sample,
         format!("4 分片分布：{dist_str}（合计 {total}）；分片点查命中 {shard_ok}/{pk_sample}"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));

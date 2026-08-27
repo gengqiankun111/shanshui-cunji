@@ -283,25 +283,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "novosdb"
-version = "0.1.0"
-dependencies = [
- "crossbeam-skiplist",
- "dashmap",
- "lru",
- "proptest",
- "roaring",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -569,6 +550,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "shanshui-cunji"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-skiplist",
+ "dashmap",
+ "lru",
+ "proptest",
+ "roaring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

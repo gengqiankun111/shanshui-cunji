@@ -23,9 +23,9 @@ RUN touch src/main.rs && \
 # scratch 空镜像：静态二进制零依赖，极致轻量且安全
 FROM scratch
 
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/novosdb /novosdb
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/shanshui-cunji /shanshui-cunji
 COPY config.toml /config.toml
 
 EXPOSE 8080
 
-ENTRYPOINT ["/novosdb", "--config", "/config.toml"]
+ENTRYPOINT ["/shanshui-cunji", "--config", "/config.toml"]
