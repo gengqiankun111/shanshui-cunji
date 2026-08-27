@@ -1,10 +1,10 @@
-novosdb 编译与部署指南
+山水存迹数据库（shanshui-cunji）编译与部署指南
 版本：v1.0
-适用版本：novosdb >= v0.1（MVP）
+适用版本：shanshui-cunji >= v0.1（MVP）
 关联文档：Readme.md | design.md | development.md
 
 1. 文档定位与适用人群
-本指南涵盖 novosdb 从源码到可运行产物的完整流程，包括本地开发编译、生产环境静态编译、交叉编译、Docker 镜像构建及常见问题排查。
+本指南涵盖 shanshui-cunji 从源码到可运行产物的完整流程，包括本地开发编译、生产环境静态编译、交叉编译、Docker 镜像构建及常见问题排查。
 
 角色	阅读重点
 用户（想从源码编译使用）	第 2、3、4、6、9 章
@@ -16,7 +16,7 @@ bash
 # 安装 Rust（如未安装）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 确认版本（novosdb 需要 Rust 1.70+）
+# 确认版本（shanshui-cunji 需要 Rust 1.70+）
 rustc --version
 cargo --version
 2.2 各平台系统依赖
@@ -36,8 +36,8 @@ make --version
 3.1 标准编译
 bash
 # 克隆仓库
-git clone https://github.com/your-org/novosdb.git
-cd novosdb
+git clone https://github.com/your-org/shanshui-cunji.git
+cd shanshui-cunji
 
 # 调试模式编译（速度快，体积大，含调试符号）
 cargo build
@@ -63,7 +63,7 @@ bash
 RUST_LOG=debug cargo run -- server --config config.toml
 
 # 仅输出特定模块日志
-RUST_LOG=novosdb::engine=debug cargo run -- server
+RUST_LOG=shanshui-cunji::engine=debug cargo run -- server
 
 # 输出 TRACE 级别（最详细）
 RUST_LOG=trace cargo run -- server
@@ -75,7 +75,7 @@ cargo fmt	自动格式化代码
 cargo doc --open	生成并打开本地文档
 4. 生产环境静态编译（musl）
 4.1 为什么使用 musl？
-novosdb 采用 完全静态链接 的方式编译，生成不依赖任何外部 .so 动态库的二进制文件。这带来了：
+shanshui-cunji 采用 完全静态链接 的方式编译，生成不依赖任何外部 .so 动态库的二进制文件。这带来了：
 
 ✅ 零依赖部署：直接复制到任意 Linux 系统即可运行
 
@@ -92,15 +92,15 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 
 # 3. 产物位置
-ls -lh target/x86_64-unknown-linux-musl/release/novosdb
+ls -lh target/x86_64-unknown-linux-musl/release/shanshui-cunji
 4.3 验证静态链接
 bash
 # 使用 file 命令查看文件类型
-file target/x86_64-unknown-linux-musl/release/novosdb
+file target/x86_64-unknown-linux-musl/release/shanshui-cunji
 # 应输出包含 "statically linked" 字样
 
 # 使用 ldd 检查动态库依赖（若显示 "not a dynamic executable" 则正确）
-ldd target/x86_64-unknown-linux-musl/release/novosdb
+ldd target/x86_64-unknown-linux-musl/release/shanshui-cunji
 # 期望输出: "statically linked" 或 "not a dynamic executable"
 4.4 体积优化（可选）
 在 Cargo.toml 的 [profile.release] 中添加以下配置，可显著减小二进制体积：
@@ -138,7 +138,7 @@ rustup target add aarch64-unknown-linux-musl
 cross build --release --target aarch64-unknown-linux-musl
 
 # 产物位置
-ls -lh target/aarch64-unknown-linux-musl/release/novosdb
+ls -lh target/aarch64-unknown-linux-musl/release/shanshui-cunji
 5.3 方案二：手动配置交叉编译工具链
 适用于需要精细控制或无法使用 Docker 的 CI/CD 环境：
 
@@ -165,7 +165,7 @@ cargo build --release --target aarch64-unknown-linux-musl
 5.4 验证交叉编译产物
 bash
 # 确认架构正确
-file target/aarch64-unknown-linux-musl/release/novosdb
+file target/aarch64-unknown-linux-musl/release/shanshui-cunji
 # 应输出包含 "ELF 64-bit LSB executable, ARM aarch64" 字样
 6. Docker 镜像构建
 6.1 推荐 Dockerfile（多阶段构建）
@@ -200,32 +200,32 @@ RUN touch src/main.rs && \
 FROM scratch
 
 # 复制二进制文件
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/novosdb /usr/local/bin/novosdb
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/shanshui-cunji /usr/local/bin/shanshui-cunji
 
 # 复制配置文件（可选）
-COPY --from=builder /app/config.toml /etc/novosdb/config.toml
+COPY --from=builder /app/config.toml /etc/shanshui-cunji/config.toml
 
 # 声明端口
 EXPOSE 8080 9090
 
 # 设置启动命令
-ENTRYPOINT ["/usr/local/bin/novosdb"]
-CMD ["server", "--config", "/etc/novosdb/config.toml"]
+ENTRYPOINT ["/usr/local/bin/shanshui-cunji"]
+CMD ["server", "--config", "/etc/shanshui-cunji/config.toml"]
 6.2 构建 Docker 镜像
 bash
 # 构建镜像
-docker build -t novosdb:latest -f Dockerfile .
+docker build -t shanshui-cunji:latest -f Dockerfile .
 
 # 查看镜像大小
-docker images | grep novosdb
+docker images | grep shanshui-cunji
 # 期望：最终镜像约 20~50MB
 
 # 运行容器
 docker run -d \
-  --name novosdb \
+  --name shanshui-cunji \
   -p 8080:8080 \
-  -v ./data:/var/lib/novosdb \
-  novosdb:latest
+  -v ./data:/var/lib/shanshui-cunji \
+  shanshui-cunji:latest
 
 # 验证运行
 curl http://localhost:8080/status
@@ -239,7 +239,7 @@ docker buildx create --name multiarch --use
 # 构建并推送多架构镜像
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  --tag your-registry/novosdb:latest \
+  --tag your-registry/shanshui-cunji:latest \
   --push .
 6.4 Docker Compose 快速启动
 yaml
@@ -247,15 +247,15 @@ yaml
 version: '3.8'
 
 services:
-  novosdb:
-    image: novosdb:latest
-    container_name: novosdb
+  shanshui-cunji:
+    image: shanshui-cunji:latest
+    container_name: shanshui-cunji
     ports:
       - "8080:8080"
       - "9090:9090"
     volumes:
-      - ./data:/var/lib/novosdb
-      - ./config.toml:/etc/novosdb/config.toml
+      - ./data:/var/lib/shanshui-cunji
+      - ./config.toml:/etc/shanshui-cunji/config.toml
     environment:
       - RUST_LOG=info
     restart: unless-stopped
@@ -298,8 +298,8 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: novosdb-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/novosdb
+          name: shanshui-cunji-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/shanshui-cunji
 7.2 加速编译的建议
 工具	说明	启用方式
 sccache	分布式编译缓存	cargo install sccache，设置 RUSTC_WRAPPER=sccache
@@ -310,23 +310,23 @@ cargo-chef	优化 Docker 层缓存	在 Dockerfile 中使用 cargo chef 精确计
 
 bash
 # 1. 检查文件是否存在
-ls -lh target/*/release/novosdb
+ls -lh target/*/release/shanshui-cunji
 
 # 2. 确认架构
-file target/x86_64-unknown-linux-musl/release/novosdb
+file target/x86_64-unknown-linux-musl/release/shanshui-cunji
 
 # 3. 确认静态链接（musl 目标）
-ldd target/x86_64-unknown-linux-musl/release/novosdb
+ldd target/x86_64-unknown-linux-musl/release/shanshui-cunji
 # 期望: "statically linked" 或 "not a dynamic executable"
 
 # 4. 检查版本信息（如已注入版本号）
-./target/release/novosdb --version
+./target/release/shanshui-cunji --version
 
 # 5. 检查配置文件是否存在
 cat config.toml
 
 # 6. （可选）检查符号表大小
-nm --size-sort target/release/novosdb | tail -20
+nm --size-sort target/release/shanshui-cunji | tail -20
 9. 常见问题与解决方案（FAQ）
 Q1：编译时报错 "failed to run custom build command for openssl-sys"
 原因：openssl-sys crate 需要系统安装 OpenSSL 开发库，或静态链接时找不到 MUSL 版本的 OpenSSL。
@@ -433,9 +433,9 @@ fn main() {
 静态编译（musl）	cargo build --release --target x86_64-unknown-linux-musl
 交叉编译 ARM	cross build --release --target aarch64-unknown-linux-musl
 运行测试	cargo test
-构建 Docker 镜像	docker build -t novosdb:latest .
-运行容器	docker run -p 8080:8080 novosdb:latest
-验证静态链接	ldd target/.../novosdb
+构建 Docker 镜像	docker build -t shanshui-cunji:latest .
+运行容器	docker run -p 8080:8080 shanshui-cunji:latest
+验证静态链接	ldd target/.../shanshui-cunji
 11. 相关文档
 文档	说明
 Readme.md	项目概览与快速开始

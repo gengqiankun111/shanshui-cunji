@@ -1,4 +1,4 @@
-# novosdb 开发文档
+# 山水存迹数据库（shanshui-cunji）开发文档
 
 > 版本：v0.1（MVP 单机实现 + 分布式演进蓝图）
 > 定位：面向**实现**的配套文档。设计决策与原理见 [design.md](./design.md)，本文件给出模块结构、数据格式约定、实现要点、开发顺序、编码规范与验收标准。
@@ -42,7 +42,7 @@
 | crc32fast | 校验和（WAL 记录、备份包、倒排段） | 替代软件 crc |
 | xxhash-rust / murmur3 | 布隆过滤器、哈希分片 | 双哈希派生 |
 | serde + toml | 配置解析 | config.toml |
-| clap | CLI 参数解析 | novosdb 命令行 |
+| clap | CLI 参数解析 | shanshui-cunji 命令行 |
 | axum / hyper | HTTP-JSON 接口 | 单机版即可用 |
 | thiserror / anyhow | 错误定义（库）/ 错误聚合（二进制） | 分层使用 |
 | jemalloc（tikv-jemallocator） | 内存分配器统计（OOM 看门狗水位线） | 可选，比 OS RSS 精准 |
@@ -64,7 +64,7 @@
 ## 3. 工程结构
 
 ```
-novosdb/
+shanshui-cunji/
 ├── design.md            # 技术设计文档
 ├── development.md       # 本文件（开发实现文档）
 ├── readme.md            # 项目说明
@@ -121,9 +121,9 @@ novosdb/
     ├── server/          # HTTP / TCP 服务
     └── cli/             # 命令行客户端
 └── tools/
-    ├── novosdb-migrate/ # MySQL → Novosdb 迁移工具（基础版提前至阶段 1.5）
-    ├── novosdb-export/  # 【新增】数据导出工具（Parquet / CSV / SQL，design 19）
-    └── novosdb-import/  # 【新增】数据导入工具（CSV/JSON/Parquet + import-schema，design 20）
+    ├── shanshui-cunji-migrate/ # MySQL → shanshui-cunji 迁移工具（基础版提前至阶段 1.5）
+    ├── shanshui-cunji-export/  # 【新增】数据导出工具（Parquet / CSV / SQL，design 19）
+    └── shanshui-cunji-import/  # 【新增】数据导入工具（CSV/JSON/Parquet + import-schema，design 20）
 ```
 
 **物理目录约定（新增，解决 G4）：**
@@ -230,7 +230,7 @@ SegmentEntry := SegmentID(u64) ++ FileName(长度前缀字符串) ++ Offset(u64)
 ### 5.1 config —— 配置体系（神经系统）
 
 - 配置模型分三层覆盖：缓存（design 6.5）、分布式（design 9.8）、加载策略（design 13）；
-- 加载顺序：**默认值 → config.toml → 环境变量 `NOVOSDB__SECTION__KEY`**；
+- 加载顺序：**默认值 → config.toml → 环境变量 `shanshui-cunji__SECTION__KEY`**；
 - 启动校验：`hotcache.max_memory_mb + blockcache.max_memory_mb < 系统可用内存 × 0.7`，否则告警并降级；
 - 阶段 3：支持 SIGHUP 热加载部分配置（如 `broadcast_query.max_concurrent`）；
 - MVP 允许硬编码，但**配置骨架必须从第 1 周就定义**（`src/config/mod.rs` 的 `AppConfig` 结构）。
@@ -371,7 +371,7 @@ enum QueryPlan {
 - **Write Stall Watchdog**（design 14.2，阶段 2）：监控 L0 数量，`stall_timeout_secs`（默认 60s）内无减少判假死 → 中断 Compaction 并重置调度器 → 连续失败 3 次主动退出；
 - **Query SLA Guard**（design 14.3）：`QueryContext` 携带 deadline，超时经 CancellationToken 退出；`Semaphore` 限制最大并发倒排合并；
 - **Sidecar 探针（解决 D4）**：
-  - **强制实现策略**：在 **tokio 运行时初始化之前**，使用 `std::process::Command` 生成一个独立的探针子进程（运行 `novosdb-sidecar` 或内置 `--mode=sidecar`），通过 TCP/UDS 与主进程心跳。**严禁在 tokio 运行时内调用 `fork()`**，防止异步任务持有锁导致子进程死锁；
+  - **强制实现策略**：在 **tokio 运行时初始化之前**，使用 `std::process::Command` 生成一个独立的探针子进程（运行 `shanshui-cunji-sidecar` 或内置 `--mode=sidecar`），通过 TCP/UDS 与主进程心跳。**严禁在 tokio 运行时内调用 `fork()`**，防止异步任务持有锁导致子进程死锁；
   - MVP 备选：独立探活线程 + 文件锁心跳。
 
 ### 5.15 query::sql —— 类 SQL 解析（降低迁移成本）
@@ -380,11 +380,11 @@ enum QueryPlan {
 - **明确拒绝**：JOIN / GROUP BY / 子查询 / 事务 / `UPDATE` 语义，命中即返回明确错误（含"不支持"提示）；
 - 不承诺 MySQL 方言兼容（design 15）。
 
-### 5.16 迁移工具（tools/novosdb-migrate）—— 前置至阶段 1.5（解决 G2）
+### 5.16 迁移工具（tools/shanshui-cunji-migrate）—— 前置至阶段 1.5（解决 G2）
 
 - **阶段 1.5（基础版）**：
   - 输入：`mysqldump` SQL 文件或 CSV 导出；
-  - 映射规则由配置文件 `mapping.toml` 静态定义（MySQL 字段 → Novosdb 字段名 + 类型）；
+  - 映射规则由配置文件 `mapping.toml` 静态定义（MySQL 字段 → shanshui-cunji 字段名 + 类型）；
   - 全量导入，单线程，产出迁移报告。
 - **阶段 3（高级版）**：
   - 增量导入（基于主键游标），支持 JDBC 直连，字段映射自动推导，断点续传。
@@ -402,10 +402,10 @@ enum QueryPlan {
 
 ### 5.19 客户端 SDK 与冷热分层（阶段 3，design 1.3）
 
-- **存储定位**：novosdb 为纯硬盘持久化（Disk-Based），Redis 为热缓存——冷热分层（Redis 扛热点、Novosdb 扛全量）；
-- **`NovosdbWithRedis` 门面**（Java/Go/Python SDK）：**Cache-Aside 读回填**（先查 Redis → Miss 查 Novosdb → `setex` 回填 TTL）+ **Write-Invalidate 写失效**（先写 Novosdb 落盘成功返回 ACK → `DEL` 旧缓存），业务代码无感切换；**绝不双写/反向同步**（红线，design 21）；
-- **MySQL 只读分析副本**：Canal / Debezium 监听 binlog 实时同步到 novosdb（规避跨库 JOIN 压主库）；
-- 与 5.16 迁移工具衔接：binlog 同步是"持续增量"，`novosdb-migrate` 是"一次性全量"；
+- **存储定位**：shanshui-cunji 为纯硬盘持久化（Disk-Based），Redis 为热缓存——冷热分层（Redis 扛热点、shanshui-cunji 扛全量）；
+- **`shanshui-cunjiWithRedis` 门面**（Java/Go/Python SDK）：**Cache-Aside 读回填**（先查 Redis → Miss 查 shanshui-cunji → `setex` 回填 TTL）+ **Write-Invalidate 写失效**（先写 shanshui-cunji 落盘成功返回 ACK → `DEL` 旧缓存），业务代码无感切换；**绝不双写/反向同步**（红线，design 21）；
+- **MySQL 只读分析副本**：Canal / Debezium 监听 binlog 实时同步到 shanshui-cunji（规避跨库 JOIN 压主库）；
+- 与 5.16 迁移工具衔接：binlog 同步是"持续增量"，`shanshui-cunji-migrate` 是"一次性全量"；
 - **零侵入**：外部缓存管理器仅在网关 / SDK 层，存储内核无感知；`[cache.external]` 默认关闭（部署详见 redis-integration-guide.md）。
 
 ### 5.20 sdk::join —— 二次查询 JOIN 辅助（阶段 1.5，design 19）
@@ -427,7 +427,7 @@ enum QueryPlan {
 - 增量模式：基于时间戳游标只处理增量数据；
 - 查询直接走结果集的倒排 / 组合索引（毫秒级）。
 
-### 5.23 tools::novosdb-export —— 数据导出（阶段 1.5 基础版 / 阶段 2 增量 / 阶段 3 JDBC，design 19/20）
+### 5.23 tools::shanshui-cunji-export —— 数据导出（阶段 1.5 基础版 / 阶段 2 增量 / 阶段 3 JDBC，design 19/20）
 
 **流式管道核心接口：**
 
@@ -460,15 +460,15 @@ pub trait Sink {
 
 - jemalloc stats（rss / allocated / active / metadata）经 `mallctl` 读取；
 - HotCache / BlockCache 命中率、倒排 term_count、LSM l0_file_count / total_sst_bytes、write_tps / query_qps；
-- CLI `novosdb admin status` + HTTP `/admin/status`（JSON）；对齐 design 17 监控项。
+- CLI `shanshui-cunji admin status` + HTTP `/admin/status`（JSON）；对齐 design 17 监控项。
 
 ### 5.26 query::explain —— 执行计划推演（阶段 1.5，design 20）
 
 - 复用优化器路由逻辑，**只推演不读数据**；
 - 输出 Access Method / Index Key / Estimated Rows（TermMeta doc_count）/ Zone Map 剪枝预期 / Cost / Execution Pool / Warning；
-- CLI `novosdb explain --filter '...'` + HTTP `/explain`；与 7.1 优化器同源，避免两套逻辑漂移。
+- CLI `shanshui-cunji explain --filter '...'` + HTTP `/explain`；与 7.1 优化器同源，避免两套逻辑漂移。
 
-### 5.27 tools::novosdb-import —— 数据导入（阶段 1.5 基础版 / 阶段 2 增强，design 20）
+### 5.27 tools::shanshui-cunji-import —— 数据导入（阶段 1.5 基础版 / 阶段 2 增强，design 20）
 
 - **核心澄清**：文档型弱 Schema，"导入结构" ≠ CREATE TABLE，而是导入**字段注册表 + 索引定义**（不强约束，新字段自动注册）；
 - `import`：CSV / JSON（阶段 1.5）→ Parquet（阶段 2）；`--id-field` 指定 DocId 列、`--timestamp-format` 解析时间、`--batch-size` 批量写入；
@@ -478,12 +478,12 @@ pub trait Sink {
 ### 5.28 cache::external::redis_manager —— Redis 外部缓存（阶段 2，design 21）
 
 - **依赖**：redis-rs / deadpool-redis；
-- **核心结构**：`RedisCacheManager`（连接池 get / set / del / batch_del）、`CacheAsideExecutor`（读路径：查 Redis → 查 Novosdb → 异步回填）、`InvalidateExecutor`（写路径：先 Novosdb 后删 Redis）；
-- **熔断降级**：Circuit Breaker（CLOSED / OPEN / HALF-OPEN），Redis 不可用时自动透传 Novosdb；`timeout_ms` 超时立即 fallback，不阻塞；
+- **核心结构**：`RedisCacheManager`（连接池 get / set / del / batch_del）、`CacheAsideExecutor`（读路径：查 Redis → 查 shanshui-cunji → 异步回填）、`InvalidateExecutor`（写路径：先 shanshui-cunji 后删 Redis）；
+- **熔断降级**：Circuit Breaker（CLOSED / OPEN / HALF-OPEN），Redis 不可用时自动透传 shanshui-cunji；`timeout_ms` 超时立即 fallback，不阻塞；
 - **一致性**：默认 `write_policy = "invalidate"`；可选 `"double_delete"`（延迟 500ms 二次删除）与版本号 / 时间戳校验；
 - **防击穿 / 防雪崩**：热点 key 互斥锁回源 + TTL 随机抖动（`300 + rand(60)`）；
 - **零侵入**：仅网关 / SDK 层，内核无感知；`[cache.external]` 默认关闭；
-- **可观测**：命中率 / 延迟 / 错误计数指标（`novosdb_cache_redis_*`），`admin cache-stats` / `cache-warm` / `cache-evict`；
+- **可观测**：命中率 / 延迟 / 错误计数指标（`shanshui-cunji_cache_redis_*`），`admin cache-stats` / `cache-warm` / `cache-evict`；
 - 部署与配置详见 [redis-integration-guide.md](./redis-integration-guide.md)。
 
 ---
@@ -629,11 +629,11 @@ impl RuntimePools {
 4. **Delta CF 部分更新**；
 5. **倒排统计载荷 + 聚合执行器**（COUNT / GROUP BY）；
 6. **FST + Mmap 字典**（与 Checkpoint 共存，无缝过渡）；
-7. **迁移工具基础版（novosdb-migrate）**（解决 G2）：支持 mysqldump / CSV 全量导入；
+7. **迁移工具基础版（shanshui-cunji-migrate）**（解决 G2）：支持 mysqldump / CSV 全量导入；
 8. **数据关联基础（design 19）**：SDK `queryAndJoin` 二次查询 + 写入 Enrich 预连接；
 9. **块级压缩（Zstd Level 3）+ 分区布隆过滤器（design 4.4.2）**：存储再降 40%~60%、布隆内存减半；
 10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（jemalloc stats + 命中率）+ `explain`（执行计划推演）；
-11. **数据管道（design 20）**：`novosdb-export`（Parquet/CSV 基础版，与迁移工具同期）+ `novosdb-import`（CSV/JSON 基础版）。
+11. **数据管道（design 20）**：`shanshui-cunji-export`（Parquet/CSV 基础版，与迁移工具同期）+ `shanshui-cunji-import`（CSV/JSON 基础版）。
 
 ### 7.3 阶段 2：分布式集群
 
@@ -644,7 +644,7 @@ impl RuntimePools {
 5. **网关全局 Term 缓存** + 失效心跳；
 6. **术语字典热备 TDS**；
 7. **无损扩容协议（design 9.1.1）**：双写（Shadow Writes）→ 数据追平（Delta Catch-up，SST 拷贝 + WAL 增量回放）→ 原子切换（Atomic Switch，1s 内）+ 5s 回滚预案，业务零感知、数据零丢失；
-8. **数据关联增强（design 19）**：物化视图调度器 + `novosdb-export` 导出工具 + JOIN 计划节点本地执行（单分片内）；
+8. **数据关联增强（design 19）**：物化视图调度器 + `shanshui-cunji-export` 导出工具 + JOIN 计划节点本地执行（单分片内）；
 9. **两级索引（design 4.4.2）**：内存索引减少 90%；
 10. **数据管道增强（design 20）**：`import` 支持 Parquet、`import-schema`（字段注册表 + 索引定义导入）；
 11. **Redis 外部缓存（design 21）**：External Cache Manager（Cache-Aside + Write-Invalidate + 熔断降级），`[cache.external]` 默认关闭，详见 redis-integration-guide.md。
@@ -654,7 +654,7 @@ impl RuntimePools {
 - Leveled-Compaction、io_uring + 环形 WAL、IO 优先级调度器、配置热加载；
 - 位图索引、MVCC、热 key 自动缓存、压缩、增量备份；
 - **迁移工具高级版**（增量 + JDBC 直连）；
-- **Redis 冷热分层 SDK（`NovosdbWithRedis` 门面）+ MySQL binlog 同步（Canal/Debezium 只读分析副本）**（design 1.3）；
+- **Redis 冷热分层 SDK（`shanshui-cunjiWithRedis` 门面）+ MySQL binlog 同步（Canal/Debezium 只读分析副本）**（design 1.3）；
 - **小表广播 JOIN（可选，design 19.3）**：`join.broadcast_enabled` 默认关闭，`broadcast_threshold` 默认 100 行；导出到 ClickHouse 直连；
 - **KV 分离存储 + Ribbon Filter（design 4.4.2，可选）**：写放大降 50%~80%（WiscKey 式 Value Log）；
 - **JDBC Sink 直连（design 20.5，阶段 3）**：MySQL / ClickHouse 实时同步（延迟 < 1min），`--rate-limit` 限流；
@@ -807,16 +807,16 @@ RUN touch src/main.rs && \
 
 # 阶段 2: Runtime（scratch 空镜像）
 FROM scratch
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/novosdb /novosdb
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/shanshui-cunji /shanshui-cunji
 COPY config.toml /config.toml
 EXPOSE 8080
-ENTRYPOINT ["/novosdb", "--config", "/config.toml"]
+ENTRYPOINT ["/shanshui-cunji", "--config", "/config.toml"]
 ```
 
 **多阶段构建要点**：最终镜像只含一个静态二进制（无编译器/源码）；依赖层独立缓存加速 CI/CD；scratch 无 shell 无外部库，安全且极小。
 
 - **与 Nova OS 协同**：开发期跑 x86 Linux；MVP 完成后交叉编译 musl 部署联调；
-- Nova OS 只补必备基础组件（SSH / 进程守护 / OTA / NTP），人力重心迁移到 novosdb（design 10）。
+- Nova OS 只补必备基础组件（SSH / 进程守护 / OTA / NTP），人力重心迁移到 shanshui-cunji（design 10）。
 
 ---
 

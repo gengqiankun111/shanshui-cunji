@@ -1,11 +1,11 @@
 架构选型文档
-项目名称：novosdb
+项目名称：山水存迹数据库（shanshui-cunji）
 文档版本：v1.0
 编制日期：2026-08-26
 文档状态：定稿
 
 1. 选型背景与目标
-novosdb 的核心工作负载特征：
+shanshui-cunji 的核心工作负载特征：
 
 特征	具体描述
 写入模式	高吞吐持续写入（日志、埋点、IoT 上报），随机 DocId，单条或小批量
@@ -27,7 +27,7 @@ novosdb 的核心工作负载特征：
 崩溃恢复	WAL + Redo Log	WAL + 重放 MemTable
 决策依据：
 
-novosdb 的核心场景是日志、埋点、IoT 上报——写入吞吐是第一优先级。B-Tree 的随机写瓶颈在每秒数万 TPS 时就会暴露，而 LSM-Tree 专为高吞吐写入设计。
+shanshui-cunji 的核心场景是日志、埋点、IoT 上报——写入吞吐是第一优先级。B-Tree 的随机写瓶颈在每秒数万 TPS 时就会暴露，而 LSM-Tree 专为高吞吐写入设计。
 
 虽然 LSM-Tree 存在读放大和 Compaction 写放大，但通过以下设计可有效控制：
 
@@ -42,7 +42,7 @@ Leveled Compaction + IO 优先级隔离：控制 Compaction 对前台的影响
 ✅ 决策：LSM-Tree
 
 2.2 索引架构：倒排索引的实现路径
-novosdb 需要支持任意字段自由 AND/OR 筛选，这要求倒排索引具备：
+shanshui-cunji 需要支持任意字段自由 AND/OR 筛选，这要求倒排索引具备：
 
 需求	技术要求
 Term → DocId 列表查找	O(1) 或 O(log N)，支持千万级 Term
@@ -177,7 +177,7 @@ text
 并发模型	tokio 多线程 + 同步内核	兼顾异步 I/O 效率和并发安全
 部署形态	单机先行 → 分布式演进	先跑通核心链路，再水平扩展
 5. 与竞品架构的定位差异
-对比项	RocksDB	TiKV	Badger	novosdb（本方案）
+对比项	RocksDB	TiKV	Badger	shanshui-cunji（本方案）
 语言	C++	Rust	Go	Rust
 存储引擎	LSM-Tree	LSM-Tree（Rust 重写）	LSM-Tree + Value Log	LSM-Tree + PAX 列组
 索引	主键 KV	主键 KV + 二级索引	主键 KV	主键 + 组合索引 + 倒排索引
@@ -186,7 +186,7 @@ text
 热点缓存	BlockCache	BlockCache	无	HotCache（文档级）+ BlockCache + TermCache
 分布式	无（嵌入式）	Raft 分布式	无（嵌入式）	网关 + 一致性 Hash 分片 + 异步复制
 典型场景	嵌入式 KV 引擎	分布式 KV	Go 服务 KV	文档检索 + 日志/埋点/IoT
-差异化定位：novosdb 不是另一个 KV 存储引擎，而是面向文档型数据的检索数据库——在 LSM-Tree 的高吞吐写入基础上，原生集成了倒排索引、组合索引、文档级缓存和聚合能力，填补了“RocksDB 能力强但无倒排”与“Elasticsearch 功能全但写入吞吐低”之间的市场空白。
+差异化定位：shanshui-cunji 不是另一个 KV 存储引擎，而是面向文档型数据的检索数据库——在 LSM-Tree 的高吞吐写入基础上，原生集成了倒排索引、组合索引、文档级缓存和聚合能力，填补了“RocksDB 能力强但无倒排”与“Elasticsearch 功能全但写入吞吐低”之间的市场空白。
 
 6. 架构演进路线
 阶段	范围	核心架构特征
