@@ -62,10 +62,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// 环境变量覆盖：`NOVOSDB__SECTION__KEY=VALUE`。
+    /// 环境变量覆盖：`SHANSHUI_CUNJI__SECTION__KEY=VALUE`。
     fn apply_env_overrides(&mut self) {
         for (key, value) in std::env::vars() {
-            let Some(rest) = key.strip_prefix("NOVOSDB__") else {
+            let Some(rest) = key.strip_prefix("SHANSHUI_CUNJI__") else {
                 continue;
             };
             let parts: Vec<&str> = rest.split("__").collect();
@@ -388,12 +388,12 @@ engine = "fst"
     #[test]
     fn env_override_applies() {
         // 用 std::env::set_var 注入，测试后清理（测试内串行）
-        std::env::set_var("NOVOSDB__HOTCACHE__MAX_MEMORY_MB", "2048");
-        std::env::set_var("NOVOSDB__SERVER__LISTEN_ADDR", "127.0.0.1:9000");
+        std::env::set_var("SHANSHUI_CUNJI__HOTCACHE__MAX_MEMORY_MB", "2048");
+        std::env::set_var("SHANSHUI_CUNJI__SERVER__LISTEN_ADDR", "127.0.0.1:9000");
         let mut cfg = Config::default();
         cfg.apply_env_overrides();
-        std::env::remove_var("NOVOSDB__HOTCACHE__MAX_MEMORY_MB");
-        std::env::remove_var("NOVOSDB__SERVER__LISTEN_ADDR");
+        std::env::remove_var("SHANSHUI_CUNJI__HOTCACHE__MAX_MEMORY_MB");
+        std::env::remove_var("SHANSHUI_CUNJI__SERVER__LISTEN_ADDR");
         assert_eq!(cfg.hotcache.max_memory_mb, 2048);
         assert_eq!(cfg.server.listen_addr, "127.0.0.1:9000");
     }
