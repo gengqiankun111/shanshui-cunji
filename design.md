@@ -1,4 +1,4 @@
-# novosdb 设计文档
+# 山水存迹数据库（shanshui-cunji）设计文档
 
 > 版本：v0.1（MVP 单机版设计稿 + 分布式演进蓝图）
 > 状态：设计稿，开发路线遵循「先单机，后分片」
@@ -32,22 +32,22 @@
 
 ### 1.3 生态定位：新旧系统融合策略
 
-**存储介质确认**：novosdb 是**纯硬盘持久化（Disk-Based）**——数据写入必须经 **WAL fsync + 落盘 SSTable** 才算真正成功；HotCache / BlockCache / 倒排字典仅是**内存加速层（Cache）**，断电或重启后缓存清空、磁盘数据完好，WAL 恢复即可。数据量仅受磁盘限制（单机 1.5 亿基准 / TB 级），而非像 Redis 受内存限制。
+**存储介质确认**：shanshui-cunji 是**纯硬盘持久化（Disk-Based）**——数据写入必须经 **WAL fsync + 落盘 SSTable** 才算真正成功；HotCache / BlockCache / 倒排字典仅是**内存加速层（Cache）**，断电或重启后缓存清空、磁盘数据完好，WAL 恢复即可。数据量仅受磁盘限制（单机 1.5 亿基准 / TB 级），而非像 Redis 受内存限制。
 
-novosdb 不是要"干掉"MySQL 或 Redis，而是作为它们的**容量与速度扩展层**：
+shanshui-cunji 不是要"干掉"MySQL 或 Redis，而是作为它们的**容量与速度扩展层**：
 
 1. **与 MySQL（交易库）的关系**：
-   - MySQL 管事务（增删改、强一致）；novosdb 管海量（埋点、日志、归档）；
-   - 数据同步：通过 **Canal / Debezium** 监听 MySQL binlog，实时同步到 novosdb 作为**只读分析副本**，规避跨库 JOIN 对主库的压力；
+   - MySQL 管事务（增删改、强一致）；shanshui-cunji 管海量（埋点、日志、归档）；
+   - 数据同步：通过 **Canal / Debezium** 监听 MySQL binlog，实时同步到 shanshui-cunji 作为**只读分析副本**，规避跨库 JOIN 对主库的压力；
 2. **与 Redis（缓存库）的关系**：
-   - Redis 管超高并发热数据（微秒级）；novosdb 管全量持久化（毫秒级 + 倒排检索）；
-   - 推荐范式：**Cache-Aside（读回填）+ Write-Invalidate（先落盘后失效）**，SDK 内置 `NovosdbWithRedis` 门面（详见 [第 21 章](#21-外部缓存集成redis-适配器)）；
-   - 冷热分层收益：用 1 份 Redis 内存成本（只存 1 小时热数据）换无限容量的全量历史查询；novosdb 仅作冷存储时 CPU 几乎全留给写入任务；
+   - Redis 管超高并发热数据（微秒级）；shanshui-cunji 管全量持久化（毫秒级 + 倒排检索）；
+   - 推荐范式：**Cache-Aside（读回填）+ Write-Invalidate（先落盘后失效）**，SDK 内置 `shanshui-cunjiWithRedis` 门面（详见 [第 21 章](#21-外部缓存集成redis-适配器)）；
+   - 冷热分层收益：用 1 份 Redis 内存成本（只存 1 小时热数据）换无限容量的全量历史查询；shanshui-cunji 仅作冷存储时 CPU 几乎全留给写入任务；
 3. **替代遗留系统（MongoDB / ES）的明确条件**：
-   - 若 MongoDB / ES 仅做**结构化文档存储与简单筛选**（无嵌套查询、无聚合管道、无全文检索），切换至 novosdb 可降低 ~60% 硬件成本、提升 3~5 倍写入速度（ES 结构化场景可 10 倍）；
+   - 若 MongoDB / ES 仅做**结构化文档存储与简单筛选**（无嵌套查询、无聚合管道、无全文检索），切换至 shanshui-cunji 可降低 ~60% 硬件成本、提升 3~5 倍写入速度（ES 结构化场景可 10 倍）；
    - **绝对禁止替代**：银行交易、库存扣减、购物车结算、账户余额（需跨行事务，保留 MySQL/PostgreSQL）。
 
-**一句话总结**：*MySQL 管钱，Redis 管热，Novosdb 管海量——三者搭配，各司其职。*
+**一句话总结**：*MySQL 管钱，Redis 管热，shanshui-cunji 管海量——三者搭配，各司其职。*
 
 ### 1.4 竞争定位：在特定领域做到极致
 
@@ -65,7 +65,7 @@ novosdb 不是要"干掉"MySQL 或 Redis，而是作为它们的**容量与速�
 - ⚠️ **无分片键全局检索是广播慢查询**：随集群规模增大而劣化；
 - ⚠️ **功能丰富度不及通用库**：无嵌套文档、地理空间查询、完整生态工具链。
 
-**选型一句话**：需要强 ACID → TiDB/OceanBase；复杂 SQL/BI → ClickHouse/Doris；高度嵌套 JSON + 多变查询 → MongoDB；跨地域强一致多活 → CockroachDB；**日志 / 埋点 / IoT / 画像的海量写入 + 快速检索 → novosdb**。完整全景对比见 Readme 第 九 章。
+**选型一句话**：需要强 ACID → TiDB/OceanBase；复杂 SQL/BI → ClickHouse/Doris；高度嵌套 JSON + 多变查询 → MongoDB；跨地域强一致多活 → CockroachDB；**日志 / 埋点 / IoT / 画像的海量写入 + 快速检索 → shanshui-cunji**。完整全景对比见 Readme 第 九 章。
 
 ---
 
@@ -148,7 +148,7 @@ novosdb 不是要"干掉"MySQL 或 Redis，而是作为它们的**容量与速�
 
 - MVP 提供 **HTTP-JSON** 接口，方便上层 Web 后台直接调用；
 - 同时提供 **TCP 简易协议**（紧凑二进制，减少边缘环境开销）；
-- CLI 客户端：`novosdb` 命令行工具，支持增删查改、备份还原、状态查看；
+- CLI 客户端：`shanshui-cunji` 命令行工具，支持增删查改、备份还原、状态查看；
 - 查询协议支持**类 SQL WHERE 子句**（基于 `sqlparser-rs`，仅 `SELECT ... WHERE AND/OR` 子集），降低从 MySQL 迁移的学习成本；**不承诺 MySQL 方言兼容**，不支持 JOIN / GROUP BY / 子查询 / 事务，详见第 15 章迁移与兼容策略。
 
 ### 3.4 数据模型细节
@@ -742,8 +742,8 @@ async fn fetch_docs(docids: &[u64], block_size: u64) -> Vec<Document> {
 
 | 命令 | 行为 |
 | --- | --- |
-| `novosdb backup /path/backup_file` | 暂停新写入 → **确保 WAL 已刷盘且所有 MemTable 已刷盘** → **主动触发倒排字典 Checkpoint** → 打包全部 SST + 倒排文件 + 字典快照 + 段清单 Manifest 为归档 → 生成元数据（文件清单、版本、时间戳、数据条数） |
-| `novosdb restore /path/backup_file` | 停止服务 → 清空现有库 → 解压备份包 → **校验文件完整性与版本兼容性** → 重启加载 |
+| `shanshui-cunji backup /path/backup_file` | 暂停新写入 → **确保 WAL 已刷盘且所有 MemTable 已刷盘** → **主动触发倒排字典 Checkpoint** → 打包全部 SST + 倒排文件 + 字典快照 + 段清单 Manifest 为归档 → 生成元数据（文件清单、版本、时间戳、数据条数） |
+| `shanshui-cunji restore /path/backup_file` | 停止服务 → 清空现有库 → 解压备份包 → **校验文件完整性与版本兼容性** → 重启加载 |
 
 - 本质为冷备份（备份期短暂停写），边缘网关流量场景完全可接受，开发量 1~3 天；
 - **一致性保证**：冷备份期间暂停写入；备份开始前强制刷盘 WAL 与所有 MemTable，保证磁盘上的 SST 集合是完整一致快照，再逐文件拷贝；
@@ -768,8 +768,8 @@ async fn fetch_docs(docids: &[u64], block_size: u64) -> Vec<Document> {
 
 - 热备份（不停写）、增量/差异备份、定时自动备份；
 - 备份加密、完整性校验、上传云端；
-- CSV 批量导入导出（`novosdb-import`），作为异构迁移的过渡方案；
-- MySQL 数据迁移来源（`novosdb-migrate`，见第 15 章——仅作导入源，**非协议兼容**）。
+- CSV 批量导入导出（`shanshui-cunji-import`），作为异构迁移的过渡方案；
+- MySQL 数据迁移来源（`shanshui-cunji-migrate`，见第 15 章——仅作导入源，**非协议兼容**）。
 
 > 注意区分：**备份还原 = 本地数据安全；云边同步 = 边缘→云端数据流转**，两者分开设计，不混在一起。
 
@@ -779,16 +779,16 @@ async fn fetch_docs(docids: &[u64], block_size: u64) -> Vec<Document> {
 
 ### 9.0 分布式设计边界：我们做"集群"，不做"分布式数据库"
 
-Novosdb 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
+shanshui-cunji 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
 
-1. **分片即单机**：每个分片节点是一个完全独立的单机 Novosdb 实例，拥有自己的 LSM 引擎、缓存和索引；
+1. **分片即单机**：每个分片节点是一个完全独立的单机 shanshui-cunji 实例，拥有自己的 LSM 引擎、缓存和索引；
 2. **网关无状态**：网关（Proxy）仅负责 `DocId` 路由转发、结果集拼接（DocId 层面）和熔断限流，**绝不执行跨分片的数据聚合或事务**；
 3. **扩容无损**：基于虚拟分片 + 双写切换协议（见 9.1.1），保证扩容期间业务零感知、数据零丢失；
 4. **明确排除**：本设计**不实现**分布式事务（2PC）、分布式全局锁、跨分片 JOIN、全局快照读（MVCC 仅在单机内有效）。相关需求应由业务层（如 Redis 分布式锁）或上游关系型数据库（MySQL / Redis）承担。
 
 **为什么不需要 NewSQL：**
 
-| 维度 | A 类：分布式扩展集群（Novosdb） | B 类：分布式事务数据库（TiDB / Spanner） |
+| 维度 | A 类：分布式扩展集群（shanshui-cunji） | B 类：分布式事务数据库（TiDB / Spanner） |
 | --- | --- | --- |
 | 核心目标 | 存更多数据（Scale-out）、扛更高吞吐 | 跨机房强一致 + 跨行事务（ACID） |
 | 分片路由 | 固定哈希，单次查询只落一个分片 | 任意字段全局索引，查询可能落多个分片 |
@@ -797,7 +797,7 @@ Novosdb 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
 | 跨分片 JOIN | ❌ 不支持（网关只合 DocId） | ✅ 分布式执行器 |
 | 实现复杂度 | 低（复用单机内核） | 极高（SQL 优化器 + 分布式事务管理器） |
 
-**给用户的承诺**："如果你需要多行事务，请把事务放在 MySQL / Redis（业务层）处理；Novosdb 只做**单分片内的高速读写**。换来的收益是：8 节点集群写入总吞吐突破 **200 万 TPS**、延迟仅 1ms（TiDB 跨分片事务延迟 8ms 以上）。"
+**给用户的承诺**："如果你需要多行事务，请把事务放在 MySQL / Redis（业务层）处理；shanshui-cunji 只做**单分片内的高速读写**。换来的收益是：8 节点集群写入总吞吐突破 **200 万 TPS**、延迟仅 1ms（TiDB 跨分片事务延迟 8ms 以上）。"
 
 ### 9.1 分片路由
 
@@ -1004,7 +1004,7 @@ Novosdb 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
 - **部分字段更新（必做）**：Delta CF + Merge-on-Read（4.7），写入 IO 放大从 10 倍降为 1 倍；
 - **倒排统计载荷（必做）**：TermMeta 内嵌 `doc_count` + 聚合执行器（5.2 / 7.2），COUNT / GROUP BY 毫秒级、无需回表；
 - **FST + Mmap 字典（高优先级，5.2.4.1）**：倒排字典从哈希表改为分层 FST + mmap，冷启动亚秒级、RSS 按需加载；
-- **迁移工具基础版（G2）**：`novosdb-migrate` 支持 mysqldump 全量导入（字段映射由配置文件静态定义），降低前期试用门槛；增量 / JDBC 实时同步留阶段 3；
+- **迁移工具基础版（G2）**：`shanshui-cunji-migrate` 支持 mysqldump 全量导入（字段映射由配置文件静态定义），降低前期试用门槛；增量 / JDBC 实时同步留阶段 3；
 - **块级压缩（Zstd）+ 分区布隆过滤器（4.4.2）**：存储再降 40%~60%、布隆内存减半；
 - 收益：读放大降低 90%，单机 QPS 提升 2~3 倍，宽表 P95 显著下降。
 
@@ -1038,7 +1038,7 @@ Novosdb 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
 
 1. 开发期 NovaDB 跑在 x86 Linux 调试，不天天在 Nova OS 硬件上调试（交叉编译坑多）；
 2. MVP 完成后交叉编译 musl 版本部署到 Nova OS 联调；
-3. Nova OS 进入维护/小迭代模式，只补必备基础组件（SSH、进程守护、OTA、NTP），人力重心迁移到 novosdb。
+3. Nova OS 进入维护/小迭代模式，只补必备基础组件（SSH、进程守护、OTA、NTP），人力重心迁移到 shanshui-cunji。
 
 ---
 
@@ -1052,7 +1052,7 @@ Novosdb 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
 
 ## 12. 演进路线（做完 MVP 之后）
 
-1. 集成进 Nova OS，做云-边演示 Demo（边缘网关采集 → 存入 novosdb → 云端网页查看）；
+1. 集成进 Nova OS，做云-边演示 Demo（边缘网关采集 → 存入 shanshui-cunji → 云端网页查看）；
 2. 开源发布单机版，参加竞赛；
 3. 性能优化迭代 → 分布式集群版 → 企业版功能。
 
@@ -1066,7 +1066,7 @@ Novosdb 的分布式设计遵循 **"计算下沉，分片自治"** 原则：
 
 1. **动态热加载（二期）**：部分配置（如 `broadcast_query.max_concurrent`、`hotcache.max_memory_mb`）支持 SIGHUP 信号重载，无需重启；
 2. **启动配置校验**：检查 `hotcache.max_memory_mb + blockcache.max_memory_mb < 系统可用内存 × 0.7`，否则告警并自动降级；
-3. **环境变量覆盖**：支持 `NOVOSDB__HOTCACHE__MAX_MEMORY_MB=2048` 覆盖文件配置，便于容器化部署；
+3. **环境变量覆盖**：支持 `shanshui-cunji__HOTCACHE__MAX_MEMORY_MB=2048` 覆盖文件配置，便于容器化部署；
 4. **默认值原则**：所有配置带安全默认值、出厂即用；MVP 可硬编码实现，但配置骨架在 MVP 阶段就定义好。
 
 **落地阶段：**
@@ -1231,7 +1231,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 **为什么不兼容：**
 
-| 维度 | MySQL | Novosdb |
+| 维度 | MySQL | shanshui-cunji |
 | --- | --- | --- |
 | 模型 | 关系型 + 强 Schema + 行存 + ACID 事务 | 文档型 + 无/弱 Schema + LSM 列组 + 无跨分片事务 |
 
@@ -1240,16 +1240,16 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 **务实的三层迁移能力：**
 
-1. **数据迁移工具 `novosdb-migrate`**：读取 mysqldump 或经 JDBC 拉取，MySQL 每行 → Novosdb 一个文档（DocId 主键）；同时将 `CREATE INDEX` 映射为组合索引 / 倒排配置；
+1. **数据迁移工具 `shanshui-cunji-migrate`**：读取 mysqldump 或经 JDBC 拉取，MySQL 每行 → shanshui-cunji 一个文档（DocId 主键）；同时将 `CREATE INDEX` 映射为组合索引 / 倒排配置；
 2. **类 SQL 查询语法**：基于 `sqlparser-rs`，仅支持 `SELECT ... WHERE ... AND/OR` 子集（内部走倒排 / 组合索引）；明确不支持 JOIN / GROUP BY / 子查询 / 事务；
-3. **客户端 SDK 抽象层（适配器）**：Java / Python / Go 的 `NovosDBClient`，提供与 JDBC 类似的 `query()` / `execute()` 接口，底层走 HTTP/RPC；用户 DAO 仅替换 `DataSource` 与连接字符串，SQL 改写为 Filter 语法（最小代价）。
+3. **客户端 SDK 抽象层（适配器）**：Java / Python / Go 的 `shanshui-cunjiClient`，提供与 JDBC 类似的 `query()` / `execute()` 接口，底层走 HTTP/RPC；用户 DAO 仅替换 `DataSource` 与连接字符串，SQL 改写为 Filter 语法（最小代价）。
 
 **官方措辞标准：**
 
 - ❌ 不写："完全兼容 MySQL，无缝切换"；
 - ✅ 写法："提供 MySQL 数据一键迁移工具和类 SQL 查询语法支持，业务代码仅需修改底层驱动与连接配置即可接入"。
 
-**给用户的预期：** 换 Novosdb 是为了 10 倍写入性能与 1/10 硬件成本；代码连接层必须改，但改动的只是底层客户端，业务逻辑无需重写。
+**给用户的预期：** 换 shanshui-cunji 是为了 10 倍写入性能与 1/10 硬件成本；代码连接层必须改，但改动的只是底层客户端，业务逻辑无需重写。
 
 ---
 
@@ -1276,7 +1276,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 | 统计总数 / 分组计数 | ❌ 缺失 | TermMeta 内嵌 `doc_count` 常驻内存，COUNT / GROUP BY 零磁盘（5.2 / 7.2） | 极高（运营刚需） | 阶段 1.5 |
 | 查最新 N 条日志 | ❌ 缺失 | 追加序 = 时间序，读 Term 尾部即最新 N 条（5.2） | 高 | 阶段 1.5 |
 
-**完成以上增强后**，novosdb 从"文档 KV 库"升级为**三合一引擎**：时序数据库淘汰能力（TTL 时间分区）+ 倒排聚合能力（统计载荷）+ 文档读写能力（Delta CF），覆盖「日志检索 + 实时看板 + 设备影子」三大核心场景，50 亿数据量下功能无死角。
+**完成以上增强后**，shanshui-cunji 从"文档 KV 库"升级为**三合一引擎**：时序数据库淘汰能力（TTL 时间分区）+ 倒排聚合能力（统计载荷）+ 文档读写能力（Delta CF），覆盖「日志检索 + 实时看板 + 设备影子」三大核心场景，50 亿数据量下功能无死角。
 
 ---
 
@@ -1332,7 +1332,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 ## 18. 可测试性设计原则
 
-> 良好的架构是"可测"的。Novosdb 的核心模块必须通过依赖注入与 trait 抽象，支持单元测试在微秒级内完成逻辑验证，而非依赖真实磁盘 / 时钟。否则并发竞态、内存泄漏、文件损坏这类 Bug 会潜伏数月才爆发。
+> 良好的架构是"可测"的。shanshui-cunji 的核心模块必须通过依赖注入与 trait 抽象，支持单元测试在微秒级内完成逻辑验证，而非依赖真实磁盘 / 时钟。否则并发竞态、内存泄漏、文件损坏这类 Bug 会潜伏数月才爆发。
 
 ### 18.1 可测试性设计原则
 
@@ -1394,18 +1394,18 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 | ① 应用层二次查询 + 内存合并（SDK `queryAndJoin`） | 外键关联、结果集 < 10 万条 | 阶段 1.5 | 10 万条结果 ~16ms |
 | ② 写入时预连接（Enrich 回调展开） | 关联关系固定、写入时已知 | 阶段 1.5 | 写入 +0.1~0.3ms，查询 0 增加 |
 | ③ 物化视图（后台定时预聚合） | 固定维度聚合统计 | 阶段 2 | 查询 < 1ms |
-| ④ 数据导出到 OLAP（`novosdb-export` → Parquet/CSV） | 复杂多表 JOIN / BI | 阶段 1.5（基础版）/ 阶段 2（增量直连） | 存储计算分离 |
+| ④ 数据导出到 OLAP（`shanshui-cunji-export` → Parquet/CSV） | 复杂多表 JOIN / BI | 阶段 1.5（基础版）/ 阶段 2（增量直连） | 存储计算分离 |
 
 ### 19.3 架构支撑
 
 - **JOIN 计划节点**（`QueryPlan::Join`）：左小→先查左再批量查右；右小→反向；两表都大→拒绝并引导导出（`join.max_rows` 默认 100 万熔断）；
 - **写入路径 Enrich**：网络层接收后、WAL 写入前执行；失败策略可配（拒绝 / 降级）；数据源可配（Redis/MySQL/HTTP/本地）；
 - **网关策略**：单分片内 JOIN 本地执行 ✅；跨分片 JOIN ❌ 返回错误；**小表广播 JOIN**（`join.broadcast_threshold` 默认 100 行、`join.broadcast_max_bytes` 默认 1MB）阶段 3 可选、默认关闭；
-- 模块：`sdk/join.rs`、`tools/novosdb-export/`、`engine/mv_scheduler.rs`、优化器关联字段索引提示。
+- 模块：`sdk/join.rs`、`tools/shanshui-cunji-export/`、`engine/mv_scheduler.rs`、优化器关联字段索引提示。
 
 ### 19.4 用户预期管理
 
-> novosdb 是文档检索数据库，不提供 SQL JOIN。常见"数据关联"场景有 4 种高效替代方案；复杂多表关联分析请导出到 ClickHouse——这是"存储与计算分离"的正确姿势。
+> shanshui-cunji 是文档检索数据库，不提供 SQL JOIN。常见"数据关联"场景有 4 种高效替代方案；复杂多表关联分析请导出到 ClickHouse——这是"存储与计算分离"的正确姿势。
 
 ---
 
@@ -1415,21 +1415,21 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 ### 20.1 特性支持决策矩阵
 
-| 特性 | Novosdb 是否支持 | 实现方式 | 优先级 |
+| 特性 | shanshui-cunji 是否支持 | 实现方式 | 优先级 |
 | --- | --- | --- | --- |
 | SHOW PROCESSLIST | ✅ 必须支持 | Admin HTTP/TCP 命令 + 内部 QueryRegistry | P0（运维刚需） |
 | SHOW STATUS / 内存监控 | ✅ 必须支持 | 暴露 jemalloc stats + 缓存命中率 | P0（排障刚需） |
 | EXPLAIN | ✅ 必须支持（适配版） | 输出索引选择、扫描行数、Zone Map 剪枝预期 | P1（性能诊断） |
 | 物理备份 | ✅ 已有（8.1 清单确认） | 冷备份，打包 SST + 倒排文件 + 元数据 | P0（已完成） |
-| 导出 Parquet / CSV / TXT | ✅ 必须支持 | `novosdb-export` 工具 | P1（分析生态） |
+| 导出 Parquet / CSV / TXT | ✅ 必须支持 | `shanshui-cunji-export` 工具 | P1（分析生态） |
 | 导入结构（仅 Schema） | ⚠️ 重新定义 | 导入字段注册表 + 索引定义（不强约束） | P2（高级用户） |
-| 导入结构 + 数据 | ✅ 必须支持 | `novosdb-import`（复用迁移工具） | P1（迁移刚需） |
+| 导入结构 + 数据 | ✅ 必须支持 | `shanshui-cunji-import`（复用迁移工具） | P1（迁移刚需） |
 
 ### 20.2 SHOW PROCESSLIST —— 查看当前运行中的查询 / 操作
 
 - 内部维护全局 **QueryRegistry**（`DashMap<QueryID, QueryContext>`）：每个查询 / 操作（**含后台 Compaction 任务**）进入执行器注册、结束注销；
 - 注册信息：QueryID（UUID/自增）、ClientAddr、Command（PUT/GET/SEARCH/DELETE/COMPACTION）、Filter（脱敏）、Plan（PrimaryGet/CompositeScan/Inverted）、StartTime、Duration、State（Executing / Waiting for IO / Computing）、RowsScanned（近似）；
-- CLI：`novosdb admin processlist`；HTTP：`/admin/processlist`；
+- CLI：`shanshui-cunji admin processlist`；HTTP：`/admin/processlist`；
 - **熔断联动**：`KILL QUERY <QueryID>` 向目标查询发送 CancellationToken 强制终止。
 
 ### 20.3 SHOW STATUS / 内存与状态监控
@@ -1445,15 +1445,15 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 | LSM 引擎 | l0_file_count（告警阈值 > 8）/ total_sst_bytes |
 | 写入 / 查询 | write_tps / query_qps |
 
-- CLI：`novosdb admin status`；HTTP：`/admin/status`（JSON）。
+- CLI：`shanshui-cunji admin status`；HTTP：`/admin/status`（JSON）。
 
 ### 20.4 EXPLAIN —— 查询执行计划诊断
 
 - `query/optimizer.rs` 提供 `explain(Filter)`：**只做路由推演，不实际执行数据读取**；
 - 输出：Access Method（PrimaryGet / CompositeIndex / InvertedIndex / FullScan）、Index Key、Estimated Rows（来自 TermMeta `doc_count`）、Zone Map Pruning 预期（跳过块比例）、Cost（相对代价）、Execution Pool（Network / Compute）、Warning（如"结果集 > 1M，建议加 time_range"）；
-- CLI：`novosdb explain --filter 'status=active AND created_at>2026-08-01'`；HTTP：`/explain?filter=...`。
+- CLI：`shanshui-cunji explain --filter 'status=active AND created_at>2026-08-01'`；HTTP：`/explain?filter=...`。
 
-### 20.5 数据导出：novosdb-export（Parquet / CSV / TXT / JSON）
+### 20.5 数据导出：shanshui-cunji-export（Parquet / CSV / TXT / JSON）
 
 - **流式导出管道**：SST 顺序扫描（range 迭代器，无随机 IO）→ Filter（条件筛选）→ Projection（字段映射/脱敏）→ **Sink Adapter 分叉**；每批 `batch_size` 刷一次，**内存恒定**（batch × 单行大小，如 10k × 1KB ≈ 10MB）；
 - **ClickHouse（分析引擎首选）**：Parquet（arrow + parquet crate）→ `INSERT ... SELECT FROM file('*.parquet')` 直读，零代码接入；`--dry-run-schema` 生成 MergeTree 建表 DDL；按 `toYYYYMM(created_at)` 分区对齐；阶段 3 可选 JDBC/HTTP INSERT 实时同步（延迟 < 1min）；
@@ -1462,7 +1462,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 - **资源控制**：顺序扫描 + 与 Compaction 共享后台 IO 优先级（默认低于前台读写）、`--rate-limit` 限流防打满网卡、断点续传——对在线业务影响 < 5%；
 - **Schema 映射**：
 
-| Novosdb 类型 | ClickHouse 类型 | MySQL 类型 |
+| shanshui-cunji 类型 | ClickHouse 类型 | MySQL 类型 |
 | --- | --- | --- |
 | DocId (u64) | UInt64 | BIGINT UNSIGNED PRIMARY KEY |
 | string | String | VARCHAR(255) 或 TEXT（`--mysql-max-varchar`） |
@@ -1471,9 +1471,9 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 | timestamp | DateTime64(3) | DATETIME(3) |
 | null | Nullable(T) | NULL |
 
-### 20.6 数据导入：novosdb-import（结构与数据）
+### 20.6 数据导入：shanshui-cunji-import（结构与数据）
 
-- **核心澄清**：Novosdb 是文档型（弱 Schema），"导入结构" **≠ CREATE TABLE**，而是**导入字段注册表（Field Registry）+ 索引定义（组合索引 / 倒排启用字段）**，且**不强制约束**（未注册字段自动注册）；
+- **核心澄清**：shanshui-cunji 是文档型（弱 Schema），"导入结构" **≠ CREATE TABLE**，而是**导入字段注册表（Field Registry）+ 索引定义（组合索引 / 倒排启用字段）**，且**不强制约束**（未注册字段自动注册）；
 - `import-schema`：YAML/JSON 定义字段映射 + 索引（预创建以优化启动性能）；
 - `import`：CSV / JSON / Parquet 全量导入，`--id-field` 指定 DocId 列，支持时间字段解析（`--timestamp-format`）与批量写入（`--batch-size`）。
 
@@ -1481,29 +1481,29 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 ## 21. 外部缓存集成（Redis 适配器）
 
-> 定位：Redis 作为 Novosdb 的 **L2 分布式热点读缓存**——**读加速器，不是数据源**。部署与运维细节详见 [redis-integration-guide.md](./redis-integration-guide.md)。
+> 定位：Redis 作为 shanshui-cunji 的 **L2 分布式热点读缓存**——**读加速器，不是数据源**。部署与运维细节详见 [redis-integration-guide.md](./redis-integration-guide.md)。
 
 ### 21.1 定位与边界（红线）
 
 - **唯一真理源**：所有写入必须先落盘（WAL fsync → MemTable → SST），返回 ACK 后才操作 Redis；
-- **单向同步**：仅 Novosdb → Redis（回填 / 失效），**绝不支持 Redis → Novosdb 反向写入**；
-- **三条红线**：❌ 禁止只写 Redis 不写 Novosdb；❌ 禁止 Redis 过期后反向回写 Novosdb；❌ 禁止从 Redis 恢复数据（仅可预热）。
+- **单向同步**：仅 shanshui-cunji → Redis（回填 / 失效），**绝不支持 Redis → shanshui-cunji 反向写入**；
+- **三条红线**：❌ 禁止只写 Redis 不写 shanshui-cunji；❌ 禁止 Redis 过期后反向回写 shanshui-cunji；❌ 禁止从 Redis 恢复数据（仅可预热）。
 
 ### 21.2 交互流程（Cache-Aside + Write-Invalidate）
 
-- **读**：查 Redis（命中 0.1ms 直返）→ 未命中查 Novosdb（HotCache / 磁盘）→ **异步回填** SETEX（`cache_null_values` 防穿透）；
-- **写**：先写 Novosdb 成功返回 ACK → **删除 Redis 旧缓存**（DEL，不更新）——删除最安全，下次读自然回填最新值，杜绝不一致；
+- **读**：查 Redis（命中 0.1ms 直返）→ 未命中查 shanshui-cunji（HotCache / 磁盘）→ **异步回填** SETEX（`cache_null_values` 防穿透）；
+- **写**：先写 shanshui-cunji 成功返回 ACK → **删除 Redis 旧缓存**（DEL，不更新）——删除最安全，下次读自然回填最新值，杜绝不一致；
 - **一致性**：默认最终一致（毫秒级收敛）；可选 `write_policy = "double_delete"`（延迟 500ms 二次删除，近似强一致）或版本号 / 时间戳校验。
 
 ### 21.3 架构影响（零侵入）
 
 - 单机存储内核（LSM / Compaction / HotCache）**完全无感知**；
 - 实现位置：**网关（Proxy）或 SDK 层**新增「外部缓存管理器」模块，不进入数据节点；
-- 缓存分层：**L1 Redis**（分布式，跨节点共享）→ **L2 Novosdb HotCache**（进程内）→ **L3 磁盘**；`[cache.external]` 默认关闭（保持单机纯净）。
+- 缓存分层：**L1 Redis**（分布式，跨节点共享）→ **L2 shanshui-cunji HotCache**（进程内）→ **L3 磁盘**；`[cache.external]` 默认关闭（保持单机纯净）。
 
 ### 21.4 高可用与极端情况
 
-- **熔断降级**：Redis 超时 / 宕机 → Circuit Breaker 打开直接透传 Novosdb（CLOSED → OPEN → HALF-OPEN 状态机）；
+- **熔断降级**：Redis 超时 / 宕机 → Circuit Breaker 打开直接透传 shanshui-cunji（CLOSED → OPEN → HALF-OPEN 状态机）；
 - **防击穿**：热点 key 失效瞬间互斥锁（仅一个请求回源）+ stale-while-revalidate；
 - **防雪崩**：TTL 随机抖动（300 + rand(60)）；
 - 故障对业务影响仅延迟上升（0.1ms → 0.5~2ms），不雪崩。
@@ -1519,7 +1519,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 ## 22. 前沿演进与借鉴：从软硬协同到 AI 索引
 
-> novosdb 的竞争力在于**"组合"**：LSM 高吞吐写入 + 倒排灵活检索 + 文档模型易用 + 精心设计的缓存/配置/运维体系，组合成一个"趁手"的产品。本章跟踪数据库技术前沿，标注可选择性吸收的方向——均为**远期**，不改变当前务实路线。
+> shanshui-cunji 的竞争力在于**"组合"**：LSM 高吞吐写入 + 倒排灵活检索 + 文档模型易用 + 精心设计的缓存/配置/运维体系，组合成一个"趁手"的产品。本章跟踪数据库技术前沿，标注可选择性吸收的方向——均为**远期**，不改变当前务实路线。
 
 ### 22.1 四大前沿趋势与借鉴价值
 
@@ -1543,7 +1543,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 
 ### 22.3 演进定位
 
-novosdb 不做"万能数据库"，而是作为**高性能、低成本、易运维的海量文档处理基础设施**，在日志、可观测性、IoT 等特定领域做到极致——这就是极具竞争力的定位。
+shanshui-cunji 不做"万能数据库"，而是作为**高性能、低成本、易运维的海量文档处理基础设施**，在日志、可观测性、IoT 等特定领域做到极致——这就是极具竞争力的定位。
 
 ---
 

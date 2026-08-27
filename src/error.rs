@@ -4,7 +4,7 @@ use std::io;
 
 use thiserror::Error;
 
-/// novosdb 全局错误类型。
+/// shanshui-cunji 全局错误类型。
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io error: {0}")]
@@ -35,7 +35,7 @@ pub enum Error {
     Stalled(String),
 }
 
-/// novosdb 全局结果类型。
+/// shanshui-cunji 全局结果类型。
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

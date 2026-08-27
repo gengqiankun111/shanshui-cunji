@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>山水存迹数据库（shanshui-cunji） v0.1.0 功能测试报告</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Segoe UI','Microsoft YaHei',sans-serif; background:#0f172a; color:#e2e8f0; padding:32px; }
+  .wrap { max-width:860px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:4px; color:#f8fafc; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:24px; }
+  .summary { background:#1e293b; border-radius:12px; padding:20px 24px; margin-bottom:28px; }
+  .summary .big { font-size:28px; font-weight:700; color:#4ade80; }
+  .bar { height:8px; background:#334155; border-radius:4px; margin-top:12px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,#34d399,#22d3ee); width:100%; }
+  .card { background:#1e293b; border-radius:12px; padding:18px 22px; margin-bottom:16px;
+           border-left:4px solid #475569; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+  .card.pass { border-left-color:#34d399; }
+  .card.fail { border-left-color:#f87171; }
+  .head { display:flex; align-items:center; gap:12px; }
+  .idx { font-size:12px; color:#64748b; }
+  .head h2 { font-size:16px; flex:1; }
+  .badge { font-size:12px; padding:2px 10px; border-radius:999px; }
+  .badge.pass { background:rgba(52,211,153,.15); color:#4ade80; }
+  .badge.fail { background:rgba(248,113,113,.15); color:#f87171; }
+  .detail { color:#94a3b8; font-size:13px; margin-top:10px; line-height:1.6; }
+  .meta { margin-top:10px; font-size:12px; color:#64748b; }
+  .meta b { color:#e2e8f0; }
+</style></head><body><div class="wrap">
+  <h1>山水存迹数据库（shanshui-cunji） v0.1.0 功能冒烟测试报告</h1>
+   <div class="sub">LSM-Tree 单机内核 · 2026-08-27 · 数据量 100000 条 · 按功能归类</div>
+   <div class="summary">
+     <span class="big">9/9</span> 项通过
+     <div class="bar"><i></i></div>
+   </div>
+   <section class="card pass" id="01-data">
+                <div class="head">
+                    <span class="idx">01</span>
+                    <h2>构造测试数据</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">生成 100000 条文档（status/city/amount 字段，city 写入倒排）</p>
+                <div class="meta">耗时 <b>29.76</b> ms</div>
+            </section><section class="card pass" id="02-insert">
+                <div class="head">
+                    <span class="idx">02</span>
+                    <h2>批量插入</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">写入 100000 / 100000 条，297 ms（337255 条/s；WAL 攒批 + 定期倒排刷盘）</p>
+                <div class="meta">耗时 <b>296.51</b> ms</div>
+            </section><section class="card pass" id="03-query-primary">
+                <div class="head">
+                    <span class="idx">03</span>
+                    <h2>查询 · 主键</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">100 次主键点查，命中 100，未命中 0（稀疏索引→布隆→Zone Map→块缓存）</p>
+                <div class="meta">耗时 <b>0.07</b> ms</div>
+            </section><section class="card pass" id="04-query-cache">
+                <div class="head">
+                    <span class="idx">04</span>
+                    <h2>查询 · HotCache</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">100 次重复查询，HotCache 命中 100 / 100（写后回填 + 读后回填）</p>
+                <div class="meta">耗时 <b>0.01</b> ms</div>
+            </section><section class="card pass" id="05-query-composite">
+                <div class="head">
+                    <span class="idx">05</span>
+                    <h2>查询 · 组合索引</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">status=active 前缀查询命中 33333 条（写入索引 33333 条）</p>
+                <div class="meta">耗时 <b>75.10</b> ms</div>
+            </section><section class="card pass" id="06-query-inverted">
+                <div class="head">
+                    <span class="idx">06</span>
+                    <h2>查询 · 倒排词条</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">city=beijing 命中 25000 条（预期 25000）</p>
+                <div class="meta">耗时 <b>10.29</b> ms</div>
+            </section><section class="card pass" id="07-sharding">
+                <div class="head">
+                    <span class="idx">07</span>
+                    <h2>分片路由</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">4 分片分布：shard0=25000, shard1=25000, shard2=25000, shard3=25000（合计 100000）；分片点查命中 100/100</p>
+                <div class="meta">耗时 <b>371.42</b> ms</div>
+            </section><section class="card pass" id="08-delete">
+                <div class="head">
+                    <span class="idx">08</span>
+                    <h2>删除</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">删除 100 条并验证不可见（Tombstone 落盘 + HotCache 失效）：100/100</p>
+                <div class="meta">耗时 <b>102.82</b> ms</div>
+            </section><section class="card pass" id="09-optimizer">
+                <div class="head">
+                    <span class="idx">09</span>
+                    <h2>优化器路由</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">静态路由 5 类访问路径自检通过（主键点查/范围/组合索引/倒排/全扫）</p>
+                <div class="meta">耗时 <b>0.00</b> ms</div>
+            </section>
+ </div></body></html>

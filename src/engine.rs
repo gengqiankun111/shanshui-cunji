@@ -15,6 +15,7 @@ use crate::config::model::Config;
 use crate::error::Result;
 use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
+use crate::keys::encode_docid;
 use crate::optimizer::{route, AccessPath, QuerySpec};
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
@@ -40,11 +41,16 @@ pub type QueryRow = (u64, Vec<u8>);
 impl Engine {
     /// 打开（或创建）引擎。倒排刷盘阈值取自内存预算的比例（MVP 固定 1M posting）。
     pub fn open(data_dir: &Path, cfg: &Config) -> Result<Self> {
+        Self::open_with_timeout(data_dir, cfg, DEFAULT_QUERY_TIMEOUT)
+    }
+
+    /// 打开引擎并指定查询超时（压测/大结果集场景需放宽熔断阈值）。
+    pub fn open_with_timeout(data_dir: &Path, cfg: &Config, query_timeout: std::time::Duration) -> Result<Self> {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
         let inverted = InvertedIndex::open(&data_dir.join("inverted"), 1_000_000)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let hotcache = HotCache::new(cfg.hotcache.clone());
-        let watchdog = Watchdog::new(cfg, DEFAULT_QUERY_TIMEOUT);
+        let watchdog = Watchdog::new(cfg, query_timeout);
         Ok(Self { primary, cidx, inverted, hotcache, watchdog, mem_ratio: 0.0 })
     }
 
@@ -59,16 +65,28 @@ impl Engine {
     pub fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // 内存限流：软水位返回限流信号（MVP 仍放行，记录计数）；硬水位直接拒绝
         let _status = self.watchdog.memory_check(self.mem_ratio)?;
+        self.put_nosync(docid, value, terms)?;
+        self.flush_wal()
+    }
+
+    /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
+    pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // ① 失效 HotCache 该 docid
         self.hotcache.invalidate(docid);
-        // ② 主数据（权威源）
-        self.primary.put(docid, value.clone())?;
+        // ② 主数据（权威源，WAL 攒批不逐条 fsync）
+        self.primary.put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）
         for t in terms {
             self.inverted.add(t, docid);
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中）
         self.hotcache.put(docid, value);
+        Ok(())
+    }
+
+    /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
+    pub fn flush_wal(&mut self) -> Result<()> {
+        self.primary.sync_wal()?;
         Ok(())
     }
 

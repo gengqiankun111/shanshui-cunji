@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>山水存迹数据库（shanshui-cunji）1 亿压测记录（超时）</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Segoe UI','Microsoft YaHei',sans-serif; background:#0f172a; color:#e2e8f0; padding:32px; }
+  .wrap { max-width:860px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:4px; color:#f8fafc; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:24px; }
+  .status { display:inline-block; font-size:13px; padding:4px 14px; border-radius:999px; margin-bottom:20px;
+            background:rgba(248,113,113,.15); color:#f87171; border:1px solid rgba(248,113,113,.4); }
+  .summary { background:#1e293b; border-radius:12px; padding:20px 24px; margin-bottom:24px; }
+  .summary .big { font-size:26px; font-weight:700; color:#f87171; }
+  table { width:100%; border-collapse:collapse; background:#1e293b; border-radius:12px; overflow:hidden; margin-bottom:24px; }
+  th, td { text-align:left; padding:12px 16px; font-size:13px; }
+  th { background:#243349; color:#94a3b8; font-weight:600; }
+  td { border-top:1px solid #334155; color:#e2e8f0; }
+  td:first-child { color:#94a3b8; width:30%; }
+  .card { background:#1e293b; border-radius:12px; padding:18px 22px; margin-bottom:16px;
+          border-left:4px solid #f87171; }
+  .card h3 { font-size:15px; margin-bottom:10px; color:#f8fafc; }
+  .card p, .card li { color:#94a3b8; font-size:13px; line-height:1.8; }
+  .card ul { padding-left:20px; }
+  code { background:#0f172a; padding:2px 8px; border-radius:6px; color:#7dd3fc; font-size:12px; }
+  .ok { color:#4ade80; } .bad { color:#f87171; }
+</style></head><body><div class="wrap">
+  <h1>山水存迹数据库（shanshui-cunji）· 1 亿条全功能压测记录</h1>
+  <div class="sub">2026-08-27 · scale=100,000,000 · 结果：超时终止</div>
+  <span class="status">❌ 超时未完成（已停止）</span>
+  <div class="summary">
+    <span class="big">TIMEOUT</span> —— 运行约 8 小时未完成 1 亿条全功能测试，已主动停止；仅主引擎写入阶段有产出，未进入分片/查询阶段。
+  </div>
+  <table>
+    <tr><th>项目</th><th>观测值</th></tr>
+    <tr><td>运行命令</td><td><code>shanshui-cunji.exe demo --scale 100000000 --out images/1亿</code></td></tr>
+    <tr><td>运行时长</td><td>启动 ~07:44 → 停止 ~15:40（约 8 小时）</td></tr>
+    <tr><td>实际数据产出</td><td><code>D:\novosdb-tmp\demo-6420\engine</code> = <span class="bad">705.8 MB</span></td></tr>
+    <tr><td>完成阶段</td><td>仅主引擎批量插入（步骤 2），未进入分片路由</td></tr>
+    <tr><td>估算写入量</td><td>约 800 万 ~ 1200 万条（按单条 60~80B + 压缩估算，远低于 1 亿）</td></tr>
+    <tr><td>对照：5000 万</td><td class="ok">119k 条/s，约 30 分钟完成（9/9 通过）</td></tr>
+    <tr><td>推断速率</td><td class="bad">约 350 条/s，较 5000 万下降 300 倍以上</td></tr>
+  </table>
+  <div class="card">
+    <h3>超时原因分析（推断）</h3>
+    <ul>
+      <li><b>倒排段刷盘退化为瓶颈</b>：demo 每满 100 万内存 docid 刷一次倒排段，1 亿规模段文件数量级膨胀，后续每次 <code>flush_inverted</code> 需加载/合并历史段，耗时随段数上升，疑似 O(n²) 退化；</li>
+      <li><b>LSM 层级写放大</b>：SSTable 达到水位后触发压缩/合并，1 亿级写放大使单条写入成本显著上升；</li>
+      <li><b>磁盘与内存压力</b>：D 盘空闲 62GB，C 盘仅 1.3GB；进程长期运行后内存占用高，或触发系统级节流。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>建议（阶段 1.5 优化项）</h3>
+    <ul>
+      <li>倒排刷盘改为<b>段合并（Segment Merge）/ 按时间窗批量落盘</b>，控制段数量级；</li>
+      <li>批量插入路径增加<b>进度日志</b>（每百万条一条），便于观测与断点续跑；</li>
+      <li>1 亿级建议采用 <b>分片并行写入</b> 或先跑 5000 万上限验证；</li>
+      <li>压测前 <code>cargo build --release</code> 产物需为 <code>shanshui-cunji.exe</code>（本次为改名后的新产物）。</li>
+    </ul>
+  </div>
+ </div></body></html>

@@ -1,4 +1,4 @@
-# novosdb 关联查询（JOIN）设计白皮书与使用指导
+# 山水存迹数据库（shanshui-cunji）关联查询（JOIN）设计白皮书与使用指导
 
 > 版本：v1.0 | 状态：设计定稿
 > 关联文档：[design.md](./design.md)（第 19 章）、[development.md](./development.md)
@@ -15,7 +15,7 @@
 | 单机内多文档关联查询 | ❌ 不支持 | 无 SQL JOIN 语法，无嵌套文档引用解析 |
 | 跨分片文档关联 | ❌ 不支持 | 网关禁止跨分片数据重分布计算（design 9.4） |
 | 应用层二次查询 | ✅ 支持 | 业务代码自行查多次，SDK 辅助批量查询 |
-| 数据导出到分析引擎 | ✅ 支持（规划中） | `novosdb-export` 导出到 ClickHouse 等 |
+| 数据导出到分析引擎 | ✅ 支持（规划中） | `shanshui-cunji-export` 导出到 ClickHouse 等 |
 
 ### 1.2 为什么不做 JOIN（设计哲学回溯）
 
@@ -39,7 +39,7 @@ design.md 1.2 明确承诺：**放弃跨分片 JOIN，换取水平扩容简单�
 | A. 文档扩展 / 补全 | 订单文档只有 user_id，需补全用户名、等级 | ❌ 写入时预连接（§4.2） |
 | B. 两表交集筛选 | 找"购买了 A 商品"且"来自北京"的用户 | ❌ 两次查询 + 内存交集（§4.1） |
 | C. 多表聚合统计 | 按用户维度统计所有订单总额 | ⚠️ 轻量→物化视图（§4.3）；重型→导出（§4.4） |
-| D. 复杂关联分析 | 画像 + 行为 + 订单三表漏斗分析 | ✅ 属 BI/OLAP 范畴，novosdb 不做 |
+| D. 复杂关联分析 | 画像 + 行为 + 订单三表漏斗分析 | ✅ 属 BI/OLAP 范畴，shanshui-cunji 不做 |
 
 **本质结论**：95% 的"需要 JOIN"实际是"需要数据关联后的结果"，而非"需要 JOIN 语法本身"。我们不需要实现 JOIN 算法，只需提供"数据关联"的替代路径。
 
@@ -56,7 +56,7 @@ design.md 1.2 明确承诺：**放弃跨分片 JOIN，换取水平扩容简单�
 | 应用层二次查询 SDK 辅助 | P1 | SDK 提供 `queryAndJoin()` 辅助方法 | 阶段 1.5 |
 | 写入时"预连接"（多文档源合一） | P1 | 写入时将关联数据展开到单文档（Enrich） | 阶段 1.5 |
 | 物化视图（单表预聚合） | P2 | 后台任务定期构建聚合结果文档 | 阶段 2 |
-| 数据导出到 OLAP 引擎 | P2 | `novosdb-export` → ClickHouse / MySQL | 阶段 2 |
+| 数据导出到 OLAP 引擎 | P2 | `shanshui-cunji-export` → ClickHouse / MySQL | 阶段 2 |
 
 ### 3.2 明确不支持
 
@@ -69,7 +69,7 @@ design.md 1.2 明确承诺：**放弃跨分片 JOIN，换取水平扩容简单�
 
 ### 3.3 用户预期管理
 
-> novosdb 是**文档检索数据库**，不是关系型数据库，**不提供 SQL JOIN 能力**。但为常见的"数据关联"场景提供了多种高效替代方案（见 §4）。若业务需要复杂多表关联分析，建议将数据导出到专业 OLAP 引擎（如 ClickHouse），novosdb 提供一键导出工具。
+> shanshui-cunji 是**文档检索数据库**，不是关系型数据库，**不提供 SQL JOIN 能力**。但为常见的"数据关联"场景提供了多种高效替代方案（见 §4）。若业务需要复杂多表关联分析，建议将数据导出到专业 OLAP 引擎（如 ClickHouse），shanshui-cunji 提供一键导出工具。
 
 ---
 
@@ -101,7 +101,7 @@ design.md 1.2 明确承诺：**放弃跨分片 JOIN，换取水平扩容简单�
 **SDK 使用（Java / Python / Go）：**
 
 ```java
-// Novosdb SDK 提供开箱即用的 JOIN 辅助
+// shanshui-cunji SDK 提供开箱即用的 JOIN 辅助
 List<JoinedDoc> results = client.join()
     .from("orders")                // 主表
     .filter("status", "active")    // 主表筛选
@@ -170,7 +170,7 @@ client.put(doc).with_enrich(|doc| {
 
 **与 MongoDB / ES 物化视图差异：**
 
-| 特性 | MongoDB 物化视图 | novosdb 物化视图（设计） |
+| 特性 | MongoDB 物化视图 | shanshui-cunji 物化视图（设计） |
 | --- | --- | --- |
 | 实时性 | 增量更新（$merge） | 定时全量 / 增量重建（阶段 2） |
 | 存储位置 | 同一集合 | 独立文档集（利用现有索引） |
@@ -183,12 +183,12 @@ client.put(doc).with_enrich(|doc| {
 **数据流**：
 
 ```
-novosdb（主存储）─── 定时导出 ───→ Parquet 文件 ───→ ClickHouse（分析引擎）
+shanshui-cunji（主存储）─── 定时导出 ───→ Parquet 文件 ───→ ClickHouse（分析引擎）
                                                          ↑
                                                    BI 工具查询
 ```
 
-- 导出命令：`novosdb-export`，支持 Parquet / CSV / SQL INSERT 三种格式；
+- 导出命令：`shanshui-cunji-export`，支持 Parquet / CSV / SQL INSERT 三种格式；
 - **增量导出**：基于 `updated_at` 时间戳字段，支持断点续传，避免重复导出。
 
 ---
@@ -200,7 +200,7 @@ novosdb（主存储）─── 定时导出 ───→ Parquet 文件 ──�
 | 模块 | 位置 | 职责 | 落地阶段 |
 | --- | --- | --- | --- |
 | JOIN 执行器（应用层辅助） | `sdk/join.rs` | 二次查询 + 内存合并的标准化实现，支持 Left / Inner / Right Join | 阶段 1.5 |
-| 数据导出服务 | `tools/novosdb-export/` | 将文档集导出为 Parquet / CSV / SQL INSERT | 阶段 2 |
+| 数据导出服务 | `tools/shanshui-cunji-export/` | 将文档集导出为 Parquet / CSV / SQL INSERT | 阶段 2 |
 | 物化视图调度器 | `engine/mv_scheduler.rs` | 定时（Cron）或触发式执行聚合任务，写入结果文档 | 阶段 2 |
 | 关联字段索引提示 | `query/optimizer.rs` | 识别 JOIN 场景，建议使用主键点查或批量预取（不改变执行） | 阶段 1.5 |
 
@@ -323,14 +323,14 @@ client.put(doc)
     .execute();
 ```
 
-### 8.3 CLI：数据导出（novosdb-export）
+### 8.3 CLI：数据导出（shanshui-cunji-export）
 
 ```bash
 # 全量导出为 Parquet（供 ClickHouse/Spark 分析）
-novosdb-export --collection orders --format parquet --out /data/export/
+shanshui-cunji-export --collection orders --format parquet --out /data/export/
 
 # 增量导出（按 updated_at 断点续传）
-novosdb-export --collection orders --format parquet \
+shanshui-cunji-export --collection orders --format parquet \
     --since "2026-08-01T00:00:00Z" --resume
 ```
 
@@ -389,4 +389,4 @@ novosdb-export --collection orders --format parquet \
 
 **一句话概括**：
 
-> Novosdb 不提供 JOIN 语法，但提供了 **4 种高效的"数据关联"替代方案**，覆盖 95% 的真实业务需求。需要复杂关联分析的，请导出到专业 OLAP 引擎——这正是现代云原生架构"存储与计算分离"的正确姿势。
+> shanshui-cunji 不提供 JOIN 语法，但提供了 **4 种高效的"数据关联"替代方案**，覆盖 95% 的真实业务需求。需要复杂关联分析的，请导出到专业 OLAP 引擎——这正是现代云原生架构"存储与计算分离"的正确姿势。
