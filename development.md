@@ -809,7 +809,9 @@ impl RuntimePools {
    高并发 10k 连接类指标留待 M6 异步运行时；**发现并修复读路径回归**（`get_from_sst` 每次点查
    克隆整个 Level 2 精确索引致倒排查询挂起 → `locate_indexed_block` 按需取单条，恢复 2.4s）；
    报告 `images/perf-0.3.0/汇总报告.md` + 每规模 10 张截图（Edge headless）；
-8. **打 v0.3.0 标签**（版本号 + tag + 发布说明 + 推送）。
+8. ~~**打 v0.3.0 标签**~~ ✅（2026-08-28）：Cargo.toml 版本 0.2.1→0.3.0 + `RELEASE-v0.3.0.md` /
+   `RELEASE-SUMMARY-v0.3.0.md` / README 发布摘要更新 + `git tag v0.3.0` + 推送；阶段 3 全部完成，
+   测试 260 全绿，三规模 demo 10/10。
 
 ---
 
