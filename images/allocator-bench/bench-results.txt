@@ -1,0 +1,28 @@
+=== glibc-system ===
+[bench] threads=1 ops/thread=400000 allocator=system
+[bench] total_ops=400000 elapsed=1.594334625s qps=250888
+[bench] threads=2 ops/thread=400000 allocator=system
+[bench] total_ops=800000 elapsed=2.95127236s qps=271070
+[bench] threads=4 ops/thread=400000 allocator=system
+[bench] total_ops=1600000 elapsed=5.922250996s qps=270168
+=== glibc-mimalloc ===
+[bench] threads=1 ops/thread=400000 allocator=mimalloc
+[bench] total_ops=400000 elapsed=1.182837231s qps=338170
+[bench] threads=2 ops/thread=400000 allocator=mimalloc
+[bench] total_ops=800000 elapsed=2.291972939s qps=349044
+[bench] threads=4 ops/thread=400000 allocator=mimalloc
+[bench] total_ops=1600000 elapsed=4.572552619s qps=349914
+=== musl-system ===
+[bench] threads=1 ops/thread=400000 allocator=system
+[bench] total_ops=400000 elapsed=7.597248947s qps=52651
+[bench] threads=2 ops/thread=400000 allocator=system
+[bench] total_ops=800000 elapsed=11.518273667s qps=69455
+[bench] threads=4 ops/thread=400000 allocator=system
+[bench] total_ops=1600000 elapsed=53.092668778s qps=30136
+=== musl-mimalloc ===
+[bench] threads=1 ops/thread=400000 allocator=mimalloc
+[bench] total_ops=400000 elapsed=1.615047056s qps=247671
+[bench] threads=2 ops/thread=400000 allocator=mimalloc
+[bench] total_ops=800000 elapsed=2.74431417s qps=291512
+[bench] threads=4 ops/thread=400000 allocator=mimalloc
+[bench] total_ops=1600000 elapsed=5.360120631s qps=298501

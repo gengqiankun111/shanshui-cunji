@@ -5,8 +5,10 @@
 
 // 全局分配器：mimalloc（design 14 分配器策略，消除 musl 默认 malloc 全局锁瓶颈；
 // `#[global_allocator]` 声明无 unsafe，unsafe 实现在 mimalloc crate 内部，不违反零 unsafe 承诺）。
-// 需 jemalloc 时启用 feature `alloc-jemalloc`。
-#[cfg(not(feature = "alloc-jemalloc"))]
+// - 默认 feature `alloc-mimalloc`：mimalloc；
+// - `alloc-jemalloc`：tikv-jemallocator（mallctl purge + stats）；
+// - `--no-default-features`：不设置 global_allocator，用系统默认分配器（压测对比基线）。
+#[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
