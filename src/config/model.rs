@@ -232,6 +232,14 @@ impl Config {
                 "broadcast_query.max_concurrent / timeout_ms 必须 > 0".into(),
             ));
         }
+        if self.broadcast_query.term_cache_invalid_threshold == 0
+            || self.broadcast_query.term_cache_max_entries == 0
+        {
+            return Err(Error::Config(
+                "broadcast_query.term_cache_invalid_threshold / term_cache_max_entries 必须 > 0"
+                    .into(),
+            ));
+        }
         if self.compaction.stall_timeout_secs == 0 || self.compaction.max_consecutive_failures == 0 {
             return Err(Error::Config(
                 "compaction.stall_timeout_secs / max_consecutive_failures 必须 > 0".into(),
@@ -632,6 +640,14 @@ pub struct BroadcastQueryConfig {
     pub timeout_ms: u64,
     /// true 时拒绝不带 DocId 的查询（纯主键场景，防广播慢查询）。
     pub reject_without_shard_key: bool,
+    /// 网关全局 Term 缓存开关（design 9.9）。
+    pub term_cache_enabled: bool,
+    /// Term 缓存 TTL 兜底过期（秒，design 9.9 默认 5s，防脏读双保险）。
+    pub term_cache_ttl_secs: u64,
+    /// 某 Term 1 秒内写入超过此阈值 → 主动失效其全局缓存（design 9.9 默认 100）。
+    pub term_cache_invalid_threshold: u32,
+    /// Term 缓存最大条目数（LRU）。
+    pub term_cache_max_entries: usize,
 }
 
 impl Default for BroadcastQueryConfig {
@@ -640,6 +656,10 @@ impl Default for BroadcastQueryConfig {
             max_concurrent: 10,
             timeout_ms: 30000,
             reject_without_shard_key: false,
+            term_cache_enabled: true,
+            term_cache_ttl_secs: 5,
+            term_cache_invalid_threshold: 100,
+            term_cache_max_entries: 10_000,
         }
     }
 }
