@@ -1,6 +1,6 @@
 [package]
 name = "shanshui-cunji"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "山水存迹数据库（shanshui-cunji）：高性能海量文档数据库，LSM-Tree 高吞吐写入 + 倒排检索 + 文档模型 + 运维体系"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ crc32fast = "1"
 fst = "0.4"
 memmap2 = "0.9"
 csv = "1"
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [[bin]]
 name = "shanshui-cunji-migrate"
@@ -36,8 +36,15 @@ path = "src/bin/export.rs"
 name = "shanshui-cunji-import"
 path = "src/bin/import.rs"
 
+[[bin]]
+name = "shanshui-cunji-bench"
+path = "src/bin/bench.rs"
+
 [features]
-# 分配器策略：默认 mimalloc（轻量、高并发、边缘友好）；"alloc-jemalloc" 切 tikv-jemallocator（mallctl purge/stats）
+# 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；
+# `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）
+default = ["alloc-mimalloc"]
+alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies.tikv-jemallocator]

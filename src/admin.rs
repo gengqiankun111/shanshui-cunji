@@ -128,8 +128,10 @@ pub fn status(engine: &Engine) -> StatusReport {
     StatusReport {
         allocator: if cfg!(feature = "alloc-jemalloc") {
             "jemalloc".into()
-        } else {
+        } else if cfg!(feature = "alloc-mimalloc") {
             "mimalloc".into()
+        } else {
+            "system".into()
         },
         sst_file_count: s.sst_file_count,
         inverted_mem_docids: s.inverted_mem_docids,

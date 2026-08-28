@@ -660,6 +660,9 @@ impl RuntimePools {
    （轻量、边缘友好、无 unsafe 声明，不违反零 unsafe 承诺），feature `alloc-jemalloc`
    可选 tikv-jemallocator（mallctl purge + stats，Linux/musl 推荐）；
    测试 157 全绿（含 mimalloc 编译验证），check 六步链通过（P27）；
+   **实测（2026-08-28，阿里云 2 核，shanshui-cunji-bench 4 组合压测）**：glibc+mimalloc +30%（×1.3），
+   musl+mimalloc **×4.7/×4.2/×9.9**（1/2/4 线程）；musl-system 4 线程全局锁瓶颈暴跌至 30k QPS，
+   musl+mimalloc 298k 基本追平 glibc；数据与图表见 `images/allocator-bench/`；
 10. ~~**运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（分配器 stats + 命中率）+ `explain`（执行计划推演）~~ ✅（2026-08-28）：
     `src/admin.rs`（QueryRegistry 注册/注销/列表/KILL 标记，KILL 真正中断留阶段 2 CancellationToken）
     + `admin::status`（分配器 / SST 文件数 / 倒排 / 内存水位，CLI `admin status` + HTTP `/admin/status`）
