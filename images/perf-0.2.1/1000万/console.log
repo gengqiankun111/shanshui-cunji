@@ -1,0 +1,65 @@
+﻿[2m2026-08-28T13:24:35.371450Z[0m [33m WARN[0m [2mshanshui_cunji::config::model[0m[2m:[0m 配置文件 config.toml 不存在，使用默认配置
+
+═══ shanshui-cunji 0.2.1 功能冒烟测试（scale=10000000）═══
+
+[2m2026-08-28T13:24:35.412270Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:24:35.413609Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-28T13:24:35.413635Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-28T13:24:35.414019Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:24:35.415111Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:24:37.094501Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000001.seg
+[2m2026-08-28T13:24:38.934863Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000002.seg
+[2m2026-08-28T13:24:40.656421Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000003.seg
+[2m2026-08-28T13:24:42.944461Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000004.seg
+[2m2026-08-28T13:24:46.050678Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (4009718 条)
+[2m2026-08-28T13:24:48.153517Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000005.seg
+[2m2026-08-28T13:24:50.177341Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000006.seg
+[2m2026-08-28T13:24:52.239637Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000007.seg
+[2m2026-08-28T13:24:54.861281Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000008.seg
+[2m2026-08-28T13:24:57.793915Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (3993189 条)
+[2m2026-08-28T13:24:59.962898Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000009.seg
+[2m2026-08-28T13:25:02.077126Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000010.seg
+[2m2026-08-28T13:25:02.897005Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx-demo] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.115894Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.116666Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-28T13:25:05.116678Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-28T13:25:05.116916Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.117661Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.121389Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.122095Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-28T13:25:05.122106Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-28T13:25:05.122335Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.123031Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.126952Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.127668Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-28T13:25:05.127678Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-28T13:25:05.127934Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.128635Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.132729Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.133446Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-28T13:25:05.133455Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-28T13:25:05.133671Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:05.134431Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:25:49.323520Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1997193 条)
+[2m2026-08-28T13:25:56.647344Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 3 个 SST，下一个 id=4
+[2m2026-08-28T13:26:14.023032Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] WAL 回放 10000100 条，seq 推进至 10000101
+[2m2026-08-28T13:26:14.166807Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 10 个段，下一个 id=11
+[2m2026-08-28T13:26:14.169116Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 10/10 段
+[2m2026-08-28T13:26:14.169583Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-28T13:26:14.170274Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+功能               结果       耗时(ms)  说明
+----------------------------------------------------------------------------------------------------
+构造测试数据           ✅       1290.52  生成 10000000 条文档（status/city/amount 字段，city 写入倒排；流式生成 100000 条耗时 13 ms）
+批量插入             ✅      27476.09  写入 10000000 / 10000000 条，27476 ms（363953 条/s；WAL 攒批 + 定期倒排刷盘）
+查询 · 主键          ✅          1.31  100 次主键点查，命中 100，未命中 0（稀疏索引→布隆→Zone Map→块缓存）
+查询 · HotCache    ✅          0.02  100 次重复查询，HotCache 命中 100 / 100（写后回填 + 读后回填）
+查询 · 组合索引        ✅        175.66  status=active 前缀查询命中 100000 条（写入索引 100000 条）
+查询 · 倒排词条        ✅       2041.22  city=beijing 命中 2500000 条（预期 2500000）；抽样回表 200000/200000 条验证
+分片路由             ✅      42321.36  4 分片分布：shard0=2500000, shard1=2500000, shard2=2500000, shard3=2500000（合计 10000000）；分片点查命中 100/100
+删除               ✅        121.74  删除 100 条并验证不可见（Tombstone 落盘 + HotCache 失效）：100/100
+优化器路由            ✅          0.00  静态路由 5 类访问路径自检通过（主键点查/范围/组合索引/倒排/全扫）
+备份 · 还原          ✅      26625.75  备份 10000000 条库 → 还原重开：未删可读 45/45（缺失 0），已删仍不可见 5/5，city=beijing 计数 2500000（预期 2500000）
+----------------------------------------------------------------------------------------------------
+总计：10/10 通过
+
+📄 HTML 报告已生成: d:\traeprojs\shanshui-cunji\images\perf-0.2.1\1000万\report.html
