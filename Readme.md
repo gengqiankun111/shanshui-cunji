@@ -8,21 +8,23 @@
 
 ---
 
-## 📦 最新发布：v0.3.0（2026-08-28）
+## 📦 最新发布：v0.4.0（2026-08-28）
 
-> 核心亮点：**分布式集群（分片路由 + 网关 + 主从复制 + 无损扩容）** + **阶段 3 深度优化（热加载 / IO 限速 / Compaction / 增量导入 / 广播 JOIN / Redis 门面）**。
+> 核心亮点：**环形 WAL（高性能写入模式）** + **Leveled-Compaction 分层压实** + **MVCC 快照读** + **热点 key 自动缓存** + **增量备份**。
 
 | 维度 | 数据 |
 | --- | --- |
-| 批量插入 | 29.5~33.8 万条/s（1000万 / 2000万 / 5000万 三规模稳定）|
-| 倒排检索 | 近常量：1.25 亿命中 ~2.9s |
-| 热点查询 | 主键 0.02~0.35ms / HotCache 0.02ms |
-| 质量 | 260 测试全绿、demo 三规模 10/10、unsafe=0 |
+| 批量插入 | 38.6 万条/s（1000万 回归快检，10/10）|
+| 历史版本 | `get_at(docid, snapshot_seq)` 快照读 |
+| 增量备份 | seq 游标断点续传 + 缺口检测 |
+| 质量 | 279 测试全绿、demo 10/10、unsafe=0 |
 
-- **分布式**：一致性哈希分片路由（128 虚拟点/节点）+ 元数据中心 + 无状态网关（广播检索 Chunk 直拼 O(1)）；主从复制（async 攒批 / sync 等 ACK）+ 网关全局 Term 缓存；TDS 术语字典热备 + **无损扩容三步协议**（Shadow Writes → Delta Catch-up → Atomic Switch）；
-- **阶段 3**：`reload` 配置热加载、`io_rate_limit_mb` Token Bucket 限速、`compact` 基础 Compaction、`shanshui-cunji-import --incremental` 增量导入、小表广播 JOIN（`[join] broadcast_enabled`）、Redis 冷热分层 SDK 门面（`ShanshuiCunjiWithRedis`）；
-- **性能**：实测对照 design 9.5（组提交写入与热点查询达成/超出目标），并修复 M5 遗留读路径回归（Level 2 索引按需取）；
-- 完整发布说明见 [RELEASE-v0.3.0.md](./RELEASE-v0.3.0.md)，性能实测存档见 `images/perf-0.3.0/`。
+- **环形 WAL（design 4.3）**：预分配环形文件 + 写指针循环，覆盖安全 + 崩溃安全；`[storage] wal_mode="ring"` 可选开启；
+- **Leveled-Compaction（design 4.5 二期）**：SST 分层（Manifest 层号，旧库兼容），L0→L1 / L1→L2 有界压实；
+- **MVCC 快照读（design 4.7）**：`begin_snapshot()` + `get_at(docid, snap)` 读历史版本（删除前快照仍可见）；
+- **热点 key 自动缓存（design 14.1.2）**：访问计数达 `hotcache.hot_threshold` 自动晋升保护区，淘汰避让；
+- **增量备份（design 20）**：`backup_incremental(since_seq)` 导出 WAL 增量 + `restore_incremental` 恢复；
+- 完整发布说明见 [RELEASE-v0.4.0.md](./RELEASE-v0.4.0.md)，性能快检存档见 `images/perf-0.4.0/`。
 
 ---
 

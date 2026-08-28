@@ -34,6 +34,9 @@ pub enum Error {
     #[error("stalled: {0}")]
     Stalled(String),
 
+    #[error("wal full: {0}")]
+    WalFull(String),
+
     #[error("migrate error: {0}")]
     Migrate(String),
 
