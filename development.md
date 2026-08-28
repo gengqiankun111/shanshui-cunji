@@ -709,7 +709,13 @@ impl RuntimePools {
      跨进程 `RpcShardEndpoint`（真实 TCP）；红线遵守（design 9.4：不跨片 JOIN/事务，只合并 DocId）；
    - **端到端验证**：2 个 Engine 分片节点真实 TCP 启动 + 元数据中心 + 网关 → 写入路由到归属节点、
      主键点查、广播检索跨片直拼、探活全通过；
-   - 复制（主→从异步/sync 数据同步）与元数据中心自动故障切换留阶段 2 后续；测试 197 全绿（+15）；
+   - 复制（主→从 async/sync）见下方补充；元数据中心自动故障切换留阶段 2 后续；测试 197 全绿（+15）；
+  3.1. ~~**主从复制（design 9.3）**~~ ✅（2026-08-28）：
+    `src/replication.rs`：`ReplicationLog`（追加持久化 + seq 单调游标，崩溃重启恢复未推送增量）；
+    `Replicator`（async 攒批后台推送 / **sync 立即推送等 Slave ACK** `ack_timeout_ms`，复用 RPC 连接）；
+    Slave 侧 `register_repl_handlers` 暴露 `repl.apply`（批量幂等应用 put/delete + 返回 acked_seq）；
+    接入点 = 分片节点 `shard.put`（单机内核零修改）；测试验证 sync 即时落 slave / async 按需推送 /
+    delete 传播 / 无 slave noop / 重启恢复；
 4. ~~**看门狗补全：写停滞假死检测自愈 + Sidecar 探针**~~ ✅（2026-08-28，检测/自愈判定 + 心跳基座）：
    `watchdog::StallWatchdog`（design 14.2）：周期采样 L0 文件数，`compaction.stall_timeout_secs`（默认 60s）
    内无减少判 Compaction 假死 → 自愈信号（中断 Compaction + 重置调度器由存储层接动作），连续
@@ -717,7 +723,12 @@ impl RuntimePools {
    `watchdog::HeartbeatSidecar` + `HeartbeatProbe`（design 14.4 MVP：独立探活线程 + 文件锁心跳，
    `sidecar.ping_interval_sec` 默认 5s × `max_missed_pings` 默认 3 判死锁；禁止 fork，独立子进程拉起留阶段 2 后续）；
    配置新增 `[compaction]` / `[sidecar]`（design 14.5）；测试 176 全绿（+5 假死判定/恢复/FatalExit/心跳存活/缺失判死）；
-5. **网关全局 Term 缓存** + 失效心跳；
+5. ~~**网关全局 Term 缓存** + 失效心跳~~ ✅（2026-08-28，缓存 + 写计数失效 + TTL 兜底）：
+   `src/term_cache.rs`（design 9.9）：Key = (节点 ID, Term)，Value = 压缩 RoaringBitmap（LRU `term_cache_max_entries`）；
+   **命中直出**（广播查询不透传后端分片，测试用计数端点验证 0 回源）+ **TTL 兜底**（`term_cache_ttl_secs` 默认 5s，过期重查）
+   + **写计数失效**（`term_cache_invalid_threshold` 默认 100：1 秒窗口写入超阈值 → 主动失效该 Term 全节点缓存）；
+   网关 `put` 记录写计数、`broadcast_search` 命中直出/未命中回填；配置见 `[broadcast_query]`；
+   测试 197→211（+14：复制 6 + Term 缓存 5 + 网关集成 3）；失效心跳（节点写计数 → RPC 通知网关）留阶段 2 后续；
 6. **术语字典热备 TDS**；
 7. **无损扩容协议（design 9.1.1）**：双写（Shadow Writes）→ 数据追平（Delta Catch-up，SST 拷贝 + WAL 增量回放）→ 原子切换（Atomic Switch，1s 内）+ 5s 回滚预案，业务零感知、数据零丢失；
 8. **数据关联增强（design 19）**：物化视图调度器 + `shanshui-cunji-export` 导出工具 + JOIN 计划节点本地执行（单分片内）；
