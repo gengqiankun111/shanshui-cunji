@@ -168,6 +168,12 @@
 - **注意**：Writer 的整文件布隆字段移除（分区布隆按块内实际 key 数构建，`expected_keys` 参数不再用于布隆），`new_with_pax` 新增 `bloom_fpr` 参数（`sstable.bloom_fpr` 默认 0.01）。
 - **提交**：随 M4 块级压缩 + 分区布隆提交（本轮）
 
+### P27. musl 默认 malloc 全局锁瓶颈 → 全局分配器替换（design 14.0）
+- **背景**：musl 分配器全进程单把互斥锁，数据库（高频小块分配：JSON/MemTable/SST 解压/倒排/HTTP）高并发下 alloc/dealloc 排队串行，极端场景吞吐差 2~7 倍；项目目标含 musl 静态部署（已交叉验证）+ 阶段 2 分布式。
+- **方案**：`#[global_allocator]` 默认 **mimalloc**（轻量、边缘友好、高并发好；声明本身无 unsafe，unsafe 在 crate 内部，不违反 `#![forbid(unsafe_code)]`，157 测试验证通过）；feature `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge + stats，Linux/musl 推荐）。
+- **坑**：jemalloc 在 Windows gnu 交叉工具链 configure 失败（mingw host C 构建问题，非项目缺陷）——文档注明 alloc-jemalloc 仅 Linux/musl 目标使用；`#[global_allocator]` 编译期决定、feature 互斥。
+- **提交**：随分配器加固提交（本轮）
+
 ---
 
 ## 环境备忘（不入库）
