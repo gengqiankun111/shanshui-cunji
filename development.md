@@ -631,7 +631,12 @@ impl RuntimePools {
    倒排 term 升级为 `field=value` 字段维度编码（段格式 v2），`InvertedIndex::doc_count` /
    `iter_terms` / `group_by`，HTTP `GET /count`、`GET /groupby`，CLI `count` / `groupby`；
    测试：137 全绿（含聚合 4 项 + 端到端断言），CLI 冒烟验证（design 5.17 / quality 报告）；
-6. **FST + Mmap 字典**（与 Checkpoint 共存，无缝过渡）；
+6. ~~**FST + Mmap 字典**（与 Checkpoint 共存，无缝过渡）~~ ✅（2026-08-28）：
+   每段刷盘编译 `inverted-{id}.fst` 术语字典（term → 段内条目偏移，`fst` crate），
+   查询 O(len(term)) 精确定位、旧段回退线性扫描；字典启动加载 + 刷盘即时更新，
+   `inverted.engine` 默认切 "fst"（design 5.2.4.1）；注意：`#![forbid(unsafe_code)]`
+   下 memmap2 的 mmap 为 unsafe API，字典暂用 fs::read 加载（FST 压缩结构体积小），
+   mmap 化留待独立 crate 封装 unsafe 白名单（P23）；
 7. **迁移工具基础版（shanshui-cunji-migrate）**（解决 G2）：支持 mysqldump / CSV 全量导入；
 8. **数据关联基础（design 19）**：SDK `queryAndJoin` 二次查询 + 写入 Enrich 预连接；
 9. **块级压缩（Zstd Level 3）+ 分区布隆过滤器（design 4.4.2）**：存储再降 40%~60%、布隆内存减半；
