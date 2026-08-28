@@ -1,6 +1,6 @@
 [package]
 name = "shanshui-cunji"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "山水存迹数据库（shanshui-cunji）：高性能海量文档数据库，LSM-Tree 高吞吐写入 + 倒排检索 + 文档模型 + 运维体系"
 license = "Apache-2.0"

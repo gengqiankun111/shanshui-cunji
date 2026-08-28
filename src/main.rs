@@ -128,6 +128,8 @@ fn main() {
         "count" => run_cli_count(&config_path, &field, &value),
         "groupby" => run_cli_group_by(&config_path, &field),
         "admin" => run_cli_admin(&config_path),
+        "reload" => run_cli_reload_config(&config_path),
+        "compact" => run_cli_compact(&config_path),
         "explain" => run_cli_explain(&config_path, &filter),
         "delete" => run_cli_delete(&config_path, id),
         "version" | "-V" | "--version" => {
@@ -574,22 +576,105 @@ fn run_cli_admin(config_path: &Path) {
     let cfg = load_config(config_path);
     let cs = shanshui_cunji::admin::cluster_status(&cfg);
     println!("集群配置：");
-    println!("  模式: {}（节点 {}，内部 RPC {}）", cs.mode, cs.node_id, cs.internal_rpc_port);
+    println!(
+        "  模式: {}（节点 {}，内部 RPC {}）",
+        cs.mode, cs.node_id, cs.internal_rpc_port
+    );
     println!(
         "  分片: {}（虚拟分片 {}，总物理分片 {}，一致性哈希 {}）",
-        if cs.sharding_enabled { "开启" } else { "关闭" },
+        if cs.sharding_enabled {
+            "开启"
+        } else {
+            "关闭"
+        },
         cs.virtual_shards,
         cs.total_shards,
         if cs.consistent_hash { "是" } else { "否" }
     );
     println!(
         "  副本: {}（角色 {}，模式 {}，Master {}）",
-        if cs.replication_enabled { "开启" } else { "关闭" },
+        if cs.replication_enabled {
+            "开启"
+        } else {
+            "关闭"
+        },
         cs.replication_role,
         cs.sync_mode,
-        if cs.master_addr.is_empty() { "-" } else { &cs.master_addr }
+        if cs.master_addr.is_empty() {
+            "-"
+        } else {
+            &cs.master_addr
+        }
     );
     println!("  广播查询并发上限: {}", cs.broadcast_max_concurrent);
+}
+
+/// `reload`（design 7.4 / 阶段 3）：配置热加载校验——重新读取并校验配置文件，
+/// 输出相对默认配置的变更区块（运行中服务可据此决定重建哪些组件）。
+fn run_cli_reload_config(config_path: &Path) {
+    let mut cfg = match shanshui_cunji::config::Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ 配置校验失败（保持原配置不变）: {e}");
+            std::process::exit(1);
+        }
+    };
+    // 热加载语义：原地 reload（读取→校验→替换），此处加载即校验通过
+    let rep = match cfg.reload(config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("❌ 热加载失败（保持原配置不变）: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("✅ 配置热加载通过: {}", config_path.display());
+    println!(
+        "  变更区块: {}",
+        if rep.changed_sections.is_empty() {
+            "无（配置未变化）".into()
+        } else {
+            rep.changed_sections.join(", ")
+        }
+    );
+    println!(
+        "  运行模式: {}（节点 {}）",
+        cfg.server.mode, cfg.cluster.node_id
+    );
+    println!(
+        "  监听: {} · 分配器: {}",
+        cfg.server.listen_addr,
+        if cfg!(feature = "alloc-jemalloc") {
+            "jemalloc"
+        } else if cfg!(feature = "alloc-mimalloc") {
+            "mimalloc"
+        } else {
+            "system"
+        }
+    );
+}
+
+/// `compact`（design 4.5 / 阶段 3）：主数据列族全量合并（L0 多 SST → 1）。
+fn run_cli_compact(config_path: &Path) {
+    let mut engine = open_engine(config_path);
+    match engine.compact() {
+        Ok(rep) => {
+            if rep.merged_ssts <= 1 {
+                println!("无需 Compaction（SST 段数 ≤ 1）");
+                return;
+            }
+            println!(
+                "✅ Compaction 完成: 合并 {} 个 SST → 消除 {} 个旧版本键，释放 {} 字节",
+                rep.merged_ssts, rep.kept_keys, rep.freed_bytes
+            );
+            if engine.needs_compact() {
+                println!("⚠️ 提示: 段数仍超阈值，建议再次 compact");
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Compaction 失败: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `explain --filter 'status=active'`（development 5.26）：执行计划推演，不读数据。
@@ -687,7 +772,11 @@ fn run_server(config_path: &Path) {
         "shanshui-cunji {VERSION} 启动: data_dir={}",
         data_dir.display()
     );
-    if let Err(e) = shanshui_cunji::server::serve(&mut engine, &cfg.server.listen_addr) {
+    let broadcast = Some(shanshui_cunji::join::JoinBroadcast {
+        enabled: cfg.join.broadcast_enabled,
+        threshold: cfg.join.broadcast_threshold,
+    });
+    if let Err(e) = shanshui_cunji::server::serve(&mut engine, &cfg.server.listen_addr, broadcast) {
         eprintln!("❌ 服务异常退出: {e}");
         std::process::exit(1);
     }

@@ -168,9 +168,16 @@ impl<E: ShardEndpoint> Gateway<E> {
 
     /// 阶段一：开始迁移（新节点加入，暂不接收读流量）。返回需迁移的虚拟分片数。
     /// 计算新旧节点集合下归属变化的虚拟分片，进入双写（Shadow Writes）。
-    pub fn begin_migration(&mut self, new_node: &str, new_addr: &str, new_role: &str) -> Result<usize> {
+    pub fn begin_migration(
+        &mut self,
+        new_node: &str,
+        new_addr: &str,
+        new_role: &str,
+    ) -> Result<usize> {
         if self.migration.is_some() {
-            return Err(Error::Cluster("已有迁移进行中，请先 commit 或 abort".into()));
+            return Err(Error::Cluster(
+                "已有迁移进行中，请先 commit 或 abort".into(),
+            ));
         }
         let old_nodes = self.meta.node_ids();
         if old_nodes.contains(&new_node.to_string()) {
@@ -316,11 +323,8 @@ impl ShardEndpoint for LocalShardEndpoint {
             .shards
             .get(node)
             .ok_or_else(|| Error::Cluster(format!("未知节点: {node}")))?;
-        let mut rows: Vec<(u64, String)> = shard
-            .docs
-            .iter()
-            .map(|(d, v)| (*d, v.clone()))
-            .collect();
+        let mut rows: Vec<(u64, String)> =
+            shard.docs.iter().map(|(d, v)| (*d, v.clone())).collect();
         rows.sort_by_key(|(d, _)| *d);
         Ok(rows)
     }
@@ -385,7 +389,9 @@ impl ShardEndpoint for RpcShardEndpoint {
     }
 
     fn get(&mut self, node: &str, docid: u64) -> Result<Option<String>> {
-        let r = self.client(node)?.call("shard.get", json!({"docid": docid}))?;
+        let r = self
+            .client(node)?
+            .call("shard.get", json!({"docid": docid}))?;
         if r["found"].as_bool().unwrap_or(false) {
             Ok(r["data"].as_str().map(|s| s.to_string()))
         } else {
@@ -414,12 +420,7 @@ impl ShardEndpoint for RpcShardEndpoint {
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|v| {
-                        Some((
-                            v["docid"].as_u64()?,
-                            v["data"].as_str()?.to_string(),
-                        ))
-                    })
+                    .filter_map(|v| Some((v["docid"].as_u64()?, v["data"].as_str()?.to_string())))
                     .collect()
             })
             .unwrap_or_default();
@@ -465,14 +466,19 @@ mod tests {
 
     #[test]
     fn put_and_get_route_to_owning_node() {
-        let meta = meta_with(&[("n1", "127.0.0.1:1", "master"), ("n2", "127.0.0.1:2", "slave")]);
+        let meta = meta_with(&[
+            ("n1", "127.0.0.1:1", "master"),
+            ("n2", "127.0.0.1:2", "slave"),
+        ]);
         let mut gw = Gateway::new(meta.clone(), LocalShardEndpoint::with_nodes(&["n1", "n2"]));
 
         // 写入：必须落在 resolve(docid) 指向的节点
         let docids = [1u64, 2, 42, 777, 123_456, 9_999_999];
         for d in docids {
             let owner = gw.meta().resolve(d).unwrap().node_id.clone();
-            let routed = gw.put(d, &format!("{{\"d\":{d}}}"), &terms(&["k=v"])).unwrap();
+            let routed = gw
+                .put(d, &format!("{{\"d\":{d}}}"), &terms(&["k=v"]))
+                .unwrap();
             assert_eq!(routed, owner, "写入必须路由到归属节点");
         }
         // 主键点查：全命中
@@ -493,7 +499,10 @@ mod tests {
             ("n2", "127.0.0.1:2", "slave"),
             ("n3", "127.0.0.1:3", "slave"),
         ]);
-        let mut gw = Gateway::new(meta.clone(), LocalShardEndpoint::with_nodes(&["n1", "n2", "n3"]));
+        let mut gw = Gateway::new(
+            meta.clone(),
+            LocalShardEndpoint::with_nodes(&["n1", "n2", "n3"]),
+        );
 
         // 写入 300 条：只给 n1 的 term 加词条，其他节点无该词条
         for d in 1..=300u64 {
@@ -528,7 +537,10 @@ mod tests {
 
     #[test]
     fn ping_all_reports_dead_nodes() {
-        let meta = meta_with(&[("n1", "127.0.0.1:1", "master"), ("n2", "127.0.0.1:2", "slave")]);
+        let meta = meta_with(&[
+            ("n1", "127.0.0.1:1", "master"),
+            ("n2", "127.0.0.1:2", "slave"),
+        ]);
         let mut gw = Gateway::new(meta, LocalShardEndpoint::with_nodes(&["n1"])); // n2 未建 → 失活
         let dead = gw.ping_all();
         assert_eq!(dead, vec!["n2".to_string()]);
@@ -566,15 +578,14 @@ mod tests {
         let addr1 = spawn_shard_node(d1.path());
         let addr2 = spawn_shard_node(d2.path());
 
-        let meta = meta_with(&[
-            ("node-a", &addr1, "master"),
-            ("node-b", &addr2, "slave"),
-        ]);
+        let meta = meta_with(&[("node-a", &addr1, "master"), ("node-b", &addr2, "slave")]);
         let mut gw = Gateway::new(meta.clone(), RpcShardEndpoint::new(meta));
 
         // 写入（路由到归属节点）
         for d in 1..=200u64 {
-            let _ = gw.put(d, &format!("{{\"d\":{d}}}"), &terms(&["status=active"])).unwrap();
+            let _ = gw
+                .put(d, &format!("{{\"d\":{d}}}"), &terms(&["status=active"]))
+                .unwrap();
         }
         // 主键点查
         for d in [1u64, 100, 200] {
@@ -624,12 +635,16 @@ mod tests {
 
     #[test]
     fn term_cache_hit_serves_without_backend_calls() {
-        let meta = meta_with(&[("n1", "127.0.0.1:1", "master"), ("n2", "127.0.0.1:2", "slave")]);
+        let meta = meta_with(&[
+            ("n1", "127.0.0.1:1", "master"),
+            ("n2", "127.0.0.1:2", "slave"),
+        ]);
         let endpoint = CountingEndpoint {
             inner: LocalShardEndpoint::with_nodes(&["n1", "n2"]),
             searches: 0,
         };
-        let cache = crate::term_cache::TermCache::new(1000, std::time::Duration::from_secs(60), 100);
+        let cache =
+            crate::term_cache::TermCache::new(1000, std::time::Duration::from_secs(60), 100);
         let mut gw = Gateway::new_with_term_cache(meta, endpoint, cache);
 
         for d in 1..=50u64 {
@@ -716,7 +731,11 @@ mod tests {
         // 扩容前存量数据（terms 与 data 字段一致，catch_up 用 extract_terms 重新派生）
         for d in 1..=200u64 {
             let _ = gw
-                .put(d, &format!("{{\"status\":\"active\",\"d\":{d}}}"), &terms(&["status=active"]))
+                .put(
+                    d,
+                    &format!("{{\"status\":\"active\",\"d\":{d}}}"),
+                    &terms(&["status=active"]),
+                )
                 .unwrap();
         }
 
@@ -729,7 +748,11 @@ mod tests {
         let mut shadowed = 0;
         for d in 201..=220u64 {
             let _ = gw
-                .put(d, &format!("{{\"status\":\"active\",\"d\":{d}}}"), &terms(&["status=active"]))
+                .put(
+                    d,
+                    &format!("{{\"status\":\"active\",\"d\":{d}}}"),
+                    &terms(&["status=active"]),
+                )
                 .unwrap();
             if moved_set.contains(&vs_of(d, 1024)) {
                 shadowed += 1;
@@ -752,7 +775,10 @@ mod tests {
         // 追平后 n3 拥有全部迁移分片存量数据
         for d in 1..=200u64 {
             if moved_set.contains(&vs_of(d, 1024)) {
-                assert!(gw.endpoint.get("n3", d).unwrap().is_some(), "追平缺失: docid={d}");
+                assert!(
+                    gw.endpoint.get("n3", d).unwrap().is_some(),
+                    "追平缺失: docid={d}"
+                );
             }
         }
 
@@ -760,13 +786,19 @@ mod tests {
         let switched = gw.commit_migration().unwrap();
         assert_eq!(switched, moved);
         assert!(gw.migration().is_none(), "切换后双写关闭");
-        assert!(gw.meta().node_ids().contains(&"n3".to_string()), "n3 已入元数据中心");
+        assert!(
+            gw.meta().node_ids().contains(&"n3".to_string()),
+            "n3 已入元数据中心"
+        );
 
         // 切换后：迁移分片读路由到 n3 且数据完整（业务零感知）
         for d in 1..=220u64 {
             if moved_set.contains(&vs_of(d, 1024)) {
                 let v = gw.get(d).unwrap().unwrap();
-                assert!(v.contains(&format!("\"d\":{d}")), "切换后读取失败 docid={d}");
+                assert!(
+                    v.contains(&format!("\"d\":{d}")),
+                    "切换后读取失败 docid={d}"
+                );
             }
         }
         // 广播检索全量一致（三节点 Chunk 直拼）
@@ -778,7 +810,8 @@ mod tests {
     fn reshard_abort_keeps_old_routing() {
         let meta = meta_with(&[("n1", "127.0.0.1:1", "master")]);
         let mut gw = Gateway::new(meta.clone(), LocalShardEndpoint::with_nodes(&["n1"]));
-        gw.put(1, "{\"status\":\"active\"}", &terms(&["status=active"])).unwrap();
+        gw.put(1, "{\"status\":\"active\"}", &terms(&["status=active"]))
+            .unwrap();
 
         let moved = gw.begin_migration("n2", "127.0.0.1:2", "slave").unwrap();
         assert!(moved > 0);
@@ -787,7 +820,11 @@ mod tests {
         assert!(gw.migration().is_none());
         assert!(!gw.meta().node_ids().contains(&"n2".to_string()));
         for d in 0..2000u64 {
-            assert_eq!(gw.meta().resolve(d).unwrap().node_id, "n1", "回滚后路由必须不变");
+            assert_eq!(
+                gw.meta().resolve(d).unwrap().node_id,
+                "n1",
+                "回滚后路由必须不变"
+            );
         }
         // 数据完好
         assert!(gw.get(1).unwrap().is_some());
@@ -798,6 +835,9 @@ mod tests {
         let meta = meta_with(&[("n1", "127.0.0.1:1", "master")]);
         let mut gw = Gateway::new(meta, LocalShardEndpoint::with_nodes(&["n1"]));
         gw.begin_migration("n2", "127.0.0.1:2", "slave").unwrap();
-        assert!(gw.begin_migration("n2", "127.0.0.1:2", "slave").is_err(), "重复迁移应拒绝");
+        assert!(
+            gw.begin_migration("n2", "127.0.0.1:2", "slave").is_err(),
+            "重复迁移应拒绝"
+        );
     }
 }

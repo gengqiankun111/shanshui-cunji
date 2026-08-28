@@ -32,7 +32,10 @@ pub enum AggValue {
     Count(u64),
     Sum(f64),
     /// 均值：sum / count。
-    Avg { sum: f64, count: u64 },
+    Avg {
+        sum: f64,
+        count: u64,
+    },
 }
 
 impl AggValue {
@@ -152,10 +155,10 @@ impl MaterializedView {
                                 .or_insert(AggValue::Sum(v));
                         }
                         _ => {
-                            let e = self.groups.entry(dim).or_insert(AggValue::Avg {
-                                sum: 0.0,
-                                count: 0,
-                            });
+                            let e = self
+                                .groups
+                                .entry(dim)
+                                .or_insert(AggValue::Avg { sum: 0.0, count: 0 });
                             if let AggValue::Avg { sum, count } = e {
                                 *sum += v;
                                 *count += 1;
@@ -231,7 +234,10 @@ impl MvScheduler {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let fname = e.file_name().to_string_lossy().into_owned();
-                if let Some(stem) = fname.strip_prefix("mv-").and_then(|s| s.strip_suffix(".json")) {
+                if let Some(stem) = fname
+                    .strip_prefix("mv-")
+                    .and_then(|s| s.strip_suffix(".json"))
+                {
                     let def = MvDefinition {
                         name: stem.to_string(),
                         dimension: String::new(),
@@ -244,7 +250,10 @@ impl MvScheduler {
                 }
             }
         }
-        Ok(Self { dir: dir.to_path_buf(), views })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            views,
+        })
     }
 
     /// 创建（或覆盖）视图。已存在同名视图返回错误（避免误覆盖）。
@@ -253,7 +262,10 @@ impl MvScheduler {
             return Err(Error::Config(format!("物化视图已存在: {}", def.name)));
         }
         let v = MaterializedView::open(def.clone(), &self.dir)?;
-        info!("物化视图创建: {}（维度 {}，聚合 {:?}）", def.name, def.dimension, def.agg);
+        info!(
+            "物化视图创建: {}（维度 {}，聚合 {:?}）",
+            def.name, def.dimension, def.agg
+        );
         self.views.insert(def.name, v);
         Ok(())
     }
@@ -335,40 +347,81 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Sum
         let mut sum_mv = MaterializedView::open(
-            MvDefinition { name: "sum".into(), dimension: "city".into(), agg_field: "amount".into(), agg: AggFn::Sum },
+            MvDefinition {
+                name: "sum".into(),
+                dimension: "city".into(),
+                agg_field: "amount".into(),
+                agg: AggFn::Sum,
+            },
             dir.path(),
-        ).unwrap();
-        sum_mv.refresh(&[(1, doc("beijing", 10.0)), (2, doc("beijing", 20.0)), (3, doc("shanghai", 5.0))]).unwrap();
+        )
+        .unwrap();
+        sum_mv
+            .refresh(&[
+                (1, doc("beijing", 10.0)),
+                (2, doc("beijing", 20.0)),
+                (3, doc("shanghai", 5.0)),
+            ])
+            .unwrap();
         assert_eq!(sum_mv.query("beijing"), Some(&AggValue::Sum(30.0)));
         assert_eq!(sum_mv.query("beijing").unwrap().as_number(), 30.0);
         // Avg
         let mut avg_mv = MaterializedView::open(
-            MvDefinition { name: "avg".into(), dimension: "city".into(), agg_field: "amount".into(), agg: AggFn::Avg },
+            MvDefinition {
+                name: "avg".into(),
+                dimension: "city".into(),
+                agg_field: "amount".into(),
+                agg: AggFn::Avg,
+            },
             dir.path(),
-        ).unwrap();
-        avg_mv.refresh(&[(1, doc("beijing", 10.0)), (2, doc("beijing", 20.0))]).unwrap();
-        assert_eq!(avg_mv.query("beijing"), Some(&AggValue::Avg { sum: 30.0, count: 2 }));
+        )
+        .unwrap();
+        avg_mv
+            .refresh(&[(1, doc("beijing", 10.0)), (2, doc("beijing", 20.0))])
+            .unwrap();
+        assert_eq!(
+            avg_mv.query("beijing"),
+            Some(&AggValue::Avg {
+                sum: 30.0,
+                count: 2
+            })
+        );
         assert_eq!(avg_mv.query("beijing").unwrap().as_number(), 15.0);
         // 无数值字段文档被跳过（Sum 不计数）
         sum_mv.refresh(&[(4, json!({"city": "beijing"}))]).unwrap();
-        assert_eq!(sum_mv.query("beijing"), Some(&AggValue::Sum(30.0)), "无数值字段不参与 Sum");
+        assert_eq!(
+            sum_mv.query("beijing"),
+            Some(&AggValue::Sum(30.0)),
+            "无数值字段不参与 Sum"
+        );
     }
 
     #[test]
     fn incremental_refresh_uses_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let mut mv = MaterializedView::open(
-            MvDefinition { name: "v".into(), dimension: "city".into(), agg_field: String::new(), agg: AggFn::Count },
+            MvDefinition {
+                name: "v".into(),
+                dimension: "city".into(),
+                agg_field: String::new(),
+                agg: AggFn::Count,
+            },
             dir.path(),
-        ).unwrap();
-        mv.refresh(&[(1, doc("a", 0.0)), (2, doc("b", 0.0)), (3, doc("a", 0.0))]).unwrap();
+        )
+        .unwrap();
+        mv.refresh(&[(1, doc("a", 0.0)), (2, doc("b", 0.0)), (3, doc("a", 0.0))])
+            .unwrap();
         // 重复刷新同一批次 → 全部被游标跳过（不重复计数）
-        let r = mv.refresh(&[(1, doc("a", 0.0)), (2, doc("b", 0.0))]).unwrap();
+        let r = mv
+            .refresh(&[(1, doc("a", 0.0)), (2, doc("b", 0.0))])
+            .unwrap();
         assert_eq!(r.processed, 0);
         assert_eq!(r.skipped, 2);
         assert_eq!(mv.query("a"), Some(&AggValue::Count(2)));
         // 增量批次（更高 docid）只处理新增
-        let r = mv.refresh(&[(4, doc("a", 0.0)), (5, doc("c", 0.0))]).unwrap();
+        let r = mv
+            .refresh(&[(4, doc("a", 0.0)), (5, doc("c", 0.0))])
+            .unwrap();
         assert_eq!(r.processed, 2);
         assert_eq!(mv.query("a"), Some(&AggValue::Count(3)));
         assert_eq!(mv.query("c"), Some(&AggValue::Count(1)));
@@ -379,21 +432,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut mv = MaterializedView::open(
-                MvDefinition { name: "p".into(), dimension: "city".into(), agg_field: "amount".into(), agg: AggFn::Sum },
+                MvDefinition {
+                    name: "p".into(),
+                    dimension: "city".into(),
+                    agg_field: "amount".into(),
+                    agg: AggFn::Sum,
+                },
                 dir.path(),
-            ).unwrap();
-            mv.refresh(&[(1, doc("beijing", 7.0)), (2, doc("beijing", 3.0))]).unwrap();
+            )
+            .unwrap();
+            mv.refresh(&[(1, doc("beijing", 7.0)), (2, doc("beijing", 3.0))])
+                .unwrap();
         }
         // 重启恢复：分组 + 游标
         let mut mv2 = MaterializedView::open(
-            MvDefinition { name: "p".into(), dimension: "city".into(), agg_field: "amount".into(), agg: AggFn::Sum },
+            MvDefinition {
+                name: "p".into(),
+                dimension: "city".into(),
+                agg_field: "amount".into(),
+                agg: AggFn::Sum,
+            },
             dir.path(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(mv2.query("beijing"), Some(&AggValue::Sum(10.0)));
         assert_eq!(mv2.cursor(), 2);
         // 增量续跑：只处理新 docid
-        mv2.refresh(&[(1, doc("beijing", 100.0)), (3, doc("beijing", 5.0))]).unwrap();
-        assert_eq!(mv2.query("beijing"), Some(&AggValue::Sum(15.0)), "旧 docid 不重复计数");
+        mv2.refresh(&[(1, doc("beijing", 100.0)), (3, doc("beijing", 5.0))])
+            .unwrap();
+        assert_eq!(
+            mv2.query("beijing"),
+            Some(&AggValue::Sum(15.0)),
+            "旧 docid 不重复计数"
+        );
     }
 
     #[test]
@@ -405,13 +476,25 @@ mod tests {
             dimension: "status".into(),
             agg_field: String::new(),
             agg: AggFn::Count,
-        }).unwrap();
-        assert!(s.create(MvDefinition { name: "by-status".into(), dimension: "x".into(), agg_field: String::new(), agg: AggFn::Count }).is_err(), "重复创建拒绝");
-        let reports = s.refresh_all(&[
-            (1, json!({"status": "active"})),
-            (2, json!({"status": "pending"})),
-            (3, json!({"status": "active"})),
-        ]).unwrap();
+        })
+        .unwrap();
+        assert!(
+            s.create(MvDefinition {
+                name: "by-status".into(),
+                dimension: "x".into(),
+                agg_field: String::new(),
+                agg: AggFn::Count
+            })
+            .is_err(),
+            "重复创建拒绝"
+        );
+        let reports = s
+            .refresh_all(&[
+                (1, json!({"status": "active"})),
+                (2, json!({"status": "pending"})),
+                (3, json!({"status": "active"})),
+            ])
+            .unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].processed, 3);
         assert_eq!(s.query("by-status", "active"), Some(&AggValue::Count(2)));

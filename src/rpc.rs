@@ -73,7 +73,10 @@ impl RpcServer {
     where
         F: Fn(&Value) -> std::result::Result<Value, String> + Send + Sync + 'static,
     {
-        self.handlers.lock().unwrap().insert(method.to_string(), Arc::new(f));
+        self.handlers
+            .lock()
+            .unwrap()
+            .insert(method.to_string(), Arc::new(f));
     }
 
     /// 阻塞监听；每连接一个线程处理（循环读取帧，直到断开或出错）。
@@ -191,12 +194,12 @@ impl RpcClient {
             method: method.to_string(),
             params,
         };
-        let payload = serde_json::to_vec(&req)
-            .map_err(|e| Error::Rpc(format!("请求序列化失败: {e}")))?;
+        let payload =
+            serde_json::to_vec(&req).map_err(|e| Error::Rpc(format!("请求序列化失败: {e}")))?;
         write_frame(&mut self.stream, &payload)?;
         let resp = read_frame(&mut self.stream)?;
-        let resp: RpcResponse = serde_json::from_slice(&resp)
-            .map_err(|e| Error::Rpc(format!("响应解析失败: {e}")))?;
+        let resp: RpcResponse =
+            serde_json::from_slice(&resp).map_err(|e| Error::Rpc(format!("响应解析失败: {e}")))?;
         if resp.ok {
             Ok(resp.result)
         } else {
@@ -370,7 +373,10 @@ mod tests {
         // put + get
         let terms = json!(["status=active", "city=beijing"]);
         client
-            .call("shard.put", json!({"docid": 1001, "data": "{\"status\":\"active\"}", "terms": terms}))
+            .call(
+                "shard.put",
+                json!({"docid": 1001, "data": "{\"status\":\"active\"}", "terms": terms}),
+            )
             .unwrap();
         let r = client.call("shard.get", json!({"docid": 1001})).unwrap();
         assert_eq!(r["found"], true);
@@ -379,9 +385,13 @@ mod tests {
         let r = client.call("shard.get", json!({"docid": 9999})).unwrap();
         assert_eq!(r["found"], false);
         // 倒排 chunk 检索（本地 posting）
-        let r = client.call("shard.search_docids", json!({"term": "status=active"})).unwrap();
+        let r = client
+            .call("shard.search_docids", json!({"term": "status=active"}))
+            .unwrap();
         assert_eq!(r["docids"].as_array().unwrap(), &[json!(1001)]);
-        let r = client.call("shard.search_docids", json!({"term": "status=pending"})).unwrap();
+        let r = client
+            .call("shard.search_docids", json!({"term": "status=pending"}))
+            .unwrap();
         assert!(r["docids"].as_array().unwrap().is_empty());
     }
 }

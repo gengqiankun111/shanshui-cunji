@@ -238,8 +238,7 @@ impl<B: CacheBackend + Send + 'static> ExternalCacheManager<B> {
         // 熔断 → 直接透传引擎（design 21.4 降级）
         if self.breaker.is_open() {
             self.bypasses.fetch_add(1, Ordering::Relaxed);
-            return fetcher()?
-                .ok_or_else(|| Error::NotFound(format!("docid={docid}")));
+            return fetcher()?.ok_or_else(|| Error::NotFound(format!("docid={docid}")));
         }
 
         match self.backend.get(&key) {
@@ -262,8 +261,7 @@ impl<B: CacheBackend + Send + 'static> ExternalCacheManager<B> {
                 }
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 self.bypasses.fetch_add(1, Ordering::Relaxed);
-                return fetcher()?
-                    .ok_or_else(|| Error::NotFound(format!("docid={docid}")));
+                return fetcher()?.ok_or_else(|| Error::NotFound(format!("docid={docid}")));
             }
         }
 
@@ -366,7 +364,10 @@ mod tests {
         }
         fn set(&mut self, key: &[u8], value: &[u8], _ttl: u64) -> Result<()> {
             self.maybe_fail()?;
-            self.store.lock().unwrap().insert(key.to_vec(), value.to_vec());
+            self.store
+                .lock()
+                .unwrap()
+                .insert(key.to_vec(), value.to_vec());
             Ok(())
         }
         fn del(&mut self, keys: &[&[u8]]) -> Result<u64> {
@@ -398,20 +399,14 @@ mod tests {
 
     fn manager(backend: MemBackend, policy: &str) -> ExternalCacheManager<MemBackend> {
         let b2 = backend.clone();
-        ExternalCacheManager::new(
-            backend,
-            Arc::new(move || b2.clone()),
-            &cfg(policy),
-        )
+        ExternalCacheManager::new(backend, Arc::new(move || b2.clone()), &cfg(policy))
     }
 
     #[test]
     fn cache_aside_hit_and_fill() {
         let mut m = manager(MemBackend::default(), "invalidate");
         // 未命中 → 回源回填
-        let v = m
-            .get_or_load(1, || Ok(Some(b"doc-1".to_vec())))
-            .unwrap();
+        let v = m.get_or_load(1, || Ok(Some(b"doc-1".to_vec()))).unwrap();
         assert_eq!(v, b"doc-1");
         // 命中直返（fetcher 不应再被调用）
         let mut fetches = 0;
@@ -433,7 +428,10 @@ mod tests {
         // 不缓存空值：未命中 + 文档不存在 → NotFound，且后续仍会回源
         let mut m = manager(MemBackend::default(), "invalidate");
         assert!(m.get_or_load(9, || Ok(None)).is_err());
-        assert!(m.get_or_load(9, || Ok(None)).is_err(), "未缓存空值则每次回源");
+        assert!(
+            m.get_or_load(9, || Ok(None)).is_err(),
+            "未缓存空值则每次回源"
+        );
         // 缓存空值：防穿透（第二次不再调用 fetcher）
         let mut m2 = manager(MemBackend::default(), "invalidate");
         m2.cache_null = true;
@@ -477,7 +475,9 @@ mod tests {
         let mut m = manager(b.clone(), "invalidate");
         // 前 3 次后端失败 → 降级回源（fetcher 提供数据）
         for i in 0..3 {
-            let v = m.get_or_load(1, || Ok(Some(format!("src-{i}").into_bytes()))).unwrap();
+            let v = m
+                .get_or_load(1, || Ok(Some(format!("src-{i}").into_bytes())))
+                .unwrap();
             assert_eq!(v, format!("src-{i}").as_bytes());
         }
         assert_eq!(m.breaker.state(), BreakerState::Open);
@@ -488,7 +488,9 @@ mod tests {
         assert_eq!(m.stats().bypasses, 4);
         // 冷却后探测成功 → 恢复 CLOSED，缓存可回填
         m.breaker.opened_at = Some(Instant::now() - Duration::from_secs(60));
-        let v = m.get_or_load(1, || Ok(Some(b"recovered".to_vec()))).unwrap();
+        let v = m
+            .get_or_load(1, || Ok(Some(b"recovered".to_vec())))
+            .unwrap();
         assert_eq!(v, b"recovered");
         assert_eq!(m.breaker.state(), BreakerState::Closed);
     }

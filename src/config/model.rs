@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::error::{Error, Result};
@@ -16,7 +16,7 @@ pub const DEFAULT_EVICTION_LOW_WATER: f64 = 0.75;
 /// 内存硬上限占可用内存比例（启动校验红线，design 13）。
 pub const MEMORY_BUDGET_RATIO: f64 = 0.7;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct Config {
@@ -57,6 +57,38 @@ impl Config {
         Ok(cfg)
     }
 
+    /// 配置热加载（design 7.4 / development 7.4 阶段 3）：重新读取、校验并原地替换。
+    /// 返回变更的配置区块（供运行中服务输出 / 决定哪些组件需重建）。
+    /// 失败时保持当前配置不变（热加载失败不破坏运行态）。
+    pub fn reload(&mut self, path: &Path) -> Result<ReloadReport> {
+        let fresh = Self::load(path)?;
+        let changed = self.changed_sections(&fresh);
+        *self = fresh;
+        Ok(ReloadReport {
+            applied: true,
+            changed_sections: changed,
+        })
+    }
+
+    /// 与另一配置比较，返回发生变更的顶层区块名（序列化后按顶层 key 对比）。
+    fn changed_sections(&self, other: &Self) -> Vec<String> {
+        let ser = |c: &Self| {
+            serde_json::to_value(c)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default()
+        };
+        let a = ser(self);
+        let b = ser(other);
+        let mut changed: Vec<String> = b
+            .keys()
+            .filter(|k| a.get(*k) != b.get(*k))
+            .cloned()
+            .collect();
+        changed.sort();
+        changed
+    }
+
     /// 环境变量覆盖：`SHANSHUI_CUNJI__SECTION__KEY=VALUE`。
     fn apply_env_overrides(&mut self) {
         for (key, value) in std::env::vars() {
@@ -76,12 +108,10 @@ impl Config {
                 ["SERVER", "LISTEN_ADDR"] => self.server.listen_addr = val,
                 ["CLUSTER", "NODE_ID"] => self.cluster.node_id = val,
                 ["CLUSTER", "INTERNAL_RPC_PORT"] => {
-                    self.cluster.internal_rpc_port = val
-                        .parse::<u16>()
-                        .unwrap_or_else(|_| {
-                            warn!("环境变量 CLUSTER__INTERNAL_RPC_PORT 解析失败，忽略");
-                            self.cluster.internal_rpc_port
-                        });
+                    self.cluster.internal_rpc_port = val.parse::<u16>().unwrap_or_else(|_| {
+                        warn!("环境变量 CLUSTER__INTERNAL_RPC_PORT 解析失败，忽略");
+                        self.cluster.internal_rpc_port
+                    });
                 }
                 ["SHARDING", "ENABLED"] => {
                     self.sharding.enabled = val == "true" || val == "1";
@@ -95,10 +125,8 @@ impl Config {
                 }
                 ["REPLICATION", "ROLE"] => self.replication.role = val,
                 ["BROADCAST_QUERY", "MAX_CONCURRENT"] => {
-                    self.broadcast_query.max_concurrent = parse_override(
-                        "broadcast_query.max_concurrent",
-                        &val,
-                    );
+                    self.broadcast_query.max_concurrent =
+                        parse_override("broadcast_query.max_concurrent", &val);
                 }
                 ["MEMORY", "WATERMARK_HIGH"] => {
                     self.memory.watermark_high = parse_override_f64("memory.watermark_high", &val)
@@ -241,7 +269,8 @@ impl Config {
                     .into(),
             ));
         }
-        if self.compaction.stall_timeout_secs == 0 || self.compaction.max_consecutive_failures == 0 {
+        if self.compaction.stall_timeout_secs == 0 || self.compaction.max_consecutive_failures == 0
+        {
             return Err(Error::Config(
                 "compaction.stall_timeout_secs / max_consecutive_failures 必须 > 0".into(),
             ));
@@ -274,6 +303,14 @@ impl Config {
     }
 }
 
+/// 配置热加载报告（design 7.4 / 阶段 3）。
+#[derive(Debug, Clone)]
+pub struct ReloadReport {
+    pub applied: bool,
+    /// 发生变更的顶层配置区块（如 ["hotcache", "sstable"]）。
+    pub changed_sections: Vec<String>,
+}
+
 fn parse_override(name: &str, v: &str) -> usize {
     v.parse::<usize>().unwrap_or_else(|_| {
         warn!("环境变量 {name} 解析失败，忽略");
@@ -295,7 +332,7 @@ fn parse_override_f64(name: &str, v: &str) -> f64 {
     })
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// 运行模式（design 9.8）："standalone"（默认）/ "cluster"。
@@ -312,7 +349,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
     /// RSS 软限流水位，触发写限流（OOM Guardian）。
@@ -330,7 +367,7 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemtableConfig {
     /// 跳表上限，达阈值冻结切换并后台刷盘。
@@ -343,7 +380,7 @@ impl Default for MemtableConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotCacheConfig {
     pub enabled: bool,
@@ -376,7 +413,7 @@ impl Default for HotCacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BlockCacheConfig {
     pub max_memory_mb: usize,
@@ -394,7 +431,7 @@ impl Default for BlockCacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
     /// multi-thread / current-thread。
@@ -424,7 +461,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SstableConfig {
     /// none / snappy / lz4 / zstd。
@@ -448,7 +485,7 @@ impl Default for SstableConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
     /// L0 文件数阈值，超过则写 Stall 限流。
@@ -463,6 +500,8 @@ pub struct StorageConfig {
     pub time_bucket: String,
     /// TTL 时间字段名（文档 JSON 内，数值秒级时间戳）。
     pub ttl_field: String,
+    /// 后台 IO 限速（MB/s，design 4.5 阶段 3）：刷盘/Compaction 走 Token Bucket；0 = 不限速。
+    pub io_rate_limit_mb: u64,
 }
 
 impl Default for StorageConfig {
@@ -474,11 +513,12 @@ impl Default for StorageConfig {
             hot_fields: Vec::new(),
             time_bucket: "day".into(),
             ttl_field: "timestamp".into(),
+            io_rate_limit_mb: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InvertedConfig {
     /// hash（MVP）/ fst（阶段 1.5，mmap 亚秒冷启动）。
@@ -504,23 +544,30 @@ impl Default for InvertedConfig {
 }
 
 /// 数据关联（sdk::join，development 5.20 / design 19）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JoinConfig {
     /// queryAndJoin 结果集上限，超限熔断（默认 100 万）。
     pub max_rows: usize,
+    /// 小表广播 JOIN（design 19.3，阶段 3）：从表（关联侧）行数 ≤ broadcast_threshold 时，
+    /// 一次性全量扫描建立内存索引复用（避免逐 key 点查）；默认关闭。
+    pub broadcast_enabled: bool,
+    /// 广播 JOIN 阈值（行）：从表行数超过则不广播（回退逐 key 点查）。
+    pub broadcast_threshold: usize,
 }
 
 impl Default for JoinConfig {
     fn default() -> Self {
         Self {
             max_rows: 1_000_000,
+            broadcast_enabled: false,
+            broadcast_threshold: 100,
         }
     }
 }
 
 /// 写入 Enrich（预连接，development 5.21 / design 19）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnrichConfig {
     /// 是否启用 Enrich。
@@ -542,7 +589,7 @@ impl Default for EnrichConfig {
 }
 
 /// 集群节点（design 9.8）：节点标识与内部 RPC。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
     /// 集群唯一标识（默认 "node-1"）。
@@ -564,7 +611,7 @@ impl Default for ClusterConfig {
 }
 
 /// 分片路由（design 9.1 / 9.8）：DocId 一致性哈希两级路由。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShardingConfig {
     /// 是否开启分片（单机模式强制 false）。
@@ -592,7 +639,7 @@ impl Default for ShardingConfig {
 }
 
 /// 主从与副本（design 9.3 / 9.8）：一主多从异步/同步复制。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplicationConfig {
     /// 是否开启副本（单机模式强制 false）。
@@ -626,7 +673,7 @@ impl Default for ReplicationConfig {
 }
 
 /// 读写分离（design 9.8）：普通查询优先路由 Slave，超滞后降级读 Master。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReadWriteSeparationConfig {
     /// 是否开启读写分离。
@@ -651,7 +698,7 @@ impl Default for ReadWriteSeparationConfig {
 }
 
 /// 广播查询熔断（design 9.2 / 9.8）：不带分片键的倒排检索保护。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BroadcastQueryConfig {
     /// 同时进行广播检索的最大并发数。
@@ -685,7 +732,7 @@ impl Default for BroadcastQueryConfig {
 }
 
 /// Compaction 看门狗（design 14.2 / 14.5）：写停滞假死检测与自愈。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompactionConfig {
     /// L0 数量在该时间内无减少 → 判定 Compaction 假死（默认 60s）。
@@ -704,7 +751,7 @@ impl Default for CompactionConfig {
 }
 
 /// 内嵌 Sidecar 进程探针（design 14.4 / 14.5）：文件锁心跳兜底。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SidecarConfig {
     /// 探针心跳间隔（秒，默认 5s）。
@@ -723,7 +770,7 @@ impl Default for SidecarConfig {
 }
 
 /// Redis 外部缓存（design 21，阶段 2）：Cache-Aside + Write-Invalidate + 熔断降级。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CacheExternalConfig {
     /// 是否启用外部 Redis 缓存（默认关闭，保持单机纯净）。
@@ -833,6 +880,48 @@ engine = "fst"
     }
 
     #[test]
+    fn reload_applies_changes_and_reports_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[hotcache]\nmax_memory_mb = 1024\n[sstable]\ncompression = \"zstd\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.hotcache.max_memory_mb, 1024);
+
+        // 修改配置：hotcache 与 sstable 区块
+        std::fs::write(
+            &path,
+            "[hotcache]\nmax_memory_mb = 2048\n[sstable]\ncompression = \"lz4\"\n",
+        )
+        .unwrap();
+        let rep = cfg.reload(&path).unwrap();
+        assert!(rep.applied);
+        assert_eq!(cfg.hotcache.max_memory_mb, 2048, "热加载应替换生效");
+        assert_eq!(cfg.sstable.compression, "lz4");
+        assert!(rep.changed_sections.contains(&"hotcache".to_string()));
+        assert!(rep.changed_sections.contains(&"sstable".to_string()));
+
+        // 无变更 → 空区块列表
+        let rep = cfg.reload(&path).unwrap();
+        assert!(rep.changed_sections.is_empty(), "无变更时不应报告区块");
+    }
+
+    #[test]
+    fn reload_failure_keeps_current_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[hotcache]\nmax_memory_mb = 512\n").unwrap();
+        let mut cfg = Config::load(&path).unwrap();
+        // 写入非法配置（watermark 越界）
+        std::fs::write(&path, "[memory]\nwatermark_high = 0.0\n").unwrap();
+        assert!(cfg.reload(&path).is_err(), "非法配置应拒绝热加载");
+        assert_eq!(cfg.hotcache.max_memory_mb, 512, "失败后保持原配置");
+    }
+
+    #[test]
     fn env_override_applies() {
         // 用 std::env::set_var 注入，测试后清理（测试内串行）
         std::env::set_var("SHANSHUI_CUNJI__HOTCACHE__MAX_MEMORY_MB", "2048");
@@ -896,7 +985,10 @@ timeout_ms = 15000
         assert_eq!(cfg.server.mode, "standalone");
         assert!(!cfg.sharding.enabled, "standalone 必须强制关闭分片");
         assert!(!cfg.replication.enabled, "standalone 必须强制关闭副本");
-        assert!(!cfg.read_write_separation.enabled, "standalone 必须强制关闭读写分离");
+        assert!(
+            !cfg.read_write_separation.enabled,
+            "standalone 必须强制关闭读写分离"
+        );
     }
 
     #[test]

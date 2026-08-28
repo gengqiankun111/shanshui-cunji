@@ -2,6 +2,8 @@
 //!
 //! - **queryAndJoin**：主表倒排筛选 → 批量回表 → 从表批量主键点查 → 内存 Hash 合并
 //!   （Inner / Left / Right），结果集上限 `join.max_rows` 熔断；
+//!   关联侧 key 数 ≤ `broadcast_threshold` 时走**小表广播 JOIN**（design 19.3，阶段 3）：
+//!   一次全量扫描从表建立内存索引复用，避免逐 key 点查；
 //! - **写入 Enrich**：网络层接收后、WAL 写入前执行回调展开关联数据到单文档，
 //!   失败策略 reject（拒绝写入）/ degrade（降级写入原文档）。
 
@@ -38,6 +40,17 @@ pub struct JoinRow {
     pub right: Option<Value>,
 }
 
+/// 小表广播 JOIN 选项（design 19.3，阶段 3）：启用且主表筛选后去重关联 key 数
+/// ≤ `threshold` 时，一次性全量扫描从表建立 `(关联 key → 文档)` 内存索引复用，
+/// 替代逐 key 点查（IO 次数从 O(distinct_keys) 降为 1 次顺序扫描）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinBroadcast {
+    /// 是否启用广播 JOIN。
+    pub enabled: bool,
+    /// 广播阈值（去重关联 key 数），超过则回退逐 key 点查。
+    pub threshold: usize,
+}
+
 /// 从表按关联 key 查询：`docid` 主键点查；否则倒排 `field=key` 取首个文档。
 fn fetch_related(engine: &mut Engine, to_field: &str, key: &str) -> Result<Option<Value>> {
     if to_field == "docid" || to_field == "id" {
@@ -63,6 +76,14 @@ fn fetch_related(engine: &mut Engine, to_field: &str, key: &str) -> Result<Optio
     }
 }
 
+/// 是否走小表广播 JOIN：未启用或无广播选项则回退逐 key 点查。
+fn should_broadcast(distinct_keys: usize, opt: Option<JoinBroadcast>) -> bool {
+    match opt {
+        Some(b) => b.enabled && distinct_keys <= b.threshold,
+        None => false,
+    }
+}
+
 /// 提取文档中字段值并转为字符串关联 key（字符串 / 数字 / 布尔）。
 fn field_to_key(val: &Value, field: &str) -> Option<String> {
     match val.get(field) {
@@ -73,12 +94,13 @@ fn field_to_key(val: &Value, field: &str) -> Option<String> {
     }
 }
 
-/// queryAndJoin：主表倒排筛选 → 回表 → 从表批量点查 → 内存 Hash 合并。
+/// queryAndJoin：主表倒排筛选 → 回表 → 从表批量点查（或小表广播索引）→ 内存 Hash 合并。
 /// 结果集超过 `max_rows` 熔断（design 5.20 / design 19）。
 pub fn query_and_join(
     engine: &mut Engine,
     spec: &JoinSpec,
     max_rows: usize,
+    broadcast: Option<JoinBroadcast>,
 ) -> Result<Vec<JoinRow>> {
     let t = std::time::Instant::now();
     // ① 主表倒排筛选 + 回表
@@ -97,13 +119,37 @@ pub fn query_and_join(
         let key = field_to_key(&val, spec.from_field);
         lefts.push((key, val));
     }
-    // ③ 从表批量点查（去重 key，避免重复 IO）
+    // ③ 从表批量取关联（去重 key，避免重复 IO）
     let mut right_cache: std::collections::HashMap<String, Option<Value>> =
         std::collections::HashMap::new();
     let unique_keys: std::collections::HashSet<String> =
         lefts.iter().filter_map(|(k, _)| k.clone()).collect();
-    for key in unique_keys {
-        right_cache.insert(key.clone(), fetch_related(engine, spec.to_field, &key)?);
+    if should_broadcast(unique_keys.len(), broadcast) {
+        // ③-a 小表广播 JOIN（design 19.3）：一次全量扫描从表建内存索引复用。
+        //     docid/id 关联 → 主键即 key；其他字段 → 提取字段值；缺字段文档跳过。
+        //     首个命中优先（与倒排 term 查询"取首个文档"语义一致）。
+        let mut idx: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        for (docid, bytes) in engine.scan_range(None, None)? {
+            let val: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Serialize(format!("从表广播扫描解析失败: {e}")))?;
+            let key = if spec.to_field == "docid" || spec.to_field == "id" {
+                docid.to_string()
+            } else {
+                match field_to_key(&val, spec.to_field) {
+                    Some(k) => k,
+                    None => continue,
+                }
+            };
+            idx.entry(key).or_insert(val);
+        }
+        for key in unique_keys {
+            right_cache.insert(key.clone(), idx.get(&key).cloned());
+        }
+    } else {
+        // ③-b 逐 key 点查（默认路径）
+        for key in unique_keys {
+            right_cache.insert(key.clone(), fetch_related(engine, spec.to_field, &key)?);
+        }
     }
     // ④ 合并
     let mut out = Vec::new();
@@ -237,7 +283,7 @@ mod tests {
             to_field: "docid",
             join_type: JoinType::Inner,
         };
-        let rows = query_and_join(&mut e, &spec, 1000).unwrap();
+        let rows = query_and_join(&mut e, &spec, 1000, None).unwrap();
         assert_eq!(rows.len(), 2, "Inner 应只保留有关联的行");
         assert_eq!(rows[0].right.as_ref().unwrap()["name"], "alice");
         assert_eq!(rows[1].right.as_ref().unwrap()["name"], "bob");
@@ -261,7 +307,7 @@ mod tests {
             to_field: "docid",
             join_type: JoinType::Left,
         };
-        let rows = query_and_join(&mut e, &spec, 1000).unwrap();
+        let rows = query_and_join(&mut e, &spec, 1000, None).unwrap();
         assert_eq!(rows.len(), 2, "Left 应保留全部主表行");
         assert!(rows[0].right.is_some());
         assert!(rows[1].right.is_none(), "缺失关联的行 right=None");
@@ -285,7 +331,7 @@ mod tests {
             to_field: "username",
             join_type: JoinType::Inner,
         };
-        let rows = query_and_join(&mut e, &spec, 1000).unwrap();
+        let rows = query_and_join(&mut e, &spec, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].right.as_ref().unwrap()["docid"], 100);
     }
@@ -303,8 +349,157 @@ mod tests {
             to_field: "docid",
             join_type: JoinType::Left,
         };
-        let err = query_and_join(&mut e, &spec, 3).unwrap_err();
+        let err = query_and_join(&mut e, &spec, 3, None).unwrap_err();
         assert!(err.to_string().contains("熔断"), "超限应熔断: {err}");
+    }
+
+    #[test]
+    fn broadcast_enabled_small_table_joins_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with(&dir.path());
+        put(
+            &mut e,
+            100,
+            json!({"docid":100,"type":"user","name":"alice"}),
+        );
+        put(&mut e, 200, json!({"docid":200,"type":"user","name":"bob"}));
+        put(
+            &mut e,
+            1,
+            json!({"docid":1,"type":"order","user_id":"100","amount":10}),
+        );
+        put(
+            &mut e,
+            2,
+            json!({"docid":2,"type":"order","user_id":"999","amount":30}),
+        );
+        let spec = JoinSpec {
+            filter: "type=order",
+            from_field: "user_id",
+            to_field: "docid",
+            join_type: JoinType::Left,
+        };
+        let bc = JoinBroadcast {
+            enabled: true,
+            threshold: 100,
+        };
+        let rows = query_and_join(&mut e, &spec, 1000, Some(bc)).unwrap();
+        assert_eq!(rows.len(), 2, "广播 Left 应保留全部主表行");
+        assert_eq!(rows[0].right.as_ref().unwrap()["name"], "alice");
+        assert!(rows[1].right.is_none(), "无关联行 right=None");
+    }
+
+    #[test]
+    fn broadcast_first_match_priority_matches_term_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with(&dir.path());
+        // 两个 user 共享 username=alice：term 查询取首个文档（docid 小者）
+        put(
+            &mut e,
+            100,
+            json!({"docid":100,"type":"user","username":"alice","name":"first"}),
+        );
+        put(
+            &mut e,
+            200,
+            json!({"docid":200,"type":"user","username":"alice","name":"second"}),
+        );
+        put(&mut e, 1, json!({"docid":1,"type":"order","buyer":"alice"}));
+        let spec = JoinSpec {
+            filter: "type=order",
+            from_field: "buyer",
+            to_field: "username",
+            join_type: JoinType::Inner,
+        };
+        let bc = JoinBroadcast {
+            enabled: true,
+            threshold: 100,
+        };
+        let rows = query_and_join(&mut e, &spec, 1000, Some(bc)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].right.as_ref().unwrap()["name"],
+            "first",
+            "广播首个命中应取 docid 最小者"
+        );
+    }
+
+    #[test]
+    fn broadcast_falls_back_when_keys_exceed_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with(&dir.path());
+        put(
+            &mut e,
+            100,
+            json!({"docid":100,"type":"user","name":"alice"}),
+        );
+        put(&mut e, 200, json!({"docid":200,"type":"user","name":"bob"}));
+        put(&mut e, 1, json!({"docid":1,"type":"order","user_id":"100"}));
+        put(&mut e, 2, json!({"docid":2,"type":"order","user_id":"200"}));
+        let spec = JoinSpec {
+            filter: "type=order",
+            from_field: "user_id",
+            to_field: "docid",
+            join_type: JoinType::Inner,
+        };
+        // 阈值 1 < 去重 key 数 2 → 回退逐 key 点查，结果仍正确
+        let bc = JoinBroadcast {
+            enabled: true,
+            threshold: 1,
+        };
+        let rows = query_and_join(&mut e, &spec, 1000, Some(bc)).unwrap();
+        assert_eq!(rows.len(), 2, "回退点查结果应一致");
+        assert_eq!(rows[0].right.as_ref().unwrap()["name"], "alice");
+        assert_eq!(rows[1].right.as_ref().unwrap()["name"], "bob");
+    }
+
+    #[test]
+    fn broadcast_disabled_keeps_point_query_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with(&dir.path());
+        put(
+            &mut e,
+            100,
+            json!({"docid":100,"type":"user","name":"alice"}),
+        );
+        put(&mut e, 1, json!({"docid":1,"type":"order","user_id":"100"}));
+        let spec = JoinSpec {
+            filter: "type=order",
+            from_field: "user_id",
+            to_field: "docid",
+            join_type: JoinType::Inner,
+        };
+        let rows = query_and_join(
+            &mut e,
+            &spec,
+            1000,
+            Some(JoinBroadcast {
+                enabled: false,
+                threshold: 100,
+            }),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "未启用广播应走点查且结果一致");
+        assert_eq!(rows[0].right.as_ref().unwrap()["name"], "alice");
+    }
+
+    #[test]
+    fn should_broadcast_gates_on_enabled_and_threshold() {
+        let opt = JoinBroadcast {
+            enabled: true,
+            threshold: 100,
+        };
+        assert!(should_broadcast(0, Some(opt)));
+        assert!(should_broadcast(100, Some(opt)));
+        assert!(!should_broadcast(101, Some(opt)));
+        assert!(!should_broadcast(
+            1,
+            Some(JoinBroadcast {
+                enabled: false,
+                threshold: 100
+            })
+        ));
+        assert!(!should_broadcast(1, None));
     }
 
     #[test]

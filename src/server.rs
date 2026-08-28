@@ -24,15 +24,24 @@ use crate::error::{Error, Result};
 use crate::optimizer::QuerySpec;
 
 /// 启动 HTTP 服务（阻塞运行，进程终止即退出）。串行处理连接（MVP）。
-pub fn serve(engine: &mut Engine, addr: &str) -> Result<()> {
+/// `broadcast`：小表广播 JOIN 选项（design 19.3，阶段 3），None 表示关闭广播。
+pub fn serve(
+    engine: &mut Engine,
+    addr: &str,
+    broadcast: Option<crate::join::JoinBroadcast>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     tracing::info!("HTTP-JSON 服务已启动: http://{local}");
-    serve_listener(engine, listener)
+    serve_listener(engine, listener, broadcast)
 }
 
 /// 接受连接并分发请求（供 `serve` 与测试复用）。
-fn serve_listener(engine: &mut Engine, listener: TcpListener) -> Result<()> {
+fn serve_listener(
+    engine: &mut Engine,
+    listener: TcpListener,
+    broadcast: Option<crate::join::JoinBroadcast>,
+) -> Result<()> {
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -41,7 +50,7 @@ fn serve_listener(engine: &mut Engine, listener: TcpListener) -> Result<()> {
                 continue;
             }
         };
-        if let Err(e) = handle_connection(engine, &mut stream) {
+        if let Err(e) = handle_connection(engine, &mut stream, broadcast) {
             tracing::warn!("请求处理失败: {e}");
         }
     }
@@ -49,9 +58,13 @@ fn serve_listener(engine: &mut Engine, listener: TcpListener) -> Result<()> {
 }
 
 /// 处理单个 HTTP 请求：读取 → 路由 → 响应。
-fn handle_connection(engine: &mut Engine, stream: &mut TcpStream) -> Result<()> {
+fn handle_connection(
+    engine: &mut Engine,
+    stream: &mut TcpStream,
+    broadcast: Option<crate::join::JoinBroadcast>,
+) -> Result<()> {
     let (method, path, query, body) = read_http_request(stream)?;
-    let (status, payload) = route_request(engine, &method, &path, &query, &body);
+    let (status, payload) = route_request(engine, &method, &path, &query, &body, broadcast);
     write_http_response(stream, status, &payload)
 }
 
@@ -232,6 +245,7 @@ fn route_request(
     path: &str,
     query: &str,
     body: &[u8],
+    broadcast: Option<crate::join::JoinBroadcast>,
 ) -> (u16, String) {
     match (method, path) {
         ("POST", "/put") => handle_put(engine, body),
@@ -241,7 +255,7 @@ fn route_request(
         ("GET", "/range") => handle_range(engine, query),
         ("GET", "/count") => handle_count(engine, query),
         ("GET", "/groupby") => handle_group_by(engine, query),
-        ("GET", "/join") => handle_join(engine, query),
+        ("GET", "/join") => handle_join(engine, query, broadcast),
         ("GET", "/admin/status") => handle_admin_status(engine),
         ("GET", "/explain") => handle_explain(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
@@ -332,7 +346,12 @@ fn handle_group_by(engine: &mut Engine, query: &str) -> (u16, String) {
 
 /// queryAndJoin（design 19）：`GET /join?filter=type=order&from=user_id&to=docid&type=inner`
 /// → `{"rows":[{"left":{...},"right":{...},"matched":true},...]}`。
-fn handle_join(engine: &mut Engine, query: &str) -> (u16, String) {
+/// `broadcast`：小表广播 JOIN 选项（design 19.3，阶段 3，来自 `[join]` 配置）。
+fn handle_join(
+    engine: &mut Engine,
+    query: &str,
+    broadcast: Option<crate::join::JoinBroadcast>,
+) -> (u16, String) {
     let params = parse_query(query);
     let p = |k: &str| params.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
     let (Some(filter), Some(from), Some(to)) = (p("filter"), p("from"), p("to")) else {
@@ -355,7 +374,7 @@ fn handle_join(engine: &mut Engine, query: &str) -> (u16, String) {
         to_field: &to,
         join_type,
     };
-    match crate::join::query_and_join(engine, &spec, max_rows) {
+    match crate::join::query_and_join(engine, &spec, max_rows, broadcast) {
         Ok(rows) => {
             let arr: Vec<Value> = rows
                 .iter()
@@ -629,7 +648,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let mut engine = engine;
-            serve_listener(&mut engine, listener).unwrap();
+            serve_listener(&mut engine, listener, None).unwrap();
         });
         addr
     }

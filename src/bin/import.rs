@@ -13,13 +13,18 @@ use std::path::PathBuf;
 
 use shanshui_cunji::config::Config;
 use shanshui_cunji::import_schema::ImportSchema;
-use shanshui_cunji::migrate::{import_csv_filtered, import_json_filtered};
+use shanshui_cunji::migrate::{
+    import_csv_filtered, import_csv_incremental, import_json_filtered, import_json_incremental,
+    load_checkpoint,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut csv_path: Option<PathBuf> = None;
     let mut json_path: Option<PathBuf> = None;
     let mut schema_path: Option<PathBuf> = None;
+    let mut checkpoint_path: Option<PathBuf> = None;
+    let mut incremental = false;
     let mut config_path = PathBuf::from("config.toml");
     let mut i = 0;
     while i < args.len() {
@@ -42,6 +47,13 @@ fn main() {
                     schema_path = Some(PathBuf::from(&args[i]));
                 }
             }
+            "--incremental" => incremental = true,
+            "--checkpoint" => {
+                i += 1;
+                if i < args.len() {
+                    checkpoint_path = Some(PathBuf::from(&args[i]));
+                }
+            }
             "--config" | "-c" => {
                 i += 1;
                 if i < args.len() {
@@ -53,7 +65,11 @@ fn main() {
         i += 1;
     }
     if csv_path.is_none() && json_path.is_none() {
-        eprintln!("❌ 用法: shanshui-cunji-import --csv <in.csv> | --json <in.jsonl> [--schema schema.json] [--config config.toml]");
+        eprintln!("❌ 用法: shanshui-cunji-import --csv <in.csv> | --json <in.jsonl> [--schema schema.json] [--incremental --checkpoint cp] [--config config.toml]");
+        std::process::exit(1);
+    }
+    if incremental && checkpoint_path.is_none() {
+        eprintln!("❌ 增量导入必须指定 --checkpoint <文件>");
         std::process::exit(1);
     }
 
@@ -107,10 +123,24 @@ fn main() {
 
     let rep = if let Some(p) = &csv_path {
         println!("CSV 导入: {}", p.display());
-        import_csv_filtered(&mut engine, p, whitelist.as_deref())
+        if incremental {
+            let cp = checkpoint_path.as_ref().unwrap();
+            let base = load_checkpoint(cp).unwrap_or(0);
+            println!("增量导入（checkpoint={base}）: {}", cp.display());
+            import_csv_incremental(&mut engine, p, whitelist.as_deref(), cp)
+        } else {
+            import_csv_filtered(&mut engine, p, whitelist.as_deref())
+        }
     } else if let Some(p) = &json_path {
         println!("JSONL 导入: {}", p.display());
-        import_json_filtered(&mut engine, p, whitelist.as_deref())
+        if incremental {
+            let cp = checkpoint_path.as_ref().unwrap();
+            let base = load_checkpoint(cp).unwrap_or(0);
+            println!("增量导入（checkpoint={base}）: {}", cp.display());
+            import_json_incremental(&mut engine, p, whitelist.as_deref(), cp)
+        } else {
+            import_json_filtered(&mut engine, p, whitelist.as_deref())
+        }
     } else {
         unreachable!()
     };
@@ -118,8 +148,8 @@ fn main() {
     match rep {
         Ok(rep) => {
             println!(
-                "✅ 导入完成: {} 行成功, {} 行失败（{:.0} ms）",
-                rep.rows, rep.failed, rep.elapsed_ms as f64
+                "✅ 导入完成: {} 行成功, {} 行失败（跳过 {} 行）· {:.0} ms",
+                rep.rows, rep.failed, rep.skipped, rep.elapsed_ms as f64
             );
             if rep.failed > 0 {
                 std::process::exit(2);
