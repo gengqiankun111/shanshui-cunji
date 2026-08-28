@@ -38,6 +38,7 @@ pub struct Config {
     pub broadcast_query: BroadcastQueryConfig,
     pub compaction: CompactionConfig,
     pub sidecar: SidecarConfig,
+    pub cache_external: CacheExternalConfig,
 }
 
 impl Config {
@@ -248,6 +249,25 @@ impl Config {
         if self.sidecar.ping_interval_sec == 0 || self.sidecar.max_missed_pings == 0 {
             return Err(Error::Config(
                 "sidecar.ping_interval_sec / max_missed_pings 必须 > 0".into(),
+            ));
+        }
+        if !matches!(
+            self.cache_external.write_policy.as_str(),
+            "invalidate" | "double_delete" | "none"
+        ) {
+            return Err(Error::Config(format!(
+                "cache.external.write_policy 非法: {}（invalidate / double_delete / none）",
+                self.cache_external.write_policy
+            )));
+        }
+        if self.cache_external.ttl_seconds == 0 || self.cache_external.timeout_ms == 0 {
+            return Err(Error::Config(
+                "cache.external.ttl_seconds / timeout_ms 必须 > 0".into(),
+            ));
+        }
+        if self.cache_external.enabled && self.cache_external.redis_addrs.is_empty() {
+            return Err(Error::Config(
+                "cache.external.enabled 时必须配置 redis_addrs".into(),
             ));
         }
         Ok(())
@@ -698,6 +718,46 @@ impl Default for SidecarConfig {
         Self {
             ping_interval_sec: 5,
             max_missed_pings: 3,
+        }
+    }
+}
+
+/// Redis 外部缓存（design 21，阶段 2）：Cache-Aside + Write-Invalidate + 熔断降级。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CacheExternalConfig {
+    /// 是否启用外部 Redis 缓存（默认关闭，保持单机纯净）。
+    pub enabled: bool,
+    /// Redis 地址（单机取第一个；sentinel/cluster 留阶段 2.5）。
+    pub redis_addrs: Vec<String>,
+    /// 缓存 TTL（秒，建议 60~600）。
+    pub ttl_seconds: u64,
+    /// 是否缓存空值（防穿透，null_ttl_seconds）。
+    pub cache_null_values: bool,
+    /// 空值缓存 TTL（秒）。
+    pub null_ttl_seconds: u64,
+    /// 写策略："invalidate"（推荐）/ "double_delete" / "none"。
+    pub write_policy: String,
+    /// Redis 操作超时（毫秒），超时自动降级。
+    pub timeout_ms: u64,
+    /// 失败重试次数。
+    pub retry_attempts: u32,
+    /// 写入后是否主动预热（增加写入延迟）。
+    pub preheat_on_write: bool,
+}
+
+impl Default for CacheExternalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redis_addrs: vec!["127.0.0.1:6379".into()],
+            ttl_seconds: 300,
+            cache_null_values: false,
+            null_ttl_seconds: 60,
+            write_policy: "invalidate".into(),
+            timeout_ms: 100,
+            retry_attempts: 3,
+            preheat_on_write: false,
         }
     }
 }
