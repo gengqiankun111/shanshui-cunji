@@ -29,6 +29,8 @@ pub struct Config {
     pub sstable: SstableConfig,
     pub storage: StorageConfig,
     pub inverted: InvertedConfig,
+    pub join: JoinConfig,
+    pub enrich: EnrichConfig,
 }
 
 impl Config {
@@ -106,6 +108,15 @@ impl Config {
             return Err(Error::Config(format!(
                 "inverted.engine 非法: {}",
                 self.inverted.engine
+            )));
+        }
+        if self.join.max_rows == 0 {
+            return Err(Error::Config("join.max_rows 必须 > 0".into()));
+        }
+        if !matches!(self.enrich.fail_policy.as_str(), "reject" | "degrade") {
+            return Err(Error::Config(format!(
+                "enrich.fail_policy 非法: {}（reject / degrade）",
+                self.enrich.fail_policy
             )));
         }
         Ok(())
@@ -324,6 +335,44 @@ impl Default for InvertedConfig {
             engine: "fst".into(),
             max_memory_bytes: 12 * 1024 * 1024 * 1024,
             max_posting_scan: 1_000_000,
+        }
+    }
+}
+
+/// 数据关联（sdk::join，development 5.20 / design 19）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct JoinConfig {
+    /// queryAndJoin 结果集上限，超限熔断（默认 100 万）。
+    pub max_rows: usize,
+}
+
+impl Default for JoinConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: 1_000_000,
+        }
+    }
+}
+
+/// 写入 Enrich（预连接，development 5.21 / design 19）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EnrichConfig {
+    /// 是否启用 Enrich。
+    pub enabled: bool,
+    /// 数据源：redis / mysql / http / local（基础版仅 local）。
+    pub source: String,
+    /// 失败策略："reject"（拒绝写入）/ "degrade"（降级写入原文档）。
+    pub fail_policy: String,
+}
+
+impl Default for EnrichConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: "local".into(),
+            fail_policy: "degrade".into(),
         }
     }
 }

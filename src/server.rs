@@ -241,6 +241,7 @@ fn route_request(
         ("GET", "/range") => handle_range(engine, query),
         ("GET", "/count") => handle_count(engine, query),
         ("GET", "/groupby") => handle_group_by(engine, query),
+        ("GET", "/join") => handle_join(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
         _ => (
@@ -294,6 +295,49 @@ fn handle_group_by(engine: &mut Engine, query: &str) -> (u16, String) {
                 })
                 .collect();
             (200, json!({"field": field, "groups": arr}).to_string())
+        }
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// queryAndJoin（design 19）：`GET /join?filter=type=order&from=user_id&to=docid&type=inner`
+/// → `{"rows":[{"left":{...},"right":{...},"matched":true},...]}`。
+fn handle_join(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let p = |k: &str| params.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+    let (Some(filter), Some(from), Some(to)) = (p("filter"), p("from"), p("to")) else {
+        return (
+            400,
+            json!({"error": "缺少 filter / from / to 参数"}).to_string(),
+        );
+    };
+    let join_type = match p("type").as_deref() {
+        Some("left") => crate::join::JoinType::Left,
+        Some("right") => crate::join::JoinType::Right,
+        _ => crate::join::JoinType::Inner,
+    };
+    let max_rows: usize = p("max")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1_000_000);
+    let spec = crate::join::JoinSpec {
+        filter: &filter,
+        from_field: &from,
+        to_field: &to,
+        join_type,
+    };
+    match crate::join::query_and_join(engine, &spec, max_rows) {
+        Ok(rows) => {
+            let arr: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "left": r.left,
+                        "right": r.right,
+                        "matched": r.right.is_some(),
+                    })
+                })
+                .collect();
+            (200, json!({"total": arr.len(), "rows": arr}).to_string())
         }
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
@@ -706,6 +750,33 @@ mod tests {
         assert_eq!(st, 400);
         let (st, _) = http_req(addr, "GET", "/groupby", b"");
         assert_eq!(st, 400);
+
+        // JOIN（design 19）：user 文档 + order 文档按 username 关联
+        let (st, body) = http_req(
+            addr,
+            "POST",
+            "/put",
+            br#"{"docid":9001,"type":"user","username":"alice"}"#,
+        );
+        assert_eq!(st, 200, "put user 失败: {body}");
+        let (st, body) = http_req(
+            addr,
+            "POST",
+            "/put",
+            br#"{"docid":9002,"type":"order","buyer":"alice","amount":99}"#,
+        );
+        assert_eq!(st, 200, "put order 失败: {body}");
+        let (st, body) = http_req(
+            addr,
+            "GET",
+            "/join?filter=type%3Dorder&from=buyer&to=username",
+            b"",
+        );
+        assert_eq!(st, 200, "join 失败: {body}");
+        assert!(body.contains("\"total\":1"), "join 应命中 1 行: {body}");
+        assert!(body.contains("alice"), "应包含关联用户: {body}");
+        let (st, _) = http_req(addr, "GET", "/join?filter=type%3Dorder", b"");
+        assert_eq!(st, 400, "缺 from/to 应 400");
 
         // RANGE（[1000,2000] 仅含 1001；2002 在外）
         let (st, body) = http_req(addr, "GET", "/range?start=1000&end=2000", b"");
