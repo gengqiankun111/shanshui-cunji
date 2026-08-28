@@ -753,8 +753,20 @@ impl RuntimePools {
    open 后不再持有完整 IndexEntry（1.5 亿文档单层 ~200MB → 两级 ~20MB，更多留给 HotCache）；
    `index_granularity` 经 ColumnFamily 注入；测试验证摘要粒度/懒加载/跨块查询/范围扫描完整；
    测试 229 全绿（+8：两级索引 3 + 物化视图 5）；
-10. **数据管道增强（design 20）**：`import` 支持 Parquet、`import-schema`（字段注册表 + 索引定义导入）；
-11. **Redis 外部缓存（design 21）**：External Cache Manager（Cache-Aside + Write-Invalidate + 熔断降级），`[cache.external]` 默认关闭，详见 redis-integration-guide.md。
+10. ~~**数据管道增强（design 20）**~~ ✅（2026-08-28，import-schema）：
+    `src/import_schema.rs`（development 5.27 阶段 2）：`ImportSchema`（JSON：id_field / 倒排字段白名单 /
+    组合索引声明 / 时间戳游标）+ 加载校验（非法时间格式/空组合键拒绝）+ `apply`（预注册字段到 FieldRegistry，
+    **预创建索引的字段基座**，返回 SchemaReport）；`import_csv_filtered` / `import_json_filtered` 支持
+    **倒排字段白名单**（只对声明字段建索引，减少写放大）；`shanshui-cunji-import --schema schema.json`
+    CLI 接入；Parquet / JdbcSink 留阶段 3；测试 229→233（+4 schema 加载/校验/apply/白名单）；
+11. ~~**Redis 外部缓存（design 21）**~~ ✅（2026-08-28，基础版）：
+    `src/redis.rs`：极简 RESP 客户端（std TcpStream 零依赖，PING/GET/SETEX/DEL + 超时 + 重连）；
+    `src/external_cache.rs`：`CacheBackend` 抽象（Redis / 测试内存双实现）+
+    **Cache-Aside**（`get_or_load`：命中直返 → 回源 SETEX 回填，TTL 抖动防雪崩 + `cache_null_values` 防穿透）+
+    **Write-Invalidate**（`invalidate`：invalidate / **double_delete**（500ms 二次删）/ none 三策略）+
+    **熔断器**（CLOSED→OPEN→HALF-OPEN 状态机，熔断直接透传引擎，仅延迟上升不雪崩）+ 统计（命中/回源/旁路/熔断）；
+    `[cache.external]` 配置（默认关闭，design 21.3 单机纯净）+ 校验；Mock RESP 服务端测试协议往返；
+    测试 233→241（+8 RESP 往返/拒绝连接/Cache-Aside/空值防穿透/失效/熔断恢复/双删）；
 
 ### 7.4 阶段 3：深度优化
 
