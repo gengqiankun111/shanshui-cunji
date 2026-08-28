@@ -10,6 +10,8 @@
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 use crate::keys::{decode_varlen, encode_varlen};
 
@@ -17,7 +19,7 @@ pub const OP_PUT: u8 = 0;
 pub const OP_DELETE: u8 = 1;
 
 /// WAL 记录负载。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalRecord {
     pub seq: u64,
     pub op: u8,
@@ -464,6 +466,12 @@ impl RingWal {
         &self.path
     }
 
+    /// 重放环内全部记录（增量备份 / 恢复用）。
+    pub fn recover_records(&self) -> Result<Vec<WalRecord>> {
+        let (recs, _) = self.scan_ring()?;
+        Ok(recs)
+    }
+
     fn fsync_file(&self) -> Result<()> {
         if let Some(f) = self.file.as_ref() {
             f.sync_all()?;
@@ -560,6 +568,14 @@ impl WalBackend {
     pub fn set_flushed_seq(&mut self, seq: u64) {
         if let WalBackend::Ring(r) = self {
             r.set_flushed_seq(seq);
+        }
+    }
+
+    /// 重放当前 WAL 内全部记录（增量备份 / 恢复用）。
+    pub fn recover_records(&self) -> Result<Vec<WalRecord>> {
+        match self {
+            WalBackend::Append(w) => WalReader::recover(w.path()),
+            WalBackend::Ring(r) => r.recover_records(),
         }
     }
 

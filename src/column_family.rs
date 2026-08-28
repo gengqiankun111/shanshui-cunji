@@ -784,6 +784,19 @@ impl ColumnFamily {
         self.wal.next_seq()
     }
 
+    /// 取 WAL 中 seq > `since_seq` 的记录（增量备份，M6-5）。
+    /// 返回 `(最旧可用 seq, 过滤记录)`：`since_seq != 0` 且最旧可用 seq > since_seq+1 表示
+    /// WAL 已被截断（环形覆盖 / 压缩），存在缺口 → 上层应改做全量备份。
+    pub fn wal_records_since(
+        &mut self,
+        since_seq: u64,
+    ) -> Result<(u64, Vec<crate::wal::WalRecord>)> {
+        let recs = self.wal.recover_records()?;
+        let oldest = recs.iter().map(|r| r.seq).min().unwrap_or(u64::MAX);
+        let filtered: Vec<_> = recs.into_iter().filter(|r| r.seq > since_seq).collect();
+        Ok((oldest, filtered))
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

@@ -840,7 +840,14 @@ impl RuntimePools {
    普通淘汰避让（LFU 选择跳过保护区 key），写失效 / 硬预算兜底仍可清除；热点 key put 原地更新
    不重置热度；`protected_len()` / `promotions()` 监控；测试验证 晋升/冷数据挤压存活/失效清除/
    原地更新/未达阈值不晋升；测试 273→277（+4）；
-5. **增量备份（design 20）**：seq 游标增量备份 + 恢复合并；
+5. ~~**增量备份（design 20）**~~ ✅（2026-08-28）：`Engine::backup_incremental(since_seq, path)`
+   ——导出 seq ∈ (since_seq, 当前] 的 WAL 记录（append WAL 全量保留、环形 WAL 重放环内），
+   JSON 原子落盘（tmp+rename）；`WalRecord` 补 Serialize；`WalBackend::recover_records` /
+   `ColumnFamily::wal_records_since` 统一取数；**缺口检测**：since_seq ≠ 0 且最旧可用 seq >
+   since_seq+1 → 报错提示改做全量备份（环形覆盖 / 长时间未备份场景）；
+   `Engine::restore_incremental(path)` 按序重放（PUT 重新派生倒排词条 / DELETE 写墓碑）；
+   `BackupReport`（since/until/records）；测试验证 全量点+增量还原（PUT/删除/保留）、since=0 全导出；
+   测试 277→279（+2）；
 6. **收尾**：性能实测 + 文档 + 打 v0.4.0 标签。
 
 ---
