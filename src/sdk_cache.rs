@@ -158,7 +158,8 @@ mod tests {
         let mut f = facade(&mut e, b.clone());
         let terms = ["name=alice"];
 
-        f.put(1, br#"{"docid":1,"name":"alice"}"#.to_vec(), &terms).unwrap();
+        f.put(1, br#"{"docid":1,"name":"alice"}"#.to_vec(), &terms)
+            .unwrap();
         assert_eq!(b.store.lock().unwrap().len(), 0, "写后应删旧缓存");
         let v = f.get(1).unwrap();
         assert_eq!(v, br#"{"docid":1,"name":"alice"}"#);

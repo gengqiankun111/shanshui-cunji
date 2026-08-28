@@ -8,21 +8,21 @@
 
 ---
 
-## 📦 最新发布：v0.2.1（2026-08-28）
+## 📦 最新发布：v0.3.0（2026-08-28）
 
-> 核心亮点：**默认 mimalloc 分配器**（musl 高并发 4~10 倍）+ **SST v5 分区布隆** + **数据关联（JOIN）** + **运维管理 / 数据管道**。
+> 核心亮点：**分布式集群（分片路由 + 网关 + 主从复制 + 无损扩容）** + **阶段 3 深度优化（热加载 / IO 限速 / Compaction / 增量导入 / 广播 JOIN / Redis 门面）**。
 
 | 维度 | 数据 |
 | --- | --- |
-| 批量插入 | 31.6~36.4 万条/s（1000万 / 2000万 / 5000万 三规模稳定）|
-| 倒排检索 | 近常量：1.25 亿命中 ~2.3s |
-| vs v0.1.0 | 插入 **+70%**、倒排 **-81%** |
-| 质量 | 163 测试全绿、demo 10/10、unsafe=0 |
+| 批量插入 | 29.5~33.8 万条/s（1000万 / 2000万 / 5000万 三规模稳定）|
+| 倒排检索 | 近常量：1.25 亿命中 ~2.9s |
+| 热点查询 | 主键 0.02~0.35ms / HotCache 0.02ms |
+| 质量 | 260 测试全绿、demo 三规模 10/10、unsafe=0 |
 
-- **分配器**：默认 mimalloc；musl 4 线程 **×9.9** 追平 glibc，而 musl 默认 malloc 全局单锁 4 线程反而暴跌 57%；构建 `cargo build --release`（mimalloc）/ `--features alloc-jemalloc`（jemalloc）/ `--no-default-features`（系统分配器对比基线）；
-- **兼容性**：SST v5 新格式，Reader 自动回退兼容 v3/v4，旧库可直接打开；
-- **新增能力**：`query_and_join`（Inner/Left/Right + 熔断）、`admin status/processlist/kill`、`explain` 推演、`shanshui-cunji-export/import`、`shanshui-cunji-bench` 压测工具；
-- 完整发布说明见 [RELEASE-v0.2.1.md](./RELEASE-v0.2.1.md)，性能实测存档见 `images/allocator-bench/` 与 `images/perf-0.2.1/`。
+- **分布式**：一致性哈希分片路由（128 虚拟点/节点）+ 元数据中心 + 无状态网关（广播检索 Chunk 直拼 O(1)）；主从复制（async 攒批 / sync 等 ACK）+ 网关全局 Term 缓存；TDS 术语字典热备 + **无损扩容三步协议**（Shadow Writes → Delta Catch-up → Atomic Switch）；
+- **阶段 3**：`reload` 配置热加载、`io_rate_limit_mb` Token Bucket 限速、`compact` 基础 Compaction、`shanshui-cunji-import --incremental` 增量导入、小表广播 JOIN（`[join] broadcast_enabled`）、Redis 冷热分层 SDK 门面（`ShanshuiCunjiWithRedis`）；
+- **性能**：实测对照 design 9.5（组提交写入与热点查询达成/超出目标），并修复 M5 遗留读路径回归（Level 2 索引按需取）；
+- 完整发布说明见 [RELEASE-v0.3.0.md](./RELEASE-v0.3.0.md)，性能实测存档见 `images/perf-0.3.0/`。
 
 ---
 
