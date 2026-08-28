@@ -22,10 +22,19 @@ crc32fast = "1"
 fst = "0.4"
 memmap2 = "0.9"
 csv = "1"
+mimalloc = { version = "0.1", default-features = false }
 
 [[bin]]
 name = "shanshui-cunji-migrate"
 path = "src/bin/migrate.rs"
+
+[features]
+# 分配器策略：默认 mimalloc（轻量、高并发、边缘友好）；"alloc-jemalloc" 切 tikv-jemallocator（mallctl purge/stats）
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies.tikv-jemallocator]
+version = "0.5"
+optional = true
 
 [dev-dependencies]
 tempfile = "3"

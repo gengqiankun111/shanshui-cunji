@@ -3,6 +3,17 @@
 // 质量承诺：全库零 unsafe，编译期强制（cargo-geiger 实测 0 处；防止未来回归）
 #![forbid(unsafe_code)]
 
+// 全局分配器：mimalloc（design 14 分配器策略，消除 musl 默认 malloc 全局锁瓶颈；
+// `#[global_allocator]` 声明无 unsafe，unsafe 实现在 mimalloc crate 内部，不违反零 unsafe 承诺）。
+// 需 jemalloc 时启用 feature `alloc-jemalloc`。
+#[cfg(not(feature = "alloc-jemalloc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 pub mod blockcache;
 pub mod bloom;
 pub mod column_family;
