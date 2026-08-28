@@ -729,8 +729,19 @@ impl RuntimePools {
    + **写计数失效**（`term_cache_invalid_threshold` 默认 100：1 秒窗口写入超阈值 → 主动失效该 Term 全节点缓存）；
    网关 `put` 记录写计数、`broadcast_search` 命中直出/未命中回填；配置见 `[broadcast_query]`；
    测试 197→211（+14：复制 6 + Term 缓存 5 + 网关集成 3）；失效心跳（节点写计数 → RPC 通知网关）留阶段 2 后续；
-6. **术语字典热备 TDS**；
-7. **无损扩容协议（design 9.1.1）**：双写（Shadow Writes）→ 数据追平（Delta Catch-up，SST 拷贝 + WAL 增量回放）→ 原子切换（Atomic Switch，1s 内）+ 5s 回滚预案，业务零感知、数据零丢失；
+6. ~~**术语字典热备 TDS（design 9.10）**~~ ✅（2026-08-28，基础版）：
+   `src/tds.rs`：`TdsServer`（RPC `tds.put/get/list`，内存 + **文件写穿持久化** `{dir}/{node}/{seg}.dict`，
+   TDS 自身重启不丢快照）+ `TdsClient` + `sync_dicts_to_tds`（刷盘后上报，预加载/蓝绿切换基础）+
+   `restore_dicts_from_tds`（重启节点拉回字典写本地 `.fst`，无磁盘重建 IO；TDS 不可用回退本地，降级可用）；
+   字节经 hex 编码走 JSON-RPC（零依赖无 unsafe）；测试验证 put/get/list 往返、TDS 重启恢复、上报→冷节点恢复；
+7. ~~**无损扩容协议（design 9.1.1）**~~ ✅（2026-08-28）：
+   `src/reshard.rs`：`compute_moved_vshards`（新旧节点一致性哈希归属变化集合，只迁移 ~1/N 虚拟分片）；
+   `Migration`（双写/追平/切换状态机）；网关集成三步：**双写（Shadow Writes）**——迁移分片 docid
+   写老节点后同时写新节点（`begin_migration`，新节点接入端点但不入元数据中心，路由暂不变）；
+   **数据追平（Delta Catch-up）**——全量扫描老节点 + `extract_terms` 重新派生词条拷贝到新节点
+   （语义等价 SST 拷贝 + WAL 增量，`catch_up`）；**原子切换（Atomic Switch）**——新节点注册元数据中心，
+   路由切换、双写关闭（`commit_migration`）；**回滚预案** `abort_migration`（不注册、路由不变、旧数据完好）；
+   测试验证：迁移生命周期数据零丢失（广播全量一致）、回滚路由不变、重复迁移拒绝；测试 221 全绿（+10）；
 8. **数据关联增强（design 19）**：物化视图调度器 + `shanshui-cunji-export` 导出工具 + JOIN 计划节点本地执行（单分片内）；
 9. **两级索引（design 4.4.2）**：内存索引减少 90%；
 10. **数据管道增强（design 20）**：`import` 支持 Parquet、`import-schema`（字段注册表 + 索引定义导入）；
