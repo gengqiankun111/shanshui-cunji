@@ -129,6 +129,7 @@ fn main() {
         "groupby" => run_cli_group_by(&config_path, &field),
         "admin" => run_cli_admin(&config_path),
         "reload" => run_cli_reload_config(&config_path),
+        "compact" => run_cli_compact(&config_path),
         "explain" => run_cli_explain(&config_path, &filter),
         "delete" => run_cli_delete(&config_path, id),
         "version" | "-V" | "--version" => {
@@ -632,6 +633,30 @@ fn run_cli_reload_config(config_path: &Path) {
             "system"
         }
     );
+}
+
+/// `compact`（design 4.5 / 阶段 3）：主数据列族全量合并（L0 多 SST → 1）。
+fn run_cli_compact(config_path: &Path) {
+    let mut engine = open_engine(config_path);
+    match engine.compact() {
+        Ok(rep) => {
+            if rep.merged_ssts <= 1 {
+                println!("无需 Compaction（SST 段数 ≤ 1）");
+                return;
+            }
+            println!(
+                "✅ Compaction 完成: 合并 {} 个 SST → 消除 {} 个旧版本键，释放 {} 字节",
+                rep.merged_ssts, rep.kept_keys, rep.freed_bytes
+            );
+            if engine.needs_compact() {
+                println!("⚠️ 提示: 段数仍超阈值，建议再次 compact");
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Compaction 失败: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `explain --filter 'status=active'`（development 5.26）：执行计划推演，不读数据。

@@ -66,6 +66,8 @@ pub struct ColumnFamily {
     index_granularity: usize,
     /// 后台 IO 限速器（design 4.5 阶段 3；`storage.io_rate_limit_mb`，None = 不限速）。
     io_limiter: Option<crate::io_scheduler::IoRateLimiter>,
+    /// L0 段数阈值（`storage.l0_stall_threshold`，超过判需要 Compaction）。
+    l0_stall_threshold: usize,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 文件（新→旧）。
@@ -78,6 +80,17 @@ pub struct ColumnFamily {
     next_sst_id: u64,
     /// 当前 WAL 写入器。
     wal: WalWriter,
+}
+
+/// Compaction 结果报告（design 4.5 阶段 3）。
+#[derive(Debug, Clone, Copy)]
+pub struct CompactReport {
+    /// 被合并的旧段数。
+    pub merged_ssts: usize,
+    /// 被消除的重复旧版本键数（含被 Tombstone 覆盖的键）。
+    pub kept_keys: usize,
+    /// 释放的磁盘字节数。
+    pub freed_bytes: u64,
 }
 
 impl ColumnFamily {
@@ -166,6 +179,7 @@ impl ColumnFamily {
             } else {
                 None
             },
+            l0_stall_threshold: cfg.storage.l0_stall_threshold,
             memtable: MemTableBuffer::new(),
             ssts,
             block_cache,
@@ -446,6 +460,99 @@ impl ColumnFamily {
             limiter.acquire(sz)?;
         }
         Ok(())
+    }
+
+    /// 基础 Compaction（design 4.5，阶段 3）：将全部 SST 合并为单个紧凑文件。
+    ///
+    /// - 读取全部条目（key, seq, value；value=None = Tombstone），按 (key 升序, seq 降序) 排序，
+    ///   同 key 保留最高 seq（后写覆盖先写，Tombstone 语义保留）；
+    /// - 新段写临时文件 → fsync → 原子更新 Manifest → 删除旧段（崩溃安全，同倒排 GC 模式）；
+    /// - 后台 IO 限速：写完后按实际字节 acquire。
+    pub fn compact(&mut self) -> Result<CompactReport> {
+        let old_count = self.ssts.len();
+        if old_count <= 1 {
+            return Ok(CompactReport {
+                merged_ssts: 0,
+                kept_keys: 0,
+                freed_bytes: 0,
+            });
+        }
+        // ① 读取全部条目
+        let mut rows: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::new();
+        for sst in &mut self.ssts {
+            sst.iterate(|k, v, seq| {
+                rows.push((k.to_vec(), seq, v.map(|x| x.to_vec())));
+            })?;
+        }
+        // ② 排序 + 去重：key 升序、seq 降序，同 key 保留首个（最高 seq）
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        let kept_keys = rows.len();
+        rows.dedup_by(|a, b| a.0 == b.0);
+
+        // ③ 写新段（新→旧序插入，读路径优先命中）
+        let sst_id = self.next_sst_id;
+        self.next_sst_id += 1;
+        let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
+        {
+            let mut w = SstWriter::new_with_pax(
+                &path,
+                self.compression,
+                self.compression_level,
+                self.block_size,
+                rows.len(),
+                &self.pax_hot_fields,
+                self.bloom_fpr,
+            )?;
+            for (key, _seq, value) in &rows {
+                match value {
+                    Some(v) => w.add(key, v, *_seq)?,
+                    None => w.add_tombstone(key, *_seq)?,
+                }
+            }
+            w.finish()?;
+        }
+        self.io_acquire(&path)?;
+
+        // ④ 原子更新 Manifest（先 Manifest 后删旧文件）
+        let old_ssts = std::mem::take(&mut self.ssts);
+        let old_bytes: u64 = old_ssts
+            .iter()
+            .map(|r| {
+                std::fs::metadata(r.path())
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        self.ssts
+            .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
+        self.persist_manifest()?;
+
+        // ⑤ 删除旧段（孤儿无害，启动只加载 Manifest）
+        for r in &old_ssts {
+            let _ = std::fs::remove_file(r.path());
+        }
+        let freed_bytes = old_bytes.saturating_sub(self.sst_bytes());
+        info!(
+            "列族 [{}] Compaction 完成: {} 段 → 1（保留 {} 键，释放 {} 字节）",
+            self.name, old_count, rows.len(), freed_bytes
+        );
+        Ok(CompactReport {
+            merged_ssts: old_count,
+            kept_keys: kept_keys.saturating_sub(rows.len()),
+            freed_bytes,
+        })
+    }
+
+    /// 是否需要 Compaction（L0 段数超过 `storage.l0_stall_threshold`）。
+    pub fn needs_compact(&self) -> bool {
+        self.ssts.len() > self.l0_stall_threshold
+    }
+    /// 全部 SST 文件字节总和。
+    pub fn sst_bytes(&self) -> u64 {
+        self.ssts
+            .iter()
+            .filter_map(|r| std::fs::metadata(r.path()).ok().map(|m| m.len()))
+            .sum()
     }
 
     fn write_rows(&self, path: &Path, rows: &[BucketRow]) -> Result<SstFooter> {
@@ -730,6 +837,59 @@ mod tests {
         cf.switch_and_flush().unwrap();
         assert!(cf.get(9).unwrap().is_none());
         assert!(cf.scan_range(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compact_merges_ssts_preserving_overwrite_and_delete() {
+        // design 4.5 阶段 3：多次刷盘 → 全量合并，覆盖/删除语义保留
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 3 个 SST：含跨段覆盖 + 删除
+        cf.put(1, b"v1".to_vec()).unwrap();
+        cf.put(2, b"v2".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST1
+        cf.put(2, b"v2b".to_vec()).unwrap(); // 跨段覆盖
+        cf.put(3, b"v3".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST2
+        cf.delete(3).unwrap(); // 删除
+        cf.put(4, b"v4".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST3
+
+        let before = cf.sst_count();
+        assert!(before >= 3, "应产生多个 SST: {before}");
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.merged_ssts, before);
+        assert!(rep.freed_bytes > 0, "合并应释放空间");
+        assert_eq!(cf.sst_count(), 1, "合并后只剩 1 个 SST");
+
+        // 语义保持
+        assert_eq!(cf.get(1).unwrap().unwrap().0, b"v1");
+        assert_eq!(cf.get(2).unwrap().unwrap().0, b"v2b", "后写覆盖先写");
+        assert!(cf.get(3).unwrap().is_none(), "删除后不可见");
+        assert_eq!(cf.get(4).unwrap().unwrap().0, b"v4");
+        let rows = cf.scan_range(None, None).unwrap();
+        assert_eq!(rows, vec![(1, b"v1".to_vec()), (2, b"v2b".to_vec()), (4, b"v4".to_vec())]);
+
+        // 重启后 Manifest 只含新段，数据完整
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.sst_count(), 1);
+        assert_eq!(cf2.get(2).unwrap().unwrap().0, b"v2b");
+        assert!(cf2.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_noop_when_single_sst() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.put(1, b"x".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_count(), 1);
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.merged_ssts, 0, "单段不需要合并");
+        assert_eq!(cf.sst_count(), 1);
+        assert_eq!(cf.get(1).unwrap().unwrap().0, b"x");
     }
 
     #[test]
