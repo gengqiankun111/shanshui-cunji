@@ -108,12 +108,10 @@ impl Config {
                 ["SERVER", "LISTEN_ADDR"] => self.server.listen_addr = val,
                 ["CLUSTER", "NODE_ID"] => self.cluster.node_id = val,
                 ["CLUSTER", "INTERNAL_RPC_PORT"] => {
-                    self.cluster.internal_rpc_port = val
-                        .parse::<u16>()
-                        .unwrap_or_else(|_| {
-                            warn!("环境变量 CLUSTER__INTERNAL_RPC_PORT 解析失败，忽略");
-                            self.cluster.internal_rpc_port
-                        });
+                    self.cluster.internal_rpc_port = val.parse::<u16>().unwrap_or_else(|_| {
+                        warn!("环境变量 CLUSTER__INTERNAL_RPC_PORT 解析失败，忽略");
+                        self.cluster.internal_rpc_port
+                    });
                 }
                 ["SHARDING", "ENABLED"] => {
                     self.sharding.enabled = val == "true" || val == "1";
@@ -127,10 +125,8 @@ impl Config {
                 }
                 ["REPLICATION", "ROLE"] => self.replication.role = val,
                 ["BROADCAST_QUERY", "MAX_CONCURRENT"] => {
-                    self.broadcast_query.max_concurrent = parse_override(
-                        "broadcast_query.max_concurrent",
-                        &val,
-                    );
+                    self.broadcast_query.max_concurrent =
+                        parse_override("broadcast_query.max_concurrent", &val);
                 }
                 ["MEMORY", "WATERMARK_HIGH"] => {
                     self.memory.watermark_high = parse_override_f64("memory.watermark_high", &val)
@@ -273,7 +269,8 @@ impl Config {
                     .into(),
             ));
         }
-        if self.compaction.stall_timeout_secs == 0 || self.compaction.max_consecutive_failures == 0 {
+        if self.compaction.stall_timeout_secs == 0 || self.compaction.max_consecutive_failures == 0
+        {
             return Err(Error::Config(
                 "compaction.stall_timeout_secs / max_consecutive_failures 必须 > 0".into(),
             ));
@@ -552,12 +549,19 @@ impl Default for InvertedConfig {
 pub struct JoinConfig {
     /// queryAndJoin 结果集上限，超限熔断（默认 100 万）。
     pub max_rows: usize,
+    /// 小表广播 JOIN（design 19.3，阶段 3）：从表（关联侧）行数 ≤ broadcast_threshold 时，
+    /// 一次性全量扫描建立内存索引复用（避免逐 key 点查）；默认关闭。
+    pub broadcast_enabled: bool,
+    /// 广播 JOIN 阈值（行）：从表行数超过则不广播（回退逐 key 点查）。
+    pub broadcast_threshold: usize,
 }
 
 impl Default for JoinConfig {
     fn default() -> Self {
         Self {
             max_rows: 1_000_000,
+            broadcast_enabled: false,
+            broadcast_threshold: 100,
         }
     }
 }
@@ -879,8 +883,11 @@ engine = "fst"
     fn reload_applies_changes_and_reports_sections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[hotcache]\nmax_memory_mb = 1024\n[sstable]\ncompression = \"zstd\"\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "[hotcache]\nmax_memory_mb = 1024\n[sstable]\ncompression = \"zstd\"\n",
+        )
+        .unwrap();
         let mut cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.hotcache.max_memory_mb, 1024);
 
@@ -978,7 +985,10 @@ timeout_ms = 15000
         assert_eq!(cfg.server.mode, "standalone");
         assert!(!cfg.sharding.enabled, "standalone 必须强制关闭分片");
         assert!(!cfg.replication.enabled, "standalone 必须强制关闭副本");
-        assert!(!cfg.read_write_separation.enabled, "standalone 必须强制关闭读写分离");
+        assert!(
+            !cfg.read_write_separation.enabled,
+            "standalone 必须强制关闭读写分离"
+        );
     }
 
     #[test]
