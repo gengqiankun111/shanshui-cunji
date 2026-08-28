@@ -33,6 +33,9 @@ pub enum Error {
 
     #[error("stalled: {0}")]
     Stalled(String),
+
+    #[error("migrate error: {0}")]
+    Migrate(String),
 }
 
 /// shanshui-cunji 全局结果类型。

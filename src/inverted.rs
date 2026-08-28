@@ -524,10 +524,8 @@ mod tests {
         idx.add("b=2", 2);
         idx.add("a=1", 3);
         let terms = idx.iter_terms().unwrap();
-        let map: std::collections::BTreeMap<String, u64> = terms
-            .into_iter()
-            .map(|(t, b)| (t, b.len() as u64))
-            .collect();
+        let map: std::collections::BTreeMap<String, u64> =
+            terms.into_iter().map(|(t, b)| (t, b.len())).collect();
         assert_eq!(map.get("a=1").copied(), Some(2), "跨段+内存合并");
         assert_eq!(map.get("b=2").copied(), Some(1));
     }
