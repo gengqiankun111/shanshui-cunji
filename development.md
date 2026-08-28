@@ -848,7 +848,8 @@ impl RuntimePools {
    `Engine::restore_incremental(path)` 按序重放（PUT 重新派生倒排词条 / DELETE 写墓碑）；
    `BackupReport`（since/until/records）；测试验证 全量点+增量还原（PUT/删除/保留）、since=0 全导出；
    测试 277→279（+2）；
-6. **收尾**：性能实测 + 文档 + 打 v0.4.0 标签。
+6. **收尾**：✅ 性能回归快检（2026-08-28，1000万 10/10，插入 38.6 万条/s 无回归，`images/perf-0.4.0/`）；
+   M6 全部 5 项功能完成、测试 279 全绿；打 v0.4.0 标签待确认（版本号 + RELEASE 说明 + 分支同步）。
 
 ---
 
