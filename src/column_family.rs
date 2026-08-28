@@ -64,6 +64,8 @@ pub struct ColumnFamily {
     ttl_field: String,
     /// 两级索引粒度（`sstable.index_granularity`，每 N 块一条 Level 1 摘要）。
     index_granularity: usize,
+    /// 后台 IO 限速器（design 4.5 阶段 3；`storage.io_rate_limit_mb`，None = 不限速）。
+    io_limiter: Option<crate::io_scheduler::IoRateLimiter>,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 文件（新→旧）。
@@ -157,6 +159,13 @@ impl ColumnFamily {
             ttl_days: cfg.storage.ttl_days,
             ttl_field: cfg.storage.ttl_field.clone(),
             index_granularity: cfg.sstable.index_granularity as usize,
+            io_limiter: if cfg.storage.io_rate_limit_mb > 0 {
+                Some(crate::io_scheduler::IoRateLimiter::new(
+                    cfg.storage.io_rate_limit_mb * 1024 * 1024,
+                ))
+            } else {
+                None
+            },
             memtable: MemTableBuffer::new(),
             ssts,
             block_cache,
@@ -367,6 +376,7 @@ impl ColumnFamily {
 
         // 新文件插到最前（读路径优先命中）
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
+        self.io_acquire(&path)?;
         self.ssts
             .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
         self.persist_manifest()?;
@@ -409,6 +419,7 @@ impl ColumnFamily {
             };
             let path = self.dir.join(&fname);
             self.write_rows(&path, &rows)?;
+            self.io_acquire(&path)?;
             self.ssts
                 .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
         }
@@ -428,6 +439,15 @@ impl ColumnFamily {
     }
 
     /// 按行序列写一个 SST（TTL 分桶用；行内 key 已升序）。
+    /// 后台 IO 限速：刷盘完成后按实际文件字节数 acquire（design 4.5 阶段 3；不限速时为空操作）。
+    fn io_acquire(&mut self, path: &Path) -> Result<()> {
+        if let Some(limiter) = &mut self.io_limiter {
+            let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            limiter.acquire(sz)?;
+        }
+        Ok(())
+    }
+
     fn write_rows(&self, path: &Path, rows: &[BucketRow]) -> Result<SstFooter> {
         let mut w = SstWriter::new_with_pax(
             path,

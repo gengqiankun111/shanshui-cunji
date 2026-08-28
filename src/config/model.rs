@@ -503,6 +503,8 @@ pub struct StorageConfig {
     pub time_bucket: String,
     /// TTL 时间字段名（文档 JSON 内，数值秒级时间戳）。
     pub ttl_field: String,
+    /// 后台 IO 限速（MB/s，design 4.5 阶段 3）：刷盘/Compaction 走 Token Bucket；0 = 不限速。
+    pub io_rate_limit_mb: u64,
 }
 
 impl Default for StorageConfig {
@@ -514,6 +516,7 @@ impl Default for StorageConfig {
             hot_fields: Vec::new(),
             time_bucket: "day".into(),
             ttl_field: "timestamp".into(),
+            io_rate_limit_mb: 0,
         }
     }
 }

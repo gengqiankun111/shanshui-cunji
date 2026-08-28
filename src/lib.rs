@@ -30,6 +30,7 @@ pub mod gateway;
 pub mod hotcache;
 pub mod import_schema;
 pub mod inverted;
+pub mod io_scheduler;
 pub mod join;
 pub mod keys;
 pub mod memtable;
