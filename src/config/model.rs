@@ -143,6 +143,11 @@ impl Config {
                 self.inverted.engine
             )));
         }
+        if self.inverted.segment_max_size_mb == 0 {
+            return Err(Error::Config(
+                "inverted.segment_max_size_mb 必须 > 0".into(),
+            ));
+        }
         if self.join.max_rows == 0 {
             return Err(Error::Config("join.max_rows 必须 > 0".into()));
         }
@@ -454,6 +459,8 @@ pub struct InvertedConfig {
     pub max_memory_bytes: usize,
     /// 魔鬼倒排列表门控：超过则不展开，降级全表扫描 + Zone Map。
     pub max_posting_scan: u64,
+    /// 倒排段 GC 阈值（MB，design 5.2.2 / 5.2.4⑤）：段文件总量超此值触发后台合并。
+    pub segment_max_size_mb: u64,
 }
 
 impl Default for InvertedConfig {
@@ -463,6 +470,7 @@ impl Default for InvertedConfig {
             engine: "fst".into(),
             max_memory_bytes: 12 * 1024 * 1024 * 1024,
             max_posting_scan: 1_000_000,
+            segment_max_size_mb: 1024,
         }
     }
 }

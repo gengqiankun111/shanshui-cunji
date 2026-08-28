@@ -10,7 +10,12 @@
 //! - **段清单 Manifest**（`inverted-manifest.json`）：记录段文件列表（新→旧），
 //!   原子写（tmp + rename），杜绝 GC 崩溃风险（design 4.5）；
 //! - **查询**：内存字典 ∪ 各段 posting 合并为 RoaringBitmap；
-//! - 段 GC / 压缩（阶段 2 分层 GC）；删除标记（Tombstone）随文档引擎层处理。
+//! - 阶段 2 架构升级：
+//!   - **预分片 Chunk（design 5.2.1）**：`chunk_for_shard` 按 `hash64(docid) % shard_count`
+//!     抽出属于指定分片的 posting 子集，网关 `concatenate_chunks` 按序直拼（O(1)），广播查询免交集/并集；
+//!   - **倒排段 GC（design 5.2.2 + 5.2.4⑤）**：段总量超 `segment_max_size_mb` 阈值时
+//!     `gc()` 将全部段合并为单个紧凑段（临时文件 → fsync → 原子更新 Manifest → 删旧段），
+//!     中途崩溃不丢数据；分层 Tiered Segments 合并（每次只合并最小 2 段）留后续优化。
 //!
 //! > mmap 按需加载（冷启动亚秒）为设计目标；本项目 `#![forbid(unsafe_code)]`，
 //! > memmap2 的 mmap 为 unsafe API，故 FST 字典采用 fs::read 加载（FST 为压缩结构、体积小），
@@ -61,16 +66,29 @@ pub struct InvertedIndex {
     next_seg_id: u64,
     /// 刷盘阈值：内存累计 posting 达此值整段落盘。
     flush_threshold: u64,
+    /// 段文件 GC 阈值（字节）：磁盘段总量超此值触发 `gc()` 合并（design 5.2.2；0 = 禁用）。
+    gc_threshold_bytes: u64,
 }
 
 impl InvertedIndex {
     /// 打开（或创建）倒排索引：加载 Manifest 与 FST 字典。默认 FST 引擎（阶段 1.5）。
+    /// GC 默认禁用（`gc_threshold_bytes = 0`），由引擎按配置开启。
     pub fn open(dir: &Path, flush_threshold: u64) -> Result<Self> {
         Self::open_with_engine(dir, flush_threshold, "fst")
     }
 
-    /// 打开（或创建）倒排索引，指定字典引擎。
+    /// 打开（或创建）倒排索引，指定字典引擎。GC 默认禁用。
     pub fn open_with_engine(dir: &Path, flush_threshold: u64, engine: &str) -> Result<Self> {
+        Self::open_with_gc(dir, flush_threshold, engine, 0)
+    }
+
+    /// 打开（或创建）倒排索引，指定字典引擎与段 GC 阈值（字节）。
+    pub fn open_with_gc(
+        dir: &Path,
+        flush_threshold: u64,
+        engine: &str,
+        gc_threshold_bytes: u64,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let manifest_path = dir.join(MANIFEST_FILE);
         let (segments, next_seg_id) = if manifest_path.exists() {
@@ -116,6 +134,7 @@ impl InvertedIndex {
             dicts,
             next_seg_id,
             flush_threshold,
+            gc_threshold_bytes,
         })
     }
 
@@ -350,6 +369,157 @@ impl InvertedIndex {
         }
         Ok(out)
     }
+
+    // ============ 预分片 Chunk（design 5.2.1，阶段 2）============
+
+    /// 取 term 完整 posting 中**属于指定分片**的那段 Chunk Bitmap。
+    /// `shard_count` 为（虚拟）分片数，`shard_id ∈ [0, shard_count)`。
+    /// 分片一致性：与 `sharding::route` 共用 `hash64`（`virtual_shard = hash64(docid) % shard_count`）。
+    ///
+    /// 广播查询流程（design 9.2）：网关给每个分片只要求本片 Chunk → 各片本地算本片 DocId →
+    /// 网关 `concatenate_chunks` 按序直拼（O(1)），无需跨片交集/并集。
+    pub fn chunk_for_shard(
+        &self,
+        term: &str,
+        shard_id: u32,
+        shard_count: u32,
+    ) -> Result<RoaringBitmap> {
+        assert!(shard_count > 0, "shard_count 必须 > 0");
+        assert!(shard_id < shard_count, "shard_id 越界");
+        let full = self.search(term)?;
+        let mut chunk = RoaringBitmap::new();
+        for d in full.iter() {
+            let vs = (crate::sharding::hash64(d as u64) % shard_count as u64) as u32;
+            if vs == shard_id {
+                chunk.insert(d);
+            }
+        }
+        Ok(chunk)
+    }
+
+    /// 网关侧按序直拼（design 5.2.1）：各分片 Chunk 互不相交，顺序 OR 即拼接（O(1) 合并开销）。
+    pub fn concatenate_chunks(chunks: &[RoaringBitmap]) -> RoaringBitmap {
+        let mut out = RoaringBitmap::new();
+        for c in chunks {
+            out |= c.clone();
+        }
+        out
+    }
+
+    // ============ 倒排段 GC / Compaction（design 5.2.2 + 5.2.4⑤，阶段 2）============
+
+    /// 全部磁盘段文件总字节数。
+    pub fn segment_bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .filter_map(|s| std::fs::metadata(self.dir.join(s)).ok().map(|m| m.len()))
+            .sum()
+    }
+
+    /// 是否需要 GC：开启（阈值 > 0）且段数 > 1 且总量 ≥ 阈值。
+    pub fn should_gc(&self) -> bool {
+        self.gc_threshold_bytes > 0
+            && self.segments.len() > 1
+            && self.segment_bytes() >= self.gc_threshold_bytes
+    }
+
+    /// 倒排文件 GC（design 5.2.2）：将全部段读取所有 Term 的最新 Bitmap，
+    /// **重写为单个紧凑段**（临时文件 → fsync → 原子更新 Manifest → 删除旧段 + 旧 FST），
+    /// 中途崩溃不丢数据（启动只加载 Manifest 中的段，孤儿段被忽略）。
+    pub fn gc(&mut self) -> Result<GcReport> {
+        if !self.should_gc() {
+            return Ok(GcReport {
+                merged: 0,
+                freed_bytes: 0,
+                segment_count: self.segments.len(),
+            });
+        }
+        // ① 读取全部段的所有 term 最新 posting（bitmap 合并天然去重）
+        let mut map: std::collections::BTreeMap<String, RoaringBitmap> =
+            std::collections::BTreeMap::new();
+        for seg in &self.segments {
+            for (term, posting) in self.read_segment_terms(seg)? {
+                let e = map.entry(term).or_default();
+                *e |= posting;
+            }
+        }
+
+        // ② 写新段（临时文件 → fsync → 原子 rename）
+        let seg_id = self.next_seg_id;
+        self.next_seg_id += 1;
+        let path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg"));
+        let mut body = Vec::new();
+        let mut term_offsets: Vec<(Vec<u8>, u64)> = Vec::new();
+        encode_varint(&mut body, map.len() as u64);
+        for (term, bitmap) in &map {
+            let file_offset = (SEG_MAGIC.len() + std::mem::size_of::<u16>() + body.len()) as u64;
+            term_offsets.push((term.clone().into_bytes(), file_offset));
+            let mut bytes = Vec::new();
+            bitmap
+                .serialize_into(&mut bytes)
+                .map_err(|e| Error::Serialize(format!("posting 序列化失败: {e}")))?;
+            encode_varlen(&mut body, term.as_bytes());
+            encode_varlen(&mut body, &bytes);
+        }
+        let tmp = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg.tmp"));
+        let mut out = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut out, SEG_MAGIC)?;
+        std::io::Write::write_all(&mut out, &SEG_VERSION.to_le_bytes())?;
+        std::io::Write::write_all(&mut out, &body)?;
+        out.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        let fname = path.file_name().unwrap().to_string_lossy().to_string();
+
+        // ③ 编译新段 FST 字典（写临时文件 → rename）
+        let new_dict = if self.engine == "fst" {
+            Some(self.write_fst_dict(seg_id, &term_offsets)?)
+        } else {
+            None
+        };
+
+        // ④ 原子更新 Manifest（先 Manifest 后删旧文件，崩溃安全）
+        let old_segments = std::mem::take(&mut self.segments);
+        let old_bytes: u64 = old_segments
+            .iter()
+            .filter_map(|s| std::fs::metadata(self.dir.join(s)).ok().map(|m| m.len()))
+            .sum();
+        self.segments = vec![fname.clone()];
+        self.persist_manifest()?;
+
+        // ⑤ 删除旧段与旧 FST（孤儿无害，启动不加载）
+        for seg in &old_segments {
+            let _ = std::fs::remove_file(self.dir.join(seg));
+            let _ = std::fs::remove_file(self.dir.join(seg.replace(".seg", ".fst")));
+        }
+        // 重建内存字典
+        self.dicts.clear();
+        if let Some(m) = new_dict {
+            self.dicts.insert(fname, m);
+        }
+
+        let freed_bytes = old_bytes.saturating_sub(self.segment_bytes());
+        info!(
+            "倒排 GC 完成: {} 段合并为 1（释放 {} 字节）",
+            old_segments.len(),
+            freed_bytes
+        );
+        Ok(GcReport {
+            merged: old_segments.len(),
+            freed_bytes,
+            segment_count: 1,
+        })
+    }
+}
+
+/// 倒排 GC 结果报告。
+#[derive(Debug, Clone, Copy)]
+pub struct GcReport {
+    /// 被合并的旧段数。
+    pub merged: usize,
+    /// 释放的磁盘字节数。
+    pub freed_bytes: u64,
+    /// GC 后的段数。
+    pub segment_count: usize,
 }
 
 /// 从段数据指定偏移解析 (term, posting) 条目（FST 字典指向的条目）。
@@ -616,5 +786,169 @@ mod tests {
         let idx2 = InvertedIndex::open(&dir, 1).unwrap();
         assert_eq!(idx2.fst_dict_count(), 0);
         assert!(idx2.search("k=1").unwrap().contains(1));
+    }
+
+    // ---- 预分片 Chunk（design 5.2.1，阶段 2）----
+
+    #[test]
+    fn chunks_partition_posting_and_concatenate() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        // 散布大量 docid，覆盖全部分片
+        for i in 1..=10_000u64 {
+            idx.add("status=active", i);
+        }
+        let shard_count = 4u32;
+        let full = idx.search("status=active").unwrap();
+        let mut chunks = Vec::new();
+        for s in 0..shard_count {
+            chunks.push(idx.chunk_for_shard("status=active", s, shard_count).unwrap());
+        }
+        // ① 分片 Chunk 互不相交（partition 性质）
+        for i in 0..shard_count {
+            for j in (i + 1)..shard_count {
+                let inter = &chunks[i as usize] & &chunks[j as usize];
+                assert!(inter.is_empty(), "分片 Chunk 不得重叠");
+            }
+        }
+        // ② 每个 Chunk 内 docid 确实属于对应分片
+        for s in 0..shard_count {
+            for d in chunks[s as usize].iter() {
+                let vs = (crate::sharding::hash64(d as u64) % shard_count as u64) as u32;
+                assert_eq!(vs, s, "Chunk 内 docid 分片归属错误");
+            }
+        }
+        // ③ 按序直拼 = 全集（design 5.2.1：O(1) 合并）
+        let merged = InvertedIndex::concatenate_chunks(&chunks);
+        assert_eq!(merged, full, "直拼结果必须等于全集");
+        assert_eq!(merged.len(), 10_000);
+        // ④ 无 docid 落点的分片 → 空 Chunk：单 docid term，其它分片必为空
+        idx.add("rare=1", 1);
+        let owner_shard =
+            (crate::sharding::hash64(1) % 4) as u32; // docid=1 归属的分片
+        let mut empty_count = 0;
+        for s in 0..4 {
+            let chunk = idx.chunk_for_shard("rare=1", s, 4).unwrap();
+            if s == owner_shard {
+                assert_eq!(chunk.len(), 1, "归属分片应含该 docid");
+            } else {
+                assert!(chunk.is_empty(), "非归属分片应为空 Chunk");
+                empty_count += 1;
+            }
+        }
+        assert_eq!(empty_count, 3, "其余 3 个分片应为空 Chunk");
+    }
+
+    #[test]
+    fn chunk_works_across_segments_and_memory() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 3).unwrap();
+        idx.add("city=beijing", 1);
+        idx.add("city=beijing", 2);
+        idx.flush_segment().unwrap();
+        idx.add("city=beijing", 3);
+        idx.add("city=beijing", 4);
+        idx.flush_segment().unwrap();
+        idx.add("city=beijing", 5); // 内存态
+        let shard_count = 2u32;
+        let mut chunks = Vec::new();
+        for s in 0..shard_count {
+            chunks.push(idx.chunk_for_shard("city=beijing", s, shard_count).unwrap());
+        }
+        let full = idx.search("city=beijing").unwrap();
+        assert_eq!(full.len(), 5);
+        assert_eq!(InvertedIndex::concatenate_chunks(&chunks), full);
+    }
+
+    // ---- 倒排段 GC（design 5.2.2 + 5.2.4⑤，阶段 2）----
+
+    #[test]
+    fn gc_merges_segments_preserving_data() {
+        let dir = tmp();
+        // 极小 GC 阈值（1 字节）：任意 >1 段即触发
+        let mut idx = InvertedIndex::open_with_gc(&dir, 2, "fst", 1).unwrap();
+        // 4 段，term 跨段重复
+        for seg in 0..4u64 {
+            idx.add("status=active", 1 + seg * 2);
+            idx.add("status=active", 2 + seg * 2);
+            idx.add("status=pending", 100 + seg);
+            idx.flush_segment().unwrap();
+        }
+        assert_eq!(idx.segment_count(), 4);
+        assert!(idx.should_gc());
+        let before = idx.segment_bytes();
+
+        let report = idx.gc().unwrap();
+        assert_eq!(report.merged, 4);
+        assert_eq!(idx.segment_count(), 1, "GC 后应合并为 1 段");
+        assert!(report.segment_count == 1);
+        // 数据保持完整
+        let active = idx.search("status=active").unwrap();
+        assert_eq!(active.len(), 8, "跨段合并去重后应有 8 个 docid");
+        let pending = idx.search("status=pending").unwrap();
+        assert_eq!(pending.len(), 4);
+        // FST 字典重建（1 段 1 字典）
+        assert_eq!(idx.fst_dict_count(), 1);
+        // 旧段文件已删除
+        for seg in ["inverted-00000001.seg", "inverted-00000002.seg"] {
+            assert!(!dir.join(seg).exists(), "旧段 {seg} 应被删除");
+        }
+        // 新段存在（id=5）
+        assert!(dir.join("inverted-00000005.seg").exists());
+        assert!(report.freed_bytes >= before.saturating_sub(idx.segment_bytes()));
+    }
+
+    #[test]
+    fn gc_disabled_when_threshold_zero() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 2).unwrap(); // gc 阈值 0 = 禁用
+        for _ in 0..3 {
+            idx.add("k=1", 1);
+            idx.flush_segment().unwrap();
+        }
+        assert!(!idx.should_gc());
+        let report = idx.gc().unwrap();
+        assert_eq!(report.merged, 0, "禁用时 GC 应为空操作");
+        assert_eq!(idx.segment_count(), 3);
+    }
+
+    #[test]
+    fn gc_then_restart_loads_manifest_correctly() {
+        let dir = tmp();
+        {
+            let mut idx = InvertedIndex::open_with_gc(&dir, 2, "fst", 1).unwrap();
+            idx.add("a=1", 1);
+            idx.add("a=1", 2);
+            idx.flush_segment().unwrap();
+            idx.add("a=1", 3);
+            idx.add("b=2", 9);
+            idx.flush_segment().unwrap();
+            idx.gc().unwrap();
+        }
+        // 重启：只加载 Manifest 中的新段
+        let idx2 = InvertedIndex::open(&dir, 2).unwrap();
+        assert_eq!(idx2.segment_count(), 1);
+        let a = idx2.search("a=1").unwrap();
+        assert!(a.contains(1) && a.contains(2) && a.contains(3));
+        assert!(idx2.search("b=2").unwrap().contains(9));
+        // Manifest 不含孤儿
+        let text = std::fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
+        assert!(!text.contains("inverted-00000001.seg"), "旧段不得出现在 Manifest");
+        assert!(text.contains("inverted-00000003.seg"));
+    }
+
+    #[test]
+    fn gc_not_triggered_below_threshold() {
+        let dir = tmp();
+        // 阈值极大（1TB）：段再多也不 GC
+        let mut idx = InvertedIndex::open_with_gc(&dir, 2, "fst", 1024 * 1024 * 1024 * 1024).unwrap();
+        for _ in 0..3 {
+            idx.add("k=1", 1);
+            idx.flush_segment().unwrap();
+        }
+        assert!(!idx.should_gc(), "低于阈值不应触发 GC");
+        let report = idx.gc().unwrap();
+        assert_eq!(report.merged, 0);
+        assert_eq!(idx.segment_count(), 3);
     }
 }

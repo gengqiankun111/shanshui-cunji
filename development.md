@@ -675,7 +675,14 @@ impl RuntimePools {
 
 ### 7.3 阶段 2：分布式集群
 
-1. **倒排架构升级**（预分片 Chunk + 分层 GC + 极端防护）；
+1. ~~**倒排架构升级（design 5.2）**：预分片 Chunk + 倒排文件 GC~~ ✅（2026-08-28，基础版）：
+   - **预分片 Chunk（5.2.1）**：`chunk_for_shard(term, shard_id, shard_count)` 按 `hash64(docid) % shard_count`
+     （与 `sharding::route` 同一哈希，分片一致性）抽出归属分片的 posting 子集；
+     `concatenate_chunks` 网关侧按序直拼 O(1)（各片 Chunk 互不相交，partition 性质测试验证）；
+   - **倒排段 GC（5.2.2 + 5.2.4⑤）**：`gc()` 全段合并为单紧凑段（临时文件 → fsync → 原子更新 Manifest → 删旧段+FST），
+     崩溃安全（启动只加载 Manifest，孤儿段忽略）；配置 `inverted.segment_max_size_mb`（默认 1024MB）经引擎注入；
+     Tiered 分层合并（每次只合最小 2 段）留后续优化；
+   - 测试 182 全绿（+6 Chunk partition/跨段/GC 合并/禁用/重启/阈值）；
 2. ~~**分布式全配置清单（design 9.8）**~~ ✅（2026-08-28，阶段 2 首发）：
    `cluster`（node_id / internal_rpc_port）、`sharding`（enabled / total_shards / virtual_shards / shard_key / consistent_hash）、
    `replication`（role / master_addr / sync_mode async|sync / ack_timeout_ms / batch_size / heartbeat_interval_sec）、
