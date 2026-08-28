@@ -10,7 +10,8 @@
 const VNODES_PER_NODE: u64 = 128;
 
 /// splitmix64 —— 确定性 64 位混合哈希（无外部依赖、无 unsafe）。
-fn hash64(mut x: u64) -> u64 {
+/// `pub(crate)`：倒排预分片 Chunk（design 5.2.1）复用同一哈希，保证分片一致性。
+pub(crate) fn hash64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
