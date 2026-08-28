@@ -72,10 +72,11 @@ impl Engine {
         query_timeout: std::time::Duration,
     ) -> Result<Self> {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
-        let inverted = InvertedIndex::open_with_engine(
+        let inverted = InvertedIndex::open_with_gc(
             &data_dir.join("inverted"),
             1_000_000,
             &cfg.inverted.engine,
+            cfg.inverted.segment_max_size_mb * 1024 * 1024,
         )?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
