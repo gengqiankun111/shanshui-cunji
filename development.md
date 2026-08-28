@@ -637,7 +637,11 @@ impl RuntimePools {
    `inverted.engine` 默认切 "fst"（design 5.2.4.1）；注意：`#![forbid(unsafe_code)]`
    下 memmap2 的 mmap 为 unsafe API，字典暂用 fs::read 加载（FST 压缩结构体积小），
    mmap 化留待独立 crate 封装 unsafe 白名单（P23）；
-7. **迁移工具基础版（shanshui-cunji-migrate）**（解决 G2）：支持 mysqldump / CSV 全量导入；
+7. ~~**迁移工具基础版（shanshui-cunji-migrate）**（解决 G2）：支持 mysqldump / CSV 全量导入~~ ✅（2026-08-28）：
+   `src/bin/migrate.rs` + 库模块 `src/migrate.rs`（development 5.16）：CSV（首行表头）与
+   mysqldump `INSERT INTO` 行解析（字符串/数字/NULL/转义引号），列名即 JSON 字段，
+   `docid`/`id` 列作主键否则递增，单线程全量导入 + 迁移报告；测试 147 全绿（+6），
+   冒烟验证 CSV 3 行 + SQL 4 行导入正确；
 8. **数据关联基础（design 19）**：SDK `queryAndJoin` 二次查询 + 写入 Enrich 预连接；
 9. **块级压缩（Zstd Level 3）+ 分区布隆过滤器（design 4.4.2）**：存储再降 40%~60%、布隆内存减半；
 10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（jemalloc stats + 命中率）+ `explain`（执行计划推演）；
