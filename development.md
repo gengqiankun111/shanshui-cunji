@@ -813,6 +813,44 @@ impl RuntimePools {
    `RELEASE-SUMMARY-v0.3.0.md` / README 发布摘要更新 + `git tag v0.3.0` + 推送；阶段 3 全部完成，
    测试 260 全绿，三规模 demo 10/10。
 
+### 7.5 M6 高性能写入模式（design 4.3 阶段 3 末）
+
+1. ~~**环形 WAL（design 4.3）**~~ ✅（2026-08-28）：`RingWal`——预分配固定大小文件 + 写指针循环移动
+   （省去文件扩展与 inode 元数据更新），记录格式与追加 WAL 兼容；**覆盖安全**：回绕仅允许在
+   整环无未刷盘记录时（Flush 后 `set_flushed_seq` 上报游标），否则 `Error::WalFull` 触发上层强制 Flush；
+   **崩溃安全**：sync 两阶段（记录区 fsync → 头部 tail fsync），恢复恒为线性区间 `[20, tail)`；
+   `[storage] wal_mode = "ring" / "append"`（默认 append）+ `wal_ring_size_mb`（默认 64）+ 校验；
+   ColumnFamily 经 `WalBackend` 统一分发（put/delete/sync 遇 WalFull 自动 Flush 重试）；
+   测试验证 回环往返/回绕恢复最新周期/未刷盘拒覆盖/容量预检/崩溃重开/集成强制 Flush 数据完整；
+   测试 260→267（+7）；io_uring 内核接入（Linux 5.8+ 异步提交）与 O_DIRECT 留待 Linux 部署验证；
+2. ~~**Leveled-Compaction（design 4.5 二期）**~~ ✅（2026-08-28）：SST 分层压实——Manifest 新增
+   `levels` 层号（旧 Manifest 全 0 兼容），刷盘产物入 L0、压实产物入 L1/L2；`select_compaction_inputs`
+   **有界压实**：L0 ≥ 2 段时合并 L0 → L1（单次压实量 = 刷盘批次；L1 达层上限则 L0+全部 L1 收敛），
+   L0 空且 L1 > 1 时 L1 → L2 下沉；`needs_compact` 分层判定；测试验证 L0→L1 / L1→L2 / 层号持久化 /
+   选择函数；测试 267→270（+3）；
+3. ~~**MVCC 快照读（design 4.7 二期）**~~ ✅（2026-08-28）：`Engine::get_at(docid, snapshot_seq)`
+   快照读——主数据 `ColumnFamily::get_bytes_at` 遍历 MemTable + 全部 SST 取 **seq ≤ 快照点** 的最新版本
+   （Tombstone 语义保留，快照点前历史版本仍可见）；`Engine::begin_snapshot()` 返回当前最大已分配 seq；
+   快照读不走 HotCache（避免污染热缓存）；`Engine::flush_primary` 强制刷盘供测试/备份；
+   基础版语义：快照隔离覆盖主数据版本，Delta 字段级热更即时叠加（独立 seq 空间，完整跨列族全局
+   seq 一致性留后续；MemTable 单版本，未刷盘覆盖的历史版本不可回读）；测试验证 刷盘后历史版本回读 /
+   快照后写入隔离 / 删除前快照可见 / Delta 叠加；测试 270→273（+3）；
+4. ~~**热点 key 自动缓存（design 14.1.2）**~~ ✅（2026-08-28）：HotCache 增加**保护区**
+   （容量 = 主缓存 1/5）——访问计数达 `hotcache.hot_threshold`（默认 5）自动从主缓存晋升保护区，
+   普通淘汰避让（LFU 选择跳过保护区 key），写失效 / 硬预算兜底仍可清除；热点 key put 原地更新
+   不重置热度；`protected_len()` / `promotions()` 监控；测试验证 晋升/冷数据挤压存活/失效清除/
+   原地更新/未达阈值不晋升；测试 273→277（+4）；
+5. ~~**增量备份（design 20）**~~ ✅（2026-08-28）：`Engine::backup_incremental(since_seq, path)`
+   ——导出 seq ∈ (since_seq, 当前] 的 WAL 记录（append WAL 全量保留、环形 WAL 重放环内），
+   JSON 原子落盘（tmp+rename）；`WalRecord` 补 Serialize；`WalBackend::recover_records` /
+   `ColumnFamily::wal_records_since` 统一取数；**缺口检测**：since_seq ≠ 0 且最旧可用 seq >
+   since_seq+1 → 报错提示改做全量备份（环形覆盖 / 长时间未备份场景）；
+   `Engine::restore_incremental(path)` 按序重放（PUT 重新派生倒排词条 / DELETE 写墓碑）；
+   `BackupReport`（since/until/records）；测试验证 全量点+增量还原（PUT/删除/保留）、since=0 全导出；
+   测试 277→279（+2）；
+6. **收尾**：✅ 性能回归快检（2026-08-28，1000万 10/10，插入 38.6 万条/s 无回归，`images/perf-0.4.0/`）；
+   M6 全部 5 项功能完成、测试 279 全绿；打 v0.4.0 标签待确认（版本号 + RELEASE 说明 + 分支同步）。
+
 ---
 
 ## 8. 编码规范

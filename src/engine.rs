@@ -15,7 +15,7 @@ use crate::config::model::Config;
 use crate::error::Result;
 use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
-use crate::keys::{encode_docid, encode_varlen};
+use crate::keys::{decode_docid, encode_docid, encode_varlen};
 use crate::optimizer::{route, AccessPath, QuerySpec};
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
@@ -41,6 +41,22 @@ pub struct Engine {
 
 /// 查询结果行：docid + 文档字节。
 pub type QueryRow = (u64, Vec<u8>);
+
+/// 增量备份文件（design 20，M6-5）：seq 游标 + WAL 记录集（JSON 持久化）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IncrementalBackupFile {
+    since_seq: u64,
+    until_seq: u64,
+    records: Vec<crate::wal::WalRecord>,
+}
+
+/// 增量备份报告。
+#[derive(Debug, Clone, Copy)]
+pub struct BackupReport {
+    pub since_seq: u64,
+    pub until_seq: u64,
+    pub records: usize,
+}
 
 /// 引擎状态指标（`admin status` 数据源）。
 #[derive(Debug, Clone)]
@@ -133,6 +149,78 @@ impl Engine {
         Ok(())
     }
 
+    /// 强制刷盘主数据 MemTable → SST（测试 / 备份一致性准备用）。
+    pub fn flush_primary(&mut self) -> Result<()> {
+        self.primary.switch_and_flush()
+    }
+
+    /// 当前已分配的最大 seq（全量备份点 / 增量备份游标基础）。
+    pub fn current_seq(&self) -> u64 {
+        self.primary.wal_next_seq().saturating_sub(1)
+    }
+
+    /// 增量备份（design 20，M6-5）：导出 seq ∈ (since_seq, 当前] 的 WAL 记录为 JSON 文件。
+    /// 若 WAL 已被截断（环形覆盖 / 长时间未备份）导致缺口 → 报错提示改做全量备份。
+    pub fn backup_incremental(&mut self, since_seq: u64, out_path: &Path) -> Result<BackupReport> {
+        let until_seq = self.current_seq();
+        let (oldest, records) = self.primary.wal_records_since(since_seq)?;
+        if since_seq != 0 && oldest > since_seq + 1 {
+            return Err(crate::error::Error::Unsupported(format!(
+                "增量备份缺口：可用 WAL 最旧 seq {oldest} > 上次备份点 {since_seq}+1，请先做全量备份"
+            )));
+        }
+        let file = IncrementalBackupFile {
+            since_seq,
+            until_seq,
+            records,
+        };
+        let count = file.records.len();
+        let text = serde_json::to_string_pretty(&file)
+            .map_err(|e| crate::error::Error::Serialize(format!("增量备份序列化失败: {e}")))?;
+        let tmp = out_path.with_extension("tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, out_path)?; // 原子落盘（tmp+rename）
+        Ok(BackupReport {
+            since_seq,
+            until_seq,
+            records: count,
+        })
+    }
+
+    /// 增量恢复：将增量记录按序重放到已还原的引擎（PUT 重新派生倒排词条；DELETE 写墓碑）。
+    /// 返回应用记录数。恢复后调用方应再做一次全量备份以合并游标。
+    pub fn restore_incremental(&mut self, path: &Path) -> Result<usize> {
+        let text = std::fs::read_to_string(path)?;
+        let file: IncrementalBackupFile = serde_json::from_str(&text)
+            .map_err(|e| crate::error::Error::Corrupted(format!("增量备份文件解析失败: {e}")))?;
+        let mut applied = 0usize;
+        for r in &file.records {
+            let docid = decode_docid(&r.key)
+                .map_err(|_| crate::error::Error::Corrupted("增量记录 key 非 docid 编码".into()))?;
+            match r.op {
+                crate::wal::OP_PUT => {
+                    let value = r.value.clone().unwrap_or_default();
+                    let terms = match serde_json::from_slice::<serde_json::Value>(&value) {
+                        Ok(v) => crate::server::extract_terms(&v),
+                        Err(_) => Vec::new(), // 非 JSON 原始字节文档：无倒排词条
+                    };
+                    let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                    self.put(docid, value, &t)?;
+                }
+                crate::wal::OP_DELETE => {
+                    self.delete(docid)?;
+                }
+                other => {
+                    return Err(crate::error::Error::Corrupted(format!(
+                        "增量记录未知 op {other}"
+                    )))
+                }
+            }
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     /// 删除文档：主数据 Tombstone + 失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.hotcache.invalidate(docid);
@@ -194,6 +282,54 @@ impl Engine {
         let merged =
             serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         self.hotcache.put(docid, merged.clone());
+        Ok(Some(merged))
+    }
+
+    /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
+    pub fn begin_snapshot(&self) -> u64 {
+        self.primary.wal_next_seq().saturating_sub(1)
+    }
+
+    /// 快照读（design 4.7 二期 MVCC，M6-3）：返回 **seq ≤ `snapshot_seq`** 的文档视图。
+    /// 主数据取快照点最新版本（MemTable + SST 按 seq 过滤，Tombstone 语义保留）；
+    /// Delta 字段级热更为独立 seq 空间，快照读即时叠加（基础版语义：快照隔离覆盖主数据版本，
+    /// 字段级热更不做隔离——完整跨列族全局 seq 一致性留后续）。
+    /// 不走 HotCache（避免快照读污染热缓存）。
+    pub fn get_at(&mut self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
+        let found = self
+            .primary
+            .get_bytes_at(&encode_docid(docid), snapshot_seq)?;
+        let Some((bv, _)) = found else {
+            return Ok(None);
+        };
+        let obj: serde_json::Value = match serde_json::from_slice(&bv) {
+            Ok(v) => v,
+            Err(_) => return Ok(Some(bv)),
+        };
+        let mut map = match obj {
+            serde_json::Value::Object(m) => m,
+            _ => return Ok(Some(bv)),
+        };
+        let start = encode_docid(docid).to_vec();
+        let mut end = start.clone();
+        end.extend_from_slice(&[0xFF; 4]);
+        let rows = self.delta.scan_raw_range(Some(&start), Some(&end))?;
+        for (k, v) in rows {
+            if !k.starts_with(&start) || k.len() < 12 {
+                continue;
+            }
+            let field = String::from_utf8(k[12..].to_vec())
+                .map_err(|_| crate::error::Error::Corrupted("Delta 字段名非法 UTF-8".into()))?;
+            let val: serde_json::Value = serde_json::from_slice(&v)
+                .map_err(|e| crate::error::Error::Corrupted(format!("Delta 值解析失败: {e}")))?;
+            if val.is_null() {
+                map.shift_remove(&field);
+            } else {
+                map.insert(field, val);
+            }
+        }
+        let merged =
+            serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         Ok(Some(merged))
     }
 
@@ -344,6 +480,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
 
@@ -404,6 +541,112 @@ mod tests {
         let rows = e.search_term("rust").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 2);
+    }
+
+    // ---------- MVCC 快照读（design 4.7 二期，M6-3） ----------
+
+    #[test]
+    fn get_at_reads_historical_version_after_flush() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        let put_doc = |e: &mut Engine, v: i64| {
+            e.put(
+                1,
+                serde_json::to_vec(&json!({"docid": 1, "v": v})).unwrap(),
+                &["v"],
+            )
+            .unwrap();
+        };
+        put_doc(&mut e, 1);
+        let s1 = e.begin_snapshot();
+        e.flush_primary().unwrap(); // v1 落 SST（历史版本保留）
+        put_doc(&mut e, 2);
+        // 快照读 → v1；最新读 → v2
+        let snap: serde_json::Value =
+            serde_json::from_slice(&e.get_at(1, s1).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["v"], 1, "快照应读回 v1");
+        let cur: serde_json::Value = serde_json::from_slice(&e.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(cur["v"], 2);
+    }
+
+    #[test]
+    fn get_at_ignores_writes_after_snapshot() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, br#"{"k":"base"}"#.to_vec(), &["k"]).unwrap();
+        e.flush_primary().unwrap(); // base 落 SST，快照后可回读
+        let s = e.begin_snapshot();
+        // 快照之后主数据覆盖 + Delta 热更
+        e.put(1, br#"{"k":"later"}"#.to_vec(), &["k"]).unwrap();
+        e.patch(1, &[("extra", json!("x"))]).unwrap();
+        // 快照读：主数据仍为 base（快照隔离）；Delta 字段级热更即时可见（基础版语义）
+        let snap: serde_json::Value =
+            serde_json::from_slice(&e.get_at(1, s).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["k"], "base", "快照应隔离主数据后续覆盖");
+        assert_eq!(snap["extra"], "x");
+        // 最新读：later + delta 叠加
+        let cur: serde_json::Value = serde_json::from_slice(&e.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(cur["k"], "later");
+        assert_eq!(cur["extra"], "x");
+    }
+
+    #[test]
+    fn get_at_returns_none_after_delete_before_snapshot() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        let s_before_delete = e.begin_snapshot();
+        e.flush_primary().unwrap();
+        e.delete(1).unwrap(); // Tombstone seq > s_before_delete
+                              // 删除前快照 → v1 仍可见
+        assert_eq!(e.get_at(1, s_before_delete).unwrap().unwrap(), b"v1");
+        // 删除后最新读 → 不存在
+        assert!(e.get(1).unwrap().is_none());
+    }
+
+    // ---------- 增量备份（design 20，M6-5） ----------
+
+    #[test]
+    fn incremental_backup_restore_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, v: &str| {
+            let val = json!({"docid": docid, "v": v});
+            let bytes = serde_json::to_vec(&val).unwrap();
+            let terms = crate::server::extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(docid, bytes, &t).unwrap();
+        };
+        put_doc(&mut e, 1, "v1");
+        put_doc(&mut e, 2, "v1");
+        let full_point = e.current_seq(); // 全量备份点
+        put_doc(&mut e, 3, "v3"); // 增量 1
+        e.delete(1).unwrap(); // 增量 2（Tombstone）
+        let bak = dir.path().join("incr.json");
+        let rep = e.backup_incremental(full_point, &bak).unwrap();
+        assert_eq!(rep.since_seq, full_point);
+        assert_eq!(rep.records, 2, "应导出 2 条增量记录");
+
+        // 模拟"全量还原"后的新引擎：先恢复全量点数据，再应用增量
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut e2 = Engine::open(dir2.path(), &crate::config::Config::default()).unwrap();
+        put_doc(&mut e2, 1, "v1");
+        put_doc(&mut e2, 2, "v1");
+        let n = e2.restore_incremental(&bak).unwrap();
+        assert_eq!(n, 2);
+        assert!(e2.get(1).unwrap().is_none(), "增量 Tombstone 应删除 doc1");
+        assert!(e2.get(2).unwrap().is_some(), "doc2 保留（全量部分）");
+        let v3: serde_json::Value = serde_json::from_slice(&e2.get(3).unwrap().unwrap()).unwrap();
+        assert_eq!(v3["v"], "v3", "增量 PUT 应恢复 doc3");
+    }
+
+    #[test]
+    fn incremental_backup_since_zero_exports_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        e.put(1, b"a".to_vec(), &["a"]).unwrap();
+        e.flush_primary().unwrap(); // 刷盘不影响 WAL 记录
+        e.put(2, b"b".to_vec(), &["b"]).unwrap();
+        let bak = dir.path().join("incr-all.json");
+        let rep = e.backup_incremental(0, &bak).unwrap();
+        assert_eq!(rep.records, 2, "since=0 应导出全部记录（含已刷盘）");
     }
 
     #[test]
