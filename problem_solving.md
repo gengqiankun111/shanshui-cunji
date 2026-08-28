@@ -180,6 +180,17 @@
 - **其他**：`QueryRegistry` 含 `Instant` 字段无法 `#[derive(Default)]`（Instant 无 Default）→ 手写 `impl Default`；MemoryConfig 无全局 `max_memory_mb` → admin status 用缓存总预算（hotcache+blockcache）替代。
 - **提交**：随 M4 运维管理 + 数据管道提交（本轮）
 
+### P29. 分配器压测三连坑：mimalloc 链接被 GC 丢弃 / cargo --config 引号 / GNU ld 丢失
+- **现象①**：musl 版 mimalloc 与 system 二进制大小完全一致（536664），4 线程双双暴跌——压测失真。
+- **根因**：`#[global_allocator]` 定义在 lib crate，bench bin 未引用 lib 任何符号 → 链接器 GC 丢弃 lib 产物，mimalloc 未生效。
+- **修复**：bench.rs 加 `let _force_lib = shanshui_cunji::error::Error::NotFound(...)` 强制链接 lib；修复后 musl-mimalloc 二进制 669856 字节（strings 命中 7 处 mimalloc），4 组合大小互不相同。
+- **现象②**：服务器 `cargo build --config source.crates-io.replace-with=vendored-sources` 报 `string values must be quoted`。
+- **根因/修复**：`--config` 的 TOML 值必须引号包裹：`replace-with="vendored-sources"`（值用 `\"...\"`）。
+- **现象③**：本地 Windows 构建报 `collect2.exe: fatal error: cannot find 'ld'`。
+- **根因**：rustup settings.toml 对本项目有目录覆盖 `stable-x86_64-pc-windows-gnu`，而 GNU 工具链的 ld 已在 C 盘清理时丢失。
+- **修复**：`rustup override unset --path <项目>` 切回默认 MSVC 工具链（VS Build Tools link.exe 完好）。
+- **提交**：随 v0.2.1 提交（f8c3615）
+
 ---
 
 ## 环境备忘（不入库）
