@@ -45,7 +45,8 @@
 | clap | CLI 参数解析 | shanshui-cunji 命令行 |
 | axum / hyper | HTTP-JSON 接口 | 单机版即可用 |
 | thiserror / anyhow | 错误定义（库）/ 错误聚合（二进制） | 分层使用 |
-| jemalloc（tikv-jemallocator） | 内存分配器统计（OOM 看门狗水位线） | 可选，比 OS RSS 精准 |
+| mimalloc | **全局分配器（默认，design 14.0）**：消除 musl 默认 malloc 全局锁瓶颈，轻量边缘友好 | `#[global_allocator]`，已落地 |
+| jemalloc（tikv-jemallocator） | 分配器统计 + mallctl purge（OOM 看门狗水位线） | feature `alloc-jemalloc`（Linux/musl 推荐） |
 | sqlparser-rs | 类 SQL WHERE 子句解析 | 仅受限子集 |
 | fst | 倒排字典 FST（阶段 1.5） | 编译后 mmap 挂载 |
 | memmap2 | FST / 字典文件 mmap | 冷启动亚秒级 |
@@ -653,7 +654,13 @@ impl RuntimePools {
    SST 格式 v4→v5，每个数据块构建独立布隆（按块内实际 key 数 + `sstable.bloom_fpr`），
    查询先二分定位块、再只校验目标块布隆（按需反序列化，内存减半）；Reader 兼容 v3/v4 旧格式
    （整文件布隆回退）；测试 157 全绿（+3 分区布隆/v4 兼容/fpr 可配）；
-10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（jemalloc stats + 命中率）+ `explain`（执行计划推演）；
+9.5. ~~**全局分配器加固（design 14.0）**：mimalloc 默认，消除 musl malloc 全局锁瓶颈~~ ✅（2026-08-28）：
+   数据库为高频小块分配大户（JSON 序列化/MemTable/SST 解压/倒排/HTTP），musl 默认 malloc
+   全进程单锁，并发 alloc 排队可致 2~7 倍吞吐差；`#[global_allocator]` 引入 **mimalloc**
+   （轻量、边缘友好、无 unsafe 声明，不违反零 unsafe 承诺），feature `alloc-jemalloc`
+   可选 tikv-jemallocator（mallctl purge + stats，Linux/musl 推荐）；
+   测试 157 全绿（含 mimalloc 编译验证），check 六步链通过（P27）；
+10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（分配器 stats + 命中率）+ `explain`（执行计划推演）；
 11. **数据管道（design 20）**：`shanshui-cunji-export`（Parquet/CSV 基础版，与迁移工具同期）+ `shanshui-cunji-import`（CSV/JSON 基础版）。
 
 ### 7.3 阶段 2：分布式集群

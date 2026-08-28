@@ -1111,13 +1111,31 @@ io_cpus = []             # 示例 [12,13]
 
 > 软件"看门狗" ≠ systemd 的 `Restart=always`，而是一套**故障预防 → 检测 → 自愈 → 降级**的闭环系统。**内存限流 + 查询超时纳入 MVP**（实现成本极低，可防 90% 线上故障）；写停滞自愈与 Sidecar 探针在阶段 2 补齐。
 
+### 14.0 全局分配器策略（高并发关键，阶段 1.5）
+
+> **musl 支持多线程 ≠ musl 的 malloc 适合高并发**：pthread 层完全可用，瓶颈在 malloc/free 堆分配——musl 默认分配器**整个进程只有一把全局互斥锁**，并发 alloc/dealloc 排队串行，极端场景吞吐差 2~7 倍。
+
+数据库是典型的高频小块分配大户（每次 put/get 的 JSON 序列化、MemTable 写入、SST 解压 buffer、倒排 posting、HTTP 请求对象），且阶段 2 分布式多线程并行——**必须替换全局分配器**：
+
+| 分配器 | 默认 | 说明 |
+| --- | --- | --- |
+| **mimalloc**（`mimalloc` crate） | ✅ 默认 | 轻量（边缘设备内存友好）、高并发表现好、编译快；`#[global_allocator]` 声明无 unsafe（unsafe 实现在 crate 内部，不违反零 unsafe 承诺） |
+| **tikv-jemallocator**（feature `alloc-jemalloc`） | 可选 | 提供 mallctl `epoch + arena.purge` 主动归还 RSS（14.1.1 紧急止损）、stats 上报；编译较重，**建议 Linux / musl 目标使用**（Windows 需 MSVC 工具链，gnu 交叉编译受限） |
+
+**适用场景判断**：
+- 低并发 CLI / 边缘嵌入式 → 系统分配器即可，但统一走 mimalloc 也无副作用（体积/内存开销小）；
+- 高并发 Tokio-web / 网关 / 消息处理 → **必须 mimalloc / jemalloc**，否则 musl 部署撞上 malloc 锁天花板；
+- 长生命周期 7×24 服务 → mimalloc 碎片控制优于 musl 原生。
+
+**注意**：`#[global_allocator]` 为编译期决定、不可运行时切换；两套 allocator 通过 feature 互斥，默认 mimalloc。
+
 ### 14.1 内存安全看门狗（OOM Guardian）—— 预防层
 
 - **风险**：HotCache + BlockCache 内存超用触发 OS OOM Killer，进程直接消失；
 - **算法**（每 100ms 检查一次当前 RSS 内存）：
   - RSS > `memory.watermark_high`（默认 0.85）× `max_memory_limit` → **软限流**：新写入的 Group Commit 主动 sleep 1ms，减缓内存增速；
   - RSS > `memory.watermark_stall`（默认 1.0）× `max_memory_limit` → **硬限流**：拒绝新写入，返回 `503 Memory Overload`，直到 Compaction 释放内存；
-- **实现**：Rust 侧经 **jemalloc 的 mallctl 接口**实时获取分配器统计，比 OS RSS 更精准；
+- **实现**：Rust 侧读取分配器统计（mimalloc 常规 stats；jemalloc 经 mallctl，比 OS RSS 更精准）；
 - **配置**：`memory.watermark_high = 0.85`、`memory.watermark_stall = 1.0`。
 
 #### 14.1.1 多层内存主动回收与紧急止损策略
@@ -1139,7 +1157,7 @@ io_cpus = []             # 示例 [12,13]
 1. **平滑驱逐（实时）**：缓存 85% 软水位主动淘汰，确保永不到达 100%；
 2. **刷盘降级（紧急）**：RSS > 95% 时强制所有 Immutable MemTable 优先刷盘并释放内存；
 3. **缓存缩容（硬止损）**：触发 Stall 限流时，同步强制将 HotCache / BlockCache 容量上限**临时降低 30%**，立即淘汰最冷数据；
-4. **物理内存归还（核心）**：Rust 用 tikv-jemallocator，即便 Drop 了数据，jemalloc 为性能通常**不把内存页归还 OS**（RSS 只增不减）——紧急时显式调用 jemalloc `mallctl`：推进 `epoch` + 执行 `arena.<i>.purge`，强制将未使用内存页归还 OS，让系统内存监控看到 RSS 下降，避免 OOM Killer。
+4. **物理内存归还（核心）**：分配器为性能通常**不把内存页归还 OS**（RSS 只增不减）——默认 mimalloc 依赖 OS 页回收；启用 feature `alloc-jemalloc` 时（Linux/musl 推荐），紧急时显式调用 jemalloc `mallctl`：推进 `epoch` + 执行 `arena.<i>.purge`，强制将未使用内存页归还 OS，让系统内存监控看到 RSS 下降，避免 OOM Killer。
 
 #### 14.1.2 三池隔离线程模型
 
@@ -1418,7 +1436,7 @@ io_uring_enabled = false     # 阶段 3 开启（Linux 5.8+），协程化磁盘
 | 特性 | shanshui-cunji 是否支持 | 实现方式 | 优先级 |
 | --- | --- | --- | --- |
 | SHOW PROCESSLIST | ✅ 必须支持 | Admin HTTP/TCP 命令 + 内部 QueryRegistry | P0（运维刚需） |
-| SHOW STATUS / 内存监控 | ✅ 必须支持 | 暴露 jemalloc stats + 缓存命中率 | P0（排障刚需） |
+| SHOW STATUS / 内存监控 | ✅ 必须支持 | 暴露分配器 stats（mimalloc/jemalloc）+ 缓存命中率 | P0（排障刚需） |
 | EXPLAIN | ✅ 必须支持（适配版） | 输出索引选择、扫描行数、Zone Map 剪枝预期 | P1（性能诊断） |
 | 物理备份 | ✅ 已有（8.1 清单确认） | 冷备份，打包 SST + 倒排文件 + 元数据 | P0（已完成） |
 | 导出 Parquet / CSV / TXT | ✅ 必须支持 | `shanshui-cunji-export` 工具 | P1（分析生态） |
