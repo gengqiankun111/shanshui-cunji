@@ -128,6 +128,7 @@ fn main() {
         "count" => run_cli_count(&config_path, &field, &value),
         "groupby" => run_cli_group_by(&config_path, &field),
         "admin" => run_cli_admin(&config_path),
+        "reload" => run_cli_reload_config(&config_path),
         "explain" => run_cli_explain(&config_path, &filter),
         "delete" => run_cli_delete(&config_path, id),
         "version" | "-V" | "--version" => {
@@ -590,6 +591,47 @@ fn run_cli_admin(config_path: &Path) {
         if cs.master_addr.is_empty() { "-" } else { &cs.master_addr }
     );
     println!("  广播查询并发上限: {}", cs.broadcast_max_concurrent);
+}
+
+/// `reload`（design 7.4 / 阶段 3）：配置热加载校验——重新读取并校验配置文件，
+/// 输出相对默认配置的变更区块（运行中服务可据此决定重建哪些组件）。
+fn run_cli_reload_config(config_path: &Path) {
+    let mut cfg = match shanshui_cunji::config::Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ 配置校验失败（保持原配置不变）: {e}");
+            std::process::exit(1);
+        }
+    };
+    // 热加载语义：原地 reload（读取→校验→替换），此处加载即校验通过
+    let rep = match cfg.reload(config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("❌ 热加载失败（保持原配置不变）: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("✅ 配置热加载通过: {}", config_path.display());
+    println!(
+        "  变更区块: {}",
+        if rep.changed_sections.is_empty() {
+            "无（配置未变化）".into()
+        } else {
+            rep.changed_sections.join(", ")
+        }
+    );
+    println!("  运行模式: {}（节点 {}）", cfg.server.mode, cfg.cluster.node_id);
+    println!(
+        "  监听: {} · 分配器: {}",
+        cfg.server.listen_addr,
+        if cfg!(feature = "alloc-jemalloc") {
+            "jemalloc"
+        } else if cfg!(feature = "alloc-mimalloc") {
+            "mimalloc"
+        } else {
+            "system"
+        }
+    );
 }
 
 /// `explain --filter 'status=active'`（development 5.26）：执行计划推演，不读数据。
