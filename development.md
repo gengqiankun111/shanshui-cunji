@@ -813,6 +813,22 @@ impl RuntimePools {
    `RELEASE-SUMMARY-v0.3.0.md` / README 发布摘要更新 + `git tag v0.3.0` + 推送；阶段 3 全部完成，
    测试 260 全绿，三规模 demo 10/10。
 
+### 7.5 M6 高性能写入模式（design 4.3 阶段 3 末）
+
+1. ~~**环形 WAL（design 4.3）**~~ ✅（2026-08-28）：`RingWal`——预分配固定大小文件 + 写指针循环移动
+   （省去文件扩展与 inode 元数据更新），记录格式与追加 WAL 兼容；**覆盖安全**：回绕仅允许在
+   整环无未刷盘记录时（Flush 后 `set_flushed_seq` 上报游标），否则 `Error::WalFull` 触发上层强制 Flush；
+   **崩溃安全**：sync 两阶段（记录区 fsync → 头部 tail fsync），恢复恒为线性区间 `[20, tail)`；
+   `[storage] wal_mode = "ring" / "append"`（默认 append）+ `wal_ring_size_mb`（默认 64）+ 校验；
+   ColumnFamily 经 `WalBackend` 统一分发（put/delete/sync 遇 WalFull 自动 Flush 重试）；
+   测试验证 回环往返/回绕恢复最新周期/未刷盘拒覆盖/容量预检/崩溃重开/集成强制 Flush 数据完整；
+   测试 260→267（+7）；io_uring 内核接入（Linux 5.8+ 异步提交）与 O_DIRECT 留待 Linux 部署验证；
+2. **Leveled-Compaction（design 4.5 二期）**：SST 分层（Manifest 带 level）+ L0 直并 + L1+ 按 key 范围重叠压实；
+3. **MVCC 快照读（design 4.7 二期）**：`get_at(docid, snapshot_seq)` 指定快照读；
+4. **热点 key 自动缓存（design 14.1.2）**：访问计数 → 自动提升 HotCache 优先级；
+5. **增量备份（design 20）**：seq 游标增量备份 + 恢复合并；
+6. **收尾**：性能实测 + 文档 + 打 v0.4.0 标签。
+
 ---
 
 ## 8. 编码规范

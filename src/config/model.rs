@@ -180,6 +180,15 @@ impl Config {
         if self.join.max_rows == 0 {
             return Err(Error::Config("join.max_rows 必须 > 0".into()));
         }
+        if !matches!(self.storage.wal_mode.as_str(), "append" | "ring") {
+            return Err(Error::Config(format!(
+                "storage.wal_mode 非法: {}（append / ring）",
+                self.storage.wal_mode
+            )));
+        }
+        if self.storage.wal_ring_size_mb == 0 {
+            return Err(Error::Config("storage.wal_ring_size_mb 必须 > 0".into()));
+        }
         if !matches!(self.enrich.fail_policy.as_str(), "reject" | "degrade") {
             return Err(Error::Config(format!(
                 "enrich.fail_policy 非法: {}（reject / degrade）",
@@ -502,6 +511,10 @@ pub struct StorageConfig {
     pub ttl_field: String,
     /// 后台 IO 限速（MB/s，design 4.5 阶段 3）：刷盘/Compaction 走 Token Bucket；0 = 不限速。
     pub io_rate_limit_mb: u64,
+    /// WAL 模式："append"（传统追加文件，默认）/ "ring"（预分配环形文件，design 4.3 阶段 3 高性能）。
+    pub wal_mode: String,
+    /// 环形 WAL 预分配大小（MB，默认 64）。环形满且未刷盘时强制 Flush 腾空。
+    pub wal_ring_size_mb: u64,
 }
 
 impl Default for StorageConfig {
@@ -514,6 +527,8 @@ impl Default for StorageConfig {
             time_bucket: "day".into(),
             ttl_field: "timestamp".into(),
             io_rate_limit_mb: 0,
+            wal_mode: "append".into(),
+            wal_ring_size_mb: 64,
         }
     }
 }

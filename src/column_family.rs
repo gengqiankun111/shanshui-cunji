@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::keys::{decode_docid, encode_docid};
 use crate::memtable::{MemTable, MemTableBuffer};
 use crate::sstable::{Compression, SstFooter, SstReader, SstWriter, FLAG_DELETE, FLAG_PUT};
-use crate::wal::{WalReader, WalWriter, OP_DELETE, OP_PUT};
+use crate::wal::{RingWal, WalBackend, WalMode, WalReader, WalWriter, OP_DELETE, OP_PUT};
 
 /// SST 文件前缀。
 const SST_PREFIX: &str = "sst-";
@@ -78,8 +78,8 @@ pub struct ColumnFamily {
     seq: AtomicU64,
     /// 下一个 SST 文件 id（跨重启由 Manifest 恢复，防止覆盖旧文件）。
     next_sst_id: u64,
-    /// 当前 WAL 写入器。
-    wal: WalWriter,
+    /// 当前 WAL 写入器（append 追加 / ring 环形，design 4.3 阶段 3）。
+    wal: WalBackend,
 }
 
 /// Compaction 结果报告（design 4.5 阶段 3）。
@@ -158,8 +158,22 @@ impl ColumnFamily {
         let compression_level = cfg.sstable.compression_level as i32;
 
         let wal_path = dir.join(WAL_FILE);
-        // 以追加模式打开（不截断旧 WAL）：先回放恢复 MemTable，再继续写入
-        let wal = WalWriter::open_append(&wal_path, 1, false)?;
+        // WAL 模式（design 4.3 阶段 3）：
+        // - append：传统追加文件（不截断旧 WAL），回放恢复 MemTable 后继续写入；
+        // - ring：预分配环形文件，Flush 后上报刷盘游标腾空空间，满则强制 Flush。
+        let (wal, wal_records) = match WalMode::parse(&cfg.storage.wal_mode) {
+            WalMode::Ring => {
+                let size = (cfg.storage.wal_ring_size_mb as usize) * 1024 * 1024;
+                let (ring, recs) = RingWal::open_or_create(&wal_path, size)?;
+                (WalBackend::Ring(ring), recs)
+            }
+            WalMode::Append => {
+                // 先创建（open_append 兼容新库空文件），再回放
+                let w = WalWriter::open_append(&wal_path, 1, false)?;
+                let recs = WalReader::recover(&wal_path)?;
+                (WalBackend::Append(w), recs)
+            }
+        };
         let mut cf = Self {
             name: name.to_string(),
             dir: dir.to_path_buf(),
@@ -189,18 +203,17 @@ impl ColumnFamily {
         };
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
-        let max_seq = cf.replay_wal(&wal_path)?;
+        let max_seq = cf.replay_records(&wal_records)?;
         // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）
         cf.wal.resume_seq(max_seq + 1);
         Ok(cf)
     }
 
-    /// 回放 WAL：重建 MemTable 并推进 seq。返回已回放的最大 seq（无记录为 0）。
+    /// 回放 WAL 记录：重建 MemTable 并推进 seq。返回已回放的最大 seq（无记录为 0）。
     /// TTL 启用时，已过期的记录（按文档 ttl_field 判断）不回放入 MemTable。
-    fn replay_wal(&mut self, wal_path: &Path) -> Result<u64> {
-        let recs = WalReader::recover(wal_path)?;
+    fn replay_records(&mut self, recs: &[crate::wal::WalRecord]) -> Result<u64> {
         let mut max_seq = 0u64;
-        for r in &recs {
+        for r in recs {
             match r.op {
                 OP_PUT => {
                     if let Some(v) = &r.value {
@@ -243,22 +256,38 @@ impl ColumnFamily {
     /// 写入原始字节键（组合索引等任意 key 使用）。
     pub fn put_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
         let seq = self.put_bytes_nosync(key, value)?;
-        self.wal.sync()?;
+        self.sync_wal()?;
         Ok(seq)
     }
 
     /// 批量写入（不逐条 fsync，由调用方最终 `sync_wal` 统一提交）。
     /// 供亿级数据压测/导入使用；强安全模式逐条写请用 `put_bytes`。
     pub fn put_bytes_nosync(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
-        let seq = self.wal.append(OP_PUT, &key, Some(&value))?;
+        let seq = match self.wal.append(OP_PUT, &key, Some(&value)) {
+            Ok(s) => s,
+            // 环形 WAL 缓冲满：先落盘腾空（必要时强制 Flush）再重试
+            Err(Error::WalFull(_)) => {
+                self.ensure_wal_room()?;
+                self.wal.append(OP_PUT, &key, Some(&value))?
+            }
+            Err(e) => return Err(e),
+        };
         self.memtable.put(key, seq, value);
         self.maybe_flush()?;
         Ok(seq)
     }
 
     /// 统一提交 WAL 缓冲（批量写入结束时调用）。
+    /// 环形 WAL 落盘若需回绕覆盖未刷盘记录 → 强制 Flush 后重试。
     pub fn sync_wal(&mut self) -> Result<()> {
-        self.wal.sync()
+        match self.wal.sync() {
+            Ok(()) => Ok(()),
+            Err(Error::WalFull(_)) => {
+                self.switch_and_flush()?;
+                self.wal.sync()
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// 删除（Tombstone，跨 flush/重启一致，见步骤 9）。
@@ -268,10 +297,29 @@ impl ColumnFamily {
 
     /// 删除原始字节键。
     pub fn delete_bytes(&mut self, key: Vec<u8>) -> Result<u64> {
-        let seq = self.wal.append(OP_DELETE, &key, None)?;
-        self.wal.sync()?;
+        let seq = match self.wal.append(OP_DELETE, &key, None) {
+            Ok(s) => s,
+            Err(Error::WalFull(_)) => {
+                self.ensure_wal_room()?;
+                self.wal.append(OP_DELETE, &key, None)?
+            }
+            Err(e) => return Err(e),
+        };
+        self.sync_wal()?;
         self.memtable.delete(key, seq);
         Ok(seq)
+    }
+
+    /// 环形 WAL 满处理：先落盘缓冲；仍满（回绕需覆盖未刷盘记录）则强制 Flush 后重试。
+    fn ensure_wal_room(&mut self) -> Result<()> {
+        match self.wal.sync() {
+            Ok(()) => Ok(()),
+            Err(Error::WalFull(_)) => {
+                self.switch_and_flush()?;
+                self.wal.sync()
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// 删除指定前缀的全部记录（阶段 1.5 Delta CF：全量 put 覆盖后清空该 docid 的增量）。
@@ -375,10 +423,15 @@ impl ColumnFamily {
         let Some(imm) = self.memtable.take_immutable() else {
             return Ok(());
         };
+        // 环形 WAL 覆盖安全：Flush 完成后上报 imm 内最大 seq（<= 该 seq 的记录已刷盘可覆盖）
+        let flushed_max = imm_scan_max_seq(&imm);
         if self.ttl_days.is_none() {
-            return self.flush_single(&imm);
+            self.flush_single(&imm)?;
+        } else {
+            self.flush_buckets(&imm)?;
         }
-        self.flush_buckets(&imm)
+        self.wal.set_flushed_seq(flushed_max);
+        Ok(())
     }
 
     /// 原逻辑：整个 Immutable 落盘为单个 SST。
@@ -735,6 +788,17 @@ fn get_from_sst(
     sst.scan_block_for_key(&block, key)
 }
 
+/// 扫描 Immutable 记录的最大 seq（环形 WAL 覆盖安全游标：<= 该 seq 均已刷盘）。
+fn imm_scan_max_seq(imm: &MemTable) -> u64 {
+    let mut max_seq = 0u64;
+    imm.scan(|_, e| {
+        if e.seq > max_seq {
+            max_seq = e.seq;
+        }
+    });
+    max_seq
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +1025,70 @@ mod tests {
             assert_eq!(cf3.get(3).unwrap().unwrap().0, b"v-3-updated");
             assert_eq!(cf3.get(5).unwrap().unwrap().0, b"v-5");
             assert_eq!(cf3.get(1).unwrap().unwrap().0, b"v-1");
+        }
+    }
+
+    // ---------- 环形 WAL 集成（design 4.3，M6-1） ----------
+
+    fn ring_cfg(mem_mb: usize) -> Config {
+        let mut cfg = small_cfg(mem_mb);
+        cfg.storage.wal_mode = "ring".into();
+        cfg.storage.wal_ring_size_mb = 1;
+        cfg
+    }
+
+    #[test]
+    fn ring_wal_mode_persists_and_recovers() {
+        let dir = tmp();
+        let cfg = ring_cfg(256);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            cf.put(1, b"v1".to_vec()).unwrap();
+            cf.put(2, b"v2".to_vec()).unwrap();
+            assert_eq!(cf.get(1).unwrap().unwrap().0, b"v1");
+        }
+        // 重启：环形 WAL 回放恢复未刷盘数据
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf.get(1).unwrap().unwrap().0, b"v1");
+        assert_eq!(cf.get(2).unwrap().unwrap().0, b"v2");
+        // 覆盖 + 追加后再次重启
+        cf.put(2, b"v2-updated".to_vec()).unwrap();
+        drop(cf);
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.get(2).unwrap().unwrap().0, b"v2-updated");
+    }
+
+    #[test]
+    fn ring_wal_full_forces_flush_keeps_data() {
+        // 写入量超过 1MB 环形容量 → 强制 Flush 腾空，数据不丢
+        let dir = tmp();
+        let cfg = ring_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        const N: u64 = 60_000;
+        for chunk in 0..6u64 {
+            for i in chunk * 10_000..(chunk + 1) * 10_000 {
+                cf.put_bytes_nosync(i.to_le_bytes().to_vec(), format!("value-{i}").into_bytes())
+                    .unwrap();
+            }
+            cf.sync_wal().unwrap();
+        }
+        // 抽查全量数据（跨 MemTable / SST / 环形覆盖后均完整）
+        for i in (0..N).step_by(997) {
+            assert_eq!(
+                cf.get_bytes(&i.to_le_bytes()).unwrap().unwrap().0,
+                format!("value-{i}").into_bytes(),
+                "key {i} 丢失（环形覆盖未刷盘记录？）"
+            );
+        }
+        // 重启后仍完整（环形恢复 + SST 合并读）
+        drop(cf);
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for i in (0..N).step_by(5003) {
+            assert_eq!(
+                cf2.get_bytes(&i.to_le_bytes()).unwrap().unwrap().0,
+                format!("value-{i}").into_bytes(),
+                "重启后 key {i} 丢失"
+            );
         }
     }
 
