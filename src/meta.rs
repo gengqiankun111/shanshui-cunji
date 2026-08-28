@@ -107,6 +107,11 @@ impl MetaCenter {
             .unwrap_or(false)
     }
 
+    /// 虚拟分片总数。
+    pub fn virtual_shards(&self) -> u32 {
+        self.virtual_shards
+    }
+
     /// 路由：docid → 归属节点（写 / 主键点查单分片定位）。
     /// 无节点时返回 None（集群未就绪）。
     pub fn resolve(&self, docid: u64) -> Option<&NodeInfo> {

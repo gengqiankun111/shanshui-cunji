@@ -274,6 +274,24 @@ pub fn register_shard_handlers(server: &RpcServer, engine: Arc<Mutex<Engine>>) {
             Ok(json!({"docids": docids}))
         }
     });
+
+    server.register("shard.scan_all", {
+        let engine = engine.clone();
+        move |_params| {
+            let mut eng = engine.lock().unwrap();
+            let rows = eng.scan_range(None, None).map_err(|e| e.to_string())?;
+            let docs: Vec<Value> = rows
+                .into_iter()
+                .map(|(docid, bytes)| {
+                    json!({
+                        "docid": docid,
+                        "data": String::from_utf8_lossy(&bytes).into_owned(),
+                    })
+                })
+                .collect();
+            Ok(json!({"docs": docs}))
+        }
+    });
 }
 
 #[cfg(test)]
