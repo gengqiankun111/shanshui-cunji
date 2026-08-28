@@ -53,7 +53,11 @@ impl Engine {
         query_timeout: std::time::Duration,
     ) -> Result<Self> {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
-        let inverted = InvertedIndex::open(&data_dir.join("inverted"), 1_000_000)?;
+        let inverted = InvertedIndex::open_with_engine(
+            &data_dir.join("inverted"),
+            1_000_000,
+            &cfg.inverted.engine,
+        )?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
         let hotcache = HotCache::new(cfg.hotcache.clone());

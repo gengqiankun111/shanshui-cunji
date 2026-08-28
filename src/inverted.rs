@@ -1,14 +1,23 @@
 //! 倒排索引（design 5.2 / development 步骤 10）。
 //!
-//! MVP 架构（与 design 5.2 对齐）：
-//! - **内存哈希字典**：`DashMap<term, Vec<docid>>` 收集增量写入；
+//! 阶段 1.5 架构（FST + 字典）：
+//! - **内存哈希字典**：`DashMap<term, Vec<docid>>` 收集增量写入（保留，热点最新数据）；
 //! - **Append-Only 倒排段文件**：达阈值后整段刷盘 `inverted-{id}.seg`，
 //!   段内每 term 的 posting 用 **RoaringBitmap** 序列化存储；
+//! - **FST 术语字典（design 5.2.4.1）**：每段刷盘时编译 `inverted-{id}.fst`（term → 段内条目字节偏移），
+//!   查询用 FST O(len(term)) 精确定位，替代逐段线性扫描；启动时加载为内存不可变字典，
+//!   无 FST 的旧段回退线性扫描（兼容）；
 //! - **段清单 Manifest**（`inverted-manifest.json`）：记录段文件列表（新→旧），
 //!   原子写（tmp + rename），杜绝 GC 崩溃风险（design 4.5）；
 //! - **查询**：内存字典 ∪ 各段 posting 合并为 RoaringBitmap；
 //! - 段 GC / 压缩（阶段 2 分层 GC）；删除标记（Tombstone）随文档引擎层处理。
+//!
+//! > mmap 按需加载（冷启动亚秒）为设计目标；本项目 `#![forbid(unsafe_code)]`，
+//! > memmap2 的 mmap 为 unsafe API，故 FST 字典采用 fs::read 加载（FST 为压缩结构、体积小），
+//! > mmap 化留待独立 crate 封装 unsafe 白名单后落地。
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,23 +45,32 @@ struct SegmentManifest {
     next_seg_id: u64,
 }
 
-/// 倒排索引：内存字典 + 磁盘段集合。
+/// 倒排索引：内存字典 + 磁盘段集合 + FST 术语字典。
 pub struct InvertedIndex {
     dir: PathBuf,
+    /// 字典引擎："hash"（纯线性）/ "fst"（FST 精确查找）。
+    engine: String,
     /// term → 内存收集的 docid 列表。
     mem: DashMap<String, Vec<u64>>,
     /// 内存累计 docid 数（触发刷盘阈值判断）。
     mem_docids: AtomicU64,
     /// 段文件列表（新→旧，仅含文件名）。
     segments: Vec<String>,
+    /// 段 → FST 术语字典（term → 段内条目字节偏移）；engine=fst 且存在 .fst 时填充。
+    dicts: HashMap<String, fst::Map<Vec<u8>>>,
     next_seg_id: u64,
     /// 刷盘阈值：内存累计 posting 达此值整段落盘。
     flush_threshold: u64,
 }
 
 impl InvertedIndex {
-    /// 打开（或创建）倒排索引：加载 Manifest。
+    /// 打开（或创建）倒排索引：加载 Manifest 与 FST 字典。默认 FST 引擎（阶段 1.5）。
     pub fn open(dir: &Path, flush_threshold: u64) -> Result<Self> {
+        Self::open_with_engine(dir, flush_threshold, "fst")
+    }
+
+    /// 打开（或创建）倒排索引，指定字典引擎。
+    pub fn open_with_engine(dir: &Path, flush_threshold: u64, engine: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let manifest_path = dir.join(MANIFEST_FILE);
         let (segments, next_seg_id) = if manifest_path.exists() {
@@ -67,11 +85,35 @@ impl InvertedIndex {
             "倒排索引打开: {} 个段，下一个 id={next_seg_id}",
             segments.len()
         );
+        // 加载 FST 术语字典（design 5.2.4.1）：每个段对应 inverted-{id}.fst；
+        // 缺失的段（旧数据 / hash 引擎写入）在查询时回退线性扫描。
+        let mut dicts = HashMap::new();
+        if engine == "fst" {
+            for seg in &segments {
+                let fst_name = seg.replace(".seg", ".fst");
+                let fst_path = dir.join(&fst_name);
+                if fst_path.exists() {
+                    if let Ok(bytes) = std::fs::read(&fst_path) {
+                        match fst::Map::new(bytes) {
+                            Ok(map) => {
+                                dicts.insert(seg.clone(), map);
+                            }
+                            Err(e) => {
+                                info!("FST 字典解析失败，该段回退线性扫描: {fst_name}: {e}")
+                            }
+                        }
+                    }
+                }
+            }
+            info!("FST 字典加载: {}/{} 段", dicts.len(), segments.len());
+        }
         Ok(Self {
             dir: dir.to_path_buf(),
+            engine: engine.to_string(),
             mem: DashMap::new(),
             mem_docids: AtomicU64::new(0),
             segments,
+            dicts,
             next_seg_id,
             flush_threshold,
         })
@@ -95,6 +137,7 @@ impl InvertedIndex {
     }
 
     /// 将内存字典整段刷盘为 `inverted-{id}.seg`，并原子更新 Manifest。
+    /// engine=fst 时同时编译术语字典 `inverted-{id}.fst`（term → 段内条目偏移）。
     pub fn flush_segment(&mut self) -> Result<()> {
         if self.mem.is_empty() {
             return Ok(());
@@ -103,10 +146,11 @@ impl InvertedIndex {
         self.next_seg_id += 1;
         let path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg"));
 
-        // 序列化段内容（内存快照）
+        // 序列化段内容（内存快照），并记录每个 term 条目的文件偏移（FST 字典用）
         let mut body = Vec::new();
+        let mut term_offsets: Vec<(Vec<u8>, u64)> = Vec::new();
         encode_varint(&mut body, self.mem.len() as u64);
-        // 按 term 排序，保证段内确定性
+        // 按 term 排序，保证段内确定性（FST 也要求 key 按字典序插入）
         let mut terms: Vec<(String, Vec<u64>)> = self
             .mem
             .iter()
@@ -114,6 +158,8 @@ impl InvertedIndex {
             .collect();
         terms.sort_by(|a, b| a.0.cmp(&b.0));
         for (term, docids) in terms {
+            let file_offset = (SEG_MAGIC.len() + std::mem::size_of::<u16>() + body.len()) as u64;
+            term_offsets.push((term.clone().into_bytes(), file_offset));
             let bitmap: RoaringBitmap = docids.iter().map(|d| *d as u32).collect();
             let mut bytes = Vec::new();
             bitmap
@@ -132,8 +178,15 @@ impl InvertedIndex {
         out.sync_all()?;
         std::fs::rename(&tmp, &path)?;
 
-        // 更新 Manifest（原子）
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
+
+        // FST 术语字典（design 5.2.4.1）：term → 段内条目字节偏移，原子写
+        if self.engine == "fst" {
+            let map = self.write_fst_dict(seg_id, &term_offsets)?;
+            self.dicts.insert(fname.clone(), map);
+        }
+
+        // 更新 Manifest（原子）
         self.segments.insert(0, fname.clone());
         self.persist_manifest()?;
 
@@ -142,6 +195,35 @@ impl InvertedIndex {
         self.mem_docids.store(0, Ordering::Relaxed);
         info!("倒排刷盘完成: {fname}");
         Ok(())
+    }
+
+    /// 编译并写 FST 字典文件 `inverted-{id}.fst`（term → 段内条目字节偏移，字典序），
+    /// 返回内存字典（供本实例即时使用，无需重启）。
+    fn write_fst_dict(
+        &self,
+        seg_id: u64,
+        term_offsets: &[(Vec<u8>, u64)],
+    ) -> Result<fst::Map<Vec<u8>>> {
+        let fst_path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.fst"));
+        let tmp = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.fst.tmp"));
+        {
+            let file = std::fs::File::create(&tmp)?;
+            let mut w = std::io::BufWriter::new(file);
+            let mut builder = fst::MapBuilder::new(&mut w)
+                .map_err(|e| Error::Serialize(format!("FST 构建失败: {e}")))?;
+            for (term, offset) in term_offsets {
+                builder
+                    .insert(term, *offset)
+                    .map_err(|e| Error::Serialize(format!("FST 写入失败: {e}")))?;
+            }
+            builder
+                .finish()
+                .map_err(|e| Error::Serialize(format!("FST 完成失败: {e}")))?;
+            w.flush()?;
+        }
+        let bytes = std::fs::read(&tmp)?;
+        std::fs::rename(&tmp, &fst_path)?;
+        fst::Map::new(bytes).map_err(|e| Error::Serialize(format!("FST 内存映射失败: {e}")))
     }
 
     fn persist_manifest(&self) -> Result<()> {
@@ -173,12 +255,21 @@ impl InvertedIndex {
     }
 
     /// 读取某段内 term 的 posting（未命中返回空 bitmap）。
+    /// FST 字典存在时 O(len(term)) 精确定位（design 5.2.4.1）；旧段回退线性扫描。
     fn read_segment_posting(&self, seg: &str, term: &str) -> Result<RoaringBitmap> {
         let path = self.dir.join(seg);
         let data = std::fs::read(&path)?;
         if data.len() < 10 || &data[0..8] != SEG_MAGIC {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
+        // FST 精确查找：term → 段内条目字节偏移
+        if let Some(map) = self.dicts.get(seg) {
+            return match map.get(term.as_bytes()) {
+                Some(offset) => parse_posting_at(&data, offset as usize),
+                None => Ok(RoaringBitmap::new()),
+            };
+        }
+        // 回退线性扫描（无 FST 的旧段 / hash 引擎）
         let mut cur = 10usize;
         let count = decode_varint(&data, &mut cur)?;
         for _ in 0..count {
@@ -195,6 +286,11 @@ impl InvertedIndex {
     /// 当前磁盘段数。
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// 当前加载的 FST 术语字典数（测试 / 监控）。
+    pub fn fst_dict_count(&self) -> usize {
+        self.dicts.len()
     }
 
     /// 某 term 命中的文档数（COUNT 原子操作，<0.1ms，design 5.17）。
@@ -254,6 +350,15 @@ impl InvertedIndex {
         }
         Ok(out)
     }
+}
+
+/// 从段数据指定偏移解析 (term, posting) 条目（FST 字典指向的条目）。
+fn parse_posting_at(data: &[u8], offset: usize) -> Result<RoaringBitmap> {
+    let mut cur = offset;
+    let _t = decode_varlen(data, &mut cur)?; // 跳过 term
+    let p = decode_varlen(data, &mut cur)?.to_vec();
+    RoaringBitmap::deserialize_from(&p[..])
+        .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))
 }
 
 /// 解码段文件计数 / term 条目数（LEB128）。
@@ -425,5 +530,93 @@ mod tests {
             .collect();
         assert_eq!(map.get("a=1").copied(), Some(2), "跨段+内存合并");
         assert_eq!(map.get("b=2").copied(), Some(1));
+    }
+
+    #[test]
+    fn fst_dict_built_on_flush_and_lookup() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap(); // 默认 fst 引擎
+        idx.add("status=active", 1);
+        idx.add("status=active", 2);
+        idx.add("type=order", 3);
+        idx.flush_segment().unwrap();
+        // .fst 文件已生成，重启后字典加载
+        assert!(
+            dir.join("inverted-00000001.fst").exists(),
+            "应生成 FST 字典文件"
+        );
+        let idx2 = InvertedIndex::open(&dir, 1).unwrap();
+        assert_eq!(idx2.fst_dict_count(), 1, "FST 字典应加载");
+        // 走 FST 精确定位路径
+        assert!(idx2.search("status=active").unwrap().contains(1));
+        assert!(idx2.search("status=active").unwrap().contains(2));
+        assert!(!idx2.search("status=active").unwrap().contains(3));
+        assert!(idx2.search("absent").unwrap().is_empty());
+        // 聚合走 FST 段数据
+        assert_eq!(idx2.doc_count("type=order").unwrap(), 1);
+    }
+
+    #[test]
+    fn fst_and_hash_engines_return_same_results() {
+        let dir_a = tmp();
+        let dir_b = tmp();
+        let mut fst = InvertedIndex::open_with_engine(&dir_a, 1, "fst").unwrap();
+        let mut hash = InvertedIndex::open_with_engine(&dir_b, 1, "hash").unwrap();
+        for i in 1..=20u64 {
+            fst.add(&format!("f={}", i % 5), i);
+            hash.add(&format!("f={}", i % 5), i);
+            if i % 7 == 0 {
+                fst.flush_segment().unwrap();
+                hash.flush_segment().unwrap();
+            }
+        }
+        fst.flush_segment().unwrap();
+        hash.flush_segment().unwrap();
+        for i in 0..5u64 {
+            let term = format!("f={i}");
+            assert_eq!(
+                fst.doc_count(&term).unwrap(),
+                hash.doc_count(&term).unwrap(),
+                "引擎结果应一致: {term}"
+            );
+        }
+        assert_eq!(
+            fst.fst_dict_count(),
+            hash.segment_count(),
+            "fst 每段一个字典"
+        );
+    }
+
+    #[test]
+    fn fst_missing_dict_falls_back_to_linear_scan() {
+        let dir = tmp();
+        {
+            let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+            idx.add("a=1", 1);
+            idx.add("b=2", 2);
+            idx.flush_segment().unwrap();
+        }
+        // 删除 FST 字典（模拟旧段 / 字典损坏），应回退线性扫描
+        std::fs::remove_file(dir.join("inverted-00000001.fst")).unwrap();
+        let idx = InvertedIndex::open(&dir, 1).unwrap();
+        assert_eq!(idx.fst_dict_count(), 0, "字典缺失应回退");
+        assert!(idx.search("a=1").unwrap().contains(1));
+        assert!(idx.search("b=2").unwrap().contains(2));
+        assert_eq!(idx.doc_count("a=1").unwrap(), 1);
+    }
+
+    #[test]
+    fn hash_engine_writes_no_fst_dict() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open_with_engine(&dir, 1, "hash").unwrap();
+        idx.add("k=1", 1);
+        idx.flush_segment().unwrap();
+        assert!(
+            !dir.join("inverted-00000001.fst").exists(),
+            "hash 引擎不生成 FST"
+        );
+        let idx2 = InvertedIndex::open(&dir, 1).unwrap();
+        assert_eq!(idx2.fst_dict_count(), 0);
+        assert!(idx2.search("k=1").unwrap().contains(1));
     }
 }
