@@ -828,7 +828,13 @@ impl RuntimePools {
    **有界压实**：L0 ≥ 2 段时合并 L0 → L1（单次压实量 = 刷盘批次；L1 达层上限则 L0+全部 L1 收敛），
    L0 空且 L1 > 1 时 L1 → L2 下沉；`needs_compact` 分层判定；测试验证 L0→L1 / L1→L2 / 层号持久化 /
    选择函数；测试 267→270（+3）；
-3. **MVCC 快照读（design 4.7 二期）**：`get_at(docid, snapshot_seq)` 指定快照读；
+3. ~~**MVCC 快照读（design 4.7 二期）**~~ ✅（2026-08-28）：`Engine::get_at(docid, snapshot_seq)`
+   快照读——主数据 `ColumnFamily::get_bytes_at` 遍历 MemTable + 全部 SST 取 **seq ≤ 快照点** 的最新版本
+   （Tombstone 语义保留，快照点前历史版本仍可见）；`Engine::begin_snapshot()` 返回当前最大已分配 seq；
+   快照读不走 HotCache（避免污染热缓存）；`Engine::flush_primary` 强制刷盘供测试/备份；
+   基础版语义：快照隔离覆盖主数据版本，Delta 字段级热更即时叠加（独立 seq 空间，完整跨列族全局
+   seq 一致性留后续；MemTable 单版本，未刷盘覆盖的历史版本不可回读）；测试验证 刷盘后历史版本回读 /
+   快照后写入隔离 / 删除前快照可见 / Delta 叠加；测试 270→273（+3）；
 4. **热点 key 自动缓存（design 14.1.2）**：访问计数 → 自动提升 HotCache 优先级；
 5. **增量备份（design 20）**：seq 游标增量备份 + 恢复合并；
 6. **收尾**：性能实测 + 文档 + 打 v0.4.0 标签。

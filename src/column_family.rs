@@ -378,6 +378,36 @@ impl ColumnFamily {
         Ok(None)
     }
 
+    /// 快照读（design 4.7 二期 MVCC，M6-3）：返回 **seq ≤ `snapshot_seq`** 的最新版本。
+    /// 遍历 MemTable + 全部 SST，取满足条件的最大 seq；该 seq 为 Tombstone 则视为不存在
+    /// （快照点已删除；快照点之前的历史版本仍可见）。
+    /// 局限：MemTable 仅保留每 key 最新版本，未刷盘覆盖的历史版本无法回读（多版本保留留后续）。
+    pub fn get_bytes_at(
+        &mut self,
+        key: &[u8],
+        snapshot_seq: u64,
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        let mut best: Option<(u64, Option<Vec<u8>>)> = None; // (seq, value)
+        if let Some(e) = self.memtable.get(key) {
+            if e.seq <= snapshot_seq && best.as_ref().map_or(true, |(s, _)| e.seq > *s) {
+                best = Some((e.seq, e.value));
+            }
+        }
+        let cache = Arc::clone(&self.block_cache);
+        for sst in &mut self.ssts {
+            if let Some((value, seq)) = get_from_sst(sst, &cache, key)? {
+                if seq <= snapshot_seq && best.as_ref().map_or(true, |(s, _)| seq > *s) {
+                    best = Some((seq, value));
+                }
+            }
+        }
+        match best {
+            Some((seq, Some(v))) => Ok(Some((v, seq))),
+            Some((_, None)) => Ok(None), // 快照点已删除
+            None => Ok(None),
+        }
+    }
+
     /// 范围扫描 [start, end]（闭区间，None 端无边界）：先收集 MemTable 与各 SST 候选，
     /// 以最大 seq 去重（最新覆盖，Tombstone 覆盖旧值），返回按 docid 升序的 (docid, value) 列表。
     pub fn scan_range(
@@ -747,6 +777,11 @@ impl ColumnFamily {
 
     pub fn sst_count(&self) -> usize {
         self.ssts.len()
+    }
+
+    /// 当前 WAL 下一可分配 seq（Engine 快照点来源，design 4.7 MVCC）。
+    pub fn wal_next_seq(&self) -> u64 {
+        self.wal.next_seq()
     }
 
     pub fn name(&self) -> &str {

@@ -133,6 +133,11 @@ impl Engine {
         Ok(())
     }
 
+    /// 强制刷盘主数据 MemTable → SST（测试 / 备份一致性准备用）。
+    pub fn flush_primary(&mut self) -> Result<()> {
+        self.primary.switch_and_flush()
+    }
+
     /// 删除文档：主数据 Tombstone + 失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.hotcache.invalidate(docid);
@@ -194,6 +199,54 @@ impl Engine {
         let merged =
             serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         self.hotcache.put(docid, merged.clone());
+        Ok(Some(merged))
+    }
+
+    /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
+    pub fn begin_snapshot(&self) -> u64 {
+        self.primary.wal_next_seq().saturating_sub(1)
+    }
+
+    /// 快照读（design 4.7 二期 MVCC，M6-3）：返回 **seq ≤ `snapshot_seq`** 的文档视图。
+    /// 主数据取快照点最新版本（MemTable + SST 按 seq 过滤，Tombstone 语义保留）；
+    /// Delta 字段级热更为独立 seq 空间，快照读即时叠加（基础版语义：快照隔离覆盖主数据版本，
+    /// 字段级热更不做隔离——完整跨列族全局 seq 一致性留后续）。
+    /// 不走 HotCache（避免快照读污染热缓存）。
+    pub fn get_at(&mut self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
+        let found = self
+            .primary
+            .get_bytes_at(&encode_docid(docid), snapshot_seq)?;
+        let Some((bv, _)) = found else {
+            return Ok(None);
+        };
+        let obj: serde_json::Value = match serde_json::from_slice(&bv) {
+            Ok(v) => v,
+            Err(_) => return Ok(Some(bv)),
+        };
+        let mut map = match obj {
+            serde_json::Value::Object(m) => m,
+            _ => return Ok(Some(bv)),
+        };
+        let start = encode_docid(docid).to_vec();
+        let mut end = start.clone();
+        end.extend_from_slice(&[0xFF; 4]);
+        let rows = self.delta.scan_raw_range(Some(&start), Some(&end))?;
+        for (k, v) in rows {
+            if !k.starts_with(&start) || k.len() < 12 {
+                continue;
+            }
+            let field = String::from_utf8(k[12..].to_vec())
+                .map_err(|_| crate::error::Error::Corrupted("Delta 字段名非法 UTF-8".into()))?;
+            let val: serde_json::Value = serde_json::from_slice(&v)
+                .map_err(|e| crate::error::Error::Corrupted(format!("Delta 值解析失败: {e}")))?;
+            if val.is_null() {
+                map.shift_remove(&field);
+            } else {
+                map.insert(field, val);
+            }
+        }
+        let merged =
+            serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         Ok(Some(merged))
     }
 
@@ -344,6 +397,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
 
@@ -404,6 +458,64 @@ mod tests {
         let rows = e.search_term("rust").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 2);
+    }
+
+    // ---------- MVCC 快照读（design 4.7 二期，M6-3） ----------
+
+    #[test]
+    fn get_at_reads_historical_version_after_flush() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        let put_doc = |e: &mut Engine, v: i64| {
+            e.put(
+                1,
+                serde_json::to_vec(&json!({"docid": 1, "v": v})).unwrap(),
+                &["v"],
+            )
+            .unwrap();
+        };
+        put_doc(&mut e, 1);
+        let s1 = e.begin_snapshot();
+        e.flush_primary().unwrap(); // v1 落 SST（历史版本保留）
+        put_doc(&mut e, 2);
+        // 快照读 → v1；最新读 → v2
+        let snap: serde_json::Value =
+            serde_json::from_slice(&e.get_at(1, s1).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["v"], 1, "快照应读回 v1");
+        let cur: serde_json::Value = serde_json::from_slice(&e.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(cur["v"], 2);
+    }
+
+    #[test]
+    fn get_at_ignores_writes_after_snapshot() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, br#"{"k":"base"}"#.to_vec(), &["k"]).unwrap();
+        e.flush_primary().unwrap(); // base 落 SST，快照后可回读
+        let s = e.begin_snapshot();
+        // 快照之后主数据覆盖 + Delta 热更
+        e.put(1, br#"{"k":"later"}"#.to_vec(), &["k"]).unwrap();
+        e.patch(1, &[("extra", json!("x"))]).unwrap();
+        // 快照读：主数据仍为 base（快照隔离）；Delta 字段级热更即时可见（基础版语义）
+        let snap: serde_json::Value =
+            serde_json::from_slice(&e.get_at(1, s).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["k"], "base", "快照应隔离主数据后续覆盖");
+        assert_eq!(snap["extra"], "x");
+        // 最新读：later + delta 叠加
+        let cur: serde_json::Value = serde_json::from_slice(&e.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(cur["k"], "later");
+        assert_eq!(cur["extra"], "x");
+    }
+
+    #[test]
+    fn get_at_returns_none_after_delete_before_snapshot() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        let s_before_delete = e.begin_snapshot();
+        e.flush_primary().unwrap();
+        e.delete(1).unwrap(); // Tombstone seq > s_before_delete
+                              // 删除前快照 → v1 仍可见
+        assert_eq!(e.get_at(1, s_before_delete).unwrap().unwrap(), b"v1");
+        // 删除后最新读 → 不存在
+        assert!(e.get(1).unwrap().is_none());
     }
 
     #[test]
