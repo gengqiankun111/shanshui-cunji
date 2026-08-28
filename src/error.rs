@@ -36,6 +36,12 @@ pub enum Error {
 
     #[error("migrate error: {0}")]
     Migrate(String),
+
+    #[error("rpc error: {0}")]
+    Rpc(String),
+
+    #[error("cluster error: {0}")]
+    Cluster(String),
 }
 
 /// shanshui-cunji 全局结果类型。
