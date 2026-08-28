@@ -43,6 +43,7 @@ pub mod replication;
 pub mod reshard;
 pub mod rpc;
 pub mod schema;
+pub mod sdk_cache;
 pub mod server;
 pub mod sharding;
 pub mod sstable;

@@ -798,7 +798,11 @@ impl RuntimePools {
    **一次全量扫描从表建内存索引**（docid 关联用主键、其余取字段值、缺字段跳过、首个命中优先），
    否则回退逐 key 点查；server 链路（serve→handle_join）透传 `JoinBroadcast`；测试验证广播命中/
    首个命中语义/超阈值回退/关闭广播/决策函数；
-6. ~~**Redis 冷热分层 SDK 门面（design 1.3/21.5）**~~ 🔄（进行中）；
+6. ~~**Redis 冷热分层 SDK 门面（design 1.3/21.5）**~~ ✅（2026-08-28）：
+   `src/sdk_cache.rs` 新增 `ShanshuiCunjiWithRedis<'a, B>` 门面——组合 `&mut Engine`（全量持久化）+
+   `ExternalCacheManager<B>`（Redis 热点）：**读回填**（`get` 命中 Redis 直返 / 未命中回源引擎
+   并 SETEX 回填，熔断透传）+ **写失效协调**（`put` / `delete` 先落盘引擎返回 ACK 再删 Redis 旧缓存）；
+   `engine()` 透传引擎访问；测试验证读回填/写失效后回源新值/删除双端清理；测试 260 全绿（+3）；
 7. **性能实测对照 design 9.5**：本地实测报告 + 截图到 images；
 8. **打 v0.3.0 标签**（版本号 + tag + 发布说明 + 推送）。
 
