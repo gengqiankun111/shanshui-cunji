@@ -179,6 +179,12 @@ impl RpcClient {
         Ok(Self { stream })
     }
 
+    /// 覆盖读超时（复制 ACK 等待等场景按需放宽）。
+    pub fn set_read_timeout(&mut self, d: std::time::Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(d))?;
+        Ok(())
+    }
+
     /// 发起一次调用，返回 result。
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let req = RpcRequest {

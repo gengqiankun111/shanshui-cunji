@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::inverted::InvertedIndex;
 use crate::meta::{MetaCenter, NodeInfo};
 use crate::rpc::RpcClient;
+use crate::term_cache::TermCache;
 
 /// 分片端点：网关访问数据节点的抽象（Local / RPC 两种实现）。
 pub trait ShardEndpoint {
@@ -34,15 +35,31 @@ pub trait ShardEndpoint {
     fn ping(&mut self, node: &str) -> Result<()>;
 }
 
-/// 网关：元数据中心（路由决策）+ 分片端点（数据访问）。
+/// 网关：元数据中心（路由决策）+ 分片端点（数据访问）+ 全局 Term 缓存（design 9.9）。
 pub struct Gateway<E: ShardEndpoint> {
     meta: MetaCenter,
     endpoint: E,
+    /// 全局 Term 缓存（None = 关闭）。
+    term_cache: Option<TermCache>,
 }
 
 impl<E: ShardEndpoint> Gateway<E> {
+    /// 构建网关（不带 Term 缓存）。
     pub fn new(meta: MetaCenter, endpoint: E) -> Self {
-        Self { meta, endpoint }
+        Self {
+            meta,
+            endpoint,
+            term_cache: None,
+        }
+    }
+
+    /// 构建网关并启用全局 Term 缓存（design 9.9）。
+    pub fn new_with_term_cache(meta: MetaCenter, endpoint: E, term_cache: TermCache) -> Self {
+        Self {
+            meta,
+            endpoint,
+            term_cache: Some(term_cache),
+        }
     }
 
     pub fn meta(&self) -> &MetaCenter {
@@ -59,10 +76,16 @@ impl<E: ShardEndpoint> Gateway<E> {
 
     /// 写入：单分片路由（design 9.1，写入口无广播）。返回归属节点 ID。
     /// 复制（主→从异步/sync 复制）由分片节点层负责（阶段 2 后续），网关只保证路由一致。
+    /// 同时记录 Term 写计数（design 9.9：超阈值主动失效全局缓存）。
     pub fn put(&mut self, docid: u64, data: &str, terms: &[String]) -> Result<String> {
         let node = self.route_node(docid)?;
         let nid = node.node_id.clone();
         self.endpoint.put(&nid, docid, data, terms)?;
+        if let Some(tc) = &self.term_cache {
+            for t in terms {
+                tc.record_write(t);
+            }
+        }
         Ok(nid)
     }
 
@@ -72,17 +95,35 @@ impl<E: ShardEndpoint> Gateway<E> {
         self.endpoint.get(&node.node_id, docid)
     }
 
-    /// 广播检索（design 9.2）：全部节点取本片 Chunk → 按序直拼。
-    /// 返回命中全部 docid（顺序 = 广播目标顺序，拼接稳定）。
+    /// 广播检索（design 9.2 + 9.9）：全部节点取本片 Chunk → 按序直拼。
+    /// Term 缓存命中直出（不透传后端分片）；未命中拉取后回填。
     pub fn broadcast_search(&mut self, term: &str) -> Result<Vec<u32>> {
         let targets: Vec<NodeInfo> = self.meta.broadcast_targets().into_iter().cloned().collect();
         if targets.is_empty() {
             return Err(Error::Cluster("集群无可用分片节点".into()));
         }
+        let term_owned = term.to_string();
         let mut chunks = Vec::with_capacity(targets.len());
         for node in &targets {
-            let docids = self.endpoint.search_docids(&node.node_id, term)?;
-            chunks.push(RoaringBitmap::from_iter(docids));
+            let nid = node.node_id.clone();
+            // ① 缓存命中直出（design 9.9）
+            let cached = self
+                .term_cache
+                .as_ref()
+                .and_then(|tc| tc.get(&nid, &term_owned));
+            let chunk = match cached {
+                Some(bm) => bm,
+                None => {
+                    // ② 未命中 → 拉取后端分片本片 Chunk → 回填
+                    let docids = self.endpoint.search_docids(&nid, &term_owned)?;
+                    let bm = RoaringBitmap::from_iter(docids);
+                    if let Some(tc) = &self.term_cache {
+                        tc.insert(&nid, &term_owned, bm.clone());
+                    }
+                    bm
+                }
+            };
+            chunks.push(chunk);
         }
         let merged = InvertedIndex::concatenate_chunks(&chunks);
         Ok(merged.iter().collect())
@@ -389,5 +430,106 @@ mod tests {
         }
         // 探活：两节点均在线
         assert!(gw.ping_all().is_empty());
+    }
+
+    // ---- 网关全局 Term 缓存（design 9.9）----
+
+    /// 包装端点：统计后端 search_docids 调用次数（验证缓存是否直出）。
+    struct CountingEndpoint {
+        inner: LocalShardEndpoint,
+        searches: usize,
+    }
+
+    impl ShardEndpoint for CountingEndpoint {
+        fn put(&mut self, node: &str, docid: u64, data: &str, terms: &[String]) -> Result<()> {
+            self.inner.put(node, docid, data, terms)
+        }
+        fn get(&mut self, node: &str, docid: u64) -> Result<Option<String>> {
+            self.inner.get(node, docid)
+        }
+        fn search_docids(&mut self, node: &str, term: &str) -> Result<Vec<u32>> {
+            self.searches += 1;
+            self.inner.search_docids(node, term)
+        }
+        fn ping(&mut self, node: &str) -> Result<()> {
+            self.inner.ping(node)
+        }
+    }
+
+    #[test]
+    fn term_cache_hit_serves_without_backend_calls() {
+        let meta = meta_with(&[("n1", "127.0.0.1:1", "master"), ("n2", "127.0.0.1:2", "slave")]);
+        let endpoint = CountingEndpoint {
+            inner: LocalShardEndpoint::with_nodes(&["n1", "n2"]),
+            searches: 0,
+        };
+        let cache = crate::term_cache::TermCache::new(1000, std::time::Duration::from_secs(60), 100);
+        let mut gw = Gateway::new_with_term_cache(meta, endpoint, cache);
+
+        for d in 1..=50u64 {
+            let _ = gw.put(d, "{\"s\":1}", &terms(&["status=active"])).unwrap();
+        }
+        // 首次广播：每节点 1 次后端调用，共 2 次
+        let first = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(first.len(), 50);
+        assert_eq!(gw.endpoint.searches, 2, "首次应全部回源");
+        // 二次广播：缓存直出，0 后端调用
+        let second = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(second, first, "缓存命中结果必须一致");
+        assert_eq!(gw.endpoint.searches, 2, "缓存命中不应打后端分片");
+        // 不同 term 未命中 → 回源
+        let _ = gw.broadcast_search("status=pending").unwrap();
+        assert_eq!(gw.endpoint.searches, 4, "新 term 应回源并回填");
+    }
+
+    #[test]
+    fn term_cache_ttl_revalidates_after_expiry() {
+        let meta = meta_with(&[("n1", "127.0.0.1:1", "master")]);
+        let endpoint = CountingEndpoint {
+            inner: LocalShardEndpoint::with_nodes(&["n1"]),
+            searches: 0,
+        };
+        let cache =
+            crate::term_cache::TermCache::new(1000, std::time::Duration::from_millis(30), 100);
+        let mut gw = Gateway::new_with_term_cache(meta, endpoint, cache);
+
+        let _ = gw.put(1, "{\"s\":1}", &terms(&["status=active"])).unwrap();
+        let _ = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(gw.endpoint.searches, 1);
+        // TTL 内命中
+        let _ = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(gw.endpoint.searches, 1);
+        // TTL 过期 → 重新拉取
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(gw.endpoint.searches, 2, "TTL 过期后应重新拉取");
+    }
+
+    #[test]
+    fn term_cache_write_count_invalidates() {
+        let meta = meta_with(&[("n1", "127.0.0.1:1", "master")]);
+        let endpoint = CountingEndpoint {
+            inner: LocalShardEndpoint::with_nodes(&["n1"]),
+            searches: 0,
+        };
+        // 阈值 3：同 term 写入 4 次后缓存应失效
+        let cache = crate::term_cache::TermCache::new(1000, std::time::Duration::from_secs(60), 3);
+        let mut gw = Gateway::new_with_term_cache(meta, endpoint, cache);
+
+        let _ = gw.put(1, "{\"s\":1}", &terms(&["hot=1"])).unwrap();
+        let _ = gw.broadcast_search("hot=1").unwrap();
+        assert_eq!(gw.endpoint.searches, 1);
+        // 缓存命中（未回源）
+        let _ = gw.broadcast_search("hot=1").unwrap();
+        assert_eq!(gw.endpoint.searches, 1);
+
+        // 同 term 高频写入触发失效
+        for d in 2..=5u64 {
+            let _ = gw.put(d, "{\"s\":1}", &terms(&["hot=1"])).unwrap();
+        }
+        // 失效后广播 → 回源（searches +1），且结果包含新 docid
+        let all = gw.broadcast_search("hot=1").unwrap();
+        assert_eq!(all.len(), 5, "失效后应看到全部 5 条");
+        assert_eq!(gw.endpoint.searches, 2, "写超阈值后应重新回源");
     }
 }
