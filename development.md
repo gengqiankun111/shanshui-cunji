@@ -696,7 +696,20 @@ impl RuntimePools {
    （一致性哈希环，每节点 128 虚拟点）；`route(docid)` 单分片定位（写/主键查询无广播）、`nodes()` 广播目标集；
    **平滑扩容属性验证**：3→4 节点仅迁移 ~1/4 虚拟分片、docid 重路由比例 ≈0.25（测试断言 0.13~0.30）；
    测试 171 全绿（+5 确定性/均匀性/扩容迁移量/稳定性/单节点）；网关层路由复用入口（阶段 2 后续）；
-3. **分片节点 RPC → 网关 + 元数据中心 → 广播检索 / 虚拟分片扩容 / 主从高可用**；
+3. ~~**分片节点 RPC → 网关 + 元数据中心 → 广播检索 / 虚拟分片扩容 / 主从高可用**~~ ✅（2026-08-28，基础闭环）：
+   - **`src/rpc.rs`**：极简 JSON-over-TCP RPC（`[u32 LE 长度][JSON]` 帧，同步 std::net 与内核一致）；
+     `RpcServer`（线程池 + 按 method 分发）/ `RpcClient`（读写超时防挂死）；`register_shard_handlers`
+     把 Engine 的 put/get/倒排 chunk 检索/ping 暴露为 RPC 方法（单机内核零修改复用，design 9.3）；
+   - **`src/meta.rs` 元数据中心**：节点注册/摘除（自动重建一致性哈希分片映射，`resolve(docid)` 单分片路由）、
+     广播目标集（顺序即 Chunk 拼接顺序）、主从角色（master/slave）、拓扑 JSON 持久化（tmp+rename 原子写）；
+     扩容重路由 ≈25% 测试验证（design 9.1 平滑扩容）；
+   - **`src/gateway.rs` 网关**：不持有数据，三类转发——写/主键点查（`resolve` 单分片路由，design 9.1）、
+     广播检索（全节点取本片 Chunk → `concatenate_chunks` 按序直拼 O(1)，design 9.2/5.2.1）、
+     健康探活（`ping_all` 失活节点检测）；`ShardEndpoint` 抽象：进程内 `LocalShardEndpoint`（测试）+
+     跨进程 `RpcShardEndpoint`（真实 TCP）；红线遵守（design 9.4：不跨片 JOIN/事务，只合并 DocId）；
+   - **端到端验证**：2 个 Engine 分片节点真实 TCP 启动 + 元数据中心 + 网关 → 写入路由到归属节点、
+     主键点查、广播检索跨片直拼、探活全通过；
+   - 复制（主→从异步/sync 数据同步）与元数据中心自动故障切换留阶段 2 后续；测试 197 全绿（+15）；
 4. ~~**看门狗补全：写停滞假死检测自愈 + Sidecar 探针**~~ ✅（2026-08-28，检测/自愈判定 + 心跳基座）：
    `watchdog::StallWatchdog`（design 14.2）：周期采样 L0 文件数，`compaction.stall_timeout_secs`（默认 60s）
    内无减少判 Compaction 假死 → 自愈信号（中断 Compaction + 重置调度器由存储层接动作），连续
