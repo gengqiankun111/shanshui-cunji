@@ -690,7 +690,13 @@ impl RuntimePools {
    **平滑扩容属性验证**：3→4 节点仅迁移 ~1/4 虚拟分片、docid 重路由比例 ≈0.25（测试断言 0.13~0.30）；
    测试 171 全绿（+5 确定性/均匀性/扩容迁移量/稳定性/单节点）；网关层路由复用入口（阶段 2 后续）；
 3. **分片节点 RPC → 网关 + 元数据中心 → 广播检索 / 虚拟分片扩容 / 主从高可用**；
-4. **看门狗补全**：写停滞假死检测自愈 + Sidecar 探针（`std::process::Command` 独立进程）；
+4. ~~**看门狗补全：写停滞假死检测自愈 + Sidecar 探针**~~ ✅（2026-08-28，检测/自愈判定 + 心跳基座）：
+   `watchdog::StallWatchdog`（design 14.2）：周期采样 L0 文件数，`compaction.stall_timeout_secs`（默认 60s）
+   内无减少判 Compaction 假死 → 自愈信号（中断 Compaction + 重置调度器由存储层接动作），连续
+   `max_consecutive_failures`（默认 3）次 → FatalExit（由外部 systemd/Sidecar 重启）；
+   `watchdog::HeartbeatSidecar` + `HeartbeatProbe`（design 14.4 MVP：独立探活线程 + 文件锁心跳，
+   `sidecar.ping_interval_sec` 默认 5s × `max_missed_pings` 默认 3 判死锁；禁止 fork，独立子进程拉起留阶段 2 后续）；
+   配置新增 `[compaction]` / `[sidecar]`（design 14.5）；测试 176 全绿（+5 假死判定/恢复/FatalExit/心跳存活/缺失判死）；
 5. **网关全局 Term 缓存** + 失效心跳；
 6. **术语字典热备 TDS**；
 7. **无损扩容协议（design 9.1.1）**：双写（Shadow Writes）→ 数据追平（Delta Catch-up，SST 拷贝 + WAL 增量回放）→ 原子切换（Atomic Switch，1s 内）+ 5s 回滚预案，业务零感知、数据零丢失；
