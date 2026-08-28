@@ -1,16 +1,24 @@
 //! 布隆过滤器（design 4.4 / development 步骤 6）。
 //!
-//! - 每 SST 按预估 key 数分配位数组：`key 数 × 10 bits`，假阳性率 ≈ 1%；
+//! - 每 SST 按预估 key 数分配位数组：`key 数 × 10 bits`，假阳性率 ≈ 1%（默认 fpr=0.01）；
 //! - 哈希函数 7 个，由双哈希（FNV-1a 主哈希 + 增量派生）生成，避免构建开销；
-//! - 用于等值查询"key 是否可能存在"，与 Zone Map 的范围剪枝互补。
+//! - 用于等值查询"key 是否可能存在"，与 Zone Map 的范围剪枝互补；
+//! - 阶段 1.5：按块分区（Partitioned Bloom，design 4.4.2），查询只加载目标块布隆。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// 每 key 分配的位（bit）数，对应约 1% 假阳性率（k=7 时）。
-const BITS_PER_KEY: usize = 10;
 /// 哈希函数个数。
 const NUM_HASHES: usize = 7;
+
+/// 按目标假阳性率计算每 key 位数：`fpr ≈ (1 - e^(-k·n/m))^k`。
+fn bits_per_key_for_fpr(fpr: f64) -> usize {
+    let fpr = fpr.clamp(1e-6, 0.5);
+    // 反解 m/n = -k / ln(1 - fpr^(1/k))
+    let k = NUM_HASHES as f64;
+    let bits = -k / (1.0 - fpr.powf(1.0 / k)).ln();
+    (bits.ceil() as usize).max(4)
+}
 
 /// 布隆过滤器：位数组 + 元素计数。
 #[derive(Debug, Clone)]
@@ -23,9 +31,16 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
-    /// 按预估 key 数分配位数组。
+    /// 按预估 key 数分配位数组（默认 fpr=0.01）。
     pub fn with_estimated_keys(expected_keys: usize) -> Self {
-        let num_bits = expected_keys.saturating_mul(BITS_PER_KEY).max(64);
+        Self::with_estimated_keys_fpr(expected_keys, 0.01)
+    }
+
+    /// 按预估 key 数与目标假阳性率分配位数组（design 4.4.2 `sstable.bloom_fpr`）。
+    pub fn with_estimated_keys_fpr(expected_keys: usize, fpr: f64) -> Self {
+        let num_bits = expected_keys
+            .saturating_mul(bits_per_key_for_fpr(fpr))
+            .max(64);
         Self {
             bits: vec![0u64; num_bits.div_ceil(64)],
             num_bits,
