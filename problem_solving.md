@@ -193,6 +193,29 @@
 
 ---
 
+## 阶段 3 · 深度优化（v0.3.0）
+
+### P30. 读路径性能回归：get_from_sst 每次点查克隆整个 Level 2 精确索引
+- **现象**：v0.3.0 性能实测（P3-7）1000万 demo 在「倒排词条查询」阶段挂起（>8min：CPU 持续占用、无新文件写入、无 sharded 目录）；v0.2.1 同规模仅 2s；100万 正常（11s 完成）——**与 SST 规模相关的读路径劣化**。
+- **根因**：M5 两级索引重构后 `SstReader::index()` 返回 `full_index.clone()`（整个 Level 2 精确索引副本，逐条 IndexEntry 含 first_key String 克隆），`column_family::get_from_sst` 沿用旧调用方式，**每次点查都克隆全量精确索引**；亿级库每 SST ~1.3 万条 IndexEntry，200k 次抽样回表 → 数亿次小分配（O(索引条数 × 查询数)），倒排查询从 2s 恶化到挂起；100万 库 SST 小（千级条目）故未暴露。
+- **修复**：`SstReader` 新增 `locate_indexed_block`（借用精确索引二分 + **只克隆单条**块条目，对齐 design 4.4.2 按需加载语义），`get_from_sst` 改用之并保留分区布隆剪枝；实测 1000万 倒排词条查询恢复 2.4s，2000万 / 5000万 稳定。
+- **提交**：`d472f94`（P3-7a）
+
+### P31. 性能实测环境：C 盘写满致 demo 卡死（临时目录重定向 D 盘）
+- **现象**：首次 1000万 demo 运行 ~10min 未完成（分片 WAL 写入近乎停滞），随后进程异常退出；console.log 0 字节（Tee 缓冲未刷）。
+- **根因**：demo 临时数据落在系统 TEMP（C 盘），彼时 C 盘 **0 字节剩余（100% 满）**——写入崩塌；C 盘此前已被 pip / npm 缓存等占满（Users 60GB / Windows 18GB / 缓存数 GB）。
+- **修复**：`pip cache purge`（删 1557 目录）+ `npm cache clean --force` 释放 ~4GB；运行前 `TMP/TEMP` 重定向到 `D:\shanshui-cunji-tmp`（demo 数据全部落 D 盘，D 盘 100GB 空闲）；重跑 1000万 ~2.5min 完成 10/10。
+- **提交**：无（环境处理；与 P30 代码修复配合，排除干扰项后定位真实回归）
+- **备注**：P4 曾记录 C 盘满导致构建失败（rustup override 已切 MSVC），本次为运行期数据目录，性质不同。
+
+### P32. Edge headless 截图静默失败：需 --user-data-dir + 绝对路径
+- **现象**：`screenshot_sections.py` 逐节截图全部未生成（脚本 `capture_output=True` 吞掉错误，仅打印文件名）。
+- **根因**：本机已运行 Edge 实例时 headless 复用会话失败；且 `--screenshot=images/...` 相对路径对 Edge 不可解析（报「系统找不到指定的路径」，Edge 解析输出路径的工作目录与调用方不一致）。
+- **修复**：脚本为每次截图加 `--user-data-dir`（独立 profile 目录）+ 输入输出路径全部 `os.path.abspath`；30 张截图（3 规模 × 10 节）全部生成。
+- **提交**：`87777df`（images/perf-0.3.0/screenshot_sections.py）
+
+---
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
