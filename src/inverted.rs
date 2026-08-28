@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn chunks_partition_posting_and_concatenate() {
         let dir = tmp();
-        let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        let idx = InvertedIndex::open(&dir, 10_000).unwrap();
         // 散布大量 docid，覆盖全部分片
         for i in 1..=10_000u64 {
             idx.add("status=active", i);
