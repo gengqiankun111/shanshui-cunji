@@ -36,6 +36,8 @@ pub struct Config {
     pub replication: ReplicationConfig,
     pub read_write_separation: ReadWriteSeparationConfig,
     pub broadcast_query: BroadcastQueryConfig,
+    pub compaction: CompactionConfig,
+    pub sidecar: SidecarConfig,
 }
 
 impl Config {
@@ -223,6 +225,16 @@ impl Config {
         if self.broadcast_query.max_concurrent == 0 || self.broadcast_query.timeout_ms == 0 {
             return Err(Error::Config(
                 "broadcast_query.max_concurrent / timeout_ms 必须 > 0".into(),
+            ));
+        }
+        if self.compaction.stall_timeout_secs == 0 || self.compaction.max_consecutive_failures == 0 {
+            return Err(Error::Config(
+                "compaction.stall_timeout_secs / max_consecutive_failures 必须 > 0".into(),
+            ));
+        }
+        if self.sidecar.ping_interval_sec == 0 || self.sidecar.max_missed_pings == 0 {
+            return Err(Error::Config(
+                "sidecar.ping_interval_sec / max_missed_pings 必须 > 0".into(),
             ));
         }
         Ok(())
@@ -620,6 +632,44 @@ impl Default for BroadcastQueryConfig {
             max_concurrent: 10,
             timeout_ms: 30000,
             reject_without_shard_key: false,
+        }
+    }
+}
+
+/// Compaction 看门狗（design 14.2 / 14.5）：写停滞假死检测与自愈。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// L0 数量在该时间内无减少 → 判定 Compaction 假死（默认 60s）。
+    pub stall_timeout_secs: u64,
+    /// 连续假死次数上限，超出主动退出进程（由外部重启）。
+    pub max_consecutive_failures: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            stall_timeout_secs: 60,
+            max_consecutive_failures: 3,
+        }
+    }
+}
+
+/// 内嵌 Sidecar 进程探针（design 14.4 / 14.5）：文件锁心跳兜底。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SidecarConfig {
+    /// 探针心跳间隔（秒，默认 5s）。
+    pub ping_interval_sec: u64,
+    /// 连续丢 ping 上限（默认 3），超出判定主进程死锁。
+    pub max_missed_pings: u32,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            ping_interval_sec: 5,
+            max_missed_pings: 3,
         }
     }
 }
