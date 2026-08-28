@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::blockcache::{BlockCache, BlockCacheKey};
+use crate::bloom::BloomFilter;
 use crate::config::model::{Config, MemtableConfig};
 use crate::error::{Error, Result};
 use crate::keys::{decode_docid, encode_docid};
@@ -53,6 +54,8 @@ pub struct ColumnFamily {
     compression: Compression,
     compression_level: i32,
     block_size: usize,
+    /// 布隆假阳性率（`sstable.bloom_fpr`，分区布隆每块构建用）。
+    bloom_fpr: f64,
     /// PAX 热字段白名单（阶段 1.5，来自 [storage] hot_fields；空 = 行式）。
     pax_hot_fields: Vec<String>,
     /// TTL 天数（None = 关闭；开启后 SST 按文档 ttl_field 分天桶，过期整文件删除）。
@@ -147,6 +150,7 @@ impl ColumnFamily {
             compression,
             compression_level,
             block_size: cfg.blockcache.block_size_kb * 1024,
+            bloom_fpr: cfg.sstable.bloom_fpr,
             pax_hot_fields: cfg.storage.hot_fields.clone(),
             ttl_days: cfg.storage.ttl_days,
             ttl_field: cfg.storage.ttl_field.clone(),
@@ -427,6 +431,7 @@ impl ColumnFamily {
             self.block_size,
             rows.len(),
             &self.pax_hot_fields,
+            self.bloom_fpr,
         )?;
         for (k, v, flag, seq) in rows {
             if *flag == FLAG_DELETE {
@@ -448,6 +453,7 @@ impl ColumnFamily {
             self.block_size,
             imm.len(),
             &self.pax_hot_fields,
+            self.bloom_fpr,
         )?;
         imm.scan(|k, e| match &e.value {
             Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
@@ -558,8 +564,11 @@ fn get_from_sst(
     cache: &BlockCache,
     key: &[u8],
 ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
-    if !sst.bloom().maybe_contains(&key.to_vec()) {
-        return Ok(None);
+    // v3/v4：整文件布隆粗筛
+    if let Some(b) = sst.legacy_bloom() {
+        if !b.maybe_contains(&key.to_vec()) {
+            return Ok(None);
+        }
     }
     // 二分定位首个 first_key <= key 的块
     let index = sst.index();
@@ -573,8 +582,22 @@ fn get_from_sst(
             hi = mid;
         }
     }
+    if lo == 0 {
+        return Ok(None);
+    }
+    let block_idx = lo - 1;
+    // v5 分区布隆：只校验目标块（design 4.4.2，查询只加载目标块布隆）
+    if let Some(pb) = sst.partition_blooms() {
+        if let Some(bytes) = pb.get(block_idx) {
+            if let Some(b) = BloomFilter::from_bytes(bytes) {
+                if !b.maybe_contains(&key.to_vec()) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
     // clone 断开借用，随后 read_block 需要 &mut sst
-    let Some(entry) = index.get(lo.wrapping_sub(1)).cloned() else {
+    let Some(entry) = index.get(block_idx).cloned() else {
         return Ok(None);
     };
     let ck = BlockCacheKey {

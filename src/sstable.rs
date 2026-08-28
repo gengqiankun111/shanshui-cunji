@@ -33,7 +33,8 @@ use crate::keys::{decode_varint, decode_varlen, encode_varint, encode_varlen};
 /// 文件魔数 + 版本。
 pub const SST_MAGIC: &[u8; 8] = b"NVSSTL01";
 /// v4：数据块引入 PAX 列式布局（块首 kind 字节）；仍可读取 v3（行式）。
-pub const SST_VERSION: u16 = 4;
+/// 当前格式版本：v5 = 分区布隆（Partitioned Bloom，design 4.4.2）。
+pub const SST_VERSION: u16 = 5;
 /// v3：行式数据块（无 kind 字节）——Reader 向后兼容的最低版本。
 pub const SST_VERSION_ROW: u16 = 3;
 
@@ -125,7 +126,7 @@ pub struct FieldZone {
     pub null_count: u32,
 }
 
-/// SSTable Writer：按 key 升序写入，自动切块、压缩、维护稀疏索引与布隆。
+/// SSTable Writer：按 key 升序写入，自动切块、压缩、维护稀疏索引与分区布隆（v5）。
 pub struct SstWriter {
     out: std::fs::File,
     compression: Compression,
@@ -134,8 +135,10 @@ pub struct SstWriter {
     buf: Vec<PendingRow>,
     /// 块索引：[first_key, offset, raw_len, comp_len, zones]。
     index: Vec<IndexEntry>,
-    /// 布隆过滤器。
-    bloom: BloomFilter,
+    /// 分区布隆（Partitioned Bloom，design 4.4.2）：每数据块一个，flush 时构建。
+    partition_blooms: Vec<Vec<u8>>,
+    /// 布隆假阳性率（`sstable.bloom_fpr`）。
+    bloom_fpr: f64,
     /// 已写入字节数（含 header）。
     written: u64,
     /// 写入 key 总数。
@@ -180,6 +183,7 @@ impl SstWriter {
             block_size,
             expected_keys,
             &[],
+            0.01,
         )
     }
 
@@ -191,7 +195,9 @@ impl SstWriter {
         block_size: usize,
         expected_keys: usize,
         hot_fields: &[String],
+        bloom_fpr: f64,
     ) -> Result<Self> {
+        let _ = expected_keys; // 分区布隆按块内实际 key 数构建，无需全文件预估
         let out = std::fs::File::create(path).map_err(Error::Io)?;
         let mut w = Self {
             out,
@@ -199,7 +205,8 @@ impl SstWriter {
             block_size,
             buf: Vec::new(),
             index: Vec::new(),
-            bloom: BloomFilter::with_estimated_keys(expected_keys),
+            partition_blooms: Vec::new(),
+            bloom_fpr,
             written: 0,
             key_count: 0,
             last_key: None,
@@ -245,7 +252,6 @@ impl SstWriter {
             flag,
             seq,
         });
-        self.bloom.insert(&key.to_vec());
         self.key_count += 1;
         self.last_key = Some(key.to_vec());
         self.buf_last_key = Some(key.to_vec());
@@ -305,6 +311,14 @@ impl SstWriter {
             comp_len: comp_len as u32,
             zones,
         });
+
+        // 分区布隆（design 4.4.2）：按当前块实际 key 数构建，查询只加载目标块布隆
+        let mut b = BloomFilter::with_estimated_keys_fpr(self.buf.len().max(1), self.bloom_fpr);
+        for r in &self.buf {
+            b.insert(&r.key);
+        }
+        self.partition_blooms.push(b.to_bytes());
+
         self.buf.clear();
         Ok(())
     }
@@ -353,12 +367,16 @@ impl SstWriter {
         self.write_all(&ib)?;
         let index_len = ib.len() as u32;
 
-        // Bloom
+        // 分区布隆区（v5）：Count(u32) + [len(u32) + bytes]*，按块顺序与 Index 对齐
         let bloom_offset = self.written;
-        let bloom_bytes = self.bloom.to_bytes();
-        self.write_all(&(bloom_bytes.len() as u32).to_le_bytes())?;
-        self.write_all(&bloom_bytes)?;
-        let bloom_len = (4 + bloom_bytes.len()) as u32;
+        let mut bb = Vec::new();
+        bb.extend_from_slice(&(self.partition_blooms.len() as u32).to_le_bytes());
+        for b in &self.partition_blooms {
+            bb.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            bb.extend_from_slice(b);
+        }
+        self.write_all(&bb)?;
+        let bloom_len = bb.len() as u32;
 
         // Footer：magic + 各段偏移/长度 + key_count + 版本
         let footer_offset = self.written;
@@ -564,9 +582,12 @@ pub struct SstReader {
     file: std::fs::File,
     footer: SstFooter,
     index: Vec<IndexEntry>,
-    bloom: BloomFilter,
+    /// v5 分区布隆：每块一个（原始字节，查询时按需反序列化目标块）。
+    partition_blooms: Option<Vec<Vec<u8>>>,
+    /// v3/v4 整文件布隆（旧格式兼容）。
+    bloom: Option<BloomFilter>,
     compression: Compression,
-    /// 文件格式版本（v3=纯行式无 kind，v4=可含 PAX）。
+    /// 文件格式版本（v3=纯行式，v4=PAX，v5=分区布隆）。
     format: u16,
 }
 
@@ -621,17 +642,47 @@ impl SstReader {
         file.read_exact(&mut ib).map_err(Error::Io)?;
         let index = decode_index(&ib, version)?;
 
-        // 读 Bloom
+        // 读 Bloom 区：v5 为分区布隆列表；v3/v4 为旧单布隆
         let mut bb = vec![0u8; bloom_len];
         file.seek(std::io::SeekFrom::Start(bloom_offset))
             .map_err(Error::Io)?;
         file.read_exact(&mut bb).map_err(Error::Io)?;
-        let bloom_len_u32 = u32::from_le_bytes(bb[0..4].try_into().unwrap()) as usize;
-        if 4 + bloom_len_u32 != bb.len() {
-            return Err(Error::Corrupted("Bloom 长度不一致".into()));
-        }
-        let bloom = BloomFilter::from_bytes(&bb[4..])
-            .ok_or_else(|| Error::Corrupted("Bloom 解析失败".into()))?;
+        let (partition_blooms, bloom) = if version >= SST_VERSION {
+            // v5：Count(u32) + [len(u32) + bytes]*，与 Index 对齐（每块一个）
+            let mut pb = Vec::new();
+            let mut cur = 0usize;
+            let count = u32::from_le_bytes(
+                bb.get(cur..cur + 4)
+                    .ok_or_else(|| Error::Corrupted("分区布隆计数越界".into()))?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            cur += 4;
+            for _ in 0..count {
+                let len = u32::from_le_bytes(
+                    bb.get(cur..cur + 4)
+                        .ok_or_else(|| Error::Corrupted("分区布隆长度越界".into()))?
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                cur += 4;
+                let bytes = bb
+                    .get(cur..cur + len)
+                    .ok_or_else(|| Error::Corrupted("分区布隆数据越界".into()))?
+                    .to_vec();
+                cur += len;
+                pb.push(bytes);
+            }
+            (Some(pb), None)
+        } else {
+            let bloom_len_u32 = u32::from_le_bytes(bb[0..4].try_into().unwrap()) as usize;
+            if 4 + bloom_len_u32 != bb.len() {
+                return Err(Error::Corrupted("Bloom 长度不一致".into()));
+            }
+            let b = BloomFilter::from_bytes(&bb[4..])
+                .ok_or_else(|| Error::Corrupted("Bloom 解析失败".into()))?;
+            (None, Some(b))
+        };
 
         // 读取 Header 获取压缩与块大小
         let mut hb = vec![0u8; 15];
@@ -655,6 +706,7 @@ impl SstReader {
                 footer_offset,
             },
             index,
+            partition_blooms,
             bloom,
             compression,
             format: version,
@@ -665,8 +717,14 @@ impl SstReader {
         &self.footer
     }
 
-    pub fn bloom(&self) -> &BloomFilter {
-        &self.bloom
+    /// v5 分区布隆原始字节（每块一个，与 Index 对齐）。
+    pub fn partition_blooms(&self) -> Option<&[Vec<u8>]> {
+        self.partition_blooms.as_deref()
+    }
+
+    /// v3/v4 旧格式整文件布隆（格式兼容用）。
+    pub fn legacy_bloom(&self) -> Option<&BloomFilter> {
+        self.bloom.as_ref()
     }
 
     pub fn index(&self) -> &[IndexEntry] {
@@ -681,17 +739,55 @@ impl SstReader {
         self.index.len()
     }
 
-    /// 等值查询：布隆剪枝 → 二分定位块 → 读块 → 块内扫描。
+    /// 等值查询：定位块 → 分区布隆剪枝（v5）/ 整文件布隆剪枝（v3/v4）→ 读块 → 块内扫描。
     /// 返回 `(value, seq)`：`value=None` 表示 Tombstone（已删除），`None` 整体表示不存在。
     pub fn get(&mut self, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
-        if !self.bloom.maybe_contains(&key.to_vec()) {
-            return Ok(None);
+        // v5 分区布隆：先定位块，再只校验目标块布隆（design 4.4.2 按需加载）
+        if let Some(pb) = &self.partition_blooms {
+            let Some(idx) = self.locate_block_index(key) else {
+                return Ok(None);
+            };
+            if let Some(bytes) = pb.get(idx) {
+                if let Some(b) = BloomFilter::from_bytes(bytes) {
+                    if !b.maybe_contains(&key.to_vec()) {
+                        return Ok(None);
+                    }
+                }
+            }
+            let e = self.index[idx].clone();
+            let data = self.read_block(&e)?;
+            return self.scan_block_for_key(&data, key);
+        }
+        // v3/v4：整文件布隆粗筛
+        if let Some(bloom) = &self.bloom {
+            if !bloom.maybe_contains(&key.to_vec()) {
+                return Ok(None);
+            }
         }
         let Some(e) = self.locate_block(key).cloned() else {
             return Ok(None);
         };
         let data = self.read_block(&e)?;
         self.scan_block_for_key(&data, key)
+    }
+
+    /// 定位包含 key 的块在 Index 中的下标（二分首个 first_key <= key 的块）。
+    fn locate_block_index(&self, key: &[u8]) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.index.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.index[mid].first_key.as_slice() <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            None
+        } else {
+            Some(lo - 1)
+        }
     }
 
     /// 块内等值扫描（按文件格式版本正确处理行式 / PAX 块）。供块缓存命中路径复用。
@@ -1111,7 +1207,8 @@ mod tests {
         // PAX 列式块：JSON 按字段拆列，重组后语义等值（保序），字段级 Zone Map 采集
         let path = tmp();
         let hot = vec!["status".to_string(), "city".to_string()];
-        let mut w = SstWriter::new_with_pax(&path, Compression::None, 0, 1024, 10, &hot).unwrap();
+        let mut w =
+            SstWriter::new_with_pax(&path, Compression::None, 0, 1024, 10, &hot, 0.01).unwrap();
         w.add(
             b"k1",
             br#"{"status":"active","city":"beijing","amount":100}"#,
@@ -1156,7 +1253,8 @@ mod tests {
         // 块内出现非 JSON 值或 Tombstone → 整块回退行式，读取不受影响
         let path = tmp();
         let hot = vec!["a".to_string()];
-        let mut w = SstWriter::new_with_pax(&path, Compression::None, 0, 1024, 10, &hot).unwrap();
+        let mut w =
+            SstWriter::new_with_pax(&path, Compression::None, 0, 1024, 10, &hot, 0.01).unwrap();
         w.add(b"k1", br#"{"a":1,"b":2}"#, 1).unwrap();
         w.add(b"k2", b"not-json-bytes", 2).unwrap();
         w.add_tombstone(b"k3", 3).unwrap();
@@ -1185,7 +1283,8 @@ mod tests {
         // 同一 v4 文件内 PAX 块与行式块共存：块 kind 分发正确
         let path = tmp();
         let hot = vec!["a".to_string()];
-        let mut w = SstWriter::new_with_pax(&path, Compression::None, 0, 30, 10, &hot).unwrap();
+        let mut w =
+            SstWriter::new_with_pax(&path, Compression::None, 0, 30, 10, &hot, 0.01).unwrap();
         w.add(b"k1", br#"{"a":1,"b":2}"#, 1).unwrap(); // 估算 ~35B ≥ 30 → 单独 flush → PAX 块
         w.add(b"k2", b"not-json", 2).unwrap(); // 行式块
         w.add(b"k3", br#"{"a":3}"#, 3).unwrap();
@@ -1315,5 +1414,110 @@ mod tests {
                 (b"c".to_vec(), true),
             ]
         );
+    }
+
+    #[test]
+    fn partitioned_bloom_built_per_block() {
+        // v5：每个数据块一个分区布隆，与 Index 对齐
+        let path = tmp();
+        let mut w = SstWriter::new(&path, Compression::Zstd, 1, 64, 500).unwrap();
+        for i in 0..500u64 {
+            let k = format!("k{i:04}").into_bytes();
+            w.add(&k, b"v", i).unwrap();
+        }
+        w.finish().unwrap();
+        let mut r = SstReader::open(&path).unwrap();
+        let pb = r.partition_blooms().expect("v5 应有分区布隆");
+        assert!(r.index_len() > 2, "多块文件");
+        assert_eq!(pb.len(), r.index_len(), "分区布隆数 = 块数");
+        assert!(r.legacy_bloom().is_none(), "v5 无整文件布隆");
+        // 查询正确（分区布隆剪枝 + 读块）
+        assert_eq!(
+            String::from_utf8_lossy(&r.get(b"k0250").unwrap().unwrap().0.unwrap()),
+            "v"
+        );
+        // 缺失 key：定位块后由分区布隆剪枝返回 None
+        assert!(r.get(b"k9999").unwrap().is_none());
+    }
+
+    #[test]
+    fn partitioned_bloom_fpr_configurable() {
+        // 不同 fpr 的位数组大小不同（fpr 越小位数越多）
+        let strict = BloomFilter::with_estimated_keys_fpr(100, 0.001);
+        let loose = BloomFilter::with_estimated_keys_fpr(100, 0.05);
+        assert!(
+            strict.num_bits() > loose.num_bits(),
+            "fpr=0.001 应比 fpr=0.05 更多位"
+        );
+    }
+
+    #[test]
+    fn v4_legacy_bloom_still_readable() {
+        // 向后兼容：手写 v4 格式（整文件布隆）读取路径
+        let dir = tempfile::tempdir().unwrap();
+        // 构造 v4 文件：header(15) + 一个行式块 + index + 旧单布隆 + footer
+        let path = dir.path().join("v4.sst");
+        let mut out = Vec::new();
+        out.extend_from_slice(SST_MAGIC);
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.push(Compression::Zstd.code());
+        out.extend_from_slice(&4096u32.to_le_bytes());
+        // 数据块（行式）：key=ab, value=xy
+        let mut block = Vec::new();
+        crate::keys::encode_varlen(&mut block, b"ab");
+        crate::keys::encode_varlen(&mut block, b"xy");
+        block.push(FLAG_PUT);
+        block.extend_from_slice(&1u64.to_le_bytes());
+        let raw = block;
+        let comp = zstd::bulk::compress(&raw, 3).unwrap();
+        let block_offset = out.len() as u64;
+        out.extend_from_slice(&comp);
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32(&comp).to_le_bytes());
+        // 索引
+        let index_offset = out.len() as u64;
+        let mut ib = Vec::new();
+        crate::keys::encode_varint(&mut ib, 1);
+        crate::keys::encode_varlen(&mut ib, b"ab");
+        crate::keys::encode_varlen(&mut ib, b"ab");
+        ib.extend_from_slice(&block_offset.to_le_bytes());
+        ib.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        ib.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        ib.extend_from_slice(&0u16.to_le_bytes()); // zones 空
+        out.extend_from_slice(&ib);
+        let index_len = ib.len() as u32;
+        // 旧单布隆
+        let bloom_offset = out.len() as u64;
+        let mut bf = BloomFilter::with_estimated_keys(1);
+        bf.insert(&b"ab".to_vec());
+        let bbytes = bf.to_bytes();
+        out.extend_from_slice(&(bbytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bbytes);
+        let bloom_len = (4 + bbytes.len()) as u32;
+        // Footer
+        let footer_offset = out.len() as u64;
+        let mut fb = Vec::new();
+        fb.extend_from_slice(SST_MAGIC);
+        fb.extend_from_slice(&4u16.to_le_bytes());
+        fb.extend_from_slice(&index_offset.to_le_bytes());
+        fb.extend_from_slice(&index_len.to_le_bytes());
+        fb.extend_from_slice(&bloom_offset.to_le_bytes());
+        fb.extend_from_slice(&bloom_len.to_le_bytes());
+        fb.extend_from_slice(&1u64.to_le_bytes());
+        fb.extend_from_slice(&footer_offset.to_le_bytes());
+        fb.extend_from_slice(&crc32(&fb).to_le_bytes());
+        out.extend_from_slice(&fb);
+        out.extend_from_slice(&footer_offset.to_le_bytes());
+        std::fs::write(&path, &out).unwrap();
+
+        let mut r = SstReader::open(&path).unwrap();
+        assert!(r.partition_blooms().is_none(), "v4 无分区布隆");
+        assert!(r.legacy_bloom().is_some(), "v4 应加载整文件布隆");
+        assert_eq!(
+            String::from_utf8_lossy(&r.get(b"ab").unwrap().unwrap().0.unwrap()),
+            "xy"
+        );
+        assert!(r.get(b"absent").unwrap().is_none(), "整文件布隆剪枝");
     }
 }

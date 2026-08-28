@@ -162,6 +162,12 @@
 - **设计约束**：`put_with_enrich` 回调签名 `FnOnce(&mut Engine, &mut Value)`——Enrich 需在 WAL 前查引擎（local 源），若回调只拿 `&mut Value` 则无法访问引擎；故回调同时借 `&mut Engine`，Enrich 修改文档后再统一序列化写入。
 - **提交**：随 M4 数据关联提交（本轮）
 
+### P26. 分区布隆：SST v5 格式与双查询路径
+- **背景**：块级压缩（zstd 每块独立 + CRC）MVP 已实现；缺口是 design 4.4.2 的**分区布隆**（整文件单布隆 → 每块一个，查询只加载目标块）。
+- **实现**：SST 格式 v4→v5，Bloom 区改为 `Count + [len + bytes]*`（与 Index 对齐）；Reader `partition_blooms: Option<Vec<Vec<u8>>>`（原始字节按需反序列化），`get()`/`get_from_sst` 先二分定位块、再校验目标块布隆；v3/v4 走 `legacy_bloom()` 整文件布隆回退（`v4_legacy_bloom_still_readable` 测试手写 v4 文件验证兼容）。
+- **注意**：Writer 的整文件布隆字段移除（分区布隆按块内实际 key 数构建，`expected_keys` 参数不再用于布隆），`new_with_pax` 新增 `bloom_fpr` 参数（`sstable.bloom_fpr` 默认 0.01）。
+- **提交**：随 M4 块级压缩 + 分区布隆提交（本轮）
+
 ---
 
 ## 环境备忘（不入库）

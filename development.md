@@ -648,7 +648,11 @@ impl RuntimePools {
    Inner/Left/Right + max_rows 熔断）、HTTP `GET /join`、写入 Enrich
    `put_with_enrich`（WAL 前回调，fail_policy reject/degrade + local 源 `enrich_check_local`）；
    测试 154 全绿（+7），HTTP 冒烟验证 inner/left；Right 语义=Inner（从表无独立筛选，基础版简化）；
-9. **块级压缩（Zstd Level 3）+ 分区布隆过滤器（design 4.4.2）**：存储再降 40%~60%、布隆内存减半；
+9. ~~**块级压缩（Zstd Level 3）+ 分区布隆过滤器（design 4.4.2）**：存储再降 40%~60%、布隆内存减半~~ ✅（2026-08-28）：
+   块级压缩 MVP 已有（每块独立 zstd + 独立 CRC32）；本轮实现 **分区布隆（Partitioned Bloom）**：
+   SST 格式 v4→v5，每个数据块构建独立布隆（按块内实际 key 数 + `sstable.bloom_fpr`），
+   查询先二分定位块、再只校验目标块布隆（按需反序列化，内存减半）；Reader 兼容 v3/v4 旧格式
+   （整文件布隆回退）；测试 157 全绿（+3 分区布隆/v4 兼容/fpr 可配）；
 10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（jemalloc stats + 命中率）+ `explain`（执行计划推演）；
 11. **数据管道（design 20）**：`shanshui-cunji-export`（Parquet/CSV 基础版，与迁移工具同期）+ `shanshui-cunji-import`（CSV/JSON 基础版）。
 
