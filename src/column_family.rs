@@ -707,22 +707,10 @@ fn get_from_sst(
             return Ok(None);
         }
     }
-    // 二分定位首个 first_key <= key 的块
-    let index = sst.index();
-    let mut lo = 0usize;
-    let mut hi = index.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if index[mid].first_key.as_slice() <= key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 {
+    // 等值定位块：借用精确索引二分，只克隆单条块条目（design 4.4.2 按需，避免克隆整个 Level 2）
+    let Some((block_idx, entry)) = sst.locate_indexed_block(key)? else {
         return Ok(None);
-    }
-    let block_idx = lo - 1;
+    };
     // v5 分区布隆：只校验目标块（design 4.4.2，查询只加载目标块布隆）
     if let Some(pb) = sst.partition_blooms() {
         if let Some(bytes) = pb.get(block_idx) {
@@ -733,10 +721,6 @@ fn get_from_sst(
             }
         }
     }
-    // clone 断开借用，随后 read_block 需要 &mut sst
-    let Some(entry) = index.get(block_idx).cloned() else {
-        return Ok(None);
-    };
     let ck = BlockCacheKey {
         file: sst.path().to_path_buf(),
         offset: entry.offset,
