@@ -823,7 +823,11 @@ impl RuntimePools {
    ColumnFamily 经 `WalBackend` 统一分发（put/delete/sync 遇 WalFull 自动 Flush 重试）；
    测试验证 回环往返/回绕恢复最新周期/未刷盘拒覆盖/容量预检/崩溃重开/集成强制 Flush 数据完整；
    测试 260→267（+7）；io_uring 内核接入（Linux 5.8+ 异步提交）与 O_DIRECT 留待 Linux 部署验证；
-2. **Leveled-Compaction（design 4.5 二期）**：SST 分层（Manifest 带 level）+ L0 直并 + L1+ 按 key 范围重叠压实；
+2. ~~**Leveled-Compaction（design 4.5 二期）**~~ ✅（2026-08-28）：SST 分层压实——Manifest 新增
+   `levels` 层号（旧 Manifest 全 0 兼容），刷盘产物入 L0、压实产物入 L1/L2；`select_compaction_inputs`
+   **有界压实**：L0 ≥ 2 段时合并 L0 → L1（单次压实量 = 刷盘批次；L1 达层上限则 L0+全部 L1 收敛），
+   L0 空且 L1 > 1 时 L1 → L2 下沉；`needs_compact` 分层判定；测试验证 L0→L1 / L1→L2 / 层号持久化 /
+   选择函数；测试 267→270（+3）；
 3. **MVCC 快照读（design 4.7 二期）**：`get_at(docid, snapshot_seq)` 指定快照读；
 4. **热点 key 自动缓存（design 14.1.2）**：访问计数 → 自动提升 HotCache 优先级；
 5. **增量备份（design 20）**：seq 游标增量备份 + 恢复合并；

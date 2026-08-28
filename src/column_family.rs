@@ -42,6 +42,10 @@ const MANIFEST_FILE: &str = "manifest.json";
 struct Manifest {
     /// 最近刷盘的文件在最前（读路径优先命中）。
     sst_files: Vec<String>,
+    /// 每个 SST 的层号（design 4.5 二期 Leveled，M6-2）：0 = 刷盘产物（允许重叠），
+    /// 1 / 2 = Compaction 输出（层内 key 范围不重叠）。旧 Manifest 缺省按全 0（L0）兼容。
+    #[serde(default)]
+    levels: Vec<u32>,
     /// 下一个可用 SST id。
     next_sst_id: u64,
 }
@@ -70,8 +74,10 @@ pub struct ColumnFamily {
     l0_stall_threshold: usize,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
-    /// SST 文件（新→旧）。
+    /// SST 文件（新→旧；读路径按序取首个命中，依赖"新文件在前"版本语义）。
     ssts: Vec<SstReader>,
+    /// 与 `ssts` 平行的层号（design 4.5 二期 Leveled Compaction，M6-2）。
+    sst_levels: Vec<u32>,
     /// 共享块缓存（跨 CF 共享）。
     block_cache: Arc<BlockCache>,
     /// 单调 seq 分配器（跨重启由 WAL 恢复推进）。
@@ -82,7 +88,7 @@ pub struct ColumnFamily {
     wal: WalBackend,
 }
 
-/// Compaction 结果报告（design 4.5 阶段 3）。
+/// Compaction 结果报告（design 4.5 阶段 3 / 二期 Leveled，M6-2）。
 #[derive(Debug, Clone, Copy)]
 pub struct CompactReport {
     /// 被合并的旧段数。
@@ -91,6 +97,8 @@ pub struct CompactReport {
     pub kept_keys: usize,
     /// 释放的磁盘字节数。
     pub freed_bytes: u64,
+    /// 压实输出所在层（0 = 未压实；1 / 2 = L1 / L2）。
+    pub out_level: u32,
 }
 
 impl ColumnFamily {
@@ -104,39 +112,49 @@ impl ColumnFamily {
             )));
         }
         let manifest_path = dir.join(MANIFEST_FILE);
-        let (mut sst_names, next_sst_id) = load_manifest(&manifest_path)?;
+        let (mut sst_names, mut sst_levels, next_sst_id) = load_manifest(&manifest_path)?;
 
         // TTL 过期桶清理：按天整文件删除（删除成本 O(1)，无墓碑；design 5.4）
         if let Some(ttl_days) = cfg.storage.ttl_days {
             let cutoff = today_epoch_days() - ttl_days as i64;
             let mut removed = 0usize;
-            for f in &sst_names {
-                if let Some(days) = parse_sst_date(f) {
-                    if days < cutoff {
-                        let p = dir.join(f);
-                        if p.exists() {
-                            std::fs::remove_file(&p).map_err(Error::Io)?;
-                            removed += 1;
-                        }
+            let mut kept = Vec::new();
+            for (i, f) in sst_names.iter().enumerate() {
+                let keep = match parse_sst_date(f) {
+                    Some(days) => days >= cutoff,
+                    None => true, // 默认桶（无日期前缀）永不过期
+                };
+                if keep {
+                    kept.push((f.clone(), sst_levels.get(i).copied().unwrap_or(0)));
+                } else {
+                    let p = dir.join(f);
+                    if p.exists() {
+                        std::fs::remove_file(&p).map_err(Error::Io)?;
+                        removed += 1;
                     }
                 }
             }
             if removed > 0 {
-                sst_names.retain(|f| parse_sst_date(f).is_none_or(|d| d >= cutoff));
+                sst_names = kept.iter().map(|(f, _)| f.clone()).collect();
+                sst_levels = kept.iter().map(|(_, l)| *l).collect();
                 info!("列族 [{name}] TTL 过期桶清理: 删除 {removed} 个 SST");
             }
         }
 
         // 打开全部 SST（新→旧）
         let mut ssts = Vec::new();
-        for f in &sst_names {
+        let mut sst_levels_loaded = Vec::new();
+        for (i, f) in sst_names.iter().enumerate() {
             let p = dir.join(f);
             if !p.exists() {
                 warn!("Manifest 中的 SST 缺失，跳过: {}", p.display());
                 continue;
             }
             match SstReader::open_with_granularity(&p, cfg.sstable.index_granularity as usize) {
-                Ok(r) => ssts.push(r),
+                Ok(r) => {
+                    ssts.push(r);
+                    sst_levels_loaded.push(sst_levels.get(i).copied().unwrap_or(0));
+                }
                 Err(e) => {
                     return Err(Error::Corrupted(format!(
                         "SST 加载失败 {}: {e}",
@@ -196,6 +214,7 @@ impl ColumnFamily {
             l0_stall_threshold: cfg.storage.l0_stall_threshold,
             memtable: MemTableBuffer::new(),
             ssts,
+            sst_levels: sst_levels_loaded,
             block_cache,
             seq: AtomicU64::new(1),
             next_sst_id,
@@ -448,6 +467,7 @@ impl ColumnFamily {
             0,
             SstReader::open_with_granularity(&path, self.index_granularity)?,
         );
+        self.sst_levels.insert(0, 0); // 刷盘产物 → L0
         self.persist_manifest()?;
         info!(
             "列族 [{}] 刷盘完成: {} ({} 条)",
@@ -493,6 +513,7 @@ impl ColumnFamily {
                 0,
                 SstReader::open_with_granularity(&path, self.index_granularity)?,
             );
+            self.sst_levels.insert(0, 0); // 刷盘产物 → L0
         }
         self.persist_manifest()?;
         info!(
@@ -519,25 +540,29 @@ impl ColumnFamily {
         Ok(())
     }
 
-    /// 基础 Compaction（design 4.5，阶段 3）：将全部 SST 合并为单个紧凑文件。
+    /// Leveled-Compaction（design 4.5 二期 / M6-2）：分层压实，限制单次压实量。
     ///
-    /// - 读取全部条目（key, seq, value；value=None = Tombstone），按 (key 升序, seq 降序) 排序，
-    ///   同 key 保留最高 seq（后写覆盖先写，Tombstone 语义保留）；
-    /// - 新段写临时文件 → fsync → 原子更新 Manifest → 删除旧段（崩溃安全，同倒排 GC 模式）；
-    /// - 后台 IO 限速：写完后按实际字节 acquire。
+    /// - **L0 → L1**：有 L0 段（刷盘产物，允许重叠）时合并 L0 → 单个 L1 段（不合并既有 L1，
+    ///   单次压实量 = 单个刷盘批次，有界）；L1 文件数达到层上限时改合并 L0 + 全部 L1（收敛）；
+    /// - **L1 → L2**：L0 为空且 L1 段数 > 1 时，合并全部 L1 → 单个 L2 段（压实下沉）；
+    /// - 合并语义：按 (key 升序, seq 降序) 排序去重，后写覆盖先写，Tombstone 保留；
+    /// - 崩溃安全：新段写入 → fsync → 原子更新 Manifest → 删除旧段；
+    /// - 后台 IO 限速：写完后按实际文件字节 acquire。
     pub fn compact(&mut self) -> Result<CompactReport> {
-        let old_count = self.ssts.len();
-        if old_count <= 1 {
+        let (sel, out_level) = select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold);
+        if sel.len() <= 1 {
             return Ok(CompactReport {
                 merged_ssts: 0,
                 kept_keys: 0,
                 freed_bytes: 0,
+                out_level: 0,
             });
         }
-        // ① 读取全部条目
+        let old_count = sel.len();
+        // ① 读取选中条目
         let mut rows: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::new();
-        for sst in &mut self.ssts {
-            sst.iterate(|k, v, seq| {
+        for idx in &sel {
+            self.ssts[*idx].iterate(|k, v, seq| {
                 rows.push((k.to_vec(), seq, v.map(|x| x.to_vec())));
             })?;
         }
@@ -546,7 +571,7 @@ impl ColumnFamily {
         let kept_keys = rows.len();
         rows.dedup_by(|a, b| a.0 == b.0);
 
-        // ③ 写新段（新→旧序插入，读路径优先命中）
+        // ③ 写新段（读路径新文件插最前）
         let sst_id = self.next_sst_id;
         self.next_sst_id += 1;
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
@@ -571,15 +596,36 @@ impl ColumnFamily {
         self.io_acquire(&path)?;
 
         // ④ 原子更新 Manifest（先 Manifest 后删旧文件）
-        let old_ssts = std::mem::take(&mut self.ssts);
-        let old_bytes: u64 = old_ssts
+        let old_bytes: u64 = sel
             .iter()
-            .map(|r| std::fs::metadata(r.path()).map(|m| m.len()).unwrap_or(0))
+            .map(|&i| {
+                std::fs::metadata(self.ssts[i].path())
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
             .sum();
+        let mut old_ssts = Vec::new();
+        let mut kept_ssts = Vec::new();
+        let mut kept_levels = Vec::new();
+        let mut removed = vec![false; self.ssts.len()];
+        for &i in &sel {
+            removed[i] = true;
+        }
+        for (i, sst) in std::mem::take(&mut self.ssts).into_iter().enumerate() {
+            if removed[i] {
+                old_ssts.push(sst);
+            } else {
+                kept_ssts.push(sst);
+                kept_levels.push(self.sst_levels[i]);
+            }
+        }
+        self.ssts = kept_ssts;
+        self.sst_levels = kept_levels;
         self.ssts.insert(
             0,
             SstReader::open_with_granularity(&path, self.index_granularity)?,
         );
+        self.sst_levels.insert(0, out_level);
         self.persist_manifest()?;
 
         // ⑤ 删除旧段（孤儿无害，启动只加载 Manifest）
@@ -588,7 +634,7 @@ impl ColumnFamily {
         }
         let freed_bytes = old_bytes.saturating_sub(self.sst_bytes());
         info!(
-            "列族 [{}] Compaction 完成: {} 段 → 1（保留 {} 键，释放 {} 字节）",
+            "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → 1（保留 {} 键，释放 {} 字节）",
             self.name,
             old_count,
             rows.len(),
@@ -598,12 +644,18 @@ impl ColumnFamily {
             merged_ssts: old_count,
             kept_keys: kept_keys.saturating_sub(rows.len()),
             freed_bytes,
+            out_level,
         })
     }
 
-    /// 是否需要 Compaction（L0 段数超过 `storage.l0_stall_threshold`）。
+    /// 是否需要 Compaction（design 4.5 二期）：
+    /// L0 段数超过 `storage.l0_stall_threshold`（L0→L1），或 L0 为空但 L1 段数 > 1（L1→L2），
+    /// 或 L0/L1 均空但 L2 段数 > 1（L2 收敛）。
     pub fn needs_compact(&self) -> bool {
-        self.ssts.len() > self.l0_stall_threshold
+        let l0 = self.sst_levels.iter().filter(|l| **l == 0).count();
+        let l1 = self.sst_levels.iter().filter(|l| **l == 1).count();
+        let l2 = self.sst_levels.iter().filter(|l| **l >= 2).count();
+        l0 > self.l0_stall_threshold || (l0 == 0 && (l1 > 1 || l2 > 1))
     }
     /// 全部 SST 文件字节总和。
     pub fn sst_bytes(&self) -> u64 {
@@ -653,7 +705,15 @@ impl ColumnFamily {
     }
 
     fn persist_manifest(&self) -> Result<()> {
-        // 以磁盘扫描维护清单（新→旧：id 降序），避免依赖 SstReader 内部状态
+        // 以磁盘扫描维护清单（新→旧：id 降序），避免依赖 SstReader 内部状态；
+        // 层号按文件名从内存 ssts/sst_levels 映射（缺省 0 = L0，兼容旧格式）
+        let mut level_by_file: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for (sst, lv) in self.ssts.iter().zip(&self.sst_levels) {
+            if let Some(name) = sst.path().file_name() {
+                level_by_file.insert(name.to_string_lossy().to_string(), *lv);
+            }
+        }
         let mut files: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -663,8 +723,13 @@ impl ColumnFamily {
             }
         }
         files.sort_by(|a, b| b.cmp(a));
+        let levels: Vec<u32> = files
+            .iter()
+            .map(|f| level_by_file.get(f).copied().unwrap_or(0))
+            .collect();
         let m = Manifest {
             sst_files: files,
+            levels,
             next_sst_id: self.next_sst_id,
         };
         let text = serde_json::to_string_pretty(&m)
@@ -722,14 +787,20 @@ fn parse_sst_date(fname: &str) -> Option<i64> {
     days_str.parse::<i64>().ok()
 }
 
-fn load_manifest(path: &Path) -> Result<(Vec<String>, u64)> {
+fn load_manifest(path: &Path) -> Result<(Vec<String>, Vec<u32>, u64)> {
     if !path.exists() {
-        return Ok((Vec::new(), 1));
+        return Ok((Vec::new(), Vec::new(), 1));
     }
     let text = std::fs::read_to_string(path)?;
     let m: Manifest = serde_json::from_str(&text)
         .map_err(|e| Error::Corrupted(format!("Manifest 解析失败: {e}")))?;
-    Ok((m.sst_files, m.next_sst_id))
+    // 旧 Manifest 无 levels → 全部按 L0 处理（对齐长度）
+    let levels = if m.levels.len() == m.sst_files.len() {
+        m.levels
+    } else {
+        vec![0; m.sst_files.len()]
+    };
+    Ok((m.sst_files, levels, m.next_sst_id))
 }
 
 /// 同 key 候选合并：仅保留 seq 更大（更新）的版本；value=None 的 Tombstone 可覆盖旧值。
@@ -797,6 +868,52 @@ fn imm_scan_max_seq(imm: &MemTable) -> u64 {
         }
     });
     max_seq
+}
+
+/// 选择本轮压实输入（design 4.5 二期 Leveled，M6-2）：
+/// - L0 ≥ 2 段且 L1 文件数 < `limit` → 合并**仅 L0**，输出 L1（单次压实量 = 刷盘批次，有界）；
+/// - L0 ≥ 2 段且 L1 已满 → 合并 L0 + 全部 L1 → L1（收敛 L1 文件数）；
+/// - L0 空且 L1 > 1 → 合并全部 L1 → L2（压实下沉）；
+/// - L0/L1 均空且 L2 > 1 → 合并 L2（异常残留收敛）。
+/// 单段 L0（未达 2 段）不压实——等待更多刷盘批次，避免无收益重写。
+/// 返回 `(选中段下标, 输出层)`；无需要压实的输入时返回 `(空, 0)`。
+fn select_compaction_inputs(levels: &[u32], level_limit: usize) -> (Vec<usize>, u32) {
+    let l0: Vec<usize> = levels
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == 0)
+        .map(|(i, _)| i)
+        .collect();
+    let l1: Vec<usize> = levels
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == 1)
+        .map(|(i, _)| i)
+        .collect();
+    let l2: Vec<usize> = levels
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l >= 2)
+        .map(|(i, _)| i)
+        .collect();
+    if !l0.is_empty() {
+        if l0.len() < 2 {
+            return (Vec::new(), 0); // 单个 L0 段：暂不压实（无收益重写）
+        }
+        if l1.len() < level_limit.max(1) {
+            (l0, 1)
+        } else {
+            let mut sel = l0.clone();
+            sel.extend(l1);
+            (sel, 1)
+        }
+    } else if l1.len() > 1 {
+        (l1, 2)
+    } else if l2.len() > 1 {
+        (l2, 2)
+    } else {
+        (Vec::new(), 0)
+    }
 }
 
 #[cfg(test)]
@@ -950,6 +1067,99 @@ mod tests {
         assert_eq!(rep.merged_ssts, 0, "单段不需要合并");
         assert_eq!(cf.sst_count(), 1);
         assert_eq!(cf.get(1).unwrap().unwrap().0, b"x");
+    }
+
+    // ---------- Leveled-Compaction（design 4.5 二期，M6-2） ----------
+
+    #[test]
+    fn leveled_compact_promotes_l0_to_l1_and_persists() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 两批写入并强制刷盘 → 2 个 L0 段
+        for i in 0..100u64 {
+            cf.put(i, format!("a{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        for i in 100..200u64 {
+            cf.put(i, format!("a{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_levels, vec![0, 0], "刷盘产物均为 L0");
+        assert!(!cf.needs_compact(), "2 个 L0 未超阈值");
+        // 手动压实 → L1
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.out_level, 1);
+        assert_eq!(cf.sst_count(), 1);
+        assert_eq!(cf.sst_levels, vec![1]);
+        // 数据完整
+        for i in (0..200u64).step_by(7) {
+            assert!(cf.get(i).unwrap().is_some());
+        }
+        // 重启：Manifest 持久化层号
+        drop(cf);
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.sst_levels, vec![1], "Manifest 应持久化层号");
+        assert!(cf2.get(150).unwrap().is_some());
+    }
+
+    #[test]
+    fn leveled_compact_sinks_l1_to_l2() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 每轮刷 2 个 L0 段并压实 → L0 合并下沉为 1 个 L1 段；4 轮后 L1 累计 4 个文件
+        for round in 0..4u64 {
+            for _ in 0..2u64 {
+                for i in 0..50u64 {
+                    cf.put(round * 100 + i, format!("v{round}-{i}").into_bytes())
+                        .unwrap();
+                }
+                cf.switch_and_flush().unwrap();
+            }
+            let r = cf.compact().unwrap();
+            assert_eq!(r.out_level, 1, "第 {round} 轮 L0→L1");
+        }
+        assert_eq!(cf.sst_levels.iter().filter(|l| **l == 1).count(), 4);
+        // L0 空、L1 > 1 → L1 → L2（压实下沉）
+        assert!(cf.needs_compact(), "L1 多段应触发 L1→L2");
+        let rep2 = cf.compact().unwrap();
+        assert_eq!(rep2.out_level, 2);
+        assert_eq!(cf.sst_count(), 1);
+        assert_eq!(cf.sst_levels, vec![2]);
+        // 全量数据仍完整
+        for round in 0..4u64 {
+            for i in (0..50u64).step_by(9) {
+                assert!(
+                    cf.get(round * 100 + i).unwrap().is_some(),
+                    "round {round} key {i} 丢失"
+                );
+            }
+        }
+        // 重启：L2 持久化 + 数据完整
+        drop(cf);
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.sst_levels, vec![2]);
+        assert!(cf2.get(300 + 10).unwrap().is_some());
+    }
+
+    #[test]
+    fn select_compaction_inputs_picks_levels() {
+        // 2 个 L0 + L1 未满 → 仅 L0
+        assert_eq!(select_compaction_inputs(&[0, 0, 1], 8), (vec![0, 1], 1));
+        // 单个 L0 → 暂不压实
+        assert_eq!(select_compaction_inputs(&[0, 1], 8), (Vec::new(), 0));
+        // L0 ≥ 2 且 L1 已满 → L0 + 全部 L1 收敛
+        assert_eq!(
+            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2),
+            (vec![0, 1, 2, 3, 4, 5], 1)
+        );
+        // L0 空、L1 > 1 → L1 → L2
+        assert_eq!(select_compaction_inputs(&[1, 1], 8), (vec![0, 1], 2));
+        // L0 空、L1 单段 → 无压实
+        assert_eq!(select_compaction_inputs(&[1], 8), (Vec::new(), 0));
+        // L0/L1 空、L2 > 1 → 收敛 L2
+        assert_eq!(select_compaction_inputs(&[2, 2], 8), (vec![0, 1], 2));
     }
 
     #[test]
