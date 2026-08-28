@@ -559,7 +559,7 @@ fn run_cli_range(config_path: &Path, start: Option<u64>, end: Option<u64>) {
     }
 }
 
-/// `admin status`（design 20）：引擎状态指标（分配器 / LSM / 倒排 / 内存水位）。
+/// `admin status`（design 20）：引擎状态指标（分配器 / LSM / 倒排 / 内存水位）+ 集群配置（design 9.8）。
 fn run_cli_admin(config_path: &Path) {
     let engine = open_engine(config_path);
     let rep = shanshui_cunji::admin::status(&engine);
@@ -570,6 +570,26 @@ fn run_cli_admin(config_path: &Path) {
     println!("  倒排段数: {}", rep.inverted_segments);
     println!("  内存水位: {:.0}%", rep.mem_ratio * 100.0);
     println!("  内存上限: {} MB", rep.max_memory_mb);
+    // 集群配置（design 9.8，standalone 模式也输出以确认分布式开关状态）
+    let cfg = load_config(config_path);
+    let cs = shanshui_cunji::admin::cluster_status(&cfg);
+    println!("集群配置：");
+    println!("  模式: {}（节点 {}，内部 RPC {}）", cs.mode, cs.node_id, cs.internal_rpc_port);
+    println!(
+        "  分片: {}（虚拟分片 {}，总物理分片 {}，一致性哈希 {}）",
+        if cs.sharding_enabled { "开启" } else { "关闭" },
+        cs.virtual_shards,
+        cs.total_shards,
+        if cs.consistent_hash { "是" } else { "否" }
+    );
+    println!(
+        "  副本: {}（角色 {}，模式 {}，Master {}）",
+        if cs.replication_enabled { "开启" } else { "关闭" },
+        cs.replication_role,
+        cs.sync_mode,
+        if cs.master_addr.is_empty() { "-" } else { &cs.master_addr }
+    );
+    println!("  广播查询并发上限: {}", cs.broadcast_max_concurrent);
 }
 
 /// `explain --filter 'status=active'`（development 5.26）：执行计划推演，不读数据。

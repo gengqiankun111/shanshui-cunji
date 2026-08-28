@@ -34,6 +34,7 @@ pub mod migrate;
 pub mod optimizer;
 pub mod schema;
 pub mod server;
+pub mod sharding;
 pub mod sstable;
 pub mod storage;
 pub mod value;

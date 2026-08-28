@@ -31,6 +31,11 @@ pub struct Config {
     pub inverted: InvertedConfig,
     pub join: JoinConfig,
     pub enrich: EnrichConfig,
+    pub cluster: ClusterConfig,
+    pub sharding: ShardingConfig,
+    pub replication: ReplicationConfig,
+    pub read_write_separation: ReadWriteSeparationConfig,
+    pub broadcast_query: BroadcastQueryConfig,
 }
 
 impl Config {
@@ -66,6 +71,32 @@ impl Config {
                     self.blockcache.max_memory_mb = parse_override("blockcache.max_memory_mb", &val)
                 }
                 ["SERVER", "LISTEN_ADDR"] => self.server.listen_addr = val,
+                ["CLUSTER", "NODE_ID"] => self.cluster.node_id = val,
+                ["CLUSTER", "INTERNAL_RPC_PORT"] => {
+                    self.cluster.internal_rpc_port = val
+                        .parse::<u16>()
+                        .unwrap_or_else(|_| {
+                            warn!("环境变量 CLUSTER__INTERNAL_RPC_PORT 解析失败，忽略");
+                            self.cluster.internal_rpc_port
+                        });
+                }
+                ["SHARDING", "ENABLED"] => {
+                    self.sharding.enabled = val == "true" || val == "1";
+                }
+                ["SHARDING", "VIRTUAL_SHARDS"] => {
+                    self.sharding.virtual_shards = parse_override_u32(
+                        "sharding.virtual_shards",
+                        &val,
+                        self.sharding.virtual_shards,
+                    );
+                }
+                ["REPLICATION", "ROLE"] => self.replication.role = val,
+                ["BROADCAST_QUERY", "MAX_CONCURRENT"] => {
+                    self.broadcast_query.max_concurrent = parse_override(
+                        "broadcast_query.max_concurrent",
+                        &val,
+                    );
+                }
                 ["MEMORY", "WATERMARK_HIGH"] => {
                     self.memory.watermark_high = parse_override_f64("memory.watermark_high", &val)
                 }
@@ -119,6 +150,81 @@ impl Config {
                 self.enrich.fail_policy
             )));
         }
+        self.validate_cluster()?;
+        Ok(())
+    }
+
+    /// 分布式配置校验（design 9.8）：模式互斥、分片/复制参数边界。
+    fn validate_cluster(&mut self) -> Result<()> {
+        if !matches!(self.server.mode.as_str(), "standalone" | "cluster") {
+            return Err(Error::Config(format!(
+                "server.mode 非法: {}（standalone / cluster）",
+                self.server.mode
+            )));
+        }
+        if self.server.mode == "standalone" {
+            // 单机模式强制关闭分片 / 副本 / 读写分离（design 9.8 "单机模式强制 false"）。
+            for (name, set) in [
+                ("sharding.enabled", &mut self.sharding.enabled),
+                ("replication.enabled", &mut self.replication.enabled),
+                (
+                    "read_write_separation.enabled",
+                    &mut self.read_write_separation.enabled,
+                ),
+            ] {
+                if *set {
+                    warn!("standalone 模式强制关闭 {name}，请改用 server.mode = \"cluster\"");
+                    *set = false;
+                }
+            }
+            return Ok(());
+        }
+        // cluster 模式
+        if !self.sharding.enabled {
+            warn!("cluster 模式建议开启分片（sharding.enabled = true）");
+        }
+        if self.sharding.virtual_shards == 0 {
+            return Err(Error::Config("sharding.virtual_shards 必须 > 0".into()));
+        }
+        if self.sharding.shard_key != "docid" {
+            return Err(Error::Config(format!(
+                "sharding.shard_key 仅支持 \"docid\"，当前: {}",
+                self.sharding.shard_key
+            )));
+        }
+        if self.cluster.internal_rpc_port == 0 {
+            return Err(Error::Config("cluster.internal_rpc_port 必须 > 0".into()));
+        }
+        if !matches!(self.replication.role.as_str(), "master" | "slave") {
+            return Err(Error::Config(format!(
+                "replication.role 非法: {}（master / slave）",
+                self.replication.role
+            )));
+        }
+        if !matches!(self.replication.sync_mode.as_str(), "async" | "sync") {
+            return Err(Error::Config(format!(
+                "replication.sync_mode 非法: {}（async / sync）",
+                self.replication.sync_mode
+            )));
+        }
+        if self.replication.role == "slave" && self.replication.master_addr.is_empty() {
+            return Err(Error::Config(
+                "replication.role=slave 必须配置 replication.master_addr".into(),
+            ));
+        }
+        if self.replication.sync_mode == "sync" && self.replication.ack_timeout_ms == 0 {
+            return Err(Error::Config("replication.ack_timeout_ms 必须 > 0".into()));
+        }
+        if self.replication.batch_size == 0 || self.replication.heartbeat_interval_sec == 0 {
+            return Err(Error::Config(
+                "replication.batch_size / heartbeat_interval_sec 必须 > 0".into(),
+            ));
+        }
+        if self.broadcast_query.max_concurrent == 0 || self.broadcast_query.timeout_ms == 0 {
+            return Err(Error::Config(
+                "broadcast_query.max_concurrent / timeout_ms 必须 > 0".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -127,6 +233,13 @@ fn parse_override(name: &str, v: &str) -> usize {
     v.parse::<usize>().unwrap_or_else(|_| {
         warn!("环境变量 {name} 解析失败，忽略");
         0
+    })
+}
+
+fn parse_override_u32(name: &str, v: &str, default: u32) -> u32 {
+    v.parse::<u32>().unwrap_or_else(|_| {
+        warn!("环境变量 {name} 解析失败，忽略");
+        default
     })
 }
 
@@ -140,12 +253,15 @@ fn parse_override_f64(name: &str, v: &str) -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// 运行模式（design 9.8）："standalone"（默认）/ "cluster"。
+    pub mode: String,
     pub listen_addr: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            mode: "standalone".into(),
             listen_addr: "0.0.0.0:8080".into(),
         }
     }
@@ -377,6 +493,137 @@ impl Default for EnrichConfig {
     }
 }
 
+/// 集群节点（design 9.8）：节点标识与内部 RPC。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// 集群唯一标识（默认 "node-1"）。
+    pub node_id: String,
+    /// 对外服务端口（HTTP/TCP）。
+    pub listen_addr: String,
+    /// 分片节点间内部 RPC 端口（数据同步、心跳）。
+    pub internal_rpc_port: u16,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            node_id: "node-1".into(),
+            listen_addr: "0.0.0.0:8080".into(),
+            internal_rpc_port: 9090,
+        }
+    }
+}
+
+/// 分片路由（design 9.1 / 9.8）：DocId 一致性哈希两级路由。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShardingConfig {
+    /// 是否开启分片（单机模式强制 false）。
+    pub enabled: bool,
+    /// 物理分片总数（0 = 按节点数自动；扩容用虚拟分片，不可变）。
+    pub total_shards: u32,
+    /// 虚拟分片数（推荐 1024/2048，扩容只迁移部分）。
+    pub virtual_shards: u32,
+    /// 分片键，固定 "docid"（暂不支持自定义，留扩展）。
+    pub shard_key: String,
+    /// 一致性哈希（true）/ 直接取模（false）。推荐一致性哈希减少扩容抖动。
+    pub consistent_hash: bool,
+}
+
+impl Default for ShardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            total_shards: 0,
+            virtual_shards: 1024,
+            shard_key: "docid".into(),
+            consistent_hash: true,
+        }
+    }
+}
+
+/// 主从与副本（design 9.3 / 9.8）：一主多从异步/同步复制。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReplicationConfig {
+    /// 是否开启副本（单机模式强制 false）。
+    pub enabled: bool,
+    /// 角色："master"（默认）/ "slave"。
+    pub role: String,
+    /// Slave 填写 Master 的 RPC 地址（host:port）。
+    pub master_addr: String,
+    /// 同步模式："async"（默认，写入延迟≈单机）/ "sync"（强一致，等 Slave ACK）。
+    pub sync_mode: String,
+    /// sync 模式等待 Slave ACK 超时（ms）。
+    pub ack_timeout_ms: u64,
+    /// 异步复制攒批发送条数。
+    pub batch_size: usize,
+    /// 主从心跳间隔（秒），用于探活。
+    pub heartbeat_interval_sec: u64,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            role: "master".into(),
+            master_addr: String::new(),
+            sync_mode: "async".into(),
+            ack_timeout_ms: 1000,
+            batch_size: 1000,
+            heartbeat_interval_sec: 5,
+        }
+    }
+}
+
+/// 读写分离（design 9.8）：普通查询优先路由 Slave，超滞后降级读 Master。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReadWriteSeparationConfig {
+    /// 是否开启读写分离。
+    pub enabled: bool,
+    /// true 时普通查询（非主键点查）优先路由 Slave。
+    pub read_from_replica: bool,
+    /// Slave 延迟超此秒数则降级读 Master。
+    pub replica_lag_threshold_sec: u64,
+    /// 主键点查永远走 Master（避免读到旧数据）。
+    pub force_master_for_primary_get: bool,
+}
+
+impl Default for ReadWriteSeparationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            read_from_replica: false,
+            replica_lag_threshold_sec: 10,
+            force_master_for_primary_get: true,
+        }
+    }
+}
+
+/// 广播查询熔断（design 9.2 / 9.8）：不带分片键的倒排检索保护。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BroadcastQueryConfig {
+    /// 同时进行广播检索的最大并发数。
+    pub max_concurrent: usize,
+    /// 单次广播查询最大等待时间（ms）。
+    pub timeout_ms: u64,
+    /// true 时拒绝不带 DocId 的查询（纯主键场景，防广播慢查询）。
+    pub reject_without_shard_key: bool,
+}
+
+impl Default for BroadcastQueryConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 10,
+            timeout_ms: 30000,
+            reject_without_shard_key: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +705,96 @@ engine = "fst"
         std::env::remove_var("SHANSHUI_CUNJI__SERVER__LISTEN_ADDR");
         assert_eq!(cfg.hotcache.max_memory_mb, 2048);
         assert_eq!(cfg.server.listen_addr, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn cluster_config_parses_with_defaults() {
+        let text = r#"
+[server]
+mode = "cluster"
+
+[cluster]
+node_id = "node-2"
+internal_rpc_port = 9091
+
+[sharding]
+enabled = true
+virtual_shards = 2048
+
+[replication]
+enabled = true
+role = "slave"
+master_addr = "node-1:9090"
+sync_mode = "sync"
+
+[broadcast_query]
+max_concurrent = 20
+timeout_ms = 15000
+"#;
+        let mut cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.server.mode, "cluster");
+        assert_eq!(cfg.cluster.node_id, "node-2");
+        assert_eq!(cfg.cluster.internal_rpc_port, 9091);
+        assert!(cfg.sharding.enabled);
+        assert_eq!(cfg.sharding.virtual_shards, 2048);
+        // 未提及字段取默认
+        assert!(cfg.sharding.consistent_hash);
+        assert_eq!(cfg.sharding.shard_key, "docid");
+        assert_eq!(cfg.replication.role, "slave");
+        assert_eq!(cfg.replication.master_addr, "node-1:9090");
+        assert_eq!(cfg.replication.sync_mode, "sync");
+        assert_eq!(cfg.replication.ack_timeout_ms, 1000);
+        assert_eq!(cfg.broadcast_query.max_concurrent, 20);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn standalone_forces_sharding_and_replication_off() {
+        let mut cfg = Config::default();
+        cfg.sharding.enabled = true;
+        cfg.replication.enabled = true;
+        cfg.read_write_separation.enabled = true;
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.mode, "standalone");
+        assert!(!cfg.sharding.enabled, "standalone 必须强制关闭分片");
+        assert!(!cfg.replication.enabled, "standalone 必须强制关闭副本");
+        assert!(!cfg.read_write_separation.enabled, "standalone 必须强制关闭读写分离");
+    }
+
+    #[test]
+    fn invalid_cluster_config_rejected() {
+        // 非法角色
+        let mut cfg = Config::default();
+        cfg.server.mode = "cluster".into();
+        cfg.sharding.enabled = true;
+        cfg.replication.role = "follower".into();
+        assert!(cfg.validate().is_err());
+
+        // slave 缺少 master_addr
+        let mut cfg = Config::default();
+        cfg.server.mode = "cluster".into();
+        cfg.sharding.enabled = true;
+        cfg.replication.role = "slave".into();
+        cfg.replication.master_addr = String::new();
+        assert!(cfg.validate().is_err());
+
+        // 非法 sync_mode
+        let mut cfg = Config::default();
+        cfg.server.mode = "cluster".into();
+        cfg.sharding.enabled = true;
+        cfg.replication.sync_mode = "raft".into();
+        assert!(cfg.validate().is_err());
+
+        // 非法 mode
+        let mut cfg = Config::default();
+        cfg.server.mode = "hybrid".into();
+        assert!(cfg.validate().is_err());
+
+        // virtual_shards = 0
+        let mut cfg = Config::default();
+        cfg.server.mode = "cluster".into();
+        cfg.sharding.enabled = true;
+        cfg.sharding.virtual_shards = 0;
+        assert!(cfg.validate().is_err());
     }
 }

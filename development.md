@@ -676,8 +676,20 @@ impl RuntimePools {
 ### 7.3 阶段 2：分布式集群
 
 1. **倒排架构升级**（预分片 Chunk + 分层 GC + 极端防护）；
-2. 分布式全配置清单（design 9.8）；
-3. 分片节点 RPC → 网关 + 元数据中心 → 广播检索 / 虚拟分片扩容 / 主从高可用；
+2. ~~**分布式全配置清单（design 9.8）**~~ ✅（2026-08-28，阶段 2 首发）：
+   `cluster`（node_id / internal_rpc_port）、`sharding`（enabled / total_shards / virtual_shards / shard_key / consistent_hash）、
+   `replication`（role / master_addr / sync_mode async|sync / ack_timeout_ms / batch_size / heartbeat_interval_sec）、
+   `read_write_separation`、`broadcast_query`（max_concurrent / timeout_ms / reject_without_shard_key）；
+   `server.mode`（standalone / cluster）——**standalone 强制关闭分片/副本/读写分离**（design 9.8"单机模式强制 false"）；
+   校验：slave 必须配 master_addr、sync 须 ack_timeout>0、virtual_shards>0、shard_key 仅 docid；
+   环境变量覆盖 `SHANSHUI_CUNJI__CLUSTER__*` 等 6 项；`admin status` CLI 输出集群配置块（admin::cluster_status）；
+   测试 166 全绿（+3 配置解析/强制关闭/非法拒绝）；
+3.0. **一致性哈希分片路由器（design 9.1）** ✅（2026-08-28）：
+   `src/sharding.rs` 两级路由：`docid → 虚拟分片`（hash64 % virtual_shards，固定不可变）→ `物理节点`
+   （一致性哈希环，每节点 128 虚拟点）；`route(docid)` 单分片定位（写/主键查询无广播）、`nodes()` 广播目标集；
+   **平滑扩容属性验证**：3→4 节点仅迁移 ~1/4 虚拟分片、docid 重路由比例 ≈0.25（测试断言 0.13~0.30）；
+   测试 171 全绿（+5 确定性/均匀性/扩容迁移量/稳定性/单节点）；网关层路由复用入口（阶段 2 后续）；
+3. **分片节点 RPC → 网关 + 元数据中心 → 广播检索 / 虚拟分片扩容 / 主从高可用**；
 4. **看门狗补全**：写停滞假死检测自愈 + Sidecar 探针（`std::process::Command` 独立进程）；
 5. **网关全局 Term 缓存** + 失效心跳；
 6. **术语字典热备 TDS**；
