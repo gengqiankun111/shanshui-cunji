@@ -320,7 +320,8 @@ pub struct InvertedConfig {
 impl Default for InvertedConfig {
     fn default() -> Self {
         Self {
-            engine: "hash".into(),
+            // 阶段 1.5 起默认 FST + mmap 字典（design 5.2.4.1：亚秒冷启动、按需加载）
+            engine: "fst".into(),
             max_memory_bytes: 12 * 1024 * 1024 * 1024,
             max_posting_scan: 1_000_000,
         }
