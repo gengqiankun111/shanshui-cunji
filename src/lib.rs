@@ -12,6 +12,7 @@ pub mod engine;
 pub mod error;
 pub mod hotcache;
 pub mod inverted;
+pub mod join;
 pub mod keys;
 pub mod memtable;
 pub mod migrate;

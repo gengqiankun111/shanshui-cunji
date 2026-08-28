@@ -642,7 +642,12 @@ impl RuntimePools {
    mysqldump `INSERT INTO` 行解析（字符串/数字/NULL/转义引号），列名即 JSON 字段，
    `docid`/`id` 列作主键否则递增，单线程全量导入 + 迁移报告；测试 147 全绿（+6），
    冒烟验证 CSV 3 行 + SQL 4 行导入正确；
-8. **数据关联基础（design 19）**：SDK `queryAndJoin` 二次查询 + 写入 Enrich 预连接；
+8. ~~**数据关联基础（design 19）**：SDK `queryAndJoin` 二次查询 + 写入 Enrich 预连接~~ ✅（2026-08-28）：
+   `src/join.rs` + 配置 `[join] max_rows` / `[enrich]`（development 5.20/5.21）：
+   `query_and_join`（主表倒排筛选 → 批量回表 → 从表主键/倒排点查 → 内存 Hash 合并，
+   Inner/Left/Right + max_rows 熔断）、HTTP `GET /join`、写入 Enrich
+   `put_with_enrich`（WAL 前回调，fail_policy reject/degrade + local 源 `enrich_check_local`）；
+   测试 154 全绿（+7），HTTP 冒烟验证 inner/left；Right 语义=Inner（从表无独立筛选，基础版简化）；
 9. **块级压缩（Zstd Level 3）+ 分区布隆过滤器（design 4.4.2）**：存储再降 40%~60%、布隆内存减半；
 10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（jemalloc stats + 命中率）+ `explain`（执行计划推演）；
 11. **数据管道（design 20）**：`shanshui-cunji-export`（Parquet/CSV 基础版，与迁移工具同期）+ `shanshui-cunji-import`（CSV/JSON 基础版）。

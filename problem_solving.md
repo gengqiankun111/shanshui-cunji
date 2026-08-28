@@ -157,6 +157,11 @@
 - **修复**：① `parse_value_tuples` 增加 `str_val` 标志（引号打开时置位），值提交时按标志构建 `SqlValue::Str` 并统一 unescape（`\'`→`'`、`\\`→`\`）；② 主键列支持 `docid` 或 `id`（数字/字符串均可解析）；③ error.rs 增加 `Migrate` 变体承接 csv/serde_json 错误（核心模块不耦合 csv crate）。
 - **提交**：随 M4 迁移工具提交（本轮）
 
+### P25. 数据关联：Right Join 语义与 Enrich 借用冲突
+- **决策**：基础版 Right Join 等价于 Inner（从表无独立筛选条件时，"保留全部右表"无意义——右表全集不参与关联）；文档注明，阶段 2 引入从表 filter 后补全。
+- **设计约束**：`put_with_enrich` 回调签名 `FnOnce(&mut Engine, &mut Value)`——Enrich 需在 WAL 前查引擎（local 源），若回调只拿 `&mut Value` 则无法访问引擎；故回调同时借 `&mut Engine`，Enrich 修改文档后再统一序列化写入。
+- **提交**：随 M4 数据关联提交（本轮）
+
 ---
 
 ## 环境备忘（不入库）
