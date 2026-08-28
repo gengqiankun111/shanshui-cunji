@@ -80,10 +80,7 @@ impl TermCache {
     pub fn record_write(&self, term: &str) {
         let now = Instant::now();
         let mut counts = self.write_counts.lock().unwrap();
-        let (count, window_start) = counts
-            .get(term)
-            .copied()
-            .unwrap_or((0, now));
+        let (count, window_start) = counts.get(term).copied().unwrap_or((0, now));
         let (count, window_start) = if now.duration_since(window_start) > WRITE_WINDOW {
             (1, now)
         } else {

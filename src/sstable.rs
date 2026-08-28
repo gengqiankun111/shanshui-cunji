@@ -1635,7 +1635,8 @@ mod tests {
         {
             let mut w = SstWriter::new(&path, Compression::Zstd, 3, 64, 100).unwrap();
             for i in 0..200u64 {
-                w.add(format!("key-{i:06}").as_bytes(), b"value", i).unwrap();
+                w.add(format!("key-{i:06}").as_bytes(), b"value", i)
+                    .unwrap();
             }
             w.finish().unwrap();
         }

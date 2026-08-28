@@ -61,8 +61,8 @@ impl IoRateLimiter {
     fn refill(&mut self) {
         let elapsed = self.last_refill.elapsed().as_secs_f64();
         if elapsed > 0.0 {
-            self.capacity = (self.capacity + elapsed * self.rate_bytes_per_sec as f64)
-                .min(self.burst);
+            self.capacity =
+                (self.capacity + elapsed * self.rate_bytes_per_sec as f64).min(self.burst);
             self.last_refill = Instant::now();
         }
     }

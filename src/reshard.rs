@@ -48,7 +48,12 @@ pub struct Migration {
 }
 
 impl Migration {
-    pub fn new(new_node: String, new_addr: String, new_role: String, moved_vshards: HashSet<u32>) -> Self {
+    pub fn new(
+        new_node: String,
+        new_addr: String,
+        new_role: String,
+        moved_vshards: HashSet<u32>,
+    ) -> Self {
         Self {
             new_node,
             new_addr,
@@ -79,7 +84,9 @@ mod tests {
         assert!(n > 128 && n < 384, "迁移量 {n}");
         // 迁移集合 = 新路由下归属 d 的虚拟分片数（一致）
         let router = ShardRouter::new(1024, new);
-        let d_count = (0..1024u32).filter(|&v| router.node_of_virtual_shard(v) == 3).count();
+        let d_count = (0..1024u32)
+            .filter(|&v| router.node_of_virtual_shard(v) == 3)
+            .count();
         assert_eq!(moved.len(), d_count);
     }
 

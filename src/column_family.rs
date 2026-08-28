@@ -391,8 +391,10 @@ impl ColumnFamily {
         // 新文件插到最前（读路径优先命中）
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
         self.io_acquire(&path)?;
-        self.ssts
-            .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
+        self.ssts.insert(
+            0,
+            SstReader::open_with_granularity(&path, self.index_granularity)?,
+        );
         self.persist_manifest()?;
         info!(
             "列族 [{}] 刷盘完成: {} ({} 条)",
@@ -434,8 +436,10 @@ impl ColumnFamily {
             let path = self.dir.join(&fname);
             self.write_rows(&path, &rows)?;
             self.io_acquire(&path)?;
-            self.ssts
-                .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
+            self.ssts.insert(
+                0,
+                SstReader::open_with_granularity(&path, self.index_granularity)?,
+            );
         }
         self.persist_manifest()?;
         info!(
@@ -517,14 +521,12 @@ impl ColumnFamily {
         let old_ssts = std::mem::take(&mut self.ssts);
         let old_bytes: u64 = old_ssts
             .iter()
-            .map(|r| {
-                std::fs::metadata(r.path())
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            })
+            .map(|r| std::fs::metadata(r.path()).map(|m| m.len()).unwrap_or(0))
             .sum();
-        self.ssts
-            .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
+        self.ssts.insert(
+            0,
+            SstReader::open_with_granularity(&path, self.index_granularity)?,
+        );
         self.persist_manifest()?;
 
         // ⑤ 删除旧段（孤儿无害，启动只加载 Manifest）
@@ -534,7 +536,10 @@ impl ColumnFamily {
         let freed_bytes = old_bytes.saturating_sub(self.sst_bytes());
         info!(
             "列族 [{}] Compaction 完成: {} 段 → 1（保留 {} 键，释放 {} 字节）",
-            self.name, old_count, rows.len(), freed_bytes
+            self.name,
+            old_count,
+            rows.len(),
+            freed_bytes
         );
         Ok(CompactReport {
             merged_ssts: old_count,
@@ -869,7 +874,14 @@ mod tests {
         assert!(cf.get(3).unwrap().is_none(), "删除后不可见");
         assert_eq!(cf.get(4).unwrap().unwrap().0, b"v4");
         let rows = cf.scan_range(None, None).unwrap();
-        assert_eq!(rows, vec![(1, b"v1".to_vec()), (2, b"v2b".to_vec()), (4, b"v4".to_vec())]);
+        assert_eq!(
+            rows,
+            vec![
+                (1, b"v1".to_vec()),
+                (2, b"v2b".to_vec()),
+                (4, b"v4".to_vec())
+            ]
+        );
 
         // 重启后 Manifest 只含新段，数据完整
         let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();

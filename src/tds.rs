@@ -75,14 +75,11 @@ impl TdsServer {
             move |params| {
                 let node = params["node"].as_str().ok_or("tds.put 缺少 node")?;
                 let seg = params["seg"].as_str().ok_or("tds.put 缺少 seg")?;
-                let bytes = hex_to_bytes(
-                    params["bytes"].as_str().ok_or("tds.put 缺少 bytes")?,
-                )
-                .map_err(|e| e.to_string())?;
+                let bytes = hex_to_bytes(params["bytes"].as_str().ok_or("tds.put 缺少 bytes")?)
+                    .map_err(|e| e.to_string())?;
                 // 写穿持久化（崩溃恢复）
                 let nd = dir.join(node);
-                std::fs::create_dir_all(&nd)
-                    .map_err(|e| format!("TDS 创建目录失败: {e}"))?;
+                std::fs::create_dir_all(&nd).map_err(|e| format!("TDS 创建目录失败: {e}"))?;
                 std::fs::write(nd.join(format!("{seg}.dict")), &bytes)
                     .map_err(|e| format!("TDS 写快照失败: {e}"))?;
                 store
@@ -102,7 +99,12 @@ impl TdsServer {
                 let node = params["node"].as_str().ok_or("tds.get 缺少 node")?;
                 let seg = params["seg"].as_str().ok_or("tds.get 缺少 seg")?;
                 // 内存优先，缺则读盘（TDS 自身重启恢复）
-                let cached = store.lock().unwrap().get(node).and_then(|m| m.get(seg)).cloned();
+                let cached = store
+                    .lock()
+                    .unwrap()
+                    .get(node)
+                    .and_then(|m| m.get(seg))
+                    .cloned();
                 let bytes = match cached {
                     Some(b) => b,
                     None => {
@@ -150,12 +152,7 @@ impl TdsServer {
 
     /// 本地快照数（监控 / 测试）。
     pub fn snapshot_count(&self) -> usize {
-        self.store
-            .lock()
-            .unwrap()
-            .values()
-            .map(|m| m.len())
-            .sum()
+        self.store.lock().unwrap().values().map(|m| m.len()).sum()
     }
 }
 
@@ -209,11 +206,7 @@ impl TdsClient {
 }
 
 /// 节点刷盘后把全部 FST 字典上报 TDS（预加载 / 蓝绿切换基础）。
-pub fn sync_dicts_to_tds(
-    dir: &Path,
-    node_id: &str,
-    client: &mut TdsClient,
-) -> Result<usize> {
+pub fn sync_dicts_to_tds(dir: &Path, node_id: &str, client: &mut TdsClient) -> Result<usize> {
     let mut n = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -231,11 +224,7 @@ pub fn sync_dicts_to_tds(
 
 /// 重启节点从 TDS 恢复字典：拉回全部快照写本地 `inverted-{seg}.fst`。
 /// 返回恢复的字典数；TDS 不可用 / 缺失时返回 0（回退本地文件重建，降级可用）。
-pub fn restore_dicts_from_tds(
-    dir: &Path,
-    node_id: &str,
-    client: &mut TdsClient,
-) -> Result<usize> {
+pub fn restore_dicts_from_tds(dir: &Path, node_id: &str, client: &mut TdsClient) -> Result<usize> {
     std::fs::create_dir_all(dir)?;
     let segs = client.list_segments(node_id)?;
     let mut n = 0;
@@ -307,7 +296,8 @@ mod tests {
         {
             let addr = spawn_tds(dir.path());
             let mut c = TdsClient::connect(&addr).unwrap();
-            c.put_dict("node-1", "inverted-00000001", b"dict-data").unwrap();
+            c.put_dict("node-1", "inverted-00000001", b"dict-data")
+                .unwrap();
         }
         // TDS 重启：从磁盘恢复
         let addr = spawn_tds(dir.path());
@@ -336,7 +326,10 @@ mod tests {
 
         // 冷节点 B：无本地字典，从 TDS 恢复
         let cold_dir = dir.path().join("node-b");
-        assert_eq!(restore_dicts_from_tds(&cold_dir, "node-a", &mut c).unwrap(), 2);
+        assert_eq!(
+            restore_dicts_from_tds(&cold_dir, "node-a", &mut c).unwrap(),
+            2
+        );
         assert_eq!(
             std::fs::read(cold_dir.join("inverted-00000001.fst")).unwrap(),
             b"fst-1"

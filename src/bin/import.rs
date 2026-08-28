@@ -149,10 +149,7 @@ fn main() {
         Ok(rep) => {
             println!(
                 "✅ 导入完成: {} 行成功, {} 行失败（跳过 {} 行）· {:.0} ms",
-                rep.rows,
-                rep.failed,
-                rep.skipped,
-                rep.elapsed_ms as f64
+                rep.rows, rep.failed, rep.skipped, rep.elapsed_ms as f64
             );
             if rep.failed > 0 {
                 std::process::exit(2);

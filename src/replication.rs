@@ -260,13 +260,18 @@ mod tests {
         let dir = tmpdir();
         {
             let mut log = ReplicationLog::open(dir.path()).unwrap();
-            log.append("put", 42, "{\"d\":42}", &terms(&["k=v"])).unwrap();
+            log.append("put", 42, "{\"d\":42}", &terms(&["k=v"]))
+                .unwrap();
         }
         // 重启：从磁盘恢复未推送增量（崩溃不丢）
         let log = ReplicationLog::open(dir.path()).unwrap();
         assert_eq!(log.pending().len(), 1);
         assert_eq!(log.pending()[0].docid, 42);
-        assert_eq!(log.pushed_seq(), 1, "重启后游标恢复为磁盘末尾 seq（重复推送幂等无害）");
+        assert_eq!(
+            log.pushed_seq(),
+            1,
+            "重启后游标恢复为磁盘末尾 seq（重复推送幂等无害）"
+        );
     }
 
     fn spawn_slave(dir: &std::path::Path) -> (String, Arc<Mutex<Engine>>) {
@@ -294,8 +299,13 @@ mod tests {
         let (slave_addr, slave_engine) = spawn_slave(tmpdir().path());
         let mut repl = Replicator::new(dir.path(), vec![slave_addr], "sync", 2000).unwrap();
 
-        repl.record("put", 1001, "{\"s\":\"active\"}", &terms(&["status=active"]))
-            .unwrap();
+        repl.record(
+            "put",
+            1001,
+            "{\"s\":\"active\"}",
+            &terms(&["status=active"]),
+        )
+        .unwrap();
         // sync 模式：record 即已推送到 slave
         assert_eq!(repl.pending_count(), 0);
         assert_eq!(repl.pushed_seq(), 1);
@@ -310,8 +320,10 @@ mod tests {
         let mut repl = Replicator::new(dir.path(), vec![slave_addr], "async", 2000).unwrap();
 
         // async：record 只写日志，不立即复制
-        repl.record("put", 1, "{\"s\":1}", &terms(&["t=1"])).unwrap();
-        repl.record("put", 2, "{\"s\":2}", &terms(&["t=2"])).unwrap();
+        repl.record("put", 1, "{\"s\":1}", &terms(&["t=1"]))
+            .unwrap();
+        repl.record("put", 2, "{\"s\":2}", &terms(&["t=2"]))
+            .unwrap();
         assert_eq!(repl.pending_count(), 2);
         assert!(slave_engine.lock().unwrap().get(1).unwrap().is_none());
 

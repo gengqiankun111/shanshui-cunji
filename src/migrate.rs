@@ -56,10 +56,7 @@ fn filter_terms(terms: Vec<String>, whitelist: Option<&[String]>) -> Vec<String>
         None => terms,
         Some(wl) => terms
             .into_iter()
-            .filter(|t| {
-                wl.iter()
-                    .any(|f| t.starts_with(&format!("{f}=")))
-            })
+            .filter(|t| wl.iter().any(|f| t.starts_with(&format!("{f}="))))
             .collect(),
     }
 }
@@ -729,7 +726,10 @@ mod tests {
         assert_eq!(rep2.skipped, 3, "旧 3 条跳过");
         assert_eq!(load_checkpoint(&cp_path).unwrap(), 5);
         // 数据正确
-        assert_eq!(engine.get(4).unwrap().unwrap(), b"{\"docid\":4,\"s\":\"c\"}");
+        assert_eq!(
+            engine.get(4).unwrap().unwrap(),
+            b"{\"docid\":4,\"s\":\"c\"}"
+        );
         assert_eq!(engine.search_term("s=c").unwrap().len(), 2);
         // 再次续跑：全部跳过
         let rep3 = import_json_incremental(&mut engine, &json_path, None, &cp_path).unwrap();

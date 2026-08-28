@@ -802,7 +802,10 @@ mod tests {
         let full = idx.search("status=active").unwrap();
         let mut chunks = Vec::new();
         for s in 0..shard_count {
-            chunks.push(idx.chunk_for_shard("status=active", s, shard_count).unwrap());
+            chunks.push(
+                idx.chunk_for_shard("status=active", s, shard_count)
+                    .unwrap(),
+            );
         }
         // ① 分片 Chunk 互不相交（partition 性质）
         for i in 0..shard_count {
@@ -824,8 +827,7 @@ mod tests {
         assert_eq!(merged.len(), 10_000);
         // ④ 无 docid 落点的分片 → 空 Chunk：单 docid term，其它分片必为空
         idx.add("rare=1", 1);
-        let owner_shard =
-            (crate::sharding::hash64(1) % 4) as u32; // docid=1 归属的分片
+        let owner_shard = (crate::sharding::hash64(1) % 4) as u32; // docid=1 归属的分片
         let mut empty_count = 0;
         for s in 0..4 {
             let chunk = idx.chunk_for_shard("rare=1", s, 4).unwrap();
@@ -933,7 +935,10 @@ mod tests {
         assert!(idx2.search("b=2").unwrap().contains(9));
         // Manifest 不含孤儿
         let text = std::fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
-        assert!(!text.contains("inverted-00000001.seg"), "旧段不得出现在 Manifest");
+        assert!(
+            !text.contains("inverted-00000001.seg"),
+            "旧段不得出现在 Manifest"
+        );
         assert!(text.contains("inverted-00000003.seg"));
     }
 
@@ -941,7 +946,8 @@ mod tests {
     fn gc_not_triggered_below_threshold() {
         let dir = tmp();
         // 阈值极大（1TB）：段再多也不 GC
-        let mut idx = InvertedIndex::open_with_gc(&dir, 2, "fst", 1024 * 1024 * 1024 * 1024).unwrap();
+        let mut idx =
+            InvertedIndex::open_with_gc(&dir, 2, "fst", 1024 * 1024 * 1024 * 1024).unwrap();
         for _ in 0..3 {
             idx.add("k=1", 1);
             idx.flush_segment().unwrap();
