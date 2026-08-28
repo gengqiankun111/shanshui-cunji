@@ -6,6 +6,26 @@
 
 > 一句话定位：**不需要复杂事务、但要求海量数据 + 极速查询**的业务，就是 shanshui-cunji 的用武之地。
 
+---
+
+## 📦 最新发布：v0.2.1（2026-08-28）
+
+> 核心亮点：**默认 mimalloc 分配器**（musl 高并发 4~10 倍）+ **SST v5 分区布隆** + **数据关联（JOIN）** + **运维管理 / 数据管道**。
+
+| 维度 | 数据 |
+| --- | --- |
+| 批量插入 | 31.6~36.4 万条/s（1000万 / 2000万 / 5000万 三规模稳定）|
+| 倒排检索 | 近常量：1.25 亿命中 ~2.3s |
+| vs v0.1.0 | 插入 **+70%**、倒排 **-81%** |
+| 质量 | 163 测试全绿、demo 10/10、unsafe=0 |
+
+- **分配器**：默认 mimalloc；musl 4 线程 **×9.9** 追平 glibc，而 musl 默认 malloc 全局单锁 4 线程反而暴跌 57%；构建 `cargo build --release`（mimalloc）/ `--features alloc-jemalloc`（jemalloc）/ `--no-default-features`（系统分配器对比基线）；
+- **兼容性**：SST v5 新格式，Reader 自动回退兼容 v3/v4，旧库可直接打开；
+- **新增能力**：`query_and_join`（Inner/Left/Right + 熔断）、`admin status/processlist/kill`、`explain` 推演、`shanshui-cunji-export/import`、`shanshui-cunji-bench` 压测工具；
+- 完整发布说明见 [RELEASE-v0.2.1.md](./RELEASE-v0.2.1.md)，性能实测存档见 `images/allocator-bench/` 与 `images/perf-0.2.1/`。
+
+---
+
 ## 目录
 
 - [一、它解决什么问题？](#一它解决什么问题)
