@@ -200,7 +200,8 @@ mod tests {
                                 }
                                 b"SETEX" => {
                                     let key = args[1].clone();
-                                    let ttl: u64 = String::from_utf8_lossy(&args[2]).parse().unwrap_or(0);
+                                    let ttl: u64 =
+                                        String::from_utf8_lossy(&args[2]).parse().unwrap_or(0);
                                     let val = args[3].clone();
                                     store.lock().unwrap().insert(key, (val, ttl));
                                     b"+OK\r\n".to_vec()

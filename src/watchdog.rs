@@ -220,9 +220,10 @@ impl StallWatchdog {
                     StallAction::Stalled
                 } else {
                     // 判定假死：自愈（中断 Compaction + 重置调度器由调用方执行），重新计时
-                    let failures =
-                        self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
+                    let failures = self
+                        .consecutive_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
                     self.heal_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     *since = Some(now);
@@ -277,8 +278,7 @@ impl HeartbeatProbe {
             .and_then(|s| s.trim().parse::<u64>().ok());
         match last_ms {
             Some(last) => {
-                let tolerance =
-                    self.interval.as_millis() as u64 * self.max_missed_pings as u64;
+                let tolerance = self.interval.as_millis() as u64 * self.max_missed_pings as u64;
                 now_ms.saturating_sub(last) <= tolerance
             }
             None => false,
@@ -466,11 +466,7 @@ mod tests {
     #[test]
     fn heartbeat_probe_missing_file_is_dead() {
         let dir = tempfile::tempdir().unwrap();
-        let probe = HeartbeatProbe::new(
-            dir.path().join("nope.hb"),
-            Duration::from_millis(10),
-            3,
-        );
+        let probe = HeartbeatProbe::new(dir.path().join("nope.hb"), Duration::from_millis(10), 3);
         assert!(!probe.is_alive(), "心跳文件不存在应判定死锁");
     }
 }

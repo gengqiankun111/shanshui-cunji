@@ -927,6 +927,15 @@ impl SstReader {
         }
     }
 
+    /// 等值定位：返回 `(块下标, 块条目)`——**只克隆单条**精确索引（design 4.4.2 按需）。
+    /// 供块缓存读路径（`column_family::get_from_sst`）复用：避免克隆整个 Level 2 索引。
+    pub(crate) fn locate_indexed_block(&self, key: &[u8]) -> Result<Option<(usize, IndexEntry)>> {
+        let Some(idx) = self.locate_block_index(key)? else {
+            return Ok(None);
+        };
+        Ok(Some((idx, self.block_entry(idx)?)))
+    }
+
     /// 读取并解压数据块，校验 CRC。
     pub fn read_block(&mut self, e: &IndexEntry) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; e.comp_len as usize];
@@ -1635,7 +1644,8 @@ mod tests {
         {
             let mut w = SstWriter::new(&path, Compression::Zstd, 3, 64, 100).unwrap();
             for i in 0..200u64 {
-                w.add(format!("key-{i:06}").as_bytes(), b"value", i).unwrap();
+                w.add(format!("key-{i:06}").as_bytes(), b"value", i)
+                    .unwrap();
             }
             w.finish().unwrap();
         }

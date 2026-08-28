@@ -780,6 +780,39 @@ impl RuntimePools {
 - **前沿演进调研（design 22）**：YCSB 基准压测定位瓶颈；GPU 加速 Compaction、PMEM WAL、Learned Index、AuraDB（WAL-time KV 分离 / RL-driven Compaction）可行性评估；CXL 长期跟踪；
 - **存算分离（远期蓝图）**。
 
+**阶段 3 落地进度**（每小任务一次提交）：
+
+1. ~~**配置热加载（design 7.4）**~~ ✅（2026-08-28）：`Config::reload`（重读+校验+原地替换）+
+   `ReloadReport`（changed_sections / error 字段）+ CLI `shanshui-cunji reload`；测试验证热加载生效/无效路径报错/变更节上报；
+2. ~~**IO 速率调度器（design 4.5）**~~ ✅（2026-08-28）：`src/io_scheduler.rs` 新增 `IoRateLimiter`
+   **Token Bucket**（acquire 按速率补桶、桶内突发、`0`=不限速），`[storage] io_rate_limit_mb` 配置；
+   测试验证稳态限速/突发/不限速；
+3. ~~**基础 Compaction（design 4.5）**~~ ✅（2026-08-28）：`ColumnFamily::compact()` 全量合并
+   （key 升序 seq 降序去重、tmp→fsync→原子 Manifest→删旧段）+ `CompactReport` + `needs_compact`
+   （L0 段数超阈值）+ 合并 IO 走 `io_acquire` 限速 + CLI `shanshui-cunji compact`；测试验证去重/原子切换/限速；
+4. ~~**迁移工具高级版·增量导入（design 5.16）**~~ ✅（2026-08-28）：`import_csv_incremental` /
+   `import_json_incremental`（**docid 游标断点续传**）+ `load/save_checkpoint`（tmp+rename 原子）+
+   `ImportReport.skipped` + CLI `--incremental --checkpoint`；测试验证续传/跳过已完成/首轮全量；
+5. ~~**小表广播 JOIN（design 19.3）**~~ ✅（2026-08-28）：`join.broadcast_enabled`（默认关）/
+   `broadcast_threshold`（默认 100）配置；`query_and_join` 在去重关联 key 数 ≤ 阈值时
+   **一次全量扫描从表建内存索引**（docid 关联用主键、其余取字段值、缺字段跳过、首个命中优先），
+   否则回退逐 key 点查；server 链路（serve→handle_join）透传 `JoinBroadcast`；测试验证广播命中/
+   首个命中语义/超阈值回退/关闭广播/决策函数；
+6. ~~**Redis 冷热分层 SDK 门面（design 1.3/21.5）**~~ ✅（2026-08-28）：
+   `src/sdk_cache.rs` 新增 `ShanshuiCunjiWithRedis<'a, B>` 门面——组合 `&mut Engine`（全量持久化）+
+   `ExternalCacheManager<B>`（Redis 热点）：**读回填**（`get` 命中 Redis 直返 / 未命中回源引擎
+   并 SETEX 回填，熔断透传）+ **写失效协调**（`put` / `delete` 先落盘引擎返回 ACK 再删 Redis 旧缓存）；
+   `engine()` 透传引擎访问；测试验证读回填/写失效后回源新值/删除双端清理；测试 260 全绿（+3）；
+7. ~~**性能实测对照 design 9.5**~~ ✅（2026-08-28）：三规模 10/10 通过（1000万 29.6s /
+   2000万 67.9s / 5000万 163.6s 批量插入，写入 29.5~33.8 万条/s；倒排检索近常量 1.25 亿命中 2.9s）；
+   对照 design 9.5：组提交写入与热点查询延迟**达成/超出**目标（硬件 6C/16G 低于基准 16C/64G），
+   高并发 10k 连接类指标留待 M6 异步运行时；**发现并修复读路径回归**（`get_from_sst` 每次点查
+   克隆整个 Level 2 精确索引致倒排查询挂起 → `locate_indexed_block` 按需取单条，恢复 2.4s）；
+   报告 `images/perf-0.3.0/汇总报告.md` + 每规模 10 张截图（Edge headless）；
+8. ~~**打 v0.3.0 标签**~~ ✅（2026-08-28）：Cargo.toml 版本 0.2.1→0.3.0 + `RELEASE-v0.3.0.md` /
+   `RELEASE-SUMMARY-v0.3.0.md` / README 发布摘要更新 + `git tag v0.3.0` + 推送；阶段 3 全部完成，
+   测试 260 全绿，三规模 demo 10/10。
+
 ---
 
 ## 8. 编码规范

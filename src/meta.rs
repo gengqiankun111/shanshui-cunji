@@ -62,7 +62,8 @@ impl MetaCenter {
             role: role.to_string(),
         });
         // master 优先（广播/写路由稳定性）
-        self.nodes.sort_by_key(|n| if n.role == "master" { 0 } else { 1 });
+        self.nodes
+            .sort_by_key(|n| if n.role == "master" { 0 } else { 1 });
         Ok(())
     }
 
@@ -90,12 +91,18 @@ impl MetaCenter {
 
     /// 节点 RPC 地址。
     pub fn node_addr(&self, node_id: &str) -> Option<&str> {
-        self.nodes.iter().find(|n| n.node_id == node_id).map(|n| n.addr.as_str())
+        self.nodes
+            .iter()
+            .find(|n| n.node_id == node_id)
+            .map(|n| n.addr.as_str())
     }
 
     /// 主节点（第一个 master；无 master 时回退第一个节点）。
     pub fn master_node(&self) -> Option<&NodeInfo> {
-        self.nodes.iter().find(|n| n.role == "master").or_else(|| self.nodes.first())
+        self.nodes
+            .iter()
+            .find(|n| n.role == "master")
+            .or_else(|| self.nodes.first())
     }
 
     /// 该节点是否为 slave。
@@ -154,8 +161,7 @@ impl MetaCenter {
     /// 从文件加载拓扑。
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text)
-            .map_err(|e| Error::Corrupted(format!("拓扑解析失败: {e}")))
+        serde_json::from_str(&text).map_err(|e| Error::Corrupted(format!("拓扑解析失败: {e}")))
     }
 }
 
@@ -213,12 +219,21 @@ mod tests {
     fn adding_node_rebalances_only_fraction() {
         let mut m = MetaCenter::new(1024);
         for i in 1..=3 {
-            m.register(&format!("node-{i}"), &format!("127.0.0.1:90{i}"), "slave").unwrap();
+            m.register(&format!("node-{i}"), &format!("127.0.0.1:90{i}"), "slave")
+                .unwrap();
         }
-        let before: Vec<String> = (0..100_000u64).map(|d| m.resolve(d).unwrap().node_id.clone()).collect();
+        let before: Vec<String> = (0..100_000u64)
+            .map(|d| m.resolve(d).unwrap().node_id.clone())
+            .collect();
         m.register("node-4", "127.0.0.1:9094", "slave").unwrap();
-        let after: Vec<String> = (0..100_000u64).map(|d| m.resolve(d).unwrap().node_id.clone()).collect();
-        let changed = before.iter().zip(after.iter()).filter(|(a, b)| a != b).count();
+        let after: Vec<String> = (0..100_000u64)
+            .map(|d| m.resolve(d).unwrap().node_id.clone())
+            .collect();
+        let changed = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         let ratio = changed as f64 / 100_000.0;
         assert!(ratio < 0.30, "扩容重路由比例 {ratio:.3} 应 ≈0.25");
     }
@@ -243,7 +258,12 @@ mod tests {
         assert_eq!(m2.master_node().unwrap().node_id, "node-1");
         // 路由一致
         for docid in [0u64, 7, 12345] {
-            let a = MetaCenter::load(&path).unwrap().resolve(docid).unwrap().node_id.clone();
+            let a = MetaCenter::load(&path)
+                .unwrap()
+                .resolve(docid)
+                .unwrap()
+                .node_id
+                .clone();
             assert_eq!(a, m2.resolve(docid).unwrap().node_id);
         }
     }

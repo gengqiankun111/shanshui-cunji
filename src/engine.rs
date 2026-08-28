@@ -299,6 +299,16 @@ impl Engine {
         self.inverted.group_by(field)
     }
 
+    /// 基础 Compaction（design 4.5，阶段 3）：主数据列族全量合并。
+    pub fn compact(&mut self) -> Result<crate::column_family::CompactReport> {
+        self.primary.compact()
+    }
+
+    /// 是否需要 Compaction（主数据列族 L0 段数超过阈值）。
+    pub fn needs_compact(&self) -> bool {
+        self.primary.needs_compact()
+    }
+
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
         EngineStats {
