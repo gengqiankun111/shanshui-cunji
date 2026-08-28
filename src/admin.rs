@@ -142,6 +142,53 @@ pub fn status(engine: &Engine) -> StatusReport {
     }
 }
 
+/// 集群配置状态（design 9.8，CLI `admin status` 输出分布式部分）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterStatus {
+    /// 运行模式：standalone / cluster。
+    pub mode: String,
+    /// 集群节点 ID。
+    pub node_id: String,
+    /// 内部 RPC 端口。
+    pub internal_rpc_port: u16,
+    /// 分片是否启用。
+    pub sharding_enabled: bool,
+    /// 物理分片数（0 = 自动）。
+    pub total_shards: u32,
+    /// 虚拟分片数。
+    pub virtual_shards: u32,
+    /// 一致性哈希 / 取模。
+    pub consistent_hash: bool,
+    /// 副本是否启用。
+    pub replication_enabled: bool,
+    /// 节点角色：master / slave。
+    pub replication_role: String,
+    /// 同步模式：async / sync。
+    pub sync_mode: String,
+    /// Master RPC 地址（slave 填写）。
+    pub master_addr: String,
+    /// 广播查询并发上限。
+    pub broadcast_max_concurrent: usize,
+}
+
+/// 聚合集群配置状态（CLI `admin status` 使用；HTTP /admin/status 仅引擎指标，集群状态由网关汇总）。
+pub fn cluster_status(cfg: &crate::config::Config) -> ClusterStatus {
+    ClusterStatus {
+        mode: cfg.server.mode.clone(),
+        node_id: cfg.cluster.node_id.clone(),
+        internal_rpc_port: cfg.cluster.internal_rpc_port,
+        sharding_enabled: cfg.sharding.enabled,
+        total_shards: cfg.sharding.total_shards,
+        virtual_shards: cfg.sharding.virtual_shards,
+        consistent_hash: cfg.sharding.consistent_hash,
+        replication_enabled: cfg.replication.enabled,
+        replication_role: cfg.replication.role.clone(),
+        sync_mode: cfg.replication.sync_mode.clone(),
+        master_addr: cfg.replication.master_addr.clone(),
+        broadcast_max_concurrent: cfg.broadcast_query.max_concurrent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
