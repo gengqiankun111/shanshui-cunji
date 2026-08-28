@@ -14,17 +14,39 @@ use crate::error::{Error, Result};
 pub struct ImportReport {
     pub rows: u64,
     pub failed: u64,
+    /// 增量导入跳过的已导入行数（游标续传）。
+    pub skipped: u64,
     pub elapsed_ms: u64,
 }
 
 impl ImportReport {
-    fn new(rows: u64, failed: u64, elapsed_ms: u64) -> Self {
+    fn new(rows: u64, failed: u64, skipped: u64, elapsed_ms: u64) -> Self {
         Self {
             rows,
             failed,
+            skipped,
             elapsed_ms,
         }
     }
+}
+
+/// 读取增量导入 checkpoint（文件记录最大已导入 docid；缺失 = 0）。
+pub fn load_checkpoint(path: &std::path::Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let text = std::fs::read_to_string(path)?;
+    text.trim()
+        .parse::<u64>()
+        .map_err(|e| Error::Corrupted(format!("checkpoint 解析失败: {e}")))
+}
+
+/// 写入增量导入 checkpoint（tmp + rename 原子写）。
+pub fn save_checkpoint(path: &std::path::Path, last_docid: u64) -> Result<()> {
+    let tmp = path.with_extension("cp.tmp");
+    std::fs::write(&tmp, last_docid.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// 倒排字段白名单过滤（import-schema，design 20）：term 形如 `field=value`，
@@ -53,6 +75,30 @@ pub fn import_csv_filtered(
     path: &std::path::Path,
     whitelist: Option<&[String]>,
 ) -> Result<ImportReport> {
+    import_csv_worker(engine, path, whitelist, None, None)
+}
+
+/// CSV **增量导入**（design 5.16 阶段 3 高级版）：基于 docid 游标断点续传。
+/// `checkpoint_path` 记录已导入的最大 docid（原子写）；重启续跑只处理新增行（docid 更大），
+/// 已导入行自动跳过。适合追加式日志 / 埋点数据增量同步。
+pub fn import_csv_incremental(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+    checkpoint_path: &std::path::Path,
+) -> Result<ImportReport> {
+    let base = load_checkpoint(checkpoint_path)?;
+    import_csv_worker(engine, path, whitelist, Some(base), Some(checkpoint_path))
+}
+
+/// CSV 导入工作器（全量 / 增量共用）。
+fn import_csv_worker(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+    cp_base: Option<u64>,
+    cp_path: Option<&std::path::Path>,
+) -> Result<ImportReport> {
     let t = Instant::now();
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -69,9 +115,17 @@ pub fn import_csv_filtered(
         return Err(Error::Unsupported("CSV 表头为空".into()));
     }
     let docid_col = headers.iter().position(|h| h == "docid");
+    // 增量导入要求显式 docid 列（自动递增无法续传）
+    if cp_base.is_some() && docid_col.is_none() {
+        return Err(Error::Migrate(
+            "增量导入必须含 docid 列（自动递增无法断点续传）".into(),
+        ));
+    }
 
     let mut rows = 0u64;
     let mut failed = 0u64;
+    let mut skipped = 0u64;
+    let mut last_docid = cp_base.unwrap_or(0);
     let mut next_id = 1u64;
     for rec in reader.records() {
         let rec = match rec {
@@ -113,6 +167,13 @@ pub fn import_csv_filtered(
                 d
             }
         };
+        // 增量：跳过已导入的 docid（游标续传）
+        if let Some(base) = cp_base {
+            if docid <= base {
+                skipped += 1;
+                continue;
+            }
+        }
         let bytes = serde_json::to_vec(&serde_json::Value::Object(obj))
             .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
         let val = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -120,7 +181,16 @@ pub fn import_csv_filtered(
         let terms = filter_terms(crate::server::extract_terms(&val), whitelist);
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         match engine.put(docid, bytes, &term_refs) {
-            Ok(()) => rows += 1,
+            Ok(()) => {
+                rows += 1;
+                // 增量：推进并持久化 checkpoint（原子写）
+                if docid > last_docid {
+                    last_docid = docid;
+                    if let Some(p) = cp_path {
+                        save_checkpoint(p, last_docid)?;
+                    }
+                }
+            }
             Err(_) => failed += 1,
         }
     }
@@ -129,6 +199,7 @@ pub fn import_csv_filtered(
     Ok(ImportReport::new(
         rows,
         failed,
+        skipped,
         t.elapsed().as_millis() as u64,
     ))
 }
@@ -364,6 +435,7 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
     Ok(ImportReport::new(
         rows,
         failed,
+        0,
         t.elapsed().as_millis() as u64,
     ))
 }
@@ -380,10 +452,34 @@ pub fn import_json_filtered(
     path: &std::path::Path,
     whitelist: Option<&[String]>,
 ) -> Result<ImportReport> {
+    import_json_worker(engine, path, whitelist, None, None)
+}
+
+/// JSONL **增量导入**（design 5.16 阶段 3）：docid 游标断点续传（需 docid/id 列）。
+pub fn import_json_incremental(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+    checkpoint_path: &std::path::Path,
+) -> Result<ImportReport> {
+    let base = load_checkpoint(checkpoint_path)?;
+    import_json_worker(engine, path, whitelist, Some(base), Some(checkpoint_path))
+}
+
+/// JSONL 导入工作器（全量 / 增量共用）。
+fn import_json_worker(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+    cp_base: Option<u64>,
+    cp_path: Option<&std::path::Path>,
+) -> Result<ImportReport> {
     let t = Instant::now();
     let text = std::fs::read_to_string(path)?;
     let mut rows = 0u64;
     let mut failed = 0u64;
+    let mut skipped = 0u64;
+    let mut last_docid = cp_base.unwrap_or(0);
     let mut next_id = 1u64;
     for line in text.lines() {
         let line = line.trim();
@@ -413,6 +509,11 @@ pub fn import_json_filtered(
         let docid = match docid {
             Some(d) => d,
             None => {
+                // 增量要求显式 docid/id 列（自动递增无法续传）
+                if cp_base.is_some() {
+                    failed += 1;
+                    continue;
+                }
                 // 自动分配：避让已占用 docid（显式 docid 与递增可能冲突）
                 let mut d = next_id;
                 while engine.get(d)?.is_some() {
@@ -423,6 +524,13 @@ pub fn import_json_filtered(
                 d
             }
         };
+        // 增量：跳过已导入的 docid（游标续传）
+        if let Some(base) = cp_base {
+            if docid <= base {
+                skipped += 1;
+                continue;
+            }
+        }
         let bytes = match serde_json::to_vec(&serde_json::Value::Object(obj)) {
             Ok(b) => b,
             Err(_) => {
@@ -439,7 +547,16 @@ pub fn import_json_filtered(
         };
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         match engine.put(docid, bytes, &term_refs) {
-            Ok(()) => rows += 1,
+            Ok(()) => {
+                rows += 1;
+                // 增量：推进并持久化 checkpoint（原子写）
+                if docid > last_docid {
+                    last_docid = docid;
+                    if let Some(p) = cp_path {
+                        save_checkpoint(p, last_docid)?;
+                    }
+                }
+            }
             Err(_) => failed += 1,
         }
     }
@@ -447,6 +564,7 @@ pub fn import_json_filtered(
     Ok(ImportReport::new(
         rows,
         failed,
+        skipped,
         t.elapsed().as_millis() as u64,
     ))
 }
@@ -576,5 +694,75 @@ mod tests {
         // 自动分配的 docid 落在 1/3 之外（=2）
         let val = engine.get(2).unwrap().expect("自动分配 docid=2");
         assert!(String::from_utf8_lossy(&val).contains("pending"));
+    }
+
+    // ---- 增量导入（design 5.16 阶段 3：docid 游标断点续传）----
+
+    #[test]
+    fn incremental_json_import_resumes_from_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("in.jsonl");
+        let cp_path = dir.path().join("checkpoint.cp");
+        // 首轮：3 条
+        std::fs::write(
+            &json_path,
+            "{\"docid\":1,\"s\":\"a\"}\n{\"docid\":2,\"s\":\"a\"}\n{\"docid\":3,\"s\":\"b\"}\n",
+        )
+        .unwrap();
+        let cfg = crate::config::Config::default();
+        let data_dir = dir.path().join("data");
+        let mut engine = Engine::open(&data_dir, &cfg).unwrap();
+        let rep1 = import_json_incremental(&mut engine, &json_path, None, &cp_path).unwrap();
+        assert_eq!(rep1.rows, 3);
+        assert_eq!(rep1.skipped, 0);
+        assert_eq!(load_checkpoint(&cp_path).unwrap(), 3, "checkpoint 推进到 3");
+
+        // 追加 2 条新数据（docid 4、5）
+        std::fs::write(
+            &json_path,
+            "{\"docid\":1,\"s\":\"a\"}\n{\"docid\":2,\"s\":\"a\"}\n{\"docid\":3,\"s\":\"b\"}\n{\"docid\":4,\"s\":\"c\"}\n{\"docid\":5,\"s\":\"c\"}\n",
+        )
+        .unwrap();
+        // 续跑：只处理新行，旧行跳过
+        let rep2 = import_json_incremental(&mut engine, &json_path, None, &cp_path).unwrap();
+        assert_eq!(rep2.rows, 2, "只导入新增 2 条");
+        assert_eq!(rep2.skipped, 3, "旧 3 条跳过");
+        assert_eq!(load_checkpoint(&cp_path).unwrap(), 5);
+        // 数据正确
+        assert_eq!(engine.get(4).unwrap().unwrap(), b"{\"docid\":4,\"s\":\"c\"}");
+        assert_eq!(engine.search_term("s=c").unwrap().len(), 2);
+        // 再次续跑：全部跳过
+        let rep3 = import_json_incremental(&mut engine, &json_path, None, &cp_path).unwrap();
+        assert_eq!(rep3.rows, 0);
+        assert_eq!(rep3.skipped, 5);
+    }
+
+    #[test]
+    fn incremental_csv_requires_docid_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("in.csv");
+        std::fs::write(&csv_path, "status,type\nactive,order\n").unwrap();
+        let cfg = crate::config::Config::default();
+        let data_dir = dir.path().join("data");
+        let mut engine = Engine::open(&data_dir, &cfg).unwrap();
+        let cp = dir.path().join("cp");
+        let err = import_csv_incremental(&mut engine, &csv_path, None, &cp).unwrap_err();
+        assert!(
+            err.to_string().contains("docid"),
+            "无 docid 列增量导入应报错: {err}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_atomic_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("cp");
+        save_checkpoint(&cp, 42).unwrap();
+        assert_eq!(load_checkpoint(&cp).unwrap(), 42);
+        // 覆盖更新
+        save_checkpoint(&cp, 100).unwrap();
+        assert_eq!(load_checkpoint(&cp).unwrap(), 100);
+        // 缺失 → 0
+        assert_eq!(load_checkpoint(&dir.path().join("nope")).unwrap(), 0);
     }
 }
