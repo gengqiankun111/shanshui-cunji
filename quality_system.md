@@ -86,7 +86,7 @@ cargo fmt --all -- --check \
 - [ ] 新增索引结构是否经过正确性验证（读回 / 重启 / 损坏注入）？
 
 > 项目已落地：WAL 重开追加恢复、主键大端序、PAX/TTL/Delta 均配回归测试；
-> 全量问题与修复见 [problem_solving.md](problem_solving.md)（P1~P32）。
+> 全量问题与修复见 [problem_solving.md](problem_solving.md)（P1~P36）。
 
 ### 第 4 层 · 单元测试 + 集成测试（覆盖率 ≥ 80%）
 
@@ -95,7 +95,7 @@ cargo fmt --all -- --check \
 - **集成测试**证明"组合起来是对的"：Engine 全链路、HTTP-JSON 端到端、备份还原、跨重启持久化、
   倒排回表、多 CF（primary/cidx/delta）协同。
 - **要求**：测试与代码同 PR（不允许后补）；覆盖率低于 80% 的 PR 不允许合并；新功能先写测试。
-- **现状**：**260 个单元测试全绿**（`cargo test`），demo 冒烟 10/10（10 万~5000 万规模压测报告在 `images/`）。
+- **现状**：**279 个单元测试全绿**（`cargo test`），demo 冒烟 10/10（10 万~5000 万规模压测报告在 `images/`）。
 
 ### 第 5 层 · 基准测试（回答"好不好"）
 
@@ -109,10 +109,10 @@ cargo fmt --all -- --check \
 **验收标准**：持续压测 60 秒 TPS 不显著下降；P99 < 100ms（边缘场景）；内存不泄漏。
 
 > 现状：demo 冒烟内置 10 项功能基准（插入/点查/缓存/组合索引/倒排/分片/删除/备份），
-> **v0.3.0**（2026-08-28，release + 默认 mimalloc，i7-10750H 6C12T / 16G / NVMe）：1000万条插入 **33.8 万条/s**（29.6s）、
-> 2000万 29.5 万条/s、5000万 30.6 万条/s，三规模 10/10 通过；倒排词条检索近常量（1.25 亿命中 ~2.9s）；
-> 热点主键 0.02~0.35ms、HotCache 0.02ms；对照 design 9.5 组提交写入与热点查询达成/超出目标（10k 并发留待 M6 异步运行时）；
-> 分配器专项对比见 `images/allocator-bench/`（musl+mimalloc 4~10 倍），性能测试报告见 `images/perf-0.3.0/`；
+> **v0.4.0**（2026-08-28，release + 默认 mimalloc，i7-10750H 6C12T / 16G / NVMe）：1000万条插入 **38.6 万条/s**（25.9s，10/10）、
+> 倒排词条 2.1s（250 万命中 + 20 万回表全对）、备份·还原 20.7s；M6 功能改动（环形 WAL / Leveled-Compaction /
+> MVCC 快照读 / 热点保护区 / 增量备份）无性能回归（环形 WAL 默认关闭、Leveled 仅 compact 路径）；
+> 历史基线：v0.3.0 三规模 29.5~33.8 万条/s（见 `images/perf-0.3.0/`）、分配器专项见 `images/allocator-bench/`（musl+mimalloc 4~10 倍）；
 > 实测中发现并修复读路径回归（`get_from_sst` 克隆整个 Level 2 索引，见 problem_solving P30）。
 
 ### 第 6 层 · 混沌测试（证明"在故障中不出事"）
@@ -129,7 +129,9 @@ cargo fmt --all -- --check \
 
 > 现状（MVP 已完成部分）：WAL 尾部截断恢复、SST 损坏注入拒载、孤儿倒排段忽略、
 > Engine 跨重启数据 + 倒排保留（步骤 16 测试，见 [images/linux-musl](images/linux-musl/验证记录.md)）；
-> **磁盘写满**：P31 实测中 C 盘 100% 满真实触发——进程错误退出而非崩溃、无数据损坏，修复环境后恢复（见 problem_solving P31）。
+> **磁盘写满**：P31 实测中 C 盘 100% 满真实触发——进程错误退出而非崩溃、无数据损坏，修复环境后恢复（见 problem_solving P31）；
+> **环形 WAL 崩溃恢复（M6-1）**：两阶段 fsync（记录区 → 头部 tail）+ 回绕覆盖安全（全刷盘前提 + WalFull 强制 Flush），
+> 测试验证崩溃重开只回放已 sync 记录（见 problem_solving P35）。
 
 ---
 
@@ -180,7 +182,7 @@ cargo fmt --all -- --check \
 | --- | --- |
 | 静态分析 | `cargo fmt --check` + `cargo clippy -D warnings`（开发机常态化）；`cargo geiger` 正式报告：**项目自身 unsafe = 0**，源码已加 `#![forbid(unsafe_code)]` 编译期强制 |
 | 架构评审 | design.md / development.md 双文档 + 每里程碑 AI 评审（quality/） |
-| 代码审查 | problem_solving.md（P1~P32 问题闭环）+ 提交前自检清单 |
-| 单元/集成测试 | **260 测试全绿** + demo 冒烟 10/10 + HTTP 端到端 |
-| 基准测试 | demo 10 项功能基准（10万~5000万压测）+ release 29.5~33.8 万条/s |
+| 代码审查 | problem_solving.md（P1~P36 问题闭环）+ 提交前自检清单 |
+| 单元/集成测试 | **279 测试全绿** + demo 冒烟 10/10 + HTTP 端到端 |
+| 基准测试 | demo 10 项功能基准（10万~5000万压测）+ release 38.6 万条/s（v0.4.0 快检）|
 | 混沌测试 | WAL 截断恢复 / SST 损坏注入 / 孤儿段忽略 / 跨重启持久化 |
