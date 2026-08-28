@@ -27,8 +27,32 @@ impl ImportReport {
     }
 }
 
+/// 倒排字段白名单过滤（import-schema，design 20）：term 形如 `field=value`，
+/// 白名单存在时只保留声明字段的词条；None 不过滤。
+fn filter_terms(terms: Vec<String>, whitelist: Option<&[String]>) -> Vec<String> {
+    match whitelist {
+        None => terms,
+        Some(wl) => terms
+            .into_iter()
+            .filter(|t| {
+                wl.iter()
+                    .any(|f| t.starts_with(&format!("{f}=")))
+            })
+            .collect(),
+    }
+}
+
 /// CSV 全量导入：首行表头即 JSON 字段名；`docid` 列存在则用之，否则从 1 递增。
 pub fn import_csv(engine: &mut Engine, path: &std::path::Path) -> Result<ImportReport> {
+    import_csv_filtered(engine, path, None)
+}
+
+/// CSV 导入并应用倒排字段白名单（import-schema，design 20）：白名单存在时只对声明字段建倒排。
+pub fn import_csv_filtered(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+) -> Result<ImportReport> {
     let t = Instant::now();
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -93,7 +117,7 @@ pub fn import_csv(engine: &mut Engine, path: &std::path::Path) -> Result<ImportR
             .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
         let val = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| Error::Serialize(format!("JSON 解析失败: {e}")))?;
-        let terms = crate::server::extract_terms(&val);
+        let terms = filter_terms(crate::server::extract_terms(&val), whitelist);
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         match engine.put(docid, bytes, &term_refs) {
             Ok(()) => rows += 1,
@@ -347,6 +371,15 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
 /// JSONL 全量导入（数据管道 `import --json`，development 5.27）：每行一个 JSON 对象，
 /// 含 docid/id 列作主键（否则从 1 递增），导入完成输出迁移报告。
 pub fn import_json(engine: &mut Engine, path: &std::path::Path) -> Result<ImportReport> {
+    import_json_filtered(engine, path, None)
+}
+
+/// JSONL 导入并应用倒排字段白名单（import-schema，design 20）。
+pub fn import_json_filtered(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+) -> Result<ImportReport> {
     let t = Instant::now();
     let text = std::fs::read_to_string(path)?;
     let mut rows = 0u64;
@@ -398,7 +431,7 @@ pub fn import_json(engine: &mut Engine, path: &std::path::Path) -> Result<Import
             }
         };
         let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(v) => crate::server::extract_terms(&v),
+            Ok(v) => filter_terms(crate::server::extract_terms(&v), whitelist),
             Err(_) => {
                 failed += 1;
                 continue;
