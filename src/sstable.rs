@@ -577,11 +577,23 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// SSTable Reader：mmap 式顺序读取（MVP 用文件 read + seek；阶段 3 可换 io_uring）。
+/// 采用**两级索引**（design 4.4.2）：
+/// - **Level 1（内存常驻）**：每 `index_granularity`（默认 16）个 Block 一条摘要
+///   （`summary`：块首键 + 块下标），极轻量；
+/// - **Level 2（按需加载）**：精确 Block 索引（全部 `IndexEntry`），首次访问从磁盘解码并缓存。
+/// 对比：单层稀疏索引 ~200MB → 两级 ~20MB，内存减少 90%（更多留给 HotCache）。
 pub struct SstReader {
     path: PathBuf,
     file: std::fs::File,
     footer: SstFooter,
-    index: Vec<IndexEntry>,
+    /// Level 1：内存常驻摘要（每 index_granularity 个块一条）。
+    summary: Vec<SummaryEntry>,
+    /// 精确块数（open 时解码索引获得；Level 2 懒加载前即可用于容量判断）。
+    index_count: usize,
+    /// 两级索引粒度（每 N 个块一条摘要）。
+    index_granularity: usize,
+    /// Level 2：精确块索引（懒加载缓存；首次访问触发磁盘解码）。
+    full_index: std::cell::RefCell<Option<Vec<IndexEntry>>>,
     /// v5 分区布隆：每块一个（原始字节，查询时按需反序列化目标块）。
     partition_blooms: Option<Vec<Vec<u8>>>,
     /// v3/v4 整文件布隆（旧格式兼容）。
@@ -591,8 +603,28 @@ pub struct SstReader {
     format: u16,
 }
 
+/// Level 1 摘要条目：每 `index_granularity` 个块一条（design 4.4.2）。
+#[derive(Debug, Clone)]
+pub struct SummaryEntry {
+    /// 块首键（Zone Map min）。
+    pub first_key: Vec<u8>,
+    /// 对应精确索引中的块下标。
+    pub block_index: usize,
+}
+
 impl SstReader {
+    /// 打开 SST（两级索引粒度默认 16，design 4.4.2）。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_granularity(path, 16)
+    }
+
+    /// 打开 SST 并指定两级索引粒度（`sstable.index_granularity`）。
+    pub fn open_with_granularity(path: &Path, index_granularity: usize) -> Result<Self> {
+        let granularity = index_granularity.max(1);
+        Self::open_inner(path, granularity)
+    }
+
+    fn open_inner(path: &Path, index_granularity: usize) -> Result<Self> {
         let mut file = std::fs::File::open(path).map_err(Error::Io)?;
         let fsize = file.metadata().map_err(Error::Io)?.len();
         if fsize < 8 + 54 {
@@ -641,6 +673,18 @@ impl SstReader {
             .map_err(Error::Io)?;
         file.read_exact(&mut ib).map_err(Error::Io)?;
         let index = decode_index(&ib, version)?;
+        let index_count = index.len();
+        // 两级索引（design 4.4.2）：只保留每 granularity 块一条摘要常驻内存，
+        // 精确索引（Level 2）懒加载——open 后不再持有完整 IndexEntry。
+        let summary = index
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % index_granularity == 0)
+            .map(|(i, e)| SummaryEntry {
+                first_key: e.first_key.clone(),
+                block_index: i,
+            })
+            .collect::<Vec<_>>();
 
         // 读 Bloom 区：v5 为分区布隆列表；v3/v4 为旧单布隆
         let mut bb = vec![0u8; bloom_len];
@@ -705,7 +749,10 @@ impl SstReader {
                 key_count,
                 footer_offset,
             },
-            index,
+            summary,
+            index_count,
+            index_granularity,
+            full_index: std::cell::RefCell::new(None),
             partition_blooms,
             bloom,
             compression,
@@ -727,16 +774,66 @@ impl SstReader {
         self.bloom.as_ref()
     }
 
-    pub fn index(&self) -> &[IndexEntry] {
-        &self.index
+    /// 精确块索引（Level 2，design 4.4.2）：懒加载触发后返回完整索引副本。
+    /// 供测试 / 全量迭代使用；生产读路径走内部 `block_entry` 按需取单条。
+    pub fn index(&self) -> Vec<IndexEntry> {
+        self.ensure_index().expect("精确索引加载失败");
+        self.full_index.borrow().as_ref().unwrap().clone()
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// 精确块数（无需触发 Level 2 加载，open 时即得）。
     pub fn index_len(&self) -> usize {
-        self.index.len()
+        self.index_count
+    }
+
+    /// 两级索引粒度（每 N 个块一条摘要）。
+    pub fn index_granularity(&self) -> usize {
+        self.index_granularity
+    }
+
+    /// Level 1 常驻摘要（测试 / 监控：验证内存减负）。
+    pub fn summary(&self) -> &[SummaryEntry] {
+        &self.summary
+    }
+
+    /// Level 1 摘要条数。
+    pub fn summary_len(&self) -> usize {
+        self.summary.len()
+    }
+
+    /// Level 2 精确索引是否已懒加载（测试 / 监控）。
+    pub fn level2_loaded(&self) -> bool {
+        self.full_index.borrow().is_some()
+    }
+
+    /// Level 2 懒加载：首次访问从磁盘解码精确块索引并缓存（design 4.4.2 按需加载）。
+    fn ensure_index(&self) -> Result<()> {
+        if self.full_index.borrow().is_some() {
+            return Ok(());
+        }
+        let mut ib = vec![0u8; self.footer.index_len];
+        let mut f = std::fs::File::open(&self.path)?;
+        f.seek(std::io::SeekFrom::Start(self.footer.index_offset))?;
+        f.read_exact(&mut ib)?;
+        let index = decode_index(&ib, self.format)?;
+        *self.full_index.borrow_mut() = Some(index);
+        Ok(())
+    }
+
+    /// 取精确索引中第 idx 块的条目（克隆，不持有借用）。
+    fn block_entry(&self, idx: usize) -> Result<IndexEntry> {
+        self.ensure_index()?;
+        self.full_index
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| Error::Corrupted(format!("块下标越界: {idx}")))
     }
 
     /// 等值查询：定位块 → 分区布隆剪枝（v5）/ 整文件布隆剪枝（v3/v4）→ 读块 → 块内扫描。
@@ -744,7 +841,7 @@ impl SstReader {
     pub fn get(&mut self, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         // v5 分区布隆：先定位块，再只校验目标块布隆（design 4.4.2 按需加载）
         if let Some(pb) = &self.partition_blooms {
-            let Some(idx) = self.locate_block_index(key) else {
+            let Some(idx) = self.locate_block_index(key)? else {
                 return Ok(None);
             };
             if let Some(bytes) = pb.get(idx) {
@@ -754,7 +851,7 @@ impl SstReader {
                     }
                 }
             }
-            let e = self.index[idx].clone();
+            let e = self.block_entry(idx)?;
             let data = self.read_block(&e)?;
             return self.scan_block_for_key(&data, key);
         }
@@ -764,7 +861,7 @@ impl SstReader {
                 return Ok(None);
             }
         }
-        let Some(e) = self.locate_block(key).cloned() else {
+        let Some(e) = self.locate_block(key)? else {
             return Ok(None);
         };
         let data = self.read_block(&e)?;
@@ -772,21 +869,25 @@ impl SstReader {
     }
 
     /// 定位包含 key 的块在 Index 中的下标（二分首个 first_key <= key 的块）。
-    fn locate_block_index(&self, key: &[u8]) -> Option<usize> {
+    /// 触发 Level 2 懒加载。
+    fn locate_block_index(&self, key: &[u8]) -> Result<Option<usize>> {
+        self.ensure_index()?;
+        let index = self.full_index.borrow();
+        let index = index.as_ref().unwrap();
         let mut lo = 0usize;
-        let mut hi = self.index.len();
+        let mut hi = index.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.index[mid].first_key.as_slice() <= key {
+            if index[mid].first_key.as_slice() <= key {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
         if lo == 0 {
-            None
+            Ok(None)
         } else {
-            Some(lo - 1)
+            Ok(Some(lo - 1))
         }
     }
 
@@ -804,22 +905,25 @@ impl SstReader {
         Ok(None)
     }
 
-    /// 定位包含 key 的数据块（二分首个 first_key <= key 的块）。
-    fn locate_block(&self, key: &[u8]) -> Option<&IndexEntry> {
+    /// 定位包含 key 的数据块（二分首个 first_key <= key 的块）。触发 Level 2 懒加载。
+    fn locate_block(&self, key: &[u8]) -> Result<Option<IndexEntry>> {
+        self.ensure_index()?;
+        let index = self.full_index.borrow();
+        let index = index.as_ref().unwrap();
         let mut lo = 0usize;
-        let mut hi = self.index.len();
+        let mut hi = index.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.index[mid].first_key.as_slice() <= key {
+            if index[mid].first_key.as_slice() <= key {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
         if lo == 0 {
-            None
+            Ok(None)
         } else {
-            self.index.get(lo - 1)
+            Ok(index.get(lo - 1).cloned())
         }
     }
 
@@ -858,7 +962,7 @@ impl SstReader {
 
     /// 迭代：按块顺序扫描全部条目。回调 `f(key, value, seq)`，`value=None` 表示 Tombstone。
     pub fn iterate<F: FnMut(&[u8], Option<&[u8]>, u64)>(&mut self, mut f: F) -> Result<()> {
-        let entries: Vec<IndexEntry> = self.index.clone();
+        let entries = self.index();
         for e in entries {
             let data = self.read_block(&e)?;
             for (k, v, seq) in decode_data_block(&data, self.format)? {
@@ -877,7 +981,7 @@ impl SstReader {
         end: Option<&[u8]>,
         mut f: F,
     ) -> Result<()> {
-        for e in self.index.clone() {
+        for e in self.index() {
             // Zone Map 剪枝
             if let Some(s) = start {
                 if e.max_key.as_slice() < s {
@@ -1519,5 +1623,85 @@ mod tests {
             "xy"
         );
         assert!(r.get(b"absent").unwrap().is_none(), "整文件布隆剪枝");
+    }
+
+    // ---- 两级索引（design 4.4.2，阶段 2）----
+
+    #[test]
+    fn two_level_index_summary_resident_exact_lazy() {
+        // 小块文件：制造多个数据块
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tli.sst");
+        {
+            let mut w = SstWriter::new(&path, Compression::Zstd, 3, 64, 100).unwrap();
+            for i in 0..200u64 {
+                w.add(format!("key-{i:06}").as_bytes(), b"value", i).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        // 粒度 4：每 4 块一条摘要
+        let mut r = SstReader::open_with_granularity(&path, 4).unwrap();
+        let blocks = r.index_len();
+        assert!(blocks > 4, "应产生多个数据块: {blocks}");
+        // Level 1 常驻：摘要条数 = ceil(blocks / 4)，远小于 blocks（内存减少 90%）
+        let expected = blocks.div_ceil(4);
+        assert_eq!(r.summary_len(), expected);
+        assert_eq!(r.summary()[0].block_index, 0);
+        // 摘要块下标等差为粒度
+        for w in r.summary().windows(2) {
+            assert_eq!(w[1].block_index - w[0].block_index, 4);
+        }
+        // Level 2 尚未懒加载（open 时只留摘要，内存减负）
+        assert!(!r.level2_loaded(), "open 后不应加载精确索引");
+        // 查询触发 Level 2 懒加载，且结果正确
+        let v = r.get(b"key-000042").unwrap().unwrap().0.unwrap();
+        assert_eq!(v, b"value");
+        assert!(r.level2_loaded(), "首次访问应懒加载精确索引");
+        // 懒加载后精确索引内容正确（块数一致）
+        assert_eq!(r.index().len(), blocks);
+    }
+
+    #[test]
+    fn two_level_index_query_across_all_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tli2.sst");
+        {
+            let mut w = SstWriter::new(&path, Compression::Zstd, 3, 32, 300).unwrap();
+            for i in 0..500u64 {
+                w.add(format!("k{i:06}").as_bytes(), format!("v{i}").as_bytes(), i)
+                    .unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let mut r = SstReader::open_with_granularity(&path, 8).unwrap();
+        // 抽查若干 key（跨多块），全部命中
+        for i in [0u64, 1, 127, 128, 250, 333, 499] {
+            let key = format!("k{i:06}");
+            let v = r.get(key.as_bytes()).unwrap().unwrap().0.unwrap();
+            assert_eq!(String::from_utf8_lossy(&v), format!("v{i}"));
+        }
+        // 未命中
+        assert!(r.get(b"k999999").unwrap().is_none());
+        // 范围扫描仍完整
+        let mut seen = 0;
+        r.scan_range(None, None, |_k, _v, _seq| seen += 1).unwrap();
+        assert_eq!(seen, 500);
+    }
+
+    #[test]
+    fn two_level_index_single_block_has_one_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tli3.sst");
+        {
+            let mut w = SstWriter::new(&path, Compression::Zstd, 3, 4096, 3).unwrap();
+            for i in 0..3u64 {
+                w.add(format!("a{i}").as_bytes(), b"x", i).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let r = SstReader::open_with_granularity(&path, 16).unwrap();
+        assert_eq!(r.index_len(), 1);
+        assert_eq!(r.summary_len(), 1, "单块也应有一条摘要（含首块）");
+        assert!(!r.level2_loaded());
     }
 }

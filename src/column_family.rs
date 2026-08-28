@@ -62,6 +62,8 @@ pub struct ColumnFamily {
     ttl_days: Option<u32>,
     /// TTL 时间字段名（文档 JSON 内数值秒级时间戳）。
     ttl_field: String,
+    /// 两级索引粒度（`sstable.index_granularity`，每 N 块一条 Level 1 摘要）。
+    index_granularity: usize,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 文件（新→旧）。
@@ -118,7 +120,7 @@ impl ColumnFamily {
                 warn!("Manifest 中的 SST 缺失，跳过: {}", p.display());
                 continue;
             }
-            match SstReader::open(&p) {
+            match SstReader::open_with_granularity(&p, cfg.sstable.index_granularity as usize) {
                 Ok(r) => ssts.push(r),
                 Err(e) => {
                     return Err(Error::Corrupted(format!(
@@ -154,6 +156,7 @@ impl ColumnFamily {
             pax_hot_fields: cfg.storage.hot_fields.clone(),
             ttl_days: cfg.storage.ttl_days,
             ttl_field: cfg.storage.ttl_field.clone(),
+            index_granularity: cfg.sstable.index_granularity as usize,
             memtable: MemTableBuffer::new(),
             ssts,
             block_cache,
@@ -364,7 +367,8 @@ impl ColumnFamily {
 
         // 新文件插到最前（读路径优先命中）
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
-        self.ssts.insert(0, SstReader::open(&path)?);
+        self.ssts
+            .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
         self.persist_manifest()?;
         info!(
             "列族 [{}] 刷盘完成: {} ({} 条)",
@@ -405,7 +409,8 @@ impl ColumnFamily {
             };
             let path = self.dir.join(&fname);
             self.write_rows(&path, &rows)?;
-            self.ssts.insert(0, SstReader::open(&path)?);
+            self.ssts
+                .insert(0, SstReader::open_with_granularity(&path, self.index_granularity)?);
         }
         self.persist_manifest()?;
         info!(

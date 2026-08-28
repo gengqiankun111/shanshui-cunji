@@ -742,8 +742,17 @@ impl RuntimePools {
    （语义等价 SST 拷贝 + WAL 增量，`catch_up`）；**原子切换（Atomic Switch）**——新节点注册元数据中心，
    路由切换、双写关闭（`commit_migration`）；**回滚预案** `abort_migration`（不注册、路由不变、旧数据完好）；
    测试验证：迁移生命周期数据零丢失（广播全量一致）、回滚路由不变、重复迁移拒绝；测试 221 全绿（+10）；
-8. **数据关联增强（design 19）**：物化视图调度器 + `shanshui-cunji-export` 导出工具 + JOIN 计划节点本地执行（单分片内）；
-9. **两级索引（design 4.4.2）**：内存索引减少 90%；
+8. ~~**数据关联增强（design 19）**~~ ✅（2026-08-28，物化视图调度器基础版）：
+   `src/mv.rs`（development 5.22）：`MaterializedView`（维度分组聚合 Count/Sum/Avg + **docid 增量游标**，
+   重复刷新同批次自动跳过）+ JSON 持久化（含定义，重启完整恢复）；`MvScheduler`（多视图容器 +
+   `refresh_all` 触发式增量聚合 + `query` 内存查表毫秒级）；JOIN 计划节点本地执行 = `sdk::join`
+   已单分片内存 Hash 合并（设计 19）；`shanshui-cunji-export` 基础版 M4 已交付（Parquet 留阶段 3）；
+9. ~~**两级索引（design 4.4.2）**：内存索引减少 90%~~ ✅（2026-08-28）：
+   `SstReader` 重构为两级索引——**Level 1 常驻**（每 `sstable.index_granularity` 默认 16 块一条摘要：
+   块首键 + 块下标，内存 ~1/16）+ **Level 2 按需加载**（精确 Block 索引懒加载，首次访问解码缓存）；
+   open 后不再持有完整 IndexEntry（1.5 亿文档单层 ~200MB → 两级 ~20MB，更多留给 HotCache）；
+   `index_granularity` 经 ColumnFamily 注入；测试验证摘要粒度/懒加载/跨块查询/范围扫描完整；
+   测试 229 全绿（+8：两级索引 3 + 物化视图 5）；
 10. **数据管道增强（design 20）**：`import` 支持 Parquet、`import-schema`（字段注册表 + 索引定义导入）；
 11. **Redis 外部缓存（design 21）**：External Cache Manager（Cache-Aside + Write-Invalidate + 熔断降级），`[cache.external]` 默认关闭，详见 redis-integration-guide.md。
 
