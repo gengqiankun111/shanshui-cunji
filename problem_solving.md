@@ -174,6 +174,12 @@
 - **坑**：jemalloc 在 Windows gnu 交叉工具链 configure 失败（mingw host C 构建问题，非项目缺陷）——文档注明 alloc-jemalloc 仅 Linux/musl 目标使用；`#[global_allocator]` 编译期决定、feature 互斥。
 - **提交**：随分配器加固提交（本轮）
 
+### P28. 运维管理与数据管道：自动分配 docid 避让 + Instant Default
+- **现象**：`json_import_creates_documents` 失败——显式 docid（1,3）与递增分配（从 1 起）冲突，递增分配的 docid=1 覆盖了显式 docid=1 的行。
+- **修复**：三处导入（CSV/SQL/JSONL）自动分配改为 `while engine.get(d)?.is_some() { d += 1; }` 避让已占用 docid。
+- **其他**：`QueryRegistry` 含 `Instant` 字段无法 `#[derive(Default)]`（Instant 无 Default）→ 手写 `impl Default`；MemoryConfig 无全局 `max_memory_mb` → admin status 用缓存总预算（hotcache+blockcache）替代。
+- **提交**：随 M4 运维管理 + 数据管道提交（本轮）
+
 ---
 
 ## 环境备忘（不入库）
