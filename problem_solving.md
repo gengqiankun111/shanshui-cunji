@@ -216,6 +216,34 @@
 
 ---
 
+## 阶段 3 末 · M6 高性能写入模式（v0.4.0）
+
+### P33. 环形 WAL 集成：新库恢复顺序导致 NotFound
+- **现象**：改造 `ColumnFamily::open` 引入 `WalBackend` 后，column_family 全部测试失败（`Io(NotFound: 系统找不到指定的文件)`）。
+- **根因**：重构时在 append 分支先 `WalReader::recover(wal_path)` 再 `WalWriter::open_append`——新库 `wal.log` 尚不存在，recover 直接 NotFound；此前旧流程是 `open_append`（`create(true)` 建文件）先执行。
+- **修复**：append 分支改为「先 `open_append` 建文件，再 recover」；顺带确认 ring 分支 `open_or_create` 内部已正确处理新文件（预分配 + 初始头）。
+- **提交**：`66813c9`（M6-1）
+
+### P34. MVCC 快照读：Delta 跨列族 seq 空间不可比
+- **现象**：`Engine::get_at` 初版对 Delta 增量按引擎快照 seq 过滤（`seq > snapshot_seq` 跳过），快照读仍读到快照后的 Delta 修改。
+- **根因**：每个列族（primary / delta）各自维护独立 seq 空间（从 1 开始），Delta 条目的 seq 是 Delta 本地序号，与引擎主数据 seq 不在同一坐标系，直接比较无意义。
+- **修复（基础版语义）**：快照隔离**只覆盖主数据版本**（`ColumnFamily::get_bytes_at` 按主数据 seq 过滤），Delta 字段级热更即时叠加；文档明确「完整跨列族全局 seq 一致性留后续」；测试同步调整（快照后 Delta 修改在快照读中可见）。
+- **提交**：`07f556e`（M6-3）
+
+### P35. 环形 WAL 回绕覆盖安全：全刷盘前提 + WalFull 强制 Flush
+- **现象**：设计环形 WAL 时，若回绕覆盖未刷盘记录会丢数据。
+- **根因/决策**：环形写指针回绕到头部会覆盖最旧记录；无法保证被覆盖记录已刷入 SST。
+- **修复**：回绕仅允许在**整个环内无未刷盘记录**时进行（`max_written_seq ≤ flushed_seq`，Flush 后由 `set_flushed_seq` 上报游标）；否则 `sync` 返回 `Error::WalFull`，ColumnFamily 捕获后强制 `switch_and_flush` 腾空再重试（append 缓冲超容量同理）；崩溃安全靠两阶段 fsync（先记录区、再头部 tail）。
+- **提交**：`66813c9`（M6-1）
+
+### P36. Leveled-Compaction：单段 L0 压实是无收益重写
+- **现象**：`select_compaction_inputs` 初版对单个 L0 段也执行压实（L0→L1），测试暴露 `out_level` 为 0（被 noop 守卫拦截）与预期不符。
+- **根因/决策**：合并 1 个文件无去重收益，纯重写浪费 IO；且「L0→L1 合并仅 L0」策略下，单段 L0 触发会让 L1 无限累计小文件。
+- **修复**：选择规则改为 **L0 ≥ 2 段才压实**（等待更多刷盘批次）；L1 文件数达层上限（`l0_stall_threshold`）时改合并 L0 + 全部 L1 收敛；测试同步（每轮刷 2 个 L0 段验证 L1 累计 → L1→L2 下沉）。
+- **提交**：`4c2e17a`（M6-2）
+
+---
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
