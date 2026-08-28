@@ -28,6 +28,14 @@ mimalloc = { version = "0.1", default-features = false }
 name = "shanshui-cunji-migrate"
 path = "src/bin/migrate.rs"
 
+[[bin]]
+name = "shanshui-cunji-export"
+path = "src/bin/export.rs"
+
+[[bin]]
+name = "shanshui-cunji-import"
+path = "src/bin/import.rs"
+
 [features]
 # 分配器策略：默认 mimalloc（轻量、高并发、边缘友好）；"alloc-jemalloc" 切 tikv-jemallocator（mallctl purge/stats）
 alloc-jemalloc = ["dep:tikv-jemallocator"]

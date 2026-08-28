@@ -660,8 +660,15 @@ impl RuntimePools {
    （轻量、边缘友好、无 unsafe 声明，不违反零 unsafe 承诺），feature `alloc-jemalloc`
    可选 tikv-jemallocator（mallctl purge + stats，Linux/musl 推荐）；
    测试 157 全绿（含 mimalloc 编译验证），check 六步链通过（P27）；
-10. **运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（分配器 stats + 命中率）+ `explain`（执行计划推演）；
-11. **数据管道（design 20）**：`shanshui-cunji-export`（Parquet/CSV 基础版，与迁移工具同期）+ `shanshui-cunji-import`（CSV/JSON 基础版）。
+10. ~~**运维管理（design 20）**：`admin processlist`（QueryRegistry + KILL QUERY）+ `admin status`（分配器 stats + 命中率）+ `explain`（执行计划推演）~~ ✅（2026-08-28）：
+    `src/admin.rs`（QueryRegistry 注册/注销/列表/KILL 标记，KILL 真正中断留阶段 2 CancellationToken）
+    + `admin::status`（分配器 / SST 文件数 / 倒排 / 内存水位，CLI `admin status` + HTTP `/admin/status`）
+    + `src/explain.rs`（复用 optimizer::route 只推演不读数据：访问路径/索引键/估算行数，CLI `explain` + HTTP `/explain`）；
+    测试 163 全绿（+6），CLI 冒烟验证；KILL 中断依赖看门狗超时 + 阶段 2；
+11. ~~**数据管道（design 20）**：`shanshui-cunji-export`（Parquet/CSV 基础版，与迁移工具同期）+ `shanshui-cunji-import`（CSV/JSON 基础版）~~ ✅（2026-08-28）：
+    `src/bin/export.rs`（CSV 两列 docid,json，RFC 4180 转义）与 `src/bin/import.rs`
+    （CSV/JSONL，复用 migrate 内核，`--id-field` 语义即 docid/id 列，自动分配避让冲突 P28）；
+    Parquet/增量/JDBC 留阶段 2+；测试 163 全绿，冒烟验证 import→status→explain→export 全链路；
 
 ### 7.3 阶段 2：分布式集群
 

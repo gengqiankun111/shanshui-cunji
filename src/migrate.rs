@@ -79,9 +79,13 @@ pub fn import_csv(engine: &mut Engine, path: &std::path::Path) -> Result<ImportR
                 }
             },
             None => {
-                obj.insert("docid".into(), serde_json::Value::from(next_id));
-                let d = next_id;
-                next_id += 1;
+                // 自动分配：避让已占用 docid
+                let mut d = next_id;
+                while engine.get(d)?.is_some() {
+                    d += 1;
+                }
+                next_id = d.wrapping_add(1);
+                obj.insert("docid".into(), serde_json::Value::from(d));
                 d
             }
         };
@@ -301,9 +305,13 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
             let docid = match docid {
                 Some(d) => d,
                 None => {
-                    obj.insert("docid".into(), serde_json::Value::from(next_id));
-                    let d = next_id;
-                    next_id += 1;
+                    // 自动分配：避让已占用 docid（SQL 显式 id 与递增可能冲突）
+                    let mut d = next_id;
+                    while engine.get(d)?.is_some() {
+                        d += 1;
+                    }
+                    next_id = d.wrapping_add(1);
+                    obj.insert("docid".into(), serde_json::Value::from(d));
                     d
                 }
             };
@@ -326,6 +334,80 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
                 Ok(()) => rows += 1,
                 Err(_) => failed += 1,
             }
+        }
+    }
+    engine.flush_inverted()?;
+    Ok(ImportReport::new(
+        rows,
+        failed,
+        t.elapsed().as_millis() as u64,
+    ))
+}
+
+/// JSONL 全量导入（数据管道 `import --json`，development 5.27）：每行一个 JSON 对象，
+/// 含 docid/id 列作主键（否则从 1 递增），导入完成输出迁移报告。
+pub fn import_json(engine: &mut Engine, path: &std::path::Path) -> Result<ImportReport> {
+    let t = Instant::now();
+    let text = std::fs::read_to_string(path)?;
+    let mut rows = 0u64;
+    let mut failed = 0u64;
+    let mut next_id = 1u64;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut obj: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(line) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                failed += 1;
+                continue;
+            }
+        };
+        // 主键：docid / id 列优先，否则递增
+        let pk = if obj.contains_key("docid") {
+            Some("docid")
+        } else if obj.contains_key("id") {
+            Some("id")
+        } else {
+            None
+        };
+        let docid = match pk.and_then(|k| obj.get(k)) {
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            Some(serde_json::Value::String(s)) => s.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        let docid = match docid {
+            Some(d) => d,
+            None => {
+                // 自动分配：避让已占用 docid（显式 docid 与递增可能冲突）
+                let mut d = next_id;
+                while engine.get(d)?.is_some() {
+                    d += 1;
+                }
+                next_id = d.wrapping_add(1);
+                obj.insert("docid".into(), serde_json::Value::from(d));
+                d
+            }
+        };
+        let bytes = match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+            Ok(b) => b,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(v) => crate::server::extract_terms(&v),
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        match engine.put(docid, bytes, &term_refs) {
+            Ok(()) => rows += 1,
+            Err(_) => failed += 1,
         }
     }
     engine.flush_inverted()?;
@@ -437,5 +519,29 @@ mod tests {
         assert_eq!(rep.rows, 3);
         assert_eq!(engine.search_term("name=a").unwrap().len(), 1);
         assert_eq!(engine.search_term("name=c").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_import_creates_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("in.jsonl");
+        std::fs::write(
+            &json_path,
+            "{\"docid\":1,\"status\":\"active\"}\n{\"status\":\"pending\"}\n{\"docid\":3,\"city\":\"bj\"}\n",
+        )
+        .unwrap();
+        let cfg = crate::config::Config::default();
+        let data_dir = dir.path().join("data");
+        let mut engine = Engine::open(&data_dir, &cfg).unwrap();
+        let rep = import_json(&mut engine, &json_path).unwrap();
+        assert_eq!(rep.rows, 3);
+        assert_eq!(rep.failed, 0);
+        // 第 2 行无 docid → 自动分配（递增）
+        assert_eq!(engine.search_term("status=active").unwrap().len(), 1);
+        assert_eq!(engine.search_term("status=pending").unwrap().len(), 1);
+        assert_eq!(engine.search_term("city=bj").unwrap().len(), 1);
+        // 自动分配的 docid 落在 1/3 之外（=2）
+        let val = engine.get(2).unwrap().expect("自动分配 docid=2");
+        assert!(String::from_utf8_lossy(&val).contains("pending"));
     }
 }
