@@ -21,6 +21,11 @@ roaring = "0.10"
 crc32fast = "1"
 fst = "0.4"
 memmap2 = "0.9"
+csv = "1"
+
+[[bin]]
+name = "shanshui-cunji-migrate"
+path = "src/bin/migrate.rs"
 
 [dev-dependencies]
 tempfile = "3"

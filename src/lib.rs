@@ -14,6 +14,7 @@ pub mod hotcache;
 pub mod inverted;
 pub mod keys;
 pub mod memtable;
+pub mod migrate;
 pub mod optimizer;
 pub mod schema;
 pub mod server;

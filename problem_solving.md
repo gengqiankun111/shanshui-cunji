@@ -151,6 +151,12 @@
 - **附加修复**：flush 后未即时把新字典插入内存 `dicts`（需重启才加载）→ `write_fst_dict` 返回 Map 并立即 `dicts.insert`，同实例即可 FST 加速。
 - **提交**：随 M4 FST 提交（本轮）
 
+### P24. 迁移工具：mysqldump 值解析与主键列语义
+- **现象**：SQL 解析测试失败——字符串值被识别为 `Other`；docid 用 `id` 列的导入 `get(10)` 返回 None。
+- **根因**：① 解析状态机剥离了引号后无法区分字符串值（`mk_sql_value` 检查 `starts_with('\'')` 失效）；② MySQL 主键惯例是 `id` 列而非 `docid`。
+- **修复**：① `parse_value_tuples` 增加 `str_val` 标志（引号打开时置位），值提交时按标志构建 `SqlValue::Str` 并统一 unescape（`\'`→`'`、`\\`→`\`）；② 主键列支持 `docid` 或 `id`（数字/字符串均可解析）；③ error.rs 增加 `Migrate` 变体承接 csv/serde_json 错误（核心模块不耦合 csv crate）。
+- **提交**：随 M4 迁移工具提交（本轮）
+
 ---
 
 ## 环境备忘（不入库）
