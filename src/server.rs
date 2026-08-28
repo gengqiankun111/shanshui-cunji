@@ -242,6 +242,8 @@ fn route_request(
         ("GET", "/count") => handle_count(engine, query),
         ("GET", "/groupby") => handle_group_by(engine, query),
         ("GET", "/join") => handle_join(engine, query),
+        ("GET", "/admin/status") => handle_admin_status(engine),
+        ("GET", "/explain") => handle_explain(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
         _ => (
@@ -271,6 +273,34 @@ fn handle_count(engine: &mut Engine, query: &str) -> (u16, String) {
             200,
             json!({"field": field, "value": value, "count": count}).to_string(),
         ),
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// 引擎状态（design 20）：`GET /admin/status` → StatusReport JSON。
+fn handle_admin_status(engine: &mut Engine) -> (u16, String) {
+    let rep = crate::admin::status(engine);
+    match serde_json::to_string(&rep) {
+        Ok(s) => (200, s),
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// 执行计划推演（development 5.26）：`GET /explain?filter=status%3Dactive` → ExplainPlan JSON。
+fn handle_explain(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let Some(filter) = params
+        .iter()
+        .find(|(k, _)| k == "filter")
+        .map(|(_, v)| v.clone())
+    else {
+        return (400, json!({"error": "缺少 filter 参数"}).to_string());
+    };
+    match crate::explain::explain(engine, &filter) {
+        Ok(plan) => match serde_json::to_string(&plan) {
+            Ok(s) => (200, s),
+            Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+        },
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }

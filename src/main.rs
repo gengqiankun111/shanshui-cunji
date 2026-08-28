@@ -127,6 +127,8 @@ fn main() {
         "range" => run_cli_range(&config_path, start, end),
         "count" => run_cli_count(&config_path, &field, &value),
         "groupby" => run_cli_group_by(&config_path, &field),
+        "admin" => run_cli_admin(&config_path),
+        "explain" => run_cli_explain(&config_path, &filter),
         "delete" => run_cli_delete(&config_path, id),
         "version" | "-V" | "--version" => {
             println!("shanshui-cunji {VERSION}");
@@ -552,6 +554,45 @@ fn run_cli_range(config_path: &Path, start: Option<u64>, end: Option<u64>) {
         }
         Err(e) => {
             eprintln!("❌ 查询失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `admin status`（design 20）：引擎状态指标（分配器 / LSM / 倒排 / 内存水位）。
+fn run_cli_admin(config_path: &Path) {
+    let engine = open_engine(config_path);
+    let rep = shanshui_cunji::admin::status(&engine);
+    println!("shanshui-cunji 状态：");
+    println!("  分配器: {}", rep.allocator);
+    println!("  SST 文件数: {}", rep.sst_file_count);
+    println!("  倒排内存 posting: {}", rep.inverted_mem_docids);
+    println!("  倒排段数: {}", rep.inverted_segments);
+    println!("  内存水位: {:.0}%", rep.mem_ratio * 100.0);
+    println!("  内存上限: {} MB", rep.max_memory_mb);
+}
+
+/// `explain --filter 'status=active'`（development 5.26）：执行计划推演，不读数据。
+fn run_cli_explain(config_path: &Path, filter: &str) {
+    if filter.is_empty() {
+        eprintln!("❌ explain 需要 --filter 'field=value'");
+        std::process::exit(1);
+    }
+    let mut engine = open_engine(config_path);
+    match shanshui_cunji::explain::explain(&mut engine, filter) {
+        Ok(plan) => {
+            println!("访问路径: {}", plan.access);
+            println!("索引键: {}", plan.key);
+            match plan.estimated_rows {
+                Some(n) => println!("估算行数: {n}"),
+                None => println!("估算行数: 未知"),
+            }
+            if let Some(w) = plan.warning {
+                println!("告警: {w}");
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ 推演失败: {e}");
             std::process::exit(1);
         }
     }

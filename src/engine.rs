@@ -35,10 +35,29 @@ pub struct Engine {
     watchdog: Watchdog,
     /// 内存使用率估算（0~1，由上层注入或监控更新）。
     mem_ratio: f64,
+    /// 内存硬上限（MB，`memory.max_memory_mb`，供 admin status）。
+    max_memory_mb: usize,
 }
 
 /// 查询结果行：docid + 文档字节。
 pub type QueryRow = (u64, Vec<u8>);
+
+/// 引擎状态指标（`admin status` 数据源）。
+#[derive(Debug, Clone)]
+pub struct EngineStats {
+    /// LSM：SST 文件总数（primary + cidx + delta）。
+    pub sst_file_count: usize,
+    /// 倒排内存累积 posting 数。
+    pub inverted_mem_docids: u64,
+    /// 倒排磁盘段数。
+    pub inverted_segments: usize,
+    /// 当前序列号（阶段 2 接入）。
+    pub seq: u64,
+    /// 内存使用率估算（0~1）。
+    pub mem_ratio: f64,
+    /// 内存硬上限（MB）。
+    pub max_memory_mb: usize,
+}
 
 impl Engine {
     /// 打开（或创建）引擎。倒排刷盘阈值取自内存预算的比例（MVP 固定 1M posting）。
@@ -70,6 +89,7 @@ impl Engine {
             hotcache,
             watchdog,
             mem_ratio: 0.0,
+            max_memory_mb: cfg.hotcache.max_memory_mb + cfg.blockcache.max_memory_mb,
         })
     }
 
@@ -276,6 +296,20 @@ impl Engine {
     /// 按字段前缀分组（GROUP BY 聚合）：返回 `field=value` 各分组的文档数。
     pub fn inverted_group_by(&self, field: &str) -> Result<Vec<(String, u64)>> {
         self.inverted.group_by(field)
+    }
+
+    /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
+    pub fn stats(&self) -> EngineStats {
+        EngineStats {
+            sst_file_count: self.primary.sst_count()
+                + self.delta.sst_count()
+                + self.cidx.as_ref().map_or(0, |c| c.sst_count()),
+            inverted_mem_docids: self.inverted.mem_docids(),
+            inverted_segments: self.inverted.segment_count(),
+            seq: 0, // 阶段 2 接入执行器统计
+            mem_ratio: self.mem_ratio,
+            max_memory_mb: self.max_memory_mb,
+        }
     }
 
     /// 备份前一致性准备（development 5.11 冷备份第 1-2 步）：
