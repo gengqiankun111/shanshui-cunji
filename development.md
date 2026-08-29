@@ -1040,6 +1040,26 @@ impl RuntimePools {
 4. **观察（非本项）**：大结果集查询（数百万行）server 端全量 JSON 构造仍会内存爆炸
    （`word=tag42` 命中全部 5M 行 → 10GB+）——API 无 limit/分页，后续加 `limit`/游标分页。
 
+### 7.16 M8-P8 大结果集查询分页（limit/offset/total，防全量回表内存爆炸）
+
+> 背景（7.15 观察）：倒排命中数百万行时（`word=rec` 命中 5M）server 端全量回表 +
+> 全量 JSON 构造内存爆炸（实测 10GB+ 卡死）。方案：倒排路径分页——RoaringBitmap 迭代
+> docid 天然升序，skip(offset) 后只回表 limit 行，内存 O(limit) 不随 total 膨胀。
+
+1. ~~**demo 研究（src/demo/pagination/，gitignore 不提交）**~~ ✅：验证分页语义与边界——
+   分页拼接 == 全量（有序稳定）、limit=0 / offset>total / 末尾不足页 / 只回表当前页；
+   4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `Engine::search_term_paged / fulltext_search_paged / scan_range_paged` → `PagedRows{total, rows}`
+     （total = bitmap.len() O(1)；scan 分页仅截断 JSON 构造，扫描本身仍全量，后续流式化）；
+   - `server::execute_filter_paged`（单条件 / 多条件 AND / docid 点查统一分页）；
+   - HTTP `/search` `/fulltext` `/range` 支持 `limit`/`offset`（limit 缺省/≤0 = 不限制，
+     兼容非分页调用）；响应 `total` = **全量命中数**（≠ 当前页行数，供客户端算总页数）。
+3. ~~**验证**~~ ✅：5M 库 `word=rec&limit=10`（命中 5M）1.1s 返回 total=5,000,000，
+   翻到 offset=4999990 页 316ms 首条 docid=4999990；`search status=active&limit=5`
+   total=1,666,667（精确）；**server WS 221MB**（修复前 10GB+ 卡死）；
+   测试 307 全绿（+3：engine 分页语义与边界 / execute_filter_paged / parse_paging）。
+
 ---
 
 ## 8. 编码规范

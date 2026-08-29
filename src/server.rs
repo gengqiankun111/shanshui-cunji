@@ -552,14 +552,16 @@ fn handle_search(engine: &mut Engine, query: &str) -> (u16, String) {
     else {
         return (400, json!({"error": "缺少 filter 参数"}).to_string());
     };
-    match execute_filter(engine, &filter) {
-        Ok(rows) => (200, rows_payload(&rows).to_string()),
+    let (limit, offset) = parse_paging(query);
+    match execute_filter_paged(engine, &filter, limit, offset) {
+        Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
 
 /// fulltext 分词检索（M8-P7）：`GET /fulltext?field=big_text_a&word=rec` →
 /// 命中该字段分词 term `ft:{field}:{word}` 的文档列表（posting 合并 → 回表）。
+/// M8-P8：支持 `limit`/`offset` 分页（大结果集防内存爆炸），`total` = 全量命中数。
 fn handle_fulltext(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);
     let field = params
@@ -573,8 +575,9 @@ fn handle_fulltext(engine: &mut Engine, query: &str) -> (u16, String) {
     let (Some(field), Some(word)) = (field, word) else {
         return (400, json!({"error": "缺少 field/word 参数"}).to_string());
     };
-    match engine.fulltext_search(&field, &word) {
-        Ok(rows) => (200, rows_payload(&rows).to_string()),
+    let (limit, offset) = parse_paging(query);
+    match engine.fulltext_search_paged(&field, &word, limit, offset) {
+        Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
@@ -589,8 +592,9 @@ fn handle_range(engine: &mut Engine, query: &str) -> (u16, String) {
         .iter()
         .find(|(k, _)| k == "end")
         .and_then(|(_, v)| v.parse::<u64>().ok());
-    match engine.scan_range(start, end) {
-        Ok(rows) => (200, rows_payload(&rows).to_string()),
+    let (limit, offset) = parse_paging(query);
+    match engine.scan_range_paged(start, end, limit, offset) {
+        Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
@@ -626,51 +630,97 @@ fn value_row(docid: u64, raw: &[u8]) -> Value {
 
 /// 将查询结果组装为 `{"total":N,"rows":[...]}`。
 fn rows_payload(rows: &[(u64, Vec<u8>)]) -> Value {
+    rows_payload_total(rows.len() as u64, rows)
+}
+
+/// 分页响应（M8-P8）：`total` = 全量命中数（≠ 当前页行数，供客户端计算总页数）。
+fn rows_payload_total(total: u64, rows: &[(u64, Vec<u8>)]) -> Value {
     let items: Vec<Value> = rows.iter().map(|(d, v)| value_row(*d, v)).collect();
-    json!({"total": items.len(), "rows": items})
+    json!({"total": total, "rows": items})
 }
 
 // ---------------------------------------------------------------------------
 // 查询执行（CLI 与 HTTP 共用内核路径）
 // ---------------------------------------------------------------------------
 
+/// 解析分页参数：`limit`（>0 生效，缺省/≤0 = 不限制）、`offset`（默认 0）。
+fn parse_paging(query: &str) -> (Option<u64>, u64) {
+    let params = parse_query(query);
+    let limit = params
+        .iter()
+        .find(|(k, _)| k == "limit")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .filter(|l| *l > 0);
+    let offset = params
+        .iter()
+        .find(|(k, _)| k == "offset")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    (limit, offset)
+}
+
 /// 按 filter 执行查询：
 /// - `docid=N` → 主键点查；
 /// - 单条件 → 倒排词条查询（term 编码 `field=value`，与 extract_terms 一致）；
 /// - 多条件（AND）→ 各词条位图交集后回表。
 pub fn execute_filter(engine: &mut Engine, filter: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+    Ok(execute_filter_paged(engine, filter, None, 0)?.rows)
+}
+
+/// 按 filter 分页执行（M8-P8）：倒排命中数很大时只回表当前页（`limit`/`offset`），
+/// `total` = 全量命中数——防大结果集全量回表 + JSON 构造内存爆炸。
+pub fn execute_filter_paged(
+    engine: &mut Engine,
+    filter: &str,
+    limit: Option<u64>,
+    offset: u64,
+) -> Result<crate::engine::PagedRows> {
     let conds = parse_filter(filter);
     if conds.is_empty() {
-        return engine.scan_range(None, None);
+        return engine.scan_range_paged(None, None, limit, offset);
     }
     // 主键条件优先
     if let Some((_, v)) = conds.iter().find(|(f, _)| f == "docid") {
         let docid: u64 = v
             .parse()
             .map_err(|_| Error::Unsupported(format!("docid 非法: {v}")))?;
-        return Ok(engine
+        let rows = engine
             .get(docid)?
             .map(|val| (docid, val))
             .into_iter()
-            .collect());
+            .collect::<Vec<_>>();
+        return Ok(crate::engine::PagedRows {
+            total: rows.len() as u64,
+            rows,
+        });
     }
     // field=value 编码成倒排 term
     let terms: Vec<String> = conds.iter().map(|(f, v)| format!("{f}={v}")).collect();
     if terms.len() == 1 {
-        return engine.search_term(&terms[0]);
+        return engine.search_term_paged(&terms[0], limit, offset);
     }
-    // 多条件 AND：位图交集（RoaringBitmap）→ 回表
+    // 多条件 AND：位图交集（RoaringBitmap）→ 分页回表
     let mut bitmap = engine.inverted_posting(&terms[0])?;
     for t in &terms[1..] {
         bitmap &= engine.inverted_posting(t)?;
     }
-    let mut out = Vec::new();
+    let total = bitmap.len() as u64;
+    let mut rows = Vec::new();
+    let cap = limit.unwrap_or(u64::MAX);
+    let mut skipped = 0u64;
     for docid in bitmap {
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        if rows.len() as u64 >= cap {
+            break;
+        }
         if let Some(val) = engine.get(docid as u64)? {
-            out.push((docid as u64, val));
+            rows.push((docid as u64, val));
         }
     }
-    Ok(out)
+    Ok(crate::engine::PagedRows { total, rows })
 }
 
 /// COUNT(field=value)：读倒排 term 的 doc_count 直接返回（<0.1ms，development 5.17）。
@@ -881,6 +931,46 @@ mod tests {
         assert!(terms.iter().any(|t| t.starts_with("ft:big_text:")));
         // 非 fulltext 字段受白名单过滤：big_text 整串 / 其他字段整串被剔除
         assert!(!terms.iter().any(|t| t.starts_with("big_text=")));
+    }
+
+    // ---------- 分页查询（M8-P8） ----------
+
+    #[test]
+    fn execute_filter_paged_returns_total_and_limit() {
+        let dir = tmp();
+        let mut e = crate::engine::Engine::open(&dir, &cfg()).unwrap();
+        for i in 0..100u64 {
+            let status = ["active", "inactive", "pending"][(i % 3) as usize];
+            let val = serde_json::json!({"docid": i, "status": status});
+            let terms = extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(i, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+        // 单条件分页：total = 全量命中，rows = 当前页
+        let p = execute_filter_paged(&mut e, "status=active", Some(10), 0).unwrap();
+        assert_eq!(p.total, 34);
+        assert_eq!(p.rows.len(), 10);
+        let last = execute_filter_paged(&mut e, "status=active", Some(10), 30).unwrap();
+        assert_eq!(last.rows.len(), 4, "尾页不足一页");
+        // 多条件 AND 分页
+        let and = execute_filter_paged(&mut e, "status=active AND status=active", Some(5), 0).unwrap();
+        assert_eq!(and.total, 34);
+        assert_eq!(and.rows.len(), 5);
+        // docid 点查不受分页影响
+        let point = execute_filter_paged(&mut e, "docid=7", Some(1), 0).unwrap();
+        assert_eq!(point.total, 1);
+        assert_eq!(point.rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_paging_query_params() {
+        assert_eq!(parse_paging(""), (None, 0));
+        assert_eq!(parse_paging("limit=10"), (Some(10), 0));
+        assert_eq!(parse_paging("limit=0"), (None, 0), "limit=0 视为不限制");
+        assert_eq!(parse_paging("limit=10&offset=20"), (Some(10), 20));
+        assert_eq!(parse_paging("offset=5"), (None, 5));
+        assert_eq!(parse_paging("limit=abc&offset=xyz"), (None, 0), "非法参数忽略");
     }
 
     #[test]

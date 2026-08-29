@@ -65,6 +65,15 @@ pub struct Engine {
 /// 查询结果行：docid + 文档字节。
 pub type QueryRow = (u64, Vec<u8>);
 
+/// 分页查询结果（M8-P8）：`total` = 全量命中数（倒排 bitmap.len()，O(1)），
+/// `rows` = 当前页（只回表 limit 行，内存 O(limit) 不随 total 膨胀——
+/// 大结果集命中数百万行时全量回表 + JSON 构造会内存爆炸，实测 5M 行 → 10GB+ 卡死）。
+#[derive(Debug, Clone)]
+pub struct PagedRows {
+    pub total: u64,
+    pub rows: Vec<QueryRow>,
+}
+
 /// 增量备份文件（design 20，M6-5）：seq 游标 + WAL 记录集（JSON 持久化）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct IncrementalBackupFile {
@@ -481,25 +490,76 @@ impl Engine {
 
     /// 倒排词条查询：合并 posting（RoaringBitmap）→ 回表取文档。
     pub fn search_term(&mut self, term: &str) -> Result<Vec<QueryRow>> {
+        Ok(self.search_term_paged(term, None, 0)?.rows)
+    }
+
+    /// 倒排词条分页查询（M8-P8）：bitmap 迭代 docid 天然升序，skip(offset) 后只回表 limit 行。
+    /// `total` = 全量命中数（bitmap.len() O(1)）；limit=None 取全部（兼容非分页调用）。
+    pub fn search_term_paged(
+        &mut self,
+        term: &str,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<PagedRows> {
         let bitmap = self.inverted.search(term)?;
-        let mut out = Vec::new();
+        let total = bitmap.len() as u64;
+        let mut rows = Vec::new();
+        let cap = limit.unwrap_or(u64::MAX);
+        let mut skipped = 0u64;
         for docid in bitmap {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if rows.len() as u64 >= cap {
+                break;
+            }
             if let Some(v) = self.get(docid as u64)? {
-                out.push((docid as u64, v));
+                rows.push((docid as u64, v));
             }
         }
-        Ok(out)
+        Ok(PagedRows { total, rows })
     }
 
     /// fulltext 分词检索（M8-P7）：按字段 + 关键词构造词 term `ft:{field}:{word}` 查询
     /// （词 term 由 fulltext_fields 声明字段分词生成）。命中 posting 合并 → 回表取文档。
     pub fn fulltext_search(&mut self, field: &str, word: &str) -> Result<Vec<QueryRow>> {
-        self.search_term(&format!("ft:{field}:{word}"))
+        self.fulltext_search_paged(field, word, None, 0).map(|p| p.rows)
+    }
+
+    /// fulltext 分词检索分页（M8-P8）：同 `search_term_paged` 语义（构造 `ft:{field}:{word}`）。
+    pub fn fulltext_search_paged(
+        &mut self,
+        field: &str,
+        word: &str,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<PagedRows> {
+        self.search_term_paged(&format!("ft:{field}:{word}"), limit, offset)
     }
 
     /// fulltext 分词字段集合（M8-P7）：供 term 提取层判断字段是否走分词索引。
     pub fn fulltext_fields(&self) -> &std::collections::HashSet<String> {
         &self.fulltext_fields
+    }
+
+    /// 主键范围扫描分页（M8-P8）：顺序扫描后截断当前页——JSON 构造 O(limit)；
+    /// 注意扫描本身仍全量收集（顺序读路径，大范围仍吃内存，后续可流式化）。
+    pub fn scan_range_paged(
+        &mut self,
+        start: Option<u64>,
+        end: Option<u64>,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<PagedRows> {
+        let all = self.primary.scan_range(start, end)?;
+        let total = all.len() as u64;
+        let rows: Vec<QueryRow> = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit.unwrap_or(u64::MAX) as usize)
+            .collect();
+        Ok(PagedRows { total, rows })
     }
 
     /// 主键范围扫描。
@@ -764,6 +824,72 @@ mod tests {
         let hits = e2.fulltext_search("big_text", "00000042").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 42);
+    }
+
+    // ---------- 分页查询（M8-P8） ----------
+
+    #[test]
+    fn paged_queries_semantics_and_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["big_text".into()];
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        // 100 docs：status 三态（active 34，docid 等差 3），big_text 每行唯一 token
+        for i in 0..100u64 {
+            let status = ["active", "inactive", "pending"][(i % 3) as usize];
+            let val = serde_json::json!({
+                "docid": i,
+                "status": status,
+                "big_text": format!("rec-{i:08}-msg-{i}"),
+            });
+            let ft = e.fulltext_fields().clone();
+            let terms = crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(i, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+
+        // 全量 total + 行数
+        let all = e.search_term_paged("status=active", None, 0).unwrap();
+        assert_eq!(all.total, 34);
+        assert_eq!(all.rows.len(), 34);
+        // 分页：total 恒为全量命中数，rows 只含当前页，docid 升序接续
+        let p1 = e.search_term_paged("status=active", Some(10), 0).unwrap();
+        let p2 = e.search_term_paged("status=active", Some(10), 10).unwrap();
+        assert_eq!(p1.total, 34);
+        assert_eq!(p1.rows.len(), 10);
+        assert_eq!(p2.rows.len(), 10);
+        assert_eq!(p2.rows[0].0, p1.rows[9].0 + 3, "active docid 等差 3 接续");
+        // 拼接 == 全量（有序稳定）
+        let mut merged = p1.rows.clone();
+        merged.extend(p2.rows);
+        for off in [20u64, 30] {
+            let p = e.search_term_paged("status=active", Some(10), off).unwrap();
+            merged.extend(p.rows);
+        }
+        assert_eq!(merged.len(), 34);
+        for (a, b) in merged.iter().zip(all.rows.iter()) {
+            assert_eq!(a.0, b.0, "分页拼接必须与全量一致");
+        }
+        // 边界：limit=0 → 空页 total 不变；offset > total → 空页；limit > total → 全部
+        let z = e.search_term_paged("status=active", Some(0), 0).unwrap();
+        assert_eq!(z.total, 34);
+        assert!(z.rows.is_empty());
+        let o = e.search_term_paged("status=active", Some(5), 100).unwrap();
+        assert!(o.rows.is_empty());
+        let big = e.search_term_paged("status=active", Some(10_000), 0).unwrap();
+        assert_eq!(big.rows.len(), 34);
+
+        // fulltext 分页同语义
+        let ft = e.fulltext_search_paged("big_text", "rec", Some(10), 90).unwrap();
+        assert_eq!(ft.total, 100);
+        assert_eq!(ft.rows.len(), 10);
+        assert_eq!(ft.rows[0].0, 90);
+        // scan 分页
+        let sc = e.scan_range_paged(Some(10), Some(50), Some(5), 0).unwrap();
+        assert_eq!(sc.total, 41);
+        assert_eq!(sc.rows.len(), 5);
+        assert_eq!(sc.rows[0].0, 10);
     }
 
     #[test]

@@ -54,18 +54,6 @@ pub fn save_checkpoint(path: &std::path::Path, last_docid: u64) -> Result<()> {
     Ok(())
 }
 
-/// 倒排字段白名单过滤（import-schema，design 20）：term 形如 `field=value`，
-/// 白名单存在时只保留声明字段的词条；None 不过滤。
-fn filter_terms(terms: Vec<String>, whitelist: Option<&[String]>) -> Vec<String> {
-    match whitelist {
-        None => terms,
-        Some(wl) => terms
-            .into_iter()
-            .filter(|t| wl.iter().any(|f| t.starts_with(&format!("{f}="))))
-            .collect(),
-    }
-}
-
 /// CSV 全量导入：首行表头即 JSON 字段名；`docid` 列存在则用之，否则从 1 递增。
 pub fn import_csv(engine: &mut Engine, path: &std::path::Path) -> Result<ImportReport> {
     import_csv_filtered(engine, path, None)
