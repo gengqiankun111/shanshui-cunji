@@ -44,6 +44,7 @@ pub mod reshard;
 pub mod rpc;
 pub mod schema;
 pub mod sdk_cache;
+pub mod seqlock;
 pub mod server;
 pub mod sharding;
 pub mod sstable;
