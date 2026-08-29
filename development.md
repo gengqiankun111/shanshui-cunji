@@ -1649,6 +1649,12 @@ impl RuntimePools {
    `src/config/model.rs` `inverted_fields` 注释引用 9.4；design_extension 9.5 回填实测；
    feature.md C 模块 + 近期里程碑更新。
 
+> **附：倒排 posting 流式输出评估**（demo `src/demo/posting-stream/`，3 测试）：
+> Roaring 位图迭代**天然惰性**（O(1) 内存）+ `search_term_paged` 回表限行 → 大结果集内存已流式；
+> 深页分页为 **O(offset)**（16M offset 591ms vs 近页 36µs，16,204×）；游标续扫（range 区间迭代，
+> 仿 M8-P11 scan_after）每页 **O(limit)**，10 万条流式 37×。**结论：不引入全量流端点**；
+> 若未来「深页 + 高频翻页」场景出现，为 term 检索加 `search_after` 游标参数即可（O(limit)/页）。
+
 ---
 
 ## 8. 编码规范

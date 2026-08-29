@@ -40,7 +40,7 @@
 | 中文 bigram 分词（中英混合文本检索） | ✅ | M8-P9 `72badfe` |
 | **jieba 完整中文词典分词**（`cjk_segmenter`，语义词精确命中） | ✅ | M8-P13（`cjk-jieba` feature + `tokenize_seg`） |
 | 倒排字段策略落地（Ex-4：9.4 模板重建 db-50m，inverted 2231.8→144.3MB -93.5%） | ✅ | `db-50m-opt`（配置模板 `config.import-example.toml`） |
-| 倒排 posting 流式输出（大结果集已由分页解决） | ⏳ | 评估中 |
+| 倒排 posting 流式输出（大结果集已由分页解决） | ✅ 评估完成 | demo `src/demo/posting-stream`：位图惰性迭代 + 分页内存 O(limit) 已流式；深页 O(offset)（16M offset 591ms vs 近页 36µs，16,204×）；游标续扫 O(limit)/页（10 万条 37×）；**不引入全量流端点**，深页高频翻页如需再加 search_after 游标 |
 
 ## D. 查询执行 / 缓存 / MVCC
 
@@ -180,4 +180,4 @@
 
 ## 下一候选
 
-- 倒排 posting 流式输出（大结果集已由分页解决，仍可评估）；类 SQL 解析 / 写入 Enrich / 读写分离（⏸）
+- 类 SQL 解析 / 写入 Enrich / 读写分离（⏸）
