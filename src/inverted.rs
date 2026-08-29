@@ -70,10 +70,25 @@ pub struct InvertedIndex {
     gc_threshold_bytes: u64,
     /// 位图索引字段白名单（design 5.2.4，M7-2）：空 = 关闭（默认零开销）。
     bitmap_fields: std::collections::HashSet<String>,
-    /// 内存位图索引：field → (value → docid RoaringBitmap)，写入时同步维护、重启重建。
-    bitmaps: std::sync::Mutex<
+    /// 内存位图索引（Ex-5.2 分片）：field → (value → docid RoaringBitmap)，按 field hash 分
+    /// `BITMAP_SHARDS` 片锁——不同 field 并行、同 field 串行（group_by 需同 field 全量一致）。
+    /// 写入时同步维护、重启重建。
+    bitmaps: Vec<std::sync::Mutex<
         std::collections::HashMap<String, std::collections::HashMap<String, RoaringBitmap>>,
-    >,
+    >>,
+}
+
+/// 位图索引分片锁数（Ex-5.2，design 4.8.3 P0-4）。
+const BITMAP_SHARDS: usize = 256;
+
+/// FNV-1a 字段分片：field → 分片下标（确定性，同 field 恒同片）。
+fn bitmap_shard(field: &str) -> usize {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in field.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h % BITMAP_SHARDS as u64) as usize
 }
 
 impl InvertedIndex {
@@ -134,7 +149,10 @@ impl InvertedIndex {
         Ok(Self {
             dir: dir.to_path_buf(),
             engine: engine.to_string(),
-            mem: DashMap::new(),
+            // Ex-5.2（design 4.8.3）：Term 字典分 256 shard 锁分区——低基数 Term 高并发时
+            // 4 shard 下大量碰撞串行，256 shard 分散（demo 实测 1.39× 加速）；
+            // dashmap 要求 shard 数为 2 的幂（256 = 2^8）。
+            mem: DashMap::with_capacity_and_shard_amount(0, 256),
             mem_docids: AtomicU64::new(0),
             segments,
             dicts,
@@ -142,7 +160,9 @@ impl InvertedIndex {
             flush_threshold,
             gc_threshold_bytes,
             bitmap_fields: std::collections::HashSet::new(),
-            bitmaps: std::sync::Mutex::new(std::collections::HashMap::new()),
+            bitmaps: (0..BITMAP_SHARDS)
+                .map(|_| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .collect(),
         })
     }
 
@@ -153,38 +173,38 @@ impl InvertedIndex {
         if self.bitmap_fields.is_empty() {
             return Ok(());
         }
-        // 全量重建：遍历内存 + 各段 posting，命中白名单字段的 term 建内存位图
-        let mut index: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, RoaringBitmap>,
-        > = std::collections::HashMap::new();
+        // 全量重建：清空全部分片，遍历内存 + 各段 posting，命中白名单字段的 term 建内存位图
+        for m in &self.bitmaps {
+            m.lock().unwrap().clear();
+        }
         for (term, posting) in self.iter_terms()? {
             let Some((field, value)) = term.split_once('=') else {
                 continue;
             };
             if self.bitmap_fields.contains(field) {
-                index
+                self.bitmaps[bitmap_shard(field)]
+                    .lock()
+                    .unwrap()
                     .entry(field.to_string())
                     .or_default()
                     .insert(value.to_string(), posting);
             }
         }
-        *self.bitmaps.lock().unwrap() = index;
         Ok(())
     }
 
     /// 内存位图 COUNT（design 5.2.4，M7-2）：field=value 命中白名单 → 亚毫秒计数；否则 None。
     pub fn bitmap_count(&self, field: &str, value: &str) -> Option<u64> {
-        let bm = self.bitmaps.lock().unwrap();
+        let bm = self.bitmaps[bitmap_shard(field)].lock().unwrap();
         bm.get(field)?.get(value).map(|b| b.len())
     }
 
     /// 内存位图 AND（M7-2）：全部 term 命中白名单字段 → 交集位图（组合筛选快速路径）；否则 None。
     pub fn bitmap_and(&self, terms: &[&str]) -> Option<RoaringBitmap> {
-        let bm = self.bitmaps.lock().unwrap();
         let mut acc: Option<RoaringBitmap> = None;
         for t in terms {
             let (field, value) = t.split_once('=')?;
+            let bm = self.bitmaps[bitmap_shard(field)].lock().unwrap();
             let bitmap = bm.get(field)?.get(value)?;
             acc = Some(match acc {
                 Some(a) => a & bitmap.clone(),
@@ -196,7 +216,7 @@ impl InvertedIndex {
 
     /// 内存位图 GROUP BY（M7-2）：字段命中白名单 → 各值计数（按值字典序）；否则 None。
     pub fn bitmap_group_by(&self, field: &str) -> Option<Vec<(String, u64)>> {
-        let bm = self.bitmaps.lock().unwrap();
+        let bm = self.bitmaps[bitmap_shard(field)].lock().unwrap();
         let values = bm.get(field)?;
         let mut out: Vec<(String, u64)> =
             values.iter().map(|(v, b)| (v.clone(), b.len())).collect();
@@ -211,7 +231,7 @@ impl InvertedIndex {
         if !self.bitmap_fields.is_empty() {
             if let Some((field, value)) = term.split_once('=') {
                 if self.bitmap_fields.contains(field) {
-                    self.bitmaps
+                    self.bitmaps[bitmap_shard(field)]
                         .lock()
                         .unwrap()
                         .entry(field.to_string())
