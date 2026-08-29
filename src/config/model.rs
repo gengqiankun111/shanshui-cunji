@@ -434,7 +434,9 @@ impl Default for BlockCacheConfig {
     fn default() -> Self {
         Self {
             max_memory_mb: 2048,
-            block_size_kb: 16,
+            // Ex-5.1（design 4.8）：SSD 原生 4KB 块（对齐 SSD 页），点查读放大 16×→4×。
+            // 压缩率略降（小块 zstd 窗口小，重复数据下压缩后体积 +~30%），SSD 空间便宜可接受。
+            block_size_kb: 4,
             eviction_high_water: DEFAULT_EVICTION_HIGH_WATER,
         }
     }
@@ -489,7 +491,9 @@ impl Default for SstableConfig {
             compression: "zstd".into(),
             compression_level: 3,
             bloom_fpr: 0.01,
-            index_granularity: 16,
+            // Ex-5.1：与 4KB 块联动（块数 ×4），64 粒度保持 L1 摘要内存与 16KB 块×16 相当
+            // （demo 实测 4KB+g64 vs 16KB+g16 摘要数比例 0.99）。
+            index_granularity: 64,
         }
     }
 }
