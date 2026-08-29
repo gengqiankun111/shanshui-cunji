@@ -8,23 +8,22 @@
 
 ---
 
-## 📦 最新发布：v0.4.0（2026-08-28）
+## 📦 最新发布：v0.5.0（2026-08-29）
 
-> 核心亮点：**环形 WAL（高性能写入模式）** + **Leveled-Compaction 分层压实** + **MVCC 快照读** + **热点 key 自动缓存** + **增量备份**。
+> 核心亮点：**MVCC 全局 seq 一致性** + **位图索引增强** + **YCSB 压测定位瓶颈** + **前沿调研**。
 
 | 维度 | 数据 |
 | --- | --- |
-| 批量插入 | 38.6 万条/s（1000万 回归快检，10/10）|
-| 历史版本 | `get_at(docid, snapshot_seq)` 快照读 |
-| 增量备份 | seq 游标断点续传 + 缺口检测 |
-| 质量 | 279 测试全绿、demo 10/10、unsafe=0 |
+| 纯读（冷缓存）| 18 万 ops/s（P50≈5µs，100 万 SST 分层不掉速）|
+| 纯读（热缓存）| 87 万 ops/s（P50 0.9µs）|
+| 写重瓶颈 | fsync 单条串行（55×）→ Group Commit 列入下里程碑 |
+| 质量 | 285 测试全绿、demo 10/10、unsafe=0 |
 
-- **环形 WAL（design 4.3）**：预分配环形文件 + 写指针循环，覆盖安全 + 崩溃安全；`[storage] wal_mode="ring"` 可选开启；
-- **Leveled-Compaction（design 4.5 二期）**：SST 分层（Manifest 层号，旧库兼容），L0→L1 / L1→L2 有界压实；
-- **MVCC 快照读（design 4.7）**：`begin_snapshot()` + `get_at(docid, snap)` 读历史版本（删除前快照仍可见）；
-- **热点 key 自动缓存（design 14.1.2）**：访问计数达 `hotcache.hot_threshold` 自动晋升保护区，淘汰避让；
-- **增量备份（design 20）**：`backup_incremental(since_seq)` 导出 WAL 增量 + `restore_incremental` 恢复；
-- 完整发布说明见 [RELEASE-v0.4.0.md](./RELEASE-v0.4.0.md)，性能快检存档见 `images/perf-0.4.0/`。
+- **MVCC 全局 seq 一致性（design 4.7）**：primary/delta 共享全局 seq，`get_at` Delta 增量按全局 seq 过滤——跨列族快照隔离正确化（快照后字段级热更不可见）；
+- **位图索引增强（design 5.2.4/7.2）**：`[inverted] bitmap_fields` 枚举字段白名单 → 内存 RoaringBitmap 常驻，COUNT/GROUP/AND 亚毫秒快速路径（默认关闭零开销）；
+- **YCSB 压测（design 22.2）**：新增 `shanshui-cunji-ycsb` 工具，实证写路径头号瓶颈 = fsync 单条串行（A 写重 2,077 vs 无 fsync 113,587 ops/s）；
+- **前沿调研（design 22）**：BVLSM / RusKey / DobLIX / TieredKV / AuraDB → 近期组提交、中期大 value KV 分离、长期 RL+学习索引；
+- 完整发布说明见 [RELEASE-v0.5.0.md](./RELEASE-v0.5.0.md)，性能快检存档见 `images/perf-0.5.0/`，前沿调研见 `frontier-research-2026-08.md`。
 
 ---
 

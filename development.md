@@ -851,6 +851,32 @@ impl RuntimePools {
 6. **收尾**：✅ 性能回归快检（2026-08-28，1000万 10/10，插入 38.6 万条/s 无回归，`images/perf-0.4.0/`）；
    M6 全部 5 项功能完成、测试 279 全绿；打 v0.4.0 标签待确认（版本号 + RELEASE 说明 + 分支同步）。
 
+### 7.6 M7 深度优化二阶段（design 4.7/5.2.4/22）
+
+1. ~~**MVCC 全局 seq 一致性（design 4.7 完善）**~~ ✅（2026-08-28）：`Engine` 增加**全局 seq 分配器**
+   （`Arc<AtomicU64>`，primary / delta 列族共享）——`ColumnFamily::set_external_seq` 接入后所有写入
+   （put / delete / patch / delta 清理）从全局计数分配 seq（`WalWriter/RingWal::append_at` 指定 seq，
+   内部 next_seq 同步推进保持单调）；`get_at` 的 **Delta 增量按全局 seq 过滤**（快照后的字段级热更
+   不可见，null 删除 / Tombstone 均按快照点判定）——补全 M6-3 遗留的跨列族快照隔离；
+   `begin_snapshot` / `current_seq` 读全局计数；重启后从各列族 WAL 恢复全局起点；
+   测试验证 快照隔离 Delta / null 删除 / 跨重启 seq 接续；测试 279→281（+2）；
+2. ~~**位图索引增强（design 5.2.4/7.2）**~~ ✅（2026-08-29）：枚举字段**内存位图加速**
+   COUNT/GROUP/AND——`[inverted] bitmap_fields` 白名单（默认关闭零开销）+ `InvertedConfig::bitmap_fields`；
+   `InvertedIndex::with_bitmap_fields` 启动时全量重建（遍历内存 + 各段 posting，term 拆分 `field=value`
+   命中白名单 → 内存 `field → (value → RoaringBitmap)` 常驻）；写路径 `add` 同步维护；快速路径
+   `bitmap_count`（COUNT 亚毫秒）/ `bitmap_group_by`（GROUP BY 各值计数）/ `bitmap_and`（组合 AND 交集）；
+   `Engine::inverted_doc_count` / `inverted_group_by` 命中白名单走位图、否则回退倒排段扫描，
+   新增 `inverted_bitmap_and_count` 组合筛选；测试验证 内存写入 / 重启从段重建（drop 前刷盘）/ 引擎级快速路径；
+   测试 281→285（+4）；
+3. ~~**YCSB 压测定位瓶颈 + 前沿调研报告（design 22）**~~ ✅（2026-08-29）：新增 `shanshui-cunji-ycsb`
+   （src/bin/ycsb.rs，YCSB 规范负载 a/b/c/f，自实现 splitmix64 伪随机 + 延迟分位数统计）；
+   压测结论（详见 `images/perf-0.5.0/验证记录.md`）：冷读 18 万 ops/s（P50≈5µs）、热缓存 87 万 ops/s、
+   100 万数据 SST 分层后读不掉速；**fsync 单条串行为写路径头号瓶颈**——A 写重带 fsync 仅 2,077 ops/s、
+   无 fsync 113,587 ops/s（**55×**）；优化建议 Group Commit（design 4.1.3 已规划未实现）+ 读写分离（P0）；
+   前沿调研（`frontier-research-2026-08.md`）：BVLSM WAL-time KV 分离（7.6× RocksDB）/ RusKey RL Compaction
+   （4×）/ DobLIX·TieredKV 学习索引 / AuraDB Rust 生态；建议 近期组提交、中期大 value KV 分离、长期 RL+学习索引；
+4. **收尾**：文档 + 性能快检 + 打 v0.5.0 标签。
+
 ---
 
 ## 8. 编码规范

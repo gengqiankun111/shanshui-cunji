@@ -68,6 +68,12 @@ pub struct InvertedIndex {
     flush_threshold: u64,
     /// 段文件 GC 阈值（字节）：磁盘段总量超此值触发 `gc()` 合并（design 5.2.2；0 = 禁用）。
     gc_threshold_bytes: u64,
+    /// 位图索引字段白名单（design 5.2.4，M7-2）：空 = 关闭（默认零开销）。
+    bitmap_fields: std::collections::HashSet<String>,
+    /// 内存位图索引：field → (value → docid RoaringBitmap)，写入时同步维护、重启重建。
+    bitmaps: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, RoaringBitmap>>,
+    >,
 }
 
 impl InvertedIndex {
@@ -135,12 +141,87 @@ impl InvertedIndex {
             next_seg_id,
             flush_threshold,
             gc_threshold_bytes,
+            bitmap_fields: std::collections::HashSet::new(),
+            bitmaps: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// 配置位图索引字段白名单并**全量重建**内存位图（design 5.2.4，M7-2）。
+    /// 仅当白名单非空时才维护位图（默认关闭零开销）。
+    pub fn with_bitmap_fields(&mut self, fields: &[String]) -> Result<()> {
+        self.bitmap_fields = fields.iter().cloned().collect();
+        if self.bitmap_fields.is_empty() {
+            return Ok(());
+        }
+        // 全量重建：遍历内存 + 各段 posting，命中白名单字段的 term 建内存位图
+        let mut index: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, RoaringBitmap>,
+        > = std::collections::HashMap::new();
+        for (term, posting) in self.iter_terms()? {
+            let Some((field, value)) = term.split_once('=') else {
+                continue;
+            };
+            if self.bitmap_fields.contains(field) {
+                index
+                    .entry(field.to_string())
+                    .or_default()
+                    .insert(value.to_string(), posting);
+            }
+        }
+        *self.bitmaps.lock().unwrap() = index;
+        Ok(())
+    }
+
+    /// 内存位图 COUNT（design 5.2.4，M7-2）：field=value 命中白名单 → 亚毫秒计数；否则 None。
+    pub fn bitmap_count(&self, field: &str, value: &str) -> Option<u64> {
+        let bm = self.bitmaps.lock().unwrap();
+        bm.get(field)?.get(value).map(|b| b.len())
+    }
+
+    /// 内存位图 AND（M7-2）：全部 term 命中白名单字段 → 交集位图（组合筛选快速路径）；否则 None。
+    pub fn bitmap_and(&self, terms: &[&str]) -> Option<RoaringBitmap> {
+        let bm = self.bitmaps.lock().unwrap();
+        let mut acc: Option<RoaringBitmap> = None;
+        for t in terms {
+            let (field, value) = t.split_once('=')?;
+            let bitmap = bm.get(field)?.get(value)?;
+            acc = Some(match acc {
+                Some(a) => a & bitmap.clone(),
+                None => bitmap.clone(),
+            });
+        }
+        acc
+    }
+
+    /// 内存位图 GROUP BY（M7-2）：字段命中白名单 → 各值计数（按值字典序）；否则 None。
+    pub fn bitmap_group_by(&self, field: &str) -> Option<Vec<(String, u64)>> {
+        let bm = self.bitmaps.lock().unwrap();
+        let values = bm.get(field)?;
+        let mut out: Vec<(String, u64)> =
+            values.iter().map(|(v, b)| (v.clone(), b.len())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(out)
     }
 
     /// 追加一个 (term, docid) 到内存字典。docid 必须 < 2^32（RoaringBitmap 上限）。
     pub fn add(&self, term: &str, docid: u64) {
         assert!(docid < u32::MAX as u64, "docid 超出 RoaringBitmap 支持范围");
+        // 位图索引同步维护（design 5.2.4，M7-2）：仅当白名单非空且 term 命中字段时更新
+        if !self.bitmap_fields.is_empty() {
+            if let Some((field, value)) = term.split_once('=') {
+                if self.bitmap_fields.contains(field) {
+                    self.bitmaps
+                        .lock()
+                        .unwrap()
+                        .entry(field.to_string())
+                        .or_default()
+                        .entry(value.to_string())
+                        .or_default()
+                        .insert(docid as u32);
+                }
+            }
+        }
         self.mem.entry(term.to_string()).or_default().push(docid);
         self.mem_docids.fetch_add(1, Ordering::Relaxed);
     }
@@ -566,6 +647,65 @@ mod tests {
         assert!(!r.contains(2));
         assert!(idx.search("go").unwrap().contains(2));
         assert!(idx.search("absent").unwrap().is_empty());
+    }
+
+    // ---------- 位图索引（design 5.2.4，M7-2） ----------
+
+    #[test]
+    fn bitmap_count_and_and_after_adds() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        idx.with_bitmap_fields(&["status".to_string(), "city".to_string()])
+            .unwrap();
+        // status=active: 1,3,5；status=inactive: 2,4；city=beijing: 1,2
+        idx.add("status=active", 1);
+        idx.add("status=inactive", 2);
+        idx.add("status=active", 3);
+        idx.add("status=inactive", 4);
+        idx.add("status=active", 5);
+        idx.add("city=beijing", 1);
+        idx.add("city=beijing", 2);
+        // COUNT 快速路径
+        assert_eq!(idx.bitmap_count("status", "active").unwrap(), 3);
+        assert_eq!(idx.bitmap_count("city", "beijing").unwrap(), 2);
+        // AND 交集：active AND beijing = {1}
+        let and = idx.bitmap_and(&["status=active", "city=beijing"]).unwrap();
+        assert_eq!(and.len(), 1);
+        assert!(and.contains(1));
+        // GROUP BY
+        let g = idx.bitmap_group_by("status").unwrap();
+        assert_eq!(
+            g,
+            vec![("active".to_string(), 3), ("inactive".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn bitmap_off_by_default_returns_none() {
+        let idx = InvertedIndex::open(&tmp(), 10_000).unwrap();
+        idx.add("status=active", 1);
+        assert!(idx.bitmap_count("status", "active").is_none(), "默认关闭");
+        assert!(idx.bitmap_and(&["status=active"]).is_none());
+        assert!(idx.bitmap_group_by("status").is_none());
+    }
+
+    #[test]
+    fn bitmap_rebuilds_from_segments_on_reopen() {
+        let dir = tmp();
+        let fields = vec!["status".to_string()];
+        {
+            let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+            idx.with_bitmap_fields(&fields).unwrap();
+            idx.add("status=active", 1);
+            idx.flush_segment().unwrap(); // 落盘段
+            idx.add("status=inactive", 2);
+            idx.flush_segment().unwrap(); // 两条均落盘（重开才能重建）
+        }
+        // 重开：位图从段全量重建
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+        idx.with_bitmap_fields(&fields).unwrap();
+        assert_eq!(idx.bitmap_count("status", "active").unwrap(), 1);
+        assert_eq!(idx.bitmap_count("status", "inactive").unwrap(), 1);
     }
 
     #[test]
