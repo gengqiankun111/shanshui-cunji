@@ -23,6 +23,8 @@ fst = "0.4"
 memmap2 = "0.9"
 csv = "1"
 mimalloc = { version = "0.1", default-features = false, optional = true }
+parquet = "59.2.0"
+arrow = "59.2.0"
 
 [[bin]]
 name = "shanshui-cunji-migrate"
@@ -43,6 +45,10 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "shanshui-cunji-ycsb"
 path = "src/bin/ycsb.rs"
+
+[[bin]]
+name = "shanshui-cunji-gen-dataset"
+path = "src/bin/gen_dataset.rs"
 
 [features]
 # 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；

@@ -6,6 +6,9 @@
 
 use std::time::Instant;
 
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 
@@ -564,6 +567,123 @@ fn import_json_worker(
         skipped,
         t.elapsed().as_millis() as u64,
     ))
+}
+
+/// Parquet 全量导入（大数据集，如 5000 万条 × 20 字段）：读 parquet → `put_nosync` 批量
+/// 写入（每 `FLUSH_EVERY` 条统一 fsync 一次 + 结尾统一提交），倒排词条自动派生。
+/// 主键：`docid` 列存在则用之，否则从 1 递增。
+pub fn import_parquet(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+) -> Result<ImportReport> {
+    let t = Instant::now();
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Migrate(format!("Parquet 打开失败: {e}")))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Migrate(format!("Parquet 元数据解析失败: {e}")))?;
+    let schema_fields = builder.schema().fields().clone();
+    let docid_idx = schema_fields.iter().position(|f| f.name() == "docid");
+    let reader = builder
+        .build()
+        .map_err(|e| Error::Migrate(format!("Parquet reader 构建失败: {e}")))?;
+
+    let mut rows = 0u64;
+    let mut failed = 0u64;
+    let mut next_id = 1u64;
+    // 批量提交：每 FLUSH_EVERY 条统一 fsync + 倒排刷盘一次（5000 万条逐条 fsync 需数小时，批量分钟级；
+    // 倒排 posting 定期刷段控制内存——100 万行 × ~10 词条 = 1 亿 posting ≈ 2-3GB，刷 20 次较优；
+    // 过频（50 万）刷段开销大拖慢导入）
+    const FLUSH_EVERY: u64 = 1_000_000;
+    let mut since_flush = 0u64;
+    for batch in reader {
+        let batch = match batch {
+            Ok(b) => b,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let n = batch.num_rows();
+        let cols: Vec<ArrayRef> = batch.columns().to_vec();
+        for r in 0..n {
+            let mut obj = serde_json::Map::new();
+            for (idx, f) in schema_fields.iter().enumerate() {
+                if let Some(v) = arr_value(&cols[idx], r) {
+                    obj.insert(f.name().clone(), v);
+                }
+            }
+            // 主键：docid 列优先，否则递增
+            let docid = match docid_idx {
+                Some(_) => match obj.get("docid").and_then(|v| v.as_i64()) {
+                    Some(d) if d >= 0 => d as u64,
+                    _ => {
+                        failed += 1;
+                        continue;
+                    }
+                },
+                None => {
+                    let d = next_id;
+                    next_id = d.wrapping_add(1);
+                    obj.insert("docid".into(), serde_json::Value::from(d));
+                    d
+                }
+            };
+            let bytes = serde_json::to_vec(&serde_json::Value::Object(obj))
+                .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
+            let val: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Serialize(format!("JSON 解析失败: {e}")))?;
+            let terms = filter_terms(crate::server::extract_terms(&val), whitelist);
+            let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            match engine.put_nosync(docid, bytes, &term_refs) {
+                Ok(()) => {
+                    rows += 1;
+                    since_flush += 1;
+                    if since_flush >= FLUSH_EVERY {
+                        engine.flush_wal()?;
+                        engine.flush_inverted()?; // 倒排 posting 定期刷段，控制内存
+                        since_flush = 0;
+                        println!(
+                            "[import-parquet] 已导入 {rows} 行（倒排段已刷盘）",
+                        );
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    engine.flush_wal()?;
+    engine.flush_inverted()?;
+    println!(
+        "[import-parquet] 完成: {rows} 行成功 / {failed} 失败 · {:.0} ms",
+        t.elapsed().as_millis() as f64
+    );
+    Ok(ImportReport::new(
+        rows,
+        failed,
+        0,
+        t.elapsed().as_millis() as u64,
+    ))
+}
+
+/// 从 arrow 数组取第 row 行的值（Int64/Int32/Float64/Boolean/Utf8 → serde_json Value）。
+fn arr_value(col: &ArrayRef, row: usize) -> Option<serde_json::Value> {
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return a.is_valid(row).then(|| serde_json::Value::from(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        return a.is_valid(row).then(|| serde_json::Value::from(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return a.is_valid(row).then(|| serde_json::Value::from(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+        return a.is_valid(row).then(|| serde_json::Value::Bool(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return a.is_valid(row).then(|| serde_json::Value::String(a.value(row).to_string()));
+    }
+    None
 }
 
 #[cfg(test)]

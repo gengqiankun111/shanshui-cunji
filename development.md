@@ -925,6 +925,22 @@ impl RuntimePools {
    默认推荐 append + 组提交（性能最优）；后续可优化点：环形头部 tail 不必每次 fsync
    （scan_ring 容忍 tail 略旧，不会读到垃圾——列入候选优化）。
 
+### 7.10 5000 万条 Parquet 数据集 + 数据库导入（数据资产，保留不删）
+
+1. ~~**数据集生成器（shanshui-cunji-gen-dataset）**~~ ✅（2026-08-29）：分块流式生成 Parquet
+   （arrow 59 + parquet 59，Snappy 压缩），**5000 万条 × 20 字段**（9 数值型：Int64×7/Int32×2/Float64×1 +
+   2×256 字符文本 big_text_a/b + 8 短字符串枚举 + Boolean），内存恒定、每 100 万条进度输出（可后台运行）；
+   `--rows/--batch/--seed/--out`；实测 5000 万条 → 3,437 MB / 314.6s（~15.9 万 rows/s）；
+   数据资产：`D:\shanshui-data\ds-50m.parquet`（**建立后不删**，除非改存储/结构）；
+2. ~~**Parquet 批量导入（import_parquet）**~~ ✅：`migrate::import_parquet` 读 parquet → `put_nosync`
+   批量写（每 50 万条统一 fsync + 结尾统一提交，5000 万条逐条 fsync 需数小时、批量分钟级）；
+   主键 docid 列优先否则递增；20 字段类型 roundtrip（Int64/Int32/Float64/Boolean/Utf8，null 列容忍）；
+   `shanshui-cunji-import --parquet <in.parquet> [--data-dir]`；导入数据库：`D:\shanshui-data\db-50m`；
+3. ~~**dataset-test demo（src/demo/dataset-test/，gitignore 不提交）**~~ ✅：4 测试全绿——含 docid 导入
+   roundtrip（行数/点查/倒排计数/数值类型/256 字符长度）、无 docid 自动分配、null 列容忍、导入后重启持久化；
+4. 依赖说明：新增 `arrow` / `parquet`（59.2，Apache-2.0 合规，deny.toml 白名单内）——数据集生成与
+   parquet 导入必需；编译体积增大但仅作用于导入/生成路径。
+
 ---
 
 ## 8. 编码规范
