@@ -524,12 +524,18 @@ pub struct StorageConfig {
     pub group_commit_us: u64,
     /// 组提交字节阈值：WAL 待刷缓冲 ≥ 此值立即 fsync（不等窗口）。
     pub group_commit_bytes: usize,
+    /// Compaction 并行度（Ex-5.4，design 4.8.3）：并行压实 primary/cidx/delta 三列族
+    /// （SSD 并发 IO 强，demo 实测 3 CF 并行 2.14×）；0 = 自动（min(4, 核数/2)）；
+    /// 1 = 串行；>1 = 指定并行数。
+    pub compaction_parallel: usize,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            l0_stall_threshold: 8,
+            // Ex-5.4（design 4.8.3）：L0 触发阈值放宽（8→12，SSD 空间换写放大——
+            // L0 更晚收敛 → 压实频率低，写放大 15~25×→6~10×；空间放大 1.2×→1.8×）。
+            l0_stall_threshold: 12,
             ttl_days: None,
             data_dir: "./data".into(),
             hot_fields: Vec::new(),
@@ -540,6 +546,7 @@ impl Default for StorageConfig {
             wal_ring_size_mb: 64,
             group_commit_us: 0,
             group_commit_bytes: 256 * 1024,
+            compaction_parallel: 0, // 0 = 自动（并行）
         }
     }
 }
@@ -872,7 +879,7 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.hotcache.eviction_policy, "lfu");
         assert_eq!(cfg.sstable.compression, "zstd");
-        assert_eq!(cfg.storage.l0_stall_threshold, 8);
+        assert_eq!(cfg.storage.l0_stall_threshold, 12);
     }
 
     #[test]
