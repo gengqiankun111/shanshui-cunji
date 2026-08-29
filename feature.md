@@ -142,7 +142,7 @@
 | 缓存伪共享：PerCpuCounter（按核分计数器）+ 热结构体 `#[repr(align(64))]` | P0 | ✅ Ex-7.1 `c5fa66c`（src/per_cpu.rs：align(64) 缓存行隔离 + thread_local 槽位映射；倒排 mem_docids/SST heat 改造；demo 8 线程写 2.1×） |
 | `[affinity]` 绑核默认开启 + 三池物理核分区（网络 0-3/计算 4-7/IO 尾核，P99 验证） | P1 | ✅ Ex-7.2 `b294532`（src/affinity.rs 三池分区 + core_affinity 绑核：server 主线程/Compaction 并行/组提交后台；taskset 兜底） |
 | io_uring SQPOLL + WAL/SSTable 多 NVMe 队列/多盘 | P1 | ✅ Ex-7.3 `fd0b519`（src/io_queue.rs IoClass→队列号抽象与 Ex-5.10 条带化对齐；io_uring 仅 Linux，unsafe 依赖待独立 crate 封装后接入 SQPOLL 后端） |
-| Compaction 动态限流（按前台负载调 rate_limit_mb/s） | P2 | ⏳ Ex-7.4 |
+| Compaction 动态限流（按前台负载调 rate_limit_mb/s） | P2 | ✅ Ex-7.4 `ddbc20e`（IoRateLimiter::set_rate 动态调速 + Engine 按 MemTable 水位下调限速：压力 p→base×(1-0.5p)，写压力高让路 50% 带宽；**Ex-7 全部完成**） |
 
 ---
 

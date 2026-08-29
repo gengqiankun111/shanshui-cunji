@@ -1514,6 +1514,25 @@ impl RuntimePools {
    待独立 crate 封装后接入 SQPOLL 后端（接入点：`IoClass::queue_id()` 路由）。
 2. ~~**验证**~~ ✅：`cargo test` **344 全绿**（+2：队列号互异 + io_uring 平台门控）；提交 `fd0b519`。
 
+### 7.41 Ex-7.4 Compaction 动态限流（design_extension v0.5 第 12.6 P2）
+
+> 背景：静态 `io_rate_limit_mb` 恒定限速——写压力低时浪费带宽（L0 追赶慢），写压力高时
+> Compaction 与前台抢盘。动态限流 = 按前台写压力实时调速率。
+
+1. ~~**demo 研究（src/demo/dynamic-rate/，gitignore 不提交）**~~ ✅：3 测试全绿——Token
+   Bucket 动态调速（set_rate 生效，无突发赠予）；压力映射 p=0 全速 / 0.5→75% / 1→50%；
+   让路语义：压力 1 取 1KB 等 1000ms vs 压力 0 后 500ms。
+2. ~~**kernel 整合**~~ ✅：
+   - `IoRateLimiter::set_rate(字节/秒)` + `rate()`：运行中调整补桶速率（容量受新突发上限
+     约束）；0 = 不限速；
+   - `ColumnFamily::set_io_rate_bytes` / `io_rate`：动态调整/读取后台 IO 限速；
+   - `Engine::adjust_compaction_io_rate()`（put 路径调用）：**MemTable 水位 = 写压力代理**
+     （used/max clamp 0~1）→ 限速 = base × (1 - 0.5p)——压力 0 全速追赶 L0 合并，压力 1
+     让路 50% 磁盘带宽给前台写；flush 后水位回落限速回升。
+3. ~~**验证**~~ ✅：`cargo test` **346 全绿**（+2：set_rate 调速 + Engine 写压力让路/回升）；
+   demo 3 测试全绿；clippy 零警告；提交 `ddbc20e`。⚠️ 写 P99 收益需 **SSD 环境**实测
+   （写重负载下 Compaction 让路对比静态限速）。
+
 ---
 
 ## 8. 编码规范
