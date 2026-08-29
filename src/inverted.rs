@@ -24,15 +24,14 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::info;
-
 use crate::error::{Error, Result};
 use crate::keys::{decode_varlen, encode_varlen};
+use crate::per_cpu::PerCpuCounter;
 use mmap_file::MmapFile;
 
 /// 段文件魔数。
@@ -58,8 +57,9 @@ pub struct InvertedIndex {
     engine: String,
     /// term → 内存收集的 docid 列表。
     mem: DashMap<String, Vec<u64>>,
-    /// 内存累计 docid 数（触发刷盘阈值判断）。
-    mem_docids: AtomicU64,
+    /// 内存累计 docid 数（触发刷盘阈值判断）。Ex-7.1：PerCpuCounter 按核拆分——
+    /// 多核并发写 posting 时消除原子计数器伪共享（demo 实测 2.1×）。
+    mem_docids: PerCpuCounter,
     /// 段文件列表（新→旧，仅含文件名）。
     segments: Vec<String>,
     /// 段 → FST 术语字典（term → 段内条目字节偏移）；engine=fst 且存在 .fst 时填充。
@@ -161,7 +161,7 @@ impl InvertedIndex {
             // 4 shard 下大量碰撞串行，256 shard 分散（demo 实测 1.39× 加速）；
             // dashmap 要求 shard 数为 2 的幂（256 = 2^8）。
             mem: DashMap::with_capacity_and_shard_amount(0, 256),
-            mem_docids: AtomicU64::new(0),
+            mem_docids: PerCpuCounter::new(),
             segments,
             dicts,
             next_seg_id,
@@ -251,7 +251,7 @@ impl InvertedIndex {
             }
         }
         self.mem.entry(term.to_string()).or_default().push(docid);
-        self.mem_docids.fetch_add(1, Ordering::Relaxed);
+        self.mem_docids.add(1);
     }
 
     /// 批量追加 (term, docid) 集合（Ex-5.3 倒排更新批处理）：
@@ -299,12 +299,12 @@ impl InvertedIndex {
                 .or_default()
                 .extend(docids);
         }
-        self.mem_docids.fetch_add(items.len() as u64, Ordering::Relaxed);
+        self.mem_docids.add(items.len() as u64);
     }
 
     /// 当前内存累计 posting 数（供外部决定是否刷盘）。
     pub fn mem_docids(&self) -> u64 {
-        self.mem_docids.load(Ordering::Relaxed)
+        self.mem_docids.get()
     }
 
     /// 内存是否达阈值，需要刷盘。
@@ -368,7 +368,7 @@ impl InvertedIndex {
 
         // 清空内存
         self.mem.clear();
-        self.mem_docids.store(0, Ordering::Relaxed);
+        self.mem_docids.reset();
         info!("倒排刷盘完成: {fname}");
         Ok(())
     }
@@ -705,6 +705,7 @@ fn encode_varint(buf: &mut Vec<u8>, n: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
 
     fn tmp() -> std::path::PathBuf {

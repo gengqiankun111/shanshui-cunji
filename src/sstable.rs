@@ -25,11 +25,11 @@
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bloom::BloomFilter;
 use crate::error::{Error, Result};
 use crate::keys::{decode_varint, decode_varlen, encode_varint, encode_varlen};
+use crate::per_cpu::PerCpuCounter;
 
 /// 文件魔数 + 版本。
 pub const SST_MAGIC: &[u8; 8] = b"NVSSTL01";
@@ -659,8 +659,9 @@ pub struct SstReader {
     compression: Compression,
     /// 文件格式版本（v3=纯行式，v4=PAX，v5=分区布隆）。
     format: u16,
-    /// Ex-5.9 冷热感知：读热度计数（点查/范围扫描命中递增，冷热 Compaction 选段依据）。
-    heat: AtomicU64,
+    /// Ex-5.9/Ex-7.1：读热度计数（点查/范围扫描命中递增，冷热 Compaction 选段依据；
+    /// PerCpuCounter 按核拆分——并发读多核 touch 无伪共享）。
+    heat: PerCpuCounter,
 }
 
 /// Level 1 摘要条目：每 `index_granularity` 个块一条（design 4.4.2）。
@@ -817,7 +818,7 @@ impl SstReader {
             bloom,
             compression,
             format: version,
-            heat: AtomicU64::new(0),
+            heat: PerCpuCounter::new(),
         })
     }
 
@@ -825,14 +826,14 @@ impl SstReader {
         &self.footer
     }
 
-    /// Ex-5.9：读命中递增热度（冷热感知 Compaction 数据源）。
+    /// Ex-5.9：读命中递增热度（冷热感知 Compaction 数据源；Ex-7.1 按核无竞争）。
     pub fn touch(&self) {
-        self.heat.fetch_add(1, Ordering::Relaxed);
+        self.heat.inc();
     }
 
     /// Ex-5.9：当前读热度计数。
     pub fn heat(&self) -> u64 {
-        self.heat.load(Ordering::Relaxed)
+        self.heat.get()
     }
 
     /// v5 分区布隆原始字节（每块一个，与 Index 对齐）。

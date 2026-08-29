@@ -39,6 +39,7 @@ pub mod meta;
 pub mod migrate;
 pub mod mv;
 pub mod optimizer;
+pub mod per_cpu;
 pub mod redis;
 pub mod replication;
 pub mod reshard;
