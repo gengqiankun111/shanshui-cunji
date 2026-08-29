@@ -1220,6 +1220,22 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` 313 全绿；demo 6 测试全绿（见 1）；提交 `056b21d`。
    ⚠️ 性能收益需在 **SSD 环境**实测（HDD 开发环境不压测，design 1.2 警告）。
 
+### 7.25 Ex-5.2 倒排分片锁（design 4.8.3 P0-4）
+
+> 背景：低基数字段（status='active'）高并发写入时同一 Term 锁竞争——倒排 Term 字典按 Hash
+> 分 256 锁分区（同 Term 串行、不同 Term 并行）；位图索引（M7-2 白名单）全局单 Mutex 同改。
+
+1. ~~**demo 研究（src/demo/sharded-lock/，gitignore 不提交）**~~ ✅：3 测试全绿——DashMap shard
+   数对比：8 线程×200K ops 低基数 32 term，4 shards 14.1ms vs 256 shards 10.1ms（**1.39× 加速**）；
+   InvertedIndex 并发 add（8 线程×51.2K）mem_docids 精确、32 term search 全一致；白名单并发
+   add 后 bitmap_count 精确（active=40000、beijing=26667）。
+2. ~~**kernel 整合**~~ ✅：`mem` DashMap 默认 4 → **256 shards**
+   （`with_capacity_and_shard_amount`，2 的幂）；`bitmaps` 全局 `Mutex<HashMap>` → 按 field hash
+   分 **256 片锁**（FNV-1a 确定性分片，同 field 恒同片；group_by 需同 field 全量一致）；
+   `bitmap_and` 逐 term 取片锁（每次仅持一把，无死锁）；`with_bitmap_fields` 重建改逐片清空+
+   按片填充；测试 313 全绿。
+3. ~~**验证**~~ ✅：`cargo test` 313 全绿；demo 3 测试全绿（见 1）；提交 `c7ebe72`。
+
 ---
 
 ## 8. 编码规范
