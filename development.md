@@ -1255,6 +1255,26 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **314 全绿**（+1：inverted_batch_pending_flush——统计含 pending/
    查询自动刷入/落盘归零）；demo 4 测试全绿（见 1）；提交 `d38e8ab`。
 
+### 7.27 并发读优化设计（Seqlock/Arc，design_extension v0.4）
+
+> 背景（2026-08-29 决策）：写 22 万 TPS + 读 85 万 QPS 高并发下读路径需持续响应。
+> 调研五方案（读写锁/双缓冲/RCU/无锁/Seqlock）后决策：RWLock 不用（读写交替互阻塞）、
+> RCU 不引入（复杂度收益有限）、无锁不用（DashMap 已够好）、双缓冲已用（MemTable/SSTable
+> 元数据/配置热加载）、**Seqlock/Arc 引入倒排**（段清单 + FST 字典指针，小数据零开销写读）。
+
+1. ~~**设计（design_extension v0.4 第 11 章）**~~ ✅：方案全景对比表 + 取舍结论；各模块最优
+   组合（现状核对：MemTableBuffer 双缓冲已实现、两级索引已实现、HotCache DashMap 已实现、
+   Config::reload 已实现——均无需改）；**Seqlock 倒排设计**（段清单 `Vec<String>` 版本化快照 +
+   FST 字典 `Arc<fst::Map>` 原子发布；写=版本号奇偶递增、读=快照校验重试，重试率预期 <0.1%）；
+   边界（大数据不适用 Seqlock，SSTable 大块维持双缓冲 + Arc）；落地路径（Seqlock 原语 → 倒排
+   接入 → 并发验证）。
+2. ~~**扩展文档**~~ ✅：development_extension.md 新增 **Ex-6 并发读优化**（Ex-6.1 Seqlock 原语 /
+   Ex-6.2 段清单 / Ex-6.3 FST 字典 Arc / Ex-6.4 验证）+ 状态表 + 文档关系；feature.md I 模块
+   新增「倒排并发读（Seqlock/Arc）⏳ Ex-6」+ 读写分离标注为前置。
+3. ~~**依赖说明**~~ ✅：Seqlock 落地依赖**打破 Engine 全局锁**（读写分离/双写加速，feature.md
+   I 模块 ⏸）——全局锁下写与读仍串行，Seqlock 无收益；原语（Ex-6.1）可独立先行（不与全局锁
+   冲突，~100 行 + 单元测试）。代码落地待读写分离评估后再启。
+
 ---
 
 ## 8. 编码规范

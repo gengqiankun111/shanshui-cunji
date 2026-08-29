@@ -110,7 +110,8 @@
 |---|---|---|
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
-| 读写分离 / 双写加速 | ⏸ | 评估中 |
+| 读写分离 / 双写加速 | ⏸ | 评估中（Ex-6 并发读的前置） |
+| 倒排并发读（Seqlock/Arc：段清单 + FST 字典指针无锁读） | ⏳ | Ex-6（design_extension v0.4 第 11 章） |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
 ## J. SSD 原生优化（v0.7 起，Ex-5，放弃 HDD 兼容）

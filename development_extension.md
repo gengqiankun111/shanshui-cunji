@@ -161,6 +161,37 @@ v0.6 存储内核（环形 WAL/倒排/compaction 已有基础）、design 4.8 �
 
 ---
 
+## Ex-6 并发读优化（Seqlock/Arc，v0.4，2026-08-29）
+
+> 设计依据：design_extension v0.4 第 11 章（方案全景对比 + 各模块最优组合 + Seqlock 倒排设计）。
+> 目标：写 22 万 TPS + 读 85 万 QPS 下读路径持续响应——倒排段清单/FST 字典用 Seqlock/Arc
+> 实现无锁读（数据小、写多读少）。
+> ⚠️ **依赖**：需先打破 Engine 全局锁（读写分离/双写加速，feature.md I 模块 ⏸）才有真实
+> 读写并发；全局锁下实现 Seqlock 无收益。
+
+### 任务分解
+
+- [ ] **Ex-6.1 Seqlock 原语**：`src/seqlock.rs`（~100 行）——版本号（AtomicU64，奇偶语义）+
+      快照模板方法（读循环校验重试）；单元测试（写不阻塞读/读重试/并发正确性）。
+- [ ] **Ex-6.2 倒排段清单 Seqlock/Arc**：`segments: Vec<String>` → 版本化快照或
+      `Arc<Vec<String>>` + ArcSwap（原子指针发布）——`flush_segment`/`gc` 更新发布，
+      `search`/`doc_count`/`iter_terms` 读快照无锁。
+- [ ] **Ex-6.3 倒排 FST 字典 Arc**：`dicts: HashMap<String, fst::Map>` → 值改 `Arc<fst::Map>` +
+      ArcSwap 指针发布——查询 `dicts.get(seg)` 拿 Arc 快照，读路径零拷贝。
+- [ ] **Ex-6.4 验证**：并发读-写正确性（读不阻塞写、写不阻塞读）、重试率统计（预期 <0.1%）、
+      与全局锁基线对比（SSD 环境实测，HDD 不压测）。
+
+### 验证
+
+Seqlock 单元测试（并发写读交错）+ 倒排端到端（flush/gc 并发 search 结果一致）+ 重试率监控。
+
+### 依赖
+
+设计已定（design_extension v0.4）；代码落地依赖**读写分离**（feature.md I 模块）解除 Engine
+全局锁；原语（Ex-6.1）可独立先行（不与全局锁冲突）。
+
+---
+
 ## 里程碑状态跟踪
 
 | 里程碑 | 内容 | 状态 | 提交 |
@@ -171,11 +202,12 @@ v0.6 存储内核（环形 WAL/倒排/compaction 已有基础）、design 4.8 �
 | Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
 | Ex-5 | SSD 原生迁移（P0 4KB 块/分片锁/批处理/compaction → P1 环形 WAL/删除位图/FST/解耦 → P2 冷热/条带化） | ⏳ | — |
+| Ex-6 | 并发读优化（Seqlock 原语 + 倒排段清单/FST 字典 Arc，依赖读写分离） | ⏳ | — |
 
 ## 与本项目其他文档关系
 
 - **design_extension.md**：本计划的设计依据（v0.1 分布式事务技术全景/分层决策；v0.2 倒排字段策略
-  三准则/配置模板；v0.3 SSD 原生优化定位与优先级）。
+  三准则/配置模板；v0.3 SSD 原生优化定位与优先级；v0.4 并发读优化 Seqlock/Arc）。
 - **design.md**：SSD 原生存储优化设计见 4.8（核心设计转变/场景瓶颈/优化优先级/配置模板/路线图）；
   HDD 开发环境警告见 1.2。
 - **feature.md**：主项目功能清单（L0 对应 M8-P0 等）；Ex-1/2 落地后同步更新 feature.md 的

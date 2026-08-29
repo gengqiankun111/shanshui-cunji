@@ -1,9 +1,9 @@
 # 设计扩展（design_extension.md）
 
-> 版本：v0.3（2026-08-29）· 多主题扩展文档：
+> 版本：v0.4（2026-08-29）· 多主题扩展文档：
 > **v0.1 分布式事务**（第 1~8 章）· **v0.2 倒排索引字段策略**（第 9 章）·
-> **v0.3 SSD 原生优化**（第 10 章，2026-08-29 增补）
-> 关联：design.md（主设计）、development_extension.md（开发扩展计划，Ex-1/2/3 分布式 + Ex-4 倒排策略 + Ex-5 SSD 原生）
+> **v0.3 SSD 原生优化**（第 10 章）· **v0.4 并发读优化**（第 11 章，2026-08-29 增补）
+> 关联：design.md（主设计）、development_extension.md（开发扩展计划，Ex-1/2/3 分布式 + Ex-4 倒排策略 + Ex-5 SSD 原生 + Ex-6 并发读优化）
 
 ---
 
@@ -215,3 +215,91 @@ max_term_len = 96                                  # 超长自动跳过（兜底
 - **最终目标**：写入 TPS 40 万+、写 P95 0.45ms、倒排更新 0.1ms、写放大 5×、冷启动 5s。
 
 落地任务见 development_extension.md **Ex-5**（Ex-5.1~5.10），feature.md **J 模块**跟踪状态。
+
+---
+
+# 第 11 章 并发读优化（v0.4，2026-08-29）
+
+> 背景：写入 22 万 TPS + 读 85 万 QPS 的高并发场景，读路径需持续响应。
+> 现状：Engine 由 `Arc<Mutex<Engine>>` 全局串行（写路径互斥），倒排读写因此**无真实并发**
+> （Rust 借用 + 全局锁保证）。本章为**读写分离/双写加速落地后的并发读设计**（feature.md I 模块 ⏸
+> 项的前置设计），核心是把 Seqlock/Arc 设计加入倒排索引。
+
+## 11.1 并发读方案全景
+
+| 方案 | 原理 | 读阻塞 | 写阻塞 | 复杂度 | 适用场景 |
+| --- | --- | --- | --- | --- | --- |
+| ① 读写锁（RWLock） | 读共享锁，写独占锁 | 写时读阻塞 | 读时写阻塞 | ⭐ 低 | 读写频繁但读多写少 |
+| ② 双缓冲 + 原子切换 | 两个副本，读写分离 | ✅ 不阻塞 | ✅ 不阻塞 | ⭐⭐ 中 | 写密集 + 读持续响应 |
+| ③ RCU（Read-Copy-Update） | 读不加锁，写复制后发布 | ✅ 不阻塞（零开销） | 发布时短暂阻塞 | ⭐⭐⭐ 高 | Linux 内核高频读（路由表/文件系统）|
+| ④ 无锁数据结构（Lock-Free） | CAS 原子操作 | ✅ 不阻塞 | ✅ 不阻塞 | ⭐⭐⭐⭐ 极高 | 极高性能（网络路由表）|
+| ⑤ Seqlock（顺序锁） | 写递增版本号，读检测重试 | 可能重试 | ✅ 不阻塞 | ⭐⭐ 中 | 数据小、写多读少 |
+
+**取舍结论（对山水存迹）**：
+- ① **不用**：读写频繁交替时写阻塞读、读阻塞写，读延迟飙升；
+- ③ **不引入**：双缓冲已足够（读 85 万 QPS），RCU 宽限期管理 + 内存屏障复杂度收益有限；
+- ④ **不用**：DashMap 分片锁已接近无锁效果，易用性/性能平衡已佳，无锁实现（ABA/内存回收）风险不值；
+- ② **已用/规划**：MemTable 切换（MemTableBuffer 双缓冲已实现）、SSTable 元数据指针、倒排段清单（Manifest）、配置热加载；
+- ⑤ **引入倒排**：倒排字典 FST 指针切换（8 字节指针，Seqlock 零开销写、查询几乎不重试）。
+
+## 11.2 各模块最优组合建议（现状核对）
+
+| 模块 | 推荐方案 | 现状 | 行动 |
+| --- | --- | --- | --- |
+| MemTable 切换 | 双缓冲 | ✅ 已实现（`MemTableBuffer`，active/buffer 切换）| 无 |
+| SSTable 元数据指针 | 双缓冲 + Arc | ✅ 稀疏索引内存摘要常驻 + 精确索引懒加载（两级索引）| 无 |
+| **倒排字典（FST）指针** | **Seqlock 或 Arc** | 现状：`dicts: HashMap<String, fst::Map>` open 加载、flush 时插入，读走 &self | **Ex-6 引入 Seqlock/Arc** |
+| HotCache 热点缓存 | DashMap（分片锁）| ✅ 已实现（LruCache 字节预算 + LFU 采样，P41）| 无 |
+| **倒排文件段清单（Manifest）** | **双缓冲 + Arc** | 现状：`segments: Vec<String>` &mut 修改、&self 遍历 | **Ex-6 引入 Arc 快照** |
+| 配置热加载 | Arc + 原子指针 | ✅ 已实现（Config::reload + ReloadReport，P3-1）| 无 |
+
+## 11.3 Seqlock 设计（倒排索引应用，核心）
+
+**为什么倒排适合 Seqlock**：段清单（`Vec<String>`，每条 30B）与 FST 字典（`Arc<Map>` 指针 8B）
+都是**小数据**（能装进缓存行），写（flush_segment / gc）不频繁且要零阻塞读；Seqlock 读只可能重试
+且几乎不重试，写零阻塞——完美匹配"数据小、写多读少"。
+
+```
+Seqlock 原语：
+写（flush_segment / gc 更新段清单/FST 指针）：
+  version.fetch_add(1, SeqCst);        // 进入奇数（写中）
+  修改 segments / 替换 dicts 指针
+  version.fetch_add(1, SeqCst);        // 回到偶数（一致）
+
+读（search / doc_count 遍历段）：
+  loop {
+    v1 = version.load(SeqCst);
+    if v1 & 1 == 1 { continue; }       // 写进行中，重试
+    let snapshot = &self.segments;     // 拷贝/快照段清单（小，<缓存行）
+    v2 = version.load(SeqCst);
+    if v1 == v2 { break; }             // 一致，用快照
+  }
+```
+
+**倒排落地位置**（Ex-6）：
+1. **段清单 `segments`**：`Vec<String>` 改为 Seqlock 保护的版本化快照——`flush_segment`/`gc`
+   更新时写版本号；`search`/`doc_count`/`iter_terms` 读快照，无锁；
+2. **FST 字典 `dicts`**：`HashMap<String, fst::Map>` 的值改为 `Arc<fst::Map>`，配合
+   `ArcSwap`（原子指针发布）或 Seqlock 版本化——查询 `dicts.get(seg)` 拿 Arc 快照，读路径零拷贝；
+3. **边界**：段清单/字典数据量大时不适用 Seqlock（拷贝开销高）——倒排段数通常 <100、
+   FST 指针 8B，均满足"一个缓存行内"约束；SSTable 大块数据不适用（维持双缓冲 + Arc）。
+
+**依赖**：需要先打破 Engine 全局锁（读写分离/双写加速，feature.md I 模块 ⏸）才有真实读-写并发；
+在全局锁下实现 Seqlock 无收益（写与读仍串行）。落地顺序见 development_extension.md **Ex-6**。
+
+## 11.4 落地路径
+
+1. **Seqlock 原语**（`src/seqlock.rs`，~100 行）：版本号 + 快照模板方法（通用小数据）；
+2. **倒排接入**：段清单 + FST 字典指针 Seqlock/Arc（依赖读写分离先行或独立先做原语与单元测试）；
+3. **验证**：并发读-写正确性（读不阻塞写、写不阻塞读）、重试率统计（预期 <0.1%）、
+   与全局锁基线对比吞吐；SSD 环境实测（HDD 不压测）。
+4. 状态跟踪：development_extension.md **Ex-6**；feature.md I 模块。
+
+---
+
+# 附录：与各文档关系
+
+- **design.md**：主设计（存储引擎 4.x、索引 5.x、缓存 6.x）；
+- **development.md 7.x**：各里程碑落地记录（7.27 起为并发读优化）；
+- **development_extension.md**：Ex-1~Ex-6 落地计划与状态；
+- **feature.md**：主项目功能清单（I 模块含读写分离/并发读候选）。
