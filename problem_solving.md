@@ -279,6 +279,26 @@
 - **遗留**：HotCache `stats` 泄漏 / `used_bytes` 虚增（LruCache 内部淘汰未同步）是独立内存缺陷，常规读写负载下也会缓慢泄漏，待后续修复。
 - **提交**：`bde422d`（M8-P6）
 
+### P41. HotCache 内部淘汰不通知 stats/used_bytes：泄漏 + 虚增 + LFU O(N) 风暴（大批量回表卡死 server）
+- **现象**：fulltext 验证时 `GET /fulltext?word=rec`（命中 5M 行）把 server 卡死——日志每秒刷
+  "HotCache 达软水位"（used_bytes 已超硬预算 285MB/268MB 仍上涨）、CPU 满、后续请求全部超时。
+- **根因**：HotCache 容量按**条目数**（`max_memory_mb×1024×1024/1024`，默认 4M 条）设 LruCache
+  容量，**LruCache 满后内部自动淘汰不通知 `stats`/`used_bytes`** → stats 无限泄漏（每写一个
+  新 docid 永久残留）+ used_bytes 只增不减（虚增）。超预算后 `evict_one` 从 stats 选 victim，
+  但该 key 常已被 LruCache 内部淘汰（`cache.pop` 返回 None）→ **淘汰永远失败 + 超预算死循环**；
+  LFU `pick_lfu_victim` 全量扫描 stats（O(N)）→ 大批量回表（每 get 一次 hotcache.put）把
+  写/查询路径卡成 **O(N²)**。这是 P40（50M 导入 4M 行卡死）的叠加因素——内存压力由 hotcache
+  虚增/泄漏放大，页面颠簸由淘汰失败雪上加霜。
+- **修复**：①容量 **unbounded**（`LruCache::unbounded`），淘汰**完全由字节预算**统一管理——
+  stats 与缓存同步（不泄漏）、used_bytes 准确（不虚增）、evict 必有真实 victim；②**软水位渐进
+  淘汰**（每 put 至多 1 个，防单次 put 的 O(N) evict 风暴）；③**LFU 采样近似**（主缓存前 64 条目
+  选最小计数，O(64) 常量，替代全量 O(N) 扫描）。
+- **结果**：hotcache 14 测试全绿（+2 回归：批量 put 无泄漏/无虚增/真淘汰、10K 次 512KB put
+  渐进淘汰 <5s）；5M 库小查询 959ms 正常（修复前 server 假死）。
+- **观察（非本项）**：大结果集查询（数百万行）server 端全量 JSON 构造仍会内存爆炸
+  （命中 5M 行 → 10GB+），API 无 limit/分页 → 后续加 limit/游标分页。
+- **提交**：待提交
+
 ---
 
 ## 环境备忘（不入库）

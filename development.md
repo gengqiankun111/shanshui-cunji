@@ -1001,6 +1001,45 @@ impl RuntimePools {
 4. **遗留**：HotCache `stats` 泄漏 / `used_bytes` 虚增是独立内存缺陷（常规读写负载缓慢泄漏），
    后续单独修复。
 
+### 7.14 M8-P7 fulltext 分词索引（长文本可检索，与 inverted:false 正交）
+
+> 背景（P38 后续方向）：长文本字段（如 big_text 256 字符）整串被 `max_term_len=96` 跳过 →
+> 长文本无法检索。方案：声明字段**分词建词 term**（`ft:{field}:{token}`），分词 token 短可建索引。
+
+1. ~~**demo 研究（src/demo/fulltext/，gitignore 不提交）**~~ ✅：分词器 `tokenize`（按非字母数字
+   边界切分 + 小写归一；中文连续字符暂为单 token，完整中文分词留后续）+ `ft:{field}:{token}`
+   编码（独立命名空间不冲突）+ 同文档 token 去重；5 测试全绿（分词边界 / 去重编码 / 端到端
+   写入查询回表 / 长文本 token 可检索 / 100K 行 perf sanity）。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `[inverted] fulltext_fields`（声明分词字段，空 = 关闭）；
+   - `server::tokenize` / `fulltext_terms` / `extract_terms_with_fulltext`（fulltext 字段分词
+     建词 term **取代整串**；其余字段整串 term 受白名单过滤——**与 inverted_fields 正交**）；
+   - `Engine::fulltext_search(field, word)`（词 term 查询 → posting 合并 → 回表）+
+     `fulltext_fields()` 访问器；HTTP `GET /fulltext?field=X&word=Y`；
+   - 写路径统一接入：HTTP put / import_parquet / CSV / JSON / mysqldump 导入。
+3. ~~**验证**~~ ✅：5M 真实数据集配 fulltext 导入（133s / 39K 行/s，分词增加 posting 量属预期），
+   HTTP 检索 `word=00000042` 精确命中 docid=42（big_text_a="rec-00000042-msg-1344-tag42"）；
+   测试 302 全绿（+4：分词边界 / 字段优先级 / 白名单正交 / 长文本端到端持久化）。
+4. **已知限制**：连续中文串 = 单 token（需 jieba/ngram 完整中文分词，留后续）；大结果集
+   （数百万行）查询无 limit/分页，server 端全量构造 JSON 会内存爆炸（见 7.15 观察）。
+
+### 7.15 P41 HotCache 内存缺陷修复（stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴）
+
+> 背景：7.14 验证时 `word=rec`（命中 5M 行）把 server 卡死——暴露 HotCache 既有缺陷。
+
+1. ~~**根因定位**~~ ✅：HotCache 容量按**条目数**（max_memory_mb/1KB）设 LruCache 容量，
+   满后 **LruCache 内部淘汰不通知 stats/used_bytes** → stats 无限泄漏、used_bytes 虚增；
+   超预算后 `evict_one` 从 stats 选 victim 但该 key 已被内部淘汰（pop=None）→ **淘汰永远失败
+   + 超预算死循环**；LFU `pick_lfu_victim` 全量扫描 stats（O(N)）→ 大批量回表（每 get 一次
+   hotcache.put）把写/查询路径卡成 O(N²)（P40 50M 导入 4M 行卡死的叠加因素）。
+2. ~~**修复**~~ ✅（2026-08-29）：容量 **unbounded**，淘汰**完全由字节预算**统一管理（stats
+   与缓存同步、used_bytes 准确）；**软水位渐进淘汰**（每 put 至多 1 个，防单次 put O(N) evict
+   风暴）；**LFU 采样近似**（主缓存前 64 条目选最小计数，O(64) 常量）。
+3. ~~**验证**~~ ✅：hotcache 14 测试全绿（+2 回归：批量 put 无泄漏/无虚增/真淘汰；
+   10K 次 512KB put 渐进淘汰 <5s）；5M 库小查询 959ms 正常（修复前 server 假死）。
+4. **观察（非本项）**：大结果集查询（数百万行）server 端全量 JSON 构造仍会内存爆炸
+   （`word=tag42` 命中全部 5M 行 → 10GB+）——API 无 limit/分页，后续加 `limit`/游标分页。
+
 ---
 
 ## 8. 编码规范
