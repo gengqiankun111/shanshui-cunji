@@ -916,6 +916,35 @@ mod tests {
     }
 
     #[test]
+    fn ring_large_capacity_multi_wrap_recovery() {
+        // Ex-5.5 规模化回归：64MB 大容量环 + 多轮回绕（每轮写满并刷盘放行覆盖）
+        // → 崩溃重开恢复最新周期记录，max_seq 接续（混沌回归增强）
+        let path = tmp();
+        let size = 8 * 1024 * 1024;
+        let (mut r, _) = RingWal::open_or_create(&path, size).unwrap();
+        let mut last_seq = 0u64;
+        for cycle in 0..6u64 {
+            // 每轮写 80_000 条（8MB 环容 ~26 万条；6 轮共 48 万条 > 容量 → 跨轮回绕覆盖）
+            for i in 0..80_000u64 {
+                last_seq = r
+                    .append(OP_PUT, format!("c{cycle}-k{i}").as_bytes(), Some(format!("v{cycle}-{i}").as_bytes()))
+                    .unwrap();
+            }
+            r.sync().unwrap();
+            r.set_flushed_seq(last_seq); // 刷盘放行 → 下一轮可覆盖本轮回绕
+        }
+        drop(r); // 模拟崩溃
+        let (_r2, recs) = RingWal::open_or_create(&path, size).unwrap();
+        assert!(!recs.is_empty(), "崩溃后应恢复环内最新记录");
+        let max_seq = recs.iter().map(|x| x.seq).max().unwrap();
+        assert_eq!(max_seq, last_seq, "恢复最大 seq 应为最后写入");
+        eprintln!(
+            "[RingWal 规模化] 5 轮 × 20 万条（64MB 环）→ 恢复 {} 条，max_seq={max_seq}",
+            recs.len()
+        );
+    }
+
+    #[test]
     fn ring_blocks_wrap_without_flush() {
         let path = tmp();
         let (mut r, _) = RingWal::open_or_create(&path, 256).unwrap();

@@ -543,7 +543,9 @@ impl Default for StorageConfig {
             ttl_field: "timestamp".into(),
             io_rate_limit_mb: 0,
             wal_mode: "append".into(),
-            wal_ring_size_mb: 64,
+            // Ex-5.5：环形 WAL 规模化默认（64→256MB）——减少小环频繁回绕强制 Flush；
+            // 大容量预分配（GB 级）+ 环形覆盖均匀（SSD 磨损天然均衡）已由 RingWal 支持。
+            wal_ring_size_mb: 256,
             group_commit_us: 0,
             group_commit_bytes: 256 * 1024,
             compaction_parallel: 0, // 0 = 自动（并行）
