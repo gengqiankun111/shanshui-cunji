@@ -1236,6 +1236,25 @@ impl RuntimePools {
    按片填充；测试 313 全绿。
 3. ~~**验证**~~ ✅：`cargo test` 313 全绿；demo 3 测试全绿（见 1）；提交 `c7ebe72`。
 
+### 7.26 Ex-5.3 倒排更新批处理（design 4.8.3 P0-3）
+
+> 背景：写入快 + 20 倒排字段场景，倒排更新占写入 CPU 60%+（每 docid 每字段一次 DashMap
+> entry hash + 锁 + Vec push）。批处理 = 同 Term 多 DocId 内存聚合，批量追加——减少锁操作次数。
+
+1. ~~**demo 研究（src/demo/inverted-batch/，gitignore 不提交）**~~ ✅：4 测试全绿——20 万行×
+   20 字段（400 万 posting）逐个 add 219ms vs `add_batch` 130ms（**1.7×**）；批量/逐个 search
+   结果全一致（8 字段×4 值）；put 未达阈值查询自动刷入（doc_count/posting/execute 全可见）；
+   20K 条超阈值自动刷入 + flush_inverted 落盘 + 重启恢复正确。
+2. ~~**kernel 整合**~~ ✅：`InvertedIndex::add_batch`——按 term 分组合并后每 term 一次 DashMap
+   entry + 批量 extend（`mem_docids` 一次累加；白名单位图按 (field,value) 分组批量 extend）；
+   `Engine::pending_inverted` 攒批缓冲——put 过滤后 term 先入缓冲，达阈值（8192）自动批量刷入；
+   倒排查询入口（execute/search_term_paged/inverted_posting/inverted_doc_count/inverted_group_by/
+   inverted_bitmap_and_count）先 flush pending（一致性）；`flush_inverted` 先刷缓冲再落盘；
+   `inverted_mem_docids` 统计含缓冲；**崩溃安全**：WAL 回放重新走 put 重建倒排，缓冲丢失不丢数据；
+   4 个 &self 查询方法改 &mut（rpc.rs 一处补 mut）；execute 倒排路由补 flush（测试暴露）。
+3. ~~**验证**~~ ✅：`cargo test` **314 全绿**（+1：inverted_batch_pending_flush——统计含 pending/
+   查询自动刷入/落盘归零）；demo 4 测试全绿（见 1）；提交 `d38e8ab`。
+
 ---
 
 ## 8. 编码规范
