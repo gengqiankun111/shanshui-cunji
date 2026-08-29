@@ -603,6 +603,46 @@ mod tests {
         assert!(gw.ping_all().is_empty());
     }
 
+    #[test]
+    fn high_concurrency_writes_strong_consistency_two_nodes() {
+        // 两节点真实 TCP 集群 + 高并发写 → 强一致（无丢失/无重复，docid 确定性路由到归属节点）
+        use std::sync::{Arc, Mutex};
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let addr1 = spawn_shard_node(d1.path());
+        let addr2 = spawn_shard_node(d2.path());
+        let meta = meta_with(&[("node-a", &addr1, "master"), ("node-b", &addr2, "slave")]);
+        let gw = Arc::new(Mutex::new(Gateway::new(meta.clone(), RpcShardEndpoint::new(meta))));
+
+        // 8 线程 × 2500 = 20000 条并发写（每线程独立 docid 区间，无跨线程竞争）
+        let mut hs = Vec::new();
+        for t in 0..8u64 {
+            let gw = Arc::clone(&gw);
+            hs.push(std::thread::spawn(move || {
+                for i in 0..2500u64 {
+                    let d = t * 2500 + i + 1;
+                    gw.lock()
+                        .unwrap()
+                        .put(d, &format!("{{\"d\":{d}}}"), &terms(&["status=active"]))
+                        .unwrap();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let mut gw = gw.lock().unwrap();
+
+        // 强一致：广播检索精确 20000（无丢失无重复）；逐条点查全部可见（跨节点确定性路由）
+        let all = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(all.len(), 20000, "并发写后广播检索无丢失/重复");
+        for d in 1..=20000u64 {
+            assert!(gw.get(d).unwrap().is_some(), "docid={d} 强一致可见");
+        }
+        assert!(gw.ping_all().is_empty(), "两节点在线");
+        eprintln!("[高并发强一致] 2 节点真实 TCP × 8 线程 × 2500 并发写：20000 条全部可见、广播精确命中");
+    }
+
     // ---- 网关全局 Term 缓存（design 9.9）----
 
     /// 包装端点：统计后端 search_docids 调用次数（验证缓存是否直出）。

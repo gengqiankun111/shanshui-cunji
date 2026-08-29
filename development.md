@@ -1715,9 +1715,25 @@ impl RuntimePools {
    get_bytes/get_bytes_at` **&self 化**（内部 PerCpuCounter/BlockCache/SstReader::touch 由
    Ex-5.9/7.1 已内部同步，&mut 为历史遗留）——sstable 22 + column_family 34 测试全绿。
 3. ~~**剩余阻塞与路径**~~：① HotCache 内部 LruCache+stats 需 Mutex 化才能 `&self`（热路径锁
-   开销需实测）；② 倒排 pending 攒批缓冲刷盘需 `&mut`——搜索类读（search/fulltext/sql/
-   count）仍需写锁，仅点查/范围扫描可并发读；③ 复制型读写分离（`read_from_replica` 路由）
-   基于已有 ReplicationLog，属**分布式阶段**（与本机+阿里云两节点测试衔接）。
+    开销需实测）；② 倒排 pending 攒批缓冲刷盘需 `&mut`——搜索类读（search/fulltext/sql/
+    count）仍需写锁，仅点查/范围扫描可并发读；③ 复制型读写分离（`read_from_replica` 路由）
+    基于已有 ReplicationLog，属**分布式阶段**（与本机+阿里云两节点测试衔接）。
+
+---
+
+### 7.50 本机性能基准（NVMe SSD，组提交 2ms，200k 记录 × 4 线程）
+
+> 环境：本机 SAMSUNG MZVLB512 NVMe SSD（design 1.2 SSD 条件满足）；release 构建；
+> `shanshui-cunji-ycsb`（负载 a/b/c × 组提交 2ms，append WAL）。
+
+| 负载 | load 写入吞吐 | 混合吞吐 | p50 | p95 | p99 | p999 |
+|---|---|---|---|---|---|---|
+| a 写重 50/50 | 185,515 w/s | 90,935 ops/s | 8.0µs | 112µs | 1046µs | 1769µs |
+| b 读重 95/5 | 186,770 w/s | 168,596 ops/s | 3.8µs | 62µs | 148µs | 1115µs |
+| c 纯读 | 199,028 w/s | 269,891 ops/s | 3.5µs | 44µs | 75µs | 176µs |
+
+> 结论：SSD + 组提交 + Ex-5/7 全量优化下，写重混合 9 万 ops/s、纯读 27 万 ops/s，
+> p50 个位数 µs。阿里云两节点对比与分布式强一致性测试见 7.51（需服务器访问）。
 
 ---
 
