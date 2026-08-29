@@ -54,7 +54,7 @@
 | 查询分页（limit/offset/total，防大结果集内存爆炸） | ✅ | M8-P8 `45c3a54`（5M 命中 WS 10GB→221MB） |
 | **scan 范围扫描流式化**（见模块 A） | ✅ | M8-P10 `516643f` |
 | **scan 游标续扫**（after + 提前终止，全库遍历每页 O(limit)） | ✅ | M8-P11（`scan_after` + `/range?after`） |
-| 类 SQL 解析（query::sql，降低迁移成本） | ⏳ | 阶段 1.5 规划，未启动 |
+| 类 SQL 解析（sqlish，SELECT...WHERE AND/OR 子集，零依赖递归下降） | ✅ | `441282d`（等值走倒排/比较+BETWEEN 扫描+AND 后过滤快路径+看门狗熔断；`/sql?q=` 路由） |
 | 写入 Enrich（预连接） | ⏳ | 阶段 1.5 规划，未启动 |
 
 ## E. 数据管道 / 迁移 / 导入导出
@@ -169,6 +169,9 @@
 - **Ex-4 倒排字段策略落地**（`db-50m-opt` 重建）：9.4 模板（7 枚举白名单 + note 排除 +
   max_term_len=96）——inverted **2231.8→144.3MB（-93.5%）**、50M 行导入 838s、计数/点查全不变；
   配置模板固化 `config.import-example.toml`
+- **类 SQL 解析器**（`441282d`）：src/sqlish.rs 零依赖递归下降（SELECT...WHERE AND/OR/NOT/
+  括号/BETWEEN/比较/LIMIT/OFFSET）+ 引擎求值——等值走倒排、比较/BETWEEN 扫描（AND 后过滤
+  快路径）+ 看门狗熔断；`GET /sql?q=...`；demo 6 测试先验证
 - **M8-P12 环形 WAL 头部 tail 合并 fsync**：sync 单次原子提交（消除冗余第二次 fsync）——
   ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
 - **M8-P13 jieba 完整中文词典分词**：`[inverted] cjk_segmenter="jieba"`（`cjk-jieba` feature，

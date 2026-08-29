@@ -1657,6 +1657,31 @@ impl RuntimePools {
 
 ---
 
+### 7.47 类 SQL 解析器（design 157/1358 行：SELECT ... WHERE AND/OR 子集）
+
+> 背景：降低 MySQL 迁移学习成本——类 SQL WHERE 查询，内部走倒排/组合索引；不承诺方言
+> （无 JOIN/GROUP BY/子查询/事务）。原计划基于 sqlparser-rs；落地改为**零依赖递归下降**
+> （子集很小，避免引入大型解析依赖）。
+
+1. ~~**demo**~~ ✅（src/demo/sqlish/，6 测试）：语法（AND/OR/NOT/括号/= != > < >= <=/
+   BETWEEN low AND high/LIMIT/OFFSET）+ 求值语义（交/并/补/闭区间）+ 语法拒绝（JOIN/GROUP BY）。
+2. ~~**kernel 整合**~~ ✅（src/sqlish.rs）：
+   - **解析器**：Lexer（关键字/标识符/引号字面量/数字/操作符）+ 递归下降（expr=or→and→unary→
+     cond；BETWEEN 消费 `low AND high`）；
+   - **求值**：`field=value` → `inverted_posting`（Roaring 位图；AND 交集/OR 并集/NOT 相对全量补集/
+     `docid` 点查单例）；比较（>/</>=/<=）与 BETWEEN → 倒排无法表达，扫描过滤——**AND 快路径**：
+     扫描叶子作后过滤，只检查另一分支（倒排等值）已命中的文档，避免全量扫描；
+   - **看门狗熔断**：Engine 新增 `query_guard()` 暴露查询守卫；全量扫描/后过滤/回表逐批检查
+     `is_expired()`，超时返回 QueryTooExpensive（**不挂起 server**——实测 db-50m 上 16.6M 基底
+     的 BETWEEN 查询 0.7s 熔断返回 400，server 持续响应）；
+   - **HTTP 路由**：`GET /sql?q=SELECT ...`（server.rs）。
+3. ~~**验证**~~ ✅：`cargo test` **367 全绿**（+5：AND 交集 / OR+NOT 补集 / 比较+docid / BETWEEN
+   数值区间+快路径 / 分页+语法拒绝）；`/sql` 实库验证（db-50m-opt：等值 AND 1.9s 返回正确行）；
+   提交 `441282d`。顺带修复 engine `gc_thread_flushes_tail` 定时 flaky（固定 sleep → 有界轮询）。
+   ⚠️ 比较/BETWEEN 在大基底下本质扫描受限（50M 库枚举等值基座 ≥10M 时熔断），推荐先倒排等值收敛。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
