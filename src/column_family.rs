@@ -728,6 +728,18 @@ impl ColumnFamily {
         Ok(())
     }
 
+    /// Ex-7.4：动态调整后台 IO 限速（前台写压力驱动，Engine 调 Compaction 让路）。
+    pub fn set_io_rate_bytes(&mut self, bytes_per_sec: u64) {
+        if let Some(limiter) = &mut self.io_limiter {
+            limiter.set_rate(bytes_per_sec);
+        }
+    }
+
+    /// Ex-7.4：当前后台 IO 限速（字节/秒；0 = 不限速/未配置）。
+    pub fn io_rate(&self) -> u64 {
+        self.io_limiter.as_ref().map_or(0, |l| l.rate())
+    }
+
     /// 基础 Compaction（无删除位图过滤）。Ex-5.8：无重叠 L0 段合并走**数据块级复用**
     /// （只重建元数据区），否则回退全量合并（等价 `compact_filtered(&|_| false)`）。
     pub fn compact(&mut self) -> Result<CompactReport> {

@@ -78,6 +78,10 @@ pub struct Engine {
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     affinity: crate::affinity::CpuPartition,
+    /// 后台 IO 限速基准（字节/秒，Ex-7.4）：`storage.io_rate_limit_mb` 换算；0 = 不限速。
+    io_rate_base_bytes: u64,
+    /// MemTable 容量上限（字节，Ex-7.4 写压力代理基准，`memtable.max_size_mb`）。
+    memtable_max_bytes: usize,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -228,6 +232,8 @@ impl Engine {
             compaction_parallel: cfg.storage.compaction_parallel,
             deletion_bitmap,
             affinity: crate::affinity::plan_partition(&cfg.affinity),
+            io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
+            memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -310,7 +316,28 @@ impl Engine {
         let _status = self.watchdog.memory_check(self.mem_ratio)?;
         self.put_nosync(docid, value, terms)?;
         // 组提交（M8）：开启时窗口内攒批一次 fsync，否则逐条 fsync（强安全）
-        self.maybe_group_commit()
+        self.maybe_group_commit()?;
+        // Ex-7.4：按前台写压力动态调整 Compaction 限速（MemTable 水位让路）
+        self.adjust_compaction_io_rate();
+        Ok(())
+    }
+
+    /// Ex-7.4：动态限流——按主数据 MemTable 水位（前台写压力代理）下调 Compaction 限速：
+    /// 压力 p → 限速 = base × (1 - 0.5p)——压力 0 全速追赶 L0 合并，压力 1 让路 50%
+    /// 磁盘带宽给前台写（design_extension 12.6：写压力高时压缩 Compaction 带宽）。
+    fn adjust_compaction_io_rate(&mut self) {
+        if self.io_rate_base_bytes == 0 {
+            return; // 未配置限速（io_rate_limit_mb = 0）
+        }
+        let used = self.primary.memtable_bytes() as f64;
+        let max = self.memtable_max_bytes.max(1) as f64;
+        let pressure = (used / max).clamp(0.0, 1.0);
+        let rate = (self.io_rate_base_bytes as f64 * (1.0 - 0.5 * pressure)) as u64;
+        self.primary.set_io_rate_bytes(rate);
+        self.delta.set_io_rate_bytes(rate);
+        if let Some(c) = &mut self.cidx {
+            c.set_io_rate_bytes(rate);
+        }
     }
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
@@ -1868,6 +1895,30 @@ mod tests {
         assert_eq!(e2.get(1).unwrap().unwrap(), b"doc1");
         assert_eq!(e2.get(2).unwrap().unwrap(), b"doc2");
         assert!(e2.search_term("rust").unwrap().len() == 1);
+    }
+
+    #[test]
+    fn dynamic_io_rate_backs_off_with_write_pressure() {
+        // Ex-7.4：MemTable 水位（写压力代理）升高 → Compaction 限速下调让路
+        // （压力 p → base×(1-0.5p)，最低 50% 基准）
+        let mut c = cfg();
+        c.storage.io_rate_limit_mb = 100; // 100MB/s 基准
+        c.memtable.max_size_mb = 1; // 1MB 小 MemTable → 快速产生写压力
+        let mut e = Engine::open(&tmp(), &c).unwrap();
+        let base = 100u64 * 1024 * 1024;
+        assert_eq!(e.primary.io_rate(), base, "空 MemTable 压力 0 全速");
+        // 写入 8 个 64KB 文档 ≈ 512KB（memtable 50% 水位）
+        let big = vec![b'x'; 64 * 1024];
+        for i in 0..8u64 {
+            e.put(i, big.clone(), &[]).unwrap();
+        }
+        let rate = e.primary.io_rate();
+        assert!(rate < base, "写压力下限速应下调: {rate} < {base}");
+        assert!(rate >= base / 2, "不低于 50% 基准: {rate}");
+        // flush 后水位回落 → 限速回升
+        e.flush_primary().unwrap();
+        let rate2 = e.primary.io_rate();
+        assert!(rate2 >= rate, "flush 后水位降、限速回升: {rate2} >= {rate}");
     }
 
     #[test]
