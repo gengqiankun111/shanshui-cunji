@@ -383,6 +383,14 @@
   `IoRateLimiter::set_rate` 动态调速（容量受新突发上限约束，不凭空赠予额度）。
 - **结果**：demo 让路 1000ms vs 恢复 500ms；346 测试全绿（+2）；提交 `ddbc20e`（Ex-7.4）。
 
+### P50. ArcSwap 化倒排段清单/FST 字典：MmapFile 不可 Clone → 值改 Arc 使 HashMap 可 rcu
+- **问题**：Ex-6.2/6.3 把 `segments`/`dicts` 改 ArcSwap 原子发布时，`rcu` 要求整体 `Clone`；
+  FST 字典值 `fst::Map<MmapFile>`（MmapFile 包 memmap2::Mmap）**不可 Clone** → HashMap 无法
+  Clone → rcu 不可用；且 `rcu` 闭包为 `FnMut`（map 无法 move 进闭包）。
+- **方案**：①dicts 值改 `Arc<fst::Map<MmapFile>>`（Ex-6.3 设计本意"值改 Arc"）——Arc 可
+  Clone → HashMap 可整体 Clone；②map 先 `Arc::new` 再闭包内克隆捕获（FnMut 多次调用安全）。
+- **结果**：快照一致性/并发读/读写交替 3 测试全绿；349 测试全绿；提交 `c8183cf`（Ex-6.2/6.3）。
+
 ---
 
 ## 环境备忘（不入库）

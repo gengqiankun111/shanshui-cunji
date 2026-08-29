@@ -1533,6 +1533,25 @@ impl RuntimePools {
    demo 3 测试全绿；clippy 零警告；提交 `ddbc20e`。⚠️ 写 P99 收益需 **SSD 环境**实测
    （写重负载下 Compaction 让路对比静态限速）。
 
+### 7.42 Ex-6.2/6.3 倒排并发读优化（design_extension v0.4 第 11 章）
+
+> 背景：Ex-6.1 已提供 Seqlock 原语；倒排段清单（`segments`）与 FST 字典（`dicts`）为
+> 普通容器——flush/gc 更新与 search 读无并发保障。Ex-6.2/6.3 = 原子指针发布（ArcSwap），
+> 读路径拿 Arc 快照无锁。
+
+1. ~~**kernel 整合**~~ ✅：
+   - **Ex-6.2 段清单**：`segments: Vec<String>` → `ArcSwap<Vec<String>>`——flush/gc 用
+     `rcu`/`store` 发布新快照；search/doc_count/iter_terms/segment_count/segment_bytes/
+     should_gc/persist_manifest 读路径 `load()` 拿 Arc 快照无锁（快照一致性：发布前读到的
+     旧 Arc 在发布后仍可查旧段，段文件未删前）；
+   - **Ex-6.3 FST 字典**：`dicts: HashMap<String, fst::Map>` → `ArcSwap<HashMap<String,
+     Arc<fst::Map<MmapFile>>>>`——值改 `Arc`（MmapFile 不可 Clone，Arc 使 HashMap 可整体
+     Clone 供 rcu 发布）；查询 `load().get(seg)` 拿 Arc 快照零拷贝；
+   - gc 顺序保持 Windows 兼容：先 `store` 发布新快照（释放旧映射）再删旧文件。
+2. ~~**验证**~~ ✅：`cargo test` **349 全绿**（+3：快照一致性 / 8 线程并发读 &self 安全 /
+   flush 与读交替结果一致）；倒排 34 测试全绿；clippy 零警告；提交 `c8183cf`。
+   ⚠️ 真实读写并发收益需**读写分离**（I 模块）解除 Engine 全局锁后实测。
+
 ---
 
 ## 8. 编码规范
