@@ -859,6 +859,12 @@ impl Engine {
         self.inverted.flush_segment()
     }
 
+    /// 查询看门狗守卫（类 SQL 扫描过滤/回表熔断用）：`is_expired()` 超时后返回
+    /// QueryTooExpensive（复用 engine.execute 的查询超时机制）。
+    pub fn query_guard(&self) -> crate::watchdog::QueryGuard {
+        self.watchdog.begin_query()
+    }
+
     /// 倒排某词条命中的 docid 集合（不回表，供测试/监控）。
     pub fn inverted_posting(&mut self, term: &str) -> Result<RoaringBitmap> {
         self.flush_inverted_pending();
@@ -1404,10 +1410,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &gc_cfg(2_000)).unwrap();
         e.put(1, b"doc-1".to_vec(), &["t"]).unwrap();
-        // 窗口内第 1 条通常不触发 fsync（有待刷缓冲）
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let pending = e.primary.wal_handle().lock().unwrap().pending_bytes()
-            + e.delta.wal_handle().lock().unwrap().pending_bytes();
+        // 窗口内第 1 条通常不触发 fsync（有待刷缓冲）；有界轮询等后台线程兜底落盘
+        // （并行测试负载下后台线程调度可能延迟，固定 sleep 易 flaky）
+        let mut pending = 1usize;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            pending = e.primary.wal_handle().lock().unwrap().pending_bytes()
+                + e.delta.wal_handle().lock().unwrap().pending_bytes();
+            if pending == 0 {
+                break;
+            }
+        }
         assert_eq!(pending, 0, "后台线程应在窗口内兜底落盘");
     }
 

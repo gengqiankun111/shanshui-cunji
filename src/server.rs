@@ -458,6 +458,7 @@ fn route_request(
         ("POST", "/patch") => handle_patch(engine, body),
         ("GET", "/get") => handle_get(engine, query),
         ("GET", "/search") => handle_search(engine, query),
+        ("GET", "/sql") => handle_sql(engine, query),
         ("GET", "/fulltext") => handle_fulltext(engine, query),
         ("GET", "/range") => handle_range(engine, query),
         ("GET", "/count") => handle_count(engine, query),
@@ -687,6 +688,19 @@ fn handle_search(engine: &mut Engine, query: &str) -> (u16, String) {
     match execute_filter_paged(engine, &filter, limit, offset) {
         Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// 类 SQL 查询（sqlish，design 157/1358 行）：`GET /sql?q=SELECT * FROM t WHERE status='active' LIMIT 10`
+/// → `{"total":N,"rows":[...]}`（复用 rows_payload_total；total=命中总数，rows 受 LIMIT/OFFSET 截断）。
+fn handle_sql(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let Some(q) = params.iter().find(|(k, _)| k == "q").map(|(_, v)| v.clone()) else {
+        return (400, json!({"error": "缺少 q 参数"}).to_string());
+    };
+    match crate::sqlish::execute(engine, &q, 10_000) {
+        Ok(rows) => (200, rows_payload_total(rows.len() as u64, &rows).to_string()),
+        Err(e) => (400, json!({"error": e.to_string()}).to_string()),
     }
 }
 

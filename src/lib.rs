@@ -54,6 +54,7 @@ pub mod seqlock;
 pub mod server;
 pub mod sharding;
 pub mod sstable;
+pub mod sqlish;
 pub mod storage;
 pub mod tds;
 pub mod term_cache;
