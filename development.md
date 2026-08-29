@@ -1444,6 +1444,22 @@ impl RuntimePools {
    column_family 无重叠复用 + 有重叠回退）；demo 3 测试全绿（见 1）；clippy 新代码零警告；
    提交 `cd00d85`。⚠️ 写放大收益需在 **SSD 环境**实测（HDD 不压测；无重叠 L0 段比例越高收益越大）。
 
+### 7.36 Ex-5.9 冷热感知 Compaction + Bloom Merge（design 4.8.3 P2）
+
+> 背景：Compaction 无热度概念——冷热段同等对待；Bloom Merge 需"合并前布隆判断有效性"。
+
+1. ~~**demo 研究（src/demo/heat-compaction/，gitignore 不提交）**~~ ✅：3 测试全绿——热段排序
+   选段（热度 [100,5,50,20,30] 取前 2 = [0,2]）；部分 L0 合并读语义不变（6 段→选热 2 段，600 键
+   全可读）；热段优先下沉（4 轮内热段退出 L0，L0 余 2）。
+2. ~~**kernel 整合**~~ ✅：`SstReader` 读热度计数（`touch()`/`heat()`，点查布隆放行后递增——
+   未命中/布隆拦截不计数）；`ColumnFamily::sst_heat(idx)` 监控接口；`select_compaction_inputs`
+   增加 heat 参数——L0 段数超过 `l0_stall_threshold` 且存在热度时**优先合并最热的 level_limit 段**
+   （热段先下沉 L1 聚合，热点读路径段数更快减少）；无热度/未超阈值维持全量合并。
+   Bloom Merge 定位：Ex-5.8 的无重叠检测（索引范围）+ 分区布隆重建（add_raw_block）已承担
+   "合并前布隆判断有效性"。
+3. ~~**验证**~~ ✅：`cargo test` **335 全绿**（+2：热段优先选段 + 热度统计）；demo 3 测试全绿；
+   clippy 新代码零警告；提交 `ba709e2`。⚠️ 热段下沉收益需在 **SSD 环境**实测。
+
 ---
 
 ## 8. 编码规范

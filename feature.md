@@ -129,7 +129,7 @@
 | 删除位图（Deletion Bitmap，删除 IO -99%） | P1 | ✅ Ex-5.6 `e615071`（按 DocId 1bit + 4KB 页对齐脏页 fsync：delete 跳 Tombstone -99% IO、get O(1) 跳过、put 清位复活、compaction 物理丢弃已删 key） |
 | 倒排 FST + Mmap 字典（冷启动 8s→50ms） | P1 | ✅ Ex-5.7 `442981c`（crates/mmap-file 只读 mmap 安全封装落地 P23 白名单：FST 字典 fs::read 全量加载→mmap 按需缺页，冷启动零堆分配 17.3MB→0B+0.14ms） |
 | 元数据-数据解耦（Compaction 只重写元数据，写放大 -50%） | P1 | ✅ Ex-5.8 `cd00d85`（无重叠 L0 合并数据块级复用：零解压只重建 Block Index/Bloom/Footer；demo 4041ms→毫秒级；有重叠/位图过滤/PAX 回退全量） |
-| 冷热感知 Compaction + Bloom Merge（写入量 -30%） | P2 | ⏳ Ex-5.9 |
+| 冷热感知 Compaction + Bloom Merge（写入量 -30%） | P2 | ✅ Ex-5.9 `ba709e2`（SST 读热度统计 + L0 超阈值热段优先合并下沉 L1 + sst_heat 监控；Bloom Merge 由 Ex-5.8 无重叠检测承担） |
 | 多 SSD 条带化（WAL 独占最快盘，多盘 +3~4×） | P2 | ⏳ Ex-5.10 |
 
 ## K. 多核优化（v0.5，Ex-7，Shard Everything）
