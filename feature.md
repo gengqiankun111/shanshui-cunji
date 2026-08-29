@@ -132,6 +132,18 @@
 | 冷热感知 Compaction + Bloom Merge（写入量 -30%） | P2 | ⏳ Ex-5.9 |
 | 多 SSD 条带化（WAL 独占最快盘，多盘 +3~4×） | P2 | ⏳ Ex-5.10 |
 
+## K. 多核优化（v0.5，Ex-7，Shard Everything）
+
+> 设计（design_extension v0.5 第 12 章）：锁竞争（已落地）→ 缓存伪共享 → 绑核 → io_uring 多队列 → compaction 动态限流。
+> ⚠️ 性能验证须在 SSD 环境（HDD 不压测）。
+
+| 任务 | 优先级 | 状态 |
+|---|---|---|
+| 缓存伪共享：PerCpuCounter（按核分计数器）+ 热结构体 `#[repr(align(64))]` | P0 | ⏳ Ex-7.1 |
+| `[affinity]` 绑核默认开启 + 三池物理核分区（网络 0-3/计算 4-7/IO 尾核，P99 验证） | P1 | ⏳ Ex-7.2 |
+| io_uring SQPOLL + WAL/SSTable 多 NVMe 队列/多盘 | P1 | ⏳ Ex-7.3 |
+| Compaction 动态限流（按前台负载调 rate_limit_mb/s） | P2 | ⏳ Ex-7.4 |
+
 ---
 
 ## 近期里程碑（按完成顺序）

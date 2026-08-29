@@ -193,6 +193,36 @@ Seqlock 单元测试（并发写读交错）+ 倒排端到端（flush/gc 并发 
 
 ---
 
+## Ex-7 多核优化（v0.5，2026-08-29）
+
+> 设计依据：design_extension v0.5 第 12 章（五处理点：锁竞争已落地 / 缓存伪共享新增 /
+> 绑核 / io_uring 多队列 / compaction 动态限流）。核心：**Shard Everything**——
+> 按核分计数器、按 Term 分锁、按物理核分调度池，把单核极限吞吐提升为多核稳定并发。
+
+### 任务分解
+
+- [ ] **Ex-7.1 缓存伪共享**（P0）：`PerCpuCounter`（按核拆分计数器，读取汇总，align(64) 隔离
+      缓存行）——`total_writes` / 倒排 `mem_docids` 改 PerCpuCounter；热统计结构体
+      `#[repr(align(64))]`；demo 验证多核写计数器吞吐提升（4/8 核对比）。
+- [ ] **Ex-7.2 绑核默认开启**（P1）：`[affinity]` 配置默认开启（多核机器），三池绑物理核
+      （网络 0-3 / 计算 4-7 / IO 尾核，跳过超线程虚拟核）；`core_affinity` crate + taskset
+      兜底；验证绑核 vs 不绑核 P99（SSD 环境，HDD 不压测）。
+- [ ] **Ex-7.3 io_uring SQPOLL + 多队列**（P1）：阶段 3 io_uring 落地时，WAL/SSTable 落不同
+      NVMe 队列/SSD（同 Ex-5.10 多盘条带化），WAL fsync 与刷盘并行。
+- [ ] **Ex-7.4 Compaction 动态限流**（P2）：并行度限后台 IO 池（2~4），按前台写负载动态下调
+      `rate_limit_mb/s`（Ex-5.4 compaction 调优后叠加）。
+
+### 验证
+
+Ex-7.1 demo（PerCpuCounter vs 单 AtomicU64 多核写吞吐）+ 热路径统计正确性；
+Ex-7.2 P99 对比（SSD 环境实测）。
+
+### 依赖
+
+Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension v0.5 设计依据。
+
+---
+
 ## 里程碑状态跟踪
 
 | 里程碑 | 内容 | 状态 | 提交 |
@@ -204,11 +234,13 @@ Seqlock 单元测试（并发写读交错）+ 倒排端到端（flush/gc 并发 
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
 | Ex-5 | SSD 原生迁移（P0 4KB 块/分片锁/批处理/compaction → P1 环形 WAL/删除位图/FST/解耦 → P2 冷热/条带化） | ⏳ | — |
 | Ex-6 | 并发读优化（Ex-6.1 Seqlock 原语 ✅ → 倒排段清单/FST 字典 Arc，依赖读写分离） | 🔄 | `1946161` |
+| Ex-7 | 多核优化（Ex-7.1 缓存伪共享 PerCpuCounter → 7.2 绑核 → 7.3 io_uring 多队列 → 7.4 compaction 动态限流） | ⏳ | — |
 
 ## 与本项目其他文档关系
 
 - **design_extension.md**：本计划的设计依据（v0.1 分布式事务技术全景/分层决策；v0.2 倒排字段策略
-  三准则/配置模板；v0.3 SSD 原生优化定位与优先级；v0.4 并发读优化 Seqlock/Arc）。
+  三准则/配置模板；v0.3 SSD 原生优化定位与优先级；v0.4 并发读优化 Seqlock/Arc；v0.5 多核优化
+  PerCpuCounter/绑核/io_uring 多队列/compaction 动态限流）。
 - **design.md**：SSD 原生存储优化设计见 4.8（核心设计转变/场景瓶颈/优化优先级/配置模板/路线图）；
   HDD 开发环境警告见 1.2。
 - **feature.md**：主项目功能清单（L0 对应 M8-P0 等）；Ex-1/2 落地后同步更新 feature.md 的

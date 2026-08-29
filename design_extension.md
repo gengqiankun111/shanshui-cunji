@@ -1,9 +1,10 @@
 # 设计扩展（design_extension.md）
 
-> 版本：v0.4（2026-08-29）· 多主题扩展文档：
+> 版本：v0.5（2026-08-29）· 多主题扩展文档：
 > **v0.1 分布式事务**（第 1~8 章）· **v0.2 倒排索引字段策略**（第 9 章）·
-> **v0.3 SSD 原生优化**（第 10 章）· **v0.4 并发读优化**（第 11 章，2026-08-29 增补）
-> 关联：design.md（主设计）、development_extension.md（开发扩展计划，Ex-1/2/3 分布式 + Ex-4 倒排策略 + Ex-5 SSD 原生 + Ex-6 并发读优化）
+> **v0.3 SSD 原生优化**（第 10 章）· **v0.4 并发读优化**（第 11 章）·
+> **v0.5 多核优化**（第 12 章，2026-08-29 增补）
+> 关联：design.md（主设计）、development_extension.md（开发扩展计划，Ex-1/2/3 分布式 + Ex-4 倒排策略 + Ex-5 SSD 原生 + Ex-6 并发读优化 + Ex-7 多核优化）
 
 ---
 
@@ -303,3 +304,103 @@ Seqlock 原语：
 - **development.md 7.x**：各里程碑落地记录（7.27 起为并发读优化）；
 - **development_extension.md**：Ex-1~Ex-6 落地计划与状态；
 - **feature.md**：主项目功能清单（I 模块含读写分离/并发读候选）。
+
+---
+
+# 第 12 章 多核优化（v0.5，2026-08-29）
+
+> 背景：多核 CPU 下数据库的明确可处理点集中在**锁竞争、缓存局部性、IO 并行**三层。
+> 核心不是"让所有核干活"，而是**数据分片（Shard Everything）**——按核分计数器、
+> 按 Term 分锁、按物理核分调度池，把单核极限吞吐提升为多核稳定并发。
+> 现状核对：design.md 已含三池模型/防超售分区/绑核（默认关闭）/io_uring/compaction 限流
+> （design 14.1.2 / 1177-1187）；Ex-5.2（倒排 256 shards + 位图分片）与 Ex-6.1（Seqlock）
+> 已落地锁竞争优化。本章新增**缓存伪共享**设计与其余强化点。
+
+## 12.1 多核五处理点全景（现状标注）
+
+| # | 层面 | 处理点 | 现状 | 行动 |
+| --- | --- | --- | --- | --- |
+| 1 | 锁竞争 | 倒排热路径：DashMap 分片调大（256/512）、Sharded Lock 按 Term、无锁读 | ✅ Ex-5.2（256 shards + bitmaps 按 field 分片）、Ex-6.1（Seqlock 无锁读）| 无（已落地）|
+| 2 | 缓存伪共享 | 高频写统计按核拆分（PerCpuCounter）+ 热结构体 `#[repr(align(64))]` | ❌ 未覆盖 | **Ex-7.1 新增** |
+| 3 | 调度/NUMA | 三池绑物理核（网络 0-3 / 计算 4-7 / IO 尾核），稳定 P99 | design 已有（`[affinity]` 默认关闭）| Ex-7.2 默认开启 + 文档指引 |
+| 4 | WAL/IO 并行 | io_uring SQPOLL 多核提交 + WAL/SSTable 落不同 NVMe 队列/SSD | design 阶段 3 已有 io_uring；多队列未细化 | Ex-7.3 强化 |
+| 5 | Compaction | 并行度 + 动态限流（rate_limit_mb/s），不给前台抢占 | design 已有 rate_limit/ionice | Ex-7.4 动态限流 |
+
+## 12.2 锁竞争（已落地，Ex-5.2 / Ex-6.1）
+
+- **Term 字典分片**：`mem: DashMap` 256 shards（2 的幂），低基数 Term 高并发 1.39×（Ex-5.2 demo）；
+- **位图索引分片**：按 field hash 256 片锁，不同 field 并行；
+- **无锁读**：Seqlock 原语（Ex-6.1，零 unsafe）——段清单/FST 字典接入待读写分离（Ex-6.2/6.3）；
+- 若极高频 Term（status=active）仍成热点，可进一步 **Term 级 Sharded Lock**（按 Term Hash 独立锁，
+  同 Term 串行、不同 Term 并行）——Ex-5.2 已按 DashMap shard 近似实现。
+
+## 12.3 缓存伪共享（False Sharing，新增设计，Ex-7.1）
+
+**问题**：多核同时修改相邻内存（相邻 DocId 计数器/统计字段）→ 同一 64B 缓存行频繁失效 →
+性能骤降（每核修改触发其他核缓存行无效 + 内存同步）。
+
+**处理点**：
+
+```rust
+/// 按核拆分的计数器（PerCpuCounter）：每核独立累加，读取时汇总——
+/// 避免多核写同一计数器导致缓存行抖动。
+#[derive(Default)]
+pub struct PerCpuCounter {
+    /// 每核独立槽（align(64) 隔离缓存行，杜绝伪共享）。
+    slots: Vec<std::sync::atomic::AtomicU64>,
+    /// 有效核数（0 = 自动检测）。
+    ncpu: usize,
+}
+impl PerCpuCounter {
+    pub fn new() -> Self {
+        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        Self { slots: (0..ncpu).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), ncpu }
+    }
+    pub fn add(&self, n: u64) {
+        // 当前线程绑核 id（近似：thread_id % ncpu）；生产可经 affinity 精确映射
+        let idx = std::thread::current().id().as_u64() as usize % self.ncpu;
+        self.slots[idx].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn sum(&self) -> u64 {
+        self.slots.iter().map(|s| s.load(std::sync::atomic::Ordering::Relaxed)).sum()
+    }
+}
+```
+
+- **热结构体对齐**：高频共写的统计/索引结构体加 `#[repr(align(64))]`（缓存行对齐），
+  相邻字段天然隔离；不同核写不同字段时互不失效缓存行；
+- **落地点**：`total_writes` / 倒排 `mem_docids`（现为单 AtomicU64 原子 RMW——多核写竞争）→
+  PerCpuCounter；HotCache 统计字段 align(64)。
+
+## 12.4 调度与 NUMA / 绑核（design 已有，Ex-7.2 强化）
+
+- design 1177-1187 已定义三池防超售分区 + `[affinity]` 绑核（默认关闭）：
+  - 网络池（Tokio）：N×0.3 物理核；计算池（Rayon）：N×0.3；后台 IO 池：固定 2~4；
+  - **绑核建议**：网络池绑物理核 0-3、计算池绑 4-7、IO 池尾核——避免 Tokio 工作窃取使
+    热点数据跨核"跳跃"（稳定 P99）；跳过超线程虚拟核；跨 NUMA 避免跨插槽访存；
+- **Ex-7.2**：`[affinity]` 默认开启（多核机器），`core_affinity` crate 绑核 + taskset 兜底；
+  验证：绑核 vs 不绑核的 P99 对比（SSD 环境实测，HDD 不压测）。
+
+## 12.5 WAL 与 IO 并行（design 已有，Ex-7.3 强化）
+
+- design 阶段 3：io_uring SQPOLL 异步提交 + 环形 WAL + O_DIRECT（NVMe 延迟 -30%~50%）；
+- **强化（多队列）**：WAL 与 SSTable 落**不同 NVMe 队列**（`/sys/block/nvme*/queue/` 或
+  不同 SSD）——WAL fsync 与 SSTable 刷盘 IO 并行，互不争抢；倒排文件可独立放置
+  （同 Ex-5.10 多 SSD 条带化）；
+- Ex-7.3：io_uring SQPOLL 落地（阶段 3）时按多队列/多盘配置验证写并行收益。
+
+## 12.6 Compaction 并行度 + 动态限流（design 已有，Ex-7.4 强化）
+
+- design 4.5：ionice 最低优先级 + `compaction.rate_limit_mb/s` + 写 Stall 阈值；
+- **强化（动态限流）**：Compaction 并行度仅限后台 IO 池特定线程（2~4），
+  按前台负载动态下调 `rate_limit_mb/s`（写压力高时压缩 Compaction 带宽，给前台网络/计算池
+  预留算力）；Ex-5.4（compaction 20× 层级 + 并行）落地后叠加动态限流。
+
+## 12.7 落地任务（Ex-7，development_extension.md）
+
+| 任务 | 内容 | 优先级 |
+| --- | --- | --- |
+| Ex-7.1 | 缓存伪共享：PerCpuCounter（统计/计数器按核拆分）+ 热结构体 `#[repr(align(64))]` | P0 |
+| Ex-7.2 | `[affinity]` 绑核默认开启 + 三池物理核分区（P99 验证）| P1 |
+| Ex-7.3 | io_uring SQPOLL + WAL/SSTable 多 NVMe 队列/多盘 | P1 |
+| Ex-7.4 | Compaction 动态限流（按前台负载调 rate_limit）| P2 |

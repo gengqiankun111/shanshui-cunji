@@ -1291,6 +1291,25 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **318 全绿**（+4 seqlock）；demo 4 测试全绿（见 1）；
    提交 `1946161`。倒排段清单/FST 字典接入（Ex-6.2/6.3）待读写分离解除 Engine 全局锁。
 
+### 7.29 多核优化设计（Shard Everything，design_extension v0.5）
+
+> 背景（2026-08-29 决策）：多核 CPU 下可处理点集中在锁竞争、缓存局部性、IO 并行三层。
+> 核心不是"让所有核干活"，而是**数据分片（Shard Everything）**——按核分计数器、
+> 按 Term 分锁、按物理核分调度池。现状核对：design.md 已含三池防超售/绑核（默认关闭）/
+> io_uring/compaction 限流；Ex-5.2 + Ex-6.1 已落地锁竞争。
+
+1. ~~**设计（design_extension v0.5 第 12 章）**~~ ✅：五处理点全景（锁竞争 ✅ / 缓存伪共享 ❌
+   新增 / 绑核 ✅ 已有 / io_uring 多队列 ⏳ / compaction 动态限流 ⏳）；**缓存伪共享设计**
+   （PerCpuCounter 按核拆分计数器 + `#[repr(align(64))]` 缓存行隔离——`total_writes`/
+   `mem_docids` 改 PerCpuCounter 消除多核原子 RMW 竞争）；绑核建议（网络 0-3 / 计算 4-7 /
+   IO 尾核，跳过超线程，稳定 P99）；WAL/SSTable 多 NVMe 队列；compaction 动态限流。
+2. ~~**扩展文档**~~ ✅：development_extension.md 新增 **Ex-7 多核优化**（Ex-7.1 PerCpuCounter
+   P0 / Ex-7.2 绑核默认开启 P1 / Ex-7.3 io_uring 多队列 P1 / Ex-7.4 compaction 动态限流 P2）
+   + 状态表；feature.md 新增 **K 模块（多核优化）** 任务清单；design.md 已有设计引用。
+3. ~~**依赖说明**~~ ✅：Ex-7.1（伪共享）独立可做（不与全局锁冲突）；Ex-7.2 依赖三池模型
+   （已有）；Ex-7.3 依赖 io_uring 阶段 3；Ex-7.4 依赖 Ex-5.4 compaction 调优。
+   性能验证须在 **SSD 环境**（HDD 不压测，design 1.2 警告）。
+
 ---
 
 ## 8. 编码规范
