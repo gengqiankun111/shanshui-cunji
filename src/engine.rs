@@ -21,6 +21,7 @@ use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
 use crate::keys::{decode_docid, encode_docid, encode_varlen};
 use crate::optimizer::{route, AccessPath, QuerySpec};
+use crate::outbox::Outbox;
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
 /// 引擎：组合主数据 + 组合索引 + Delta 增量 + 倒排 + HotCache。
@@ -82,6 +83,9 @@ pub struct Engine {
     io_rate_base_bytes: u64,
     /// MemTable 容量上限（字节，Ex-7.4 写压力代理基准，`memtable.max_size_mb`）。
     memtable_max_bytes: usize,
+    /// 本地消息表（Ex-1）：Some = 启用（业务写同一本地事务入队 outbox，后台投递幂等消费）；
+    /// None = 关闭（默认零开销）。
+    outbox: Option<Outbox>,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -194,10 +198,19 @@ impl Engine {
         } else {
             None
         };
+        // 本地消息表（Ex-1）：开启时打开 outbox 列族（数据盘，与 primary 同崩溃安全模型）
+        let outbox = if cfg.outbox.enabled {
+            Some(Outbox::open(&sst_root.join("outbox"), cfg)?)
+        } else {
+            None
+        };
         // MVCC 全局 seq（M7-1）：以各列族 WAL 恢复后的 next_seq 取最大作为全局起点，
-        // 此后 primary / delta 写入共享同一计数器（跨列族快照隔离正确）。
+        // 此后 primary / delta / outbox 写入共享同一计数器（跨列族快照隔离正确）。
         let global_seq = Arc::new(AtomicU64::new(
-            primary.wal_next_seq().max(delta.wal_next_seq()),
+            primary
+                .wal_next_seq()
+                .max(delta.wal_next_seq())
+                .max(outbox.as_ref().map_or(0, |o| o.wal_next_seq())),
         ));
         let mut primary = primary;
         primary.set_external_seq(Arc::clone(&global_seq));
@@ -234,6 +247,7 @@ impl Engine {
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
+            outbox,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -395,6 +409,10 @@ impl Engine {
         }
         self.primary.sync_wal()?;
         self.delta.sync_wal()?;
+        // Ex-1：outbox 消息与业务写同 fsync 点（本地原子：崩溃恢复按 seq 回放）
+        if let Some(ob) = &mut self.outbox {
+            ob.sync_wal()?;
+        }
         Ok(())
     }
 
@@ -974,6 +992,53 @@ impl Engine {
     /// Ex-7.2：网络核列表（server 主线程绑核用）。
     pub fn network_cores(&self) -> Vec<usize> {
         self.affinity.network.clone()
+    }
+
+    // ============ Ex-1 本地消息表（Outbox）============
+
+    /// 入队 outbox 消息（Ex-1.1）：docid + 全局 seq 幂等键，与业务写共享 fsync 点
+    /// （`maybe_group_commit`）——崩溃恢复按 seq 回放，消息与业务写本地原子。
+    /// 返回幂等键（docid, seq）；outbox 关闭时返回 Err(Unsupported)。
+    pub fn enqueue_outbox(&mut self, docid: u64, payload: &[u8]) -> Result<(u64, u64)> {
+        let Some(ob) = &mut self.outbox else {
+            return Err(crate::error::Error::Unsupported(
+                "outbox 未启用（config.outbox.enabled = true）".into(),
+            ));
+        };
+        let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
+        ob.enqueue(docid, seq, payload)?;
+        self.maybe_group_commit()?; // 与业务写同 fsync 点（本地原子）
+        Ok((docid, seq))
+    }
+
+    /// 投递器（Ex-1.2）：扫描 pending → 回调投递（true=成功）→ 标记 done。
+    /// 返回投递成功数；失败留 pending（调用方退避重试）。投递成功后统一落盘
+    /// （done 状态持久，防重投）。
+    pub fn dispatch_outbox(&mut self, deliver: impl FnMut(&[u8], &[u8]) -> bool) -> Result<usize> {
+        let n = match &mut self.outbox {
+            Some(ob) => ob.dispatch(deliver)?,
+            None => 0,
+        };
+        if n > 0 {
+            self.flush_wal()?;
+        }
+        Ok(n)
+    }
+
+    /// 当前 pending 消息数（排空校验/监控）。
+    pub fn outbox_pending(&mut self) -> Result<usize> {
+        match &mut self.outbox {
+            Some(ob) => ob.pending_count(),
+            None => Ok(0),
+        }
+    }
+
+    /// 是否已排空（Ex-1.4：扩容/切换前置条件）。
+    pub fn outbox_drained(&mut self) -> Result<bool> {
+        match &mut self.outbox {
+            Some(ob) => ob.drained(),
+            None => Ok(true),
+        }
     }
 
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
@@ -1919,6 +1984,60 @@ mod tests {
         e.flush_primary().unwrap();
         let rate2 = e.primary.io_rate();
         assert!(rate2 >= rate, "flush 后水位降、限速回升: {rate2} >= {rate}");
+    }
+
+    #[test]
+    fn outbox_e2e_enqueue_dispatch_drain() {
+        // Ex-1 端到端：enqueue（与业务写同 seq 空间）→ 重启保留 → 幂等投递 → 排空
+        let mut c = cfg();
+        c.outbox.enabled = true;
+        let dir = tmp();
+        let mut consumer = crate::outbox::IdempotentConsumer::new();
+        {
+            let mut e = Engine::open(&dir, &c).unwrap();
+            e.put(1, b"doc1".to_vec(), &["k"]).unwrap();
+            e.enqueue_outbox(1, b"msg-1").unwrap();
+            e.enqueue_outbox(2, b"msg-2").unwrap();
+            e.flush_wal().unwrap();
+            assert_eq!(e.outbox_pending().unwrap(), 2);
+            // 幂等投递
+            let n = e
+                .dispatch_outbox(|k, p| {
+                    assert!(p.starts_with(b"msg-"));
+                    consumer.apply(k)
+                })
+                .unwrap();
+            assert_eq!(n, 2);
+            assert!(e.outbox_drained().unwrap(), "投递后排空");
+        }
+        // 重启：pending 保持 0（done 状态持久）
+        let mut e2 = Engine::open(&dir, &c).unwrap();
+        assert!(e2.outbox_drained().unwrap());
+        assert_eq!(consumer.received(), 2);
+    }
+
+    #[test]
+    fn outbox_disabled_by_default() {
+        // outbox 默认关闭（零开销）：enqueue 返回 Unsupported、pending=0
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        assert!(e.enqueue_outbox(1, b"x").is_err(), "未启用应拒绝入队");
+        assert_eq!(e.outbox_pending().unwrap(), 0);
+        assert!(e.outbox_drained().unwrap());
+    }
+
+    #[test]
+    fn outbox_pending_survives_restart() {
+        // 崩溃恢复：enqueue 未投递 → 重开 pending 保留（WAL 回放重建）
+        let mut c = cfg();
+        c.outbox.enabled = true;
+        let dir = tmp();
+        {
+            let mut e = Engine::open(&dir, &c).unwrap();
+            e.enqueue_outbox(7, b"keep").unwrap();
+            e.flush_wal().unwrap();
+        }
+        let mut e2 = Engine::open(&dir, &c).unwrap();
+        assert_eq!(e2.outbox_pending().unwrap(), 1, "重开 pending 保留");
     }
 
     #[test]

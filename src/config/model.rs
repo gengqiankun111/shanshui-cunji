@@ -32,6 +32,7 @@ pub struct Config {
     pub inverted: InvertedConfig,
     pub join: JoinConfig,
     pub enrich: EnrichConfig,
+    pub outbox: OutboxConfig,
     pub cluster: ClusterConfig,
     pub sharding: ShardingConfig,
     pub replication: ReplicationConfig,
@@ -695,6 +696,15 @@ impl Default for EnrichConfig {
             fail_policy: "degrade".into(),
         }
     }
+}
+
+/// 本地消息表（Ex-1，design_extension v0.1 L1）：业务写 + outbox 消息同一本地事务，
+/// 后台投递幂等消费（双写扩容衔接 / 异步索引补偿 / 跨节点异步写）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboxConfig {
+    /// 是否启用 outbox 列族（默认关闭——按需开启，零额外开销）。
+    pub enabled: bool,
 }
 
 /// 集群节点（design 9.8）：节点标识与内部 RPC。
