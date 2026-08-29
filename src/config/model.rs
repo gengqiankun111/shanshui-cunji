@@ -26,6 +26,7 @@ pub struct Config {
     pub hotcache: HotCacheConfig,
     pub blockcache: BlockCacheConfig,
     pub runtime: RuntimeConfig,
+    pub affinity: AffinityConfig,
     pub sstable: SstableConfig,
     pub storage: StorageConfig,
     pub inverted: InvertedConfig,
@@ -468,6 +469,31 @@ impl Default for RuntimeConfig {
             compute_queue_max: 1000,
             io_background_threads: 4,
             io_uring_enabled: false,
+        }
+    }
+}
+
+/// CPU 绑核（Ex-7.2，design_extension v0.5 第 12.2）：网络/计算/IO 三池物理核分区。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AffinityConfig {
+    /// 是否启用绑核（默认 true：多核机器自动分区；1 核机器自动退化为 no-op）。
+    pub enabled: bool,
+    /// 网络线程绑定的核列表（空 = 自动：核 0 起最低编号核）。
+    pub network_cores: Vec<usize>,
+    /// 计算线程（Compaction 并行等）绑定的核列表（空 = 自动：中间段核）。
+    pub compute_cores: Vec<usize>,
+    /// IO 后台线程（组提交刷盘等）绑定的核列表（空 = 自动：尾部核）。
+    pub io_cores: Vec<usize>,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            network_cores: Vec::new(),
+            compute_cores: Vec::new(),
+            io_cores: Vec::new(),
         }
     }
 }

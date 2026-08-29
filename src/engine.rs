@@ -75,6 +75,9 @@ pub struct Engine {
     /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
     /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
     deletion_bitmap: Option<DeletionBitmap>,
+    /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
+    /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
+    affinity: crate::affinity::CpuPartition,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -224,6 +227,7 @@ impl Engine {
             pending_inverted: Vec::new(),
             compaction_parallel: cfg.storage.compaction_parallel,
             deletion_bitmap,
+            affinity: crate::affinity::plan_partition(&cfg.affinity),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -254,7 +258,10 @@ impl Engine {
             Duration::from_millis(10)
         };
         self.gc_stop = Some(stop);
-        self.gc_thread = Some(std::thread::spawn(move || loop {
+        let io_cores = self.affinity.io.clone(); // Ex-7.2：IO 后台线程绑 io 核
+        self.gc_thread = Some(std::thread::spawn(move || {
+            crate::affinity::bind_current(&io_cores); // 失败仅忽略（no-op）
+            loop {
             std::thread::sleep(tick);
             if stop2.load(Ordering::Relaxed) {
                 break;
@@ -268,6 +275,7 @@ impl Engine {
                         }
                     }
                 });
+            }
             }
         }));
     }
@@ -878,15 +886,34 @@ impl Engine {
             return Ok(rep);
         }
         // 并行：三列族独立 &mut 借用（字段拆分）→ thread::scope 并发压实，聚合返回
+        let compute_cores = self.affinity.compute.clone(); // Ex-7.2：Compaction 并行线程绑 compute 核
         let (p, c, d) = (&mut self.primary, self.cidx.as_mut(), &mut self.delta);
         let merged = std::thread::scope(|s| -> Result<crate::column_family::CompactReport> {
             let h1 = if needs_filter {
-                s.spawn(move || p.compact_filtered(&filter))
+                let cc = compute_cores.clone();
+                s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    p.compact_filtered(&filter)
+                })
             } else {
-                s.spawn(move || p.compact())
+                let cc = compute_cores.clone();
+                s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    p.compact()
+                })
             };
-            let h3 = s.spawn(move || d.compact());
-            let h2 = c.map(|cf| s.spawn(move || cf.compact()));
+            let cc = compute_cores.clone();
+            let h3 = s.spawn(move || {
+                crate::affinity::bind_current(&cc);
+                d.compact()
+            });
+            let h2 = c.map(|cf| {
+                let cc = compute_cores.clone();
+                s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    cf.compact()
+                })
+            });
             let r1 = h1.join().unwrap()?;
             let r2 = match h2 {
                 Some(h) => Some(h.join().unwrap()?),
@@ -915,6 +942,11 @@ impl Engine {
     /// 是否需要 Compaction（主数据列族 L0 段数超过阈值）。
     pub fn needs_compact(&self) -> bool {
         self.primary.needs_compact()
+    }
+
+    /// Ex-7.2：网络核列表（server 主线程绑核用）。
+    pub fn network_cores(&self) -> Vec<usize> {
+        self.affinity.network.clone()
     }
 
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。

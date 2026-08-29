@@ -30,6 +30,8 @@ pub fn serve(
     addr: &str,
     broadcast: Option<crate::join::JoinBroadcast>,
 ) -> Result<()> {
+    // Ex-7.2：server 主线程绑网络核（绑定失败忽略——单核/受限环境 no-op）
+    crate::affinity::bind_current(&engine.network_cores());
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     tracing::info!("HTTP-JSON 服务已启动: http://{local}");

@@ -25,6 +25,9 @@ memmap2 = "0.9"
 # 倒排 FST 字典按需加载（冷启动零堆分配，design 5.2.4.1）
 mmap-file = { path = "crates/mmap-file" }
 csv = "1"
+# Ex-7.2（design_extension v0.5 第 12.2）：CPU 绑核（网络/计算/IO 三池物理核分区，
+# 跳过超线程虚拟核由显式核列表配置；core_affinity 跨 Windows/Linux/macOS）
+core_affinity = "0.8"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 parquet = "59.2.0"
 arrow = "59.2.0"
