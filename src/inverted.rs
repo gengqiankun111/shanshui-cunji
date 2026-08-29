@@ -246,6 +246,54 @@ impl InvertedIndex {
         self.mem_docids.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 批量追加 (term, docid) 集合（Ex-5.3 倒排更新批处理）：
+    /// 按 term 分组合并后每 term 一次 DashMap entry + 批量 extend——同 term 多 docid
+    /// 一次锁操作，省去逐条 add 的重复 hash 查找 / shard 锁 / Vec 反复 realloc；
+    /// `mem_docids` 一次累加；白名单位图按 (field,value) 分组合并批量 extend。
+    /// 调用方（Engine 攒批缓冲 / 批量导入）负责按写入批次聚合。
+    pub fn add_batch(&self, items: &[(&str, u64)]) {
+        if items.is_empty() {
+            return;
+        }
+        // 局部分组：同 term 合并 docid（借用 items，不拷贝 term 字符串）
+        let mut groups: std::collections::HashMap<&str, Vec<u64>> =
+            std::collections::HashMap::with_capacity(items.len());
+        for (term, docid) in items {
+            assert!(*docid < u32::MAX as u64, "docid 超出 RoaringBitmap 支持范围");
+            groups.entry(term).or_default().push(*docid);
+        }
+        // 位图索引同步维护（design 5.2.4，M7-2）：按 (field, value) 分组合并批量 extend
+        if !self.bitmap_fields.is_empty() {
+            let mut bm_groups: std::collections::HashMap<(&str, &str), Vec<u64>> =
+                std::collections::HashMap::new();
+            for (term, docid) in items {
+                if let Some((field, value)) = term.split_once('=') {
+                    if self.bitmap_fields.contains(field) {
+                        bm_groups.entry((field, value)).or_default().push(*docid);
+                    }
+                }
+            }
+            for ((field, value), docids) in bm_groups {
+                self.bitmaps[bitmap_shard(field)]
+                    .lock()
+                    .unwrap()
+                    .entry(field.to_string())
+                    .or_default()
+                    .entry(value.to_string())
+                    .or_default()
+                    .extend(docids.iter().map(|d| *d as u32));
+            }
+        }
+        // 每 term 一次 entry + 批量 extend（Vec 预分配扩容一次）
+        for (term, docids) in groups {
+            self.mem
+                .entry(term.to_string())
+                .or_default()
+                .extend(docids);
+        }
+        self.mem_docids.fetch_add(items.len() as u64, Ordering::Relaxed);
+    }
+
     /// 当前内存累计 posting 数（供外部决定是否刷盘）。
     pub fn mem_docids(&self) -> u64 {
         self.mem_docids.load(Ordering::Relaxed)

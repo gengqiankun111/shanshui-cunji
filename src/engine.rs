@@ -63,7 +63,15 @@ pub struct Engine {
     /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
     /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
     skip_hotcache: bool,
+    /// 倒排更新攒批缓冲（Ex-5.3）：put 时 term 先入缓冲，达阈值/查询/flush 时
+    /// 一次性 `add_batch` 批量刷入内存字典——低基数 term 跨行聚合，
+    /// 减少 DashMap 锁操作次数（N×字段数 → ~唯一 term 数）。
+    /// 崩溃安全：WAL 回放重新走 put 重建倒排，缓冲丢失不丢数据。
+    pending_inverted: Vec<(String, u64)>,
 }
+
+/// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
+const INVERTED_PENDING_CAP: usize = 8192;
 
 /// 查询结果行：docid + 文档字节。
 pub type QueryRow = (u64, Vec<u8>);
@@ -167,6 +175,7 @@ impl Engine {
             fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
             use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
             skip_hotcache: false,
+            pending_inverted: Vec::new(),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -258,12 +267,15 @@ impl Engine {
         self.primary
             .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         self.delta.delete_prefix(&encode_docid(docid))?;
-        // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）；
+        // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
         //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
         for t in terms {
             if self.inverted_allowed(t) {
-                self.inverted.add(t, docid);
+                self.pending_inverted.push((t.to_string(), docid));
             }
+        }
+        if self.pending_inverted.len() >= INVERTED_PENDING_CAP {
+            self.flush_inverted_pending();
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中；批量导入模式跳过，P40）
         if !self.skip_hotcache {
@@ -505,6 +517,8 @@ impl Engine {
         limit: Option<u64>,
         offset: u64,
     ) -> Result<PagedRows> {
+        // Ex-5.3：查询前刷入攒批缓冲，保证 put 后未达阈值的数据立即可查（一致性）
+        self.flush_inverted_pending();
         let bitmap = self.inverted.search(term)?;
         let total = bitmap.len() as u64;
         let mut rows = Vec::new();
@@ -641,6 +655,8 @@ impl Engine {
     /// 看门狗：查询超时熔断（逐行检查 QueryGuard，超时返回 QueryTooExpensive）。
     pub fn execute(&mut self, spec: &QuerySpec) -> Result<Vec<QueryRow>> {
         let guard = self.watchdog.begin_query();
+        // Ex-5.3：倒排查询前刷入攒批缓冲（Inverted 分支可能命中 pending 中的 term）
+        self.flush_inverted_pending();
         let rows = match route(spec) {
             AccessPath::PrimaryPoint => {
                 let docid = spec
@@ -679,25 +695,44 @@ impl Engine {
         Ok(rows)
     }
 
-    /// 倒排内存累积条数（供后台刷盘决策）。
+    /// 倒排内存累积条数（供后台刷盘决策；含攒批缓冲，Ex-5.3）。
     pub fn inverted_mem_docids(&self) -> u64 {
-        self.inverted.mem_docids()
+        self.inverted.mem_docids() + self.pending_inverted.len() as u64
     }
 
-    /// 强制倒排刷盘。
+    /// 将倒排攒批缓冲一次性刷入内存字典（Ex-5.3 批处理）。
+    /// 低基数 term 跨行聚合：一组 (term, docid) 按 term 分组合并，每 term 一次锁操作。
+    /// 崩溃安全：WAL 回放重新走 put 重建倒排，缓冲丢失不丢数据。
+    fn flush_inverted_pending(&mut self) {
+        if self.pending_inverted.is_empty() {
+            return;
+        }
+        let items: Vec<(&str, u64)> = self
+            .pending_inverted
+            .iter()
+            .map(|(t, d)| (t.as_str(), *d))
+            .collect();
+        self.inverted.add_batch(&items);
+        self.pending_inverted.clear();
+    }
+
+    /// 强制倒排刷盘（先刷入攒批缓冲，再整段落盘）。
     pub fn flush_inverted(&mut self) -> Result<()> {
+        self.flush_inverted_pending();
         self.inverted.flush_segment()
     }
 
     /// 倒排某词条命中的 docid 集合（不回表，供测试/监控）。
-    pub fn inverted_posting(&self, term: &str) -> Result<RoaringBitmap> {
+    pub fn inverted_posting(&mut self, term: &str) -> Result<RoaringBitmap> {
+        self.flush_inverted_pending();
         self.inverted.search(term)
     }
 
     /// 倒排某词条命中的文档数（COUNT 聚合，<0.1ms）。
     /// 位图索引快速路径（design 5.2.4，M7-2）：term 命中 `bitmap_fields` 白名单 → 内存位图计数；
     /// 否则回退倒排段扫描。
-    pub fn inverted_doc_count(&self, term: &str) -> Result<u64> {
+    pub fn inverted_doc_count(&mut self, term: &str) -> Result<u64> {
+        self.flush_inverted_pending();
         if let Some((field, value)) = term.split_once('=') {
             if let Some(n) = self.inverted.bitmap_count(field, value) {
                 return Ok(n);
@@ -708,7 +743,8 @@ impl Engine {
 
     /// 按字段前缀分组（GROUP BY 聚合）：返回 `field=value` 各分组的文档数。
     /// 位图索引快速路径（M7-2）：字段命中白名单 → 内存位图分组；否则回退倒排段扫描。
-    pub fn inverted_group_by(&self, field: &str) -> Result<Vec<(String, u64)>> {
+    pub fn inverted_group_by(&mut self, field: &str) -> Result<Vec<(String, u64)>> {
+        self.flush_inverted_pending();
         if let Some(rows) = self.inverted.bitmap_group_by(field) {
             return Ok(rows);
         }
@@ -717,7 +753,8 @@ impl Engine {
 
     /// 内存位图组合 AND 计数（design 5.2.4，M7-2）：全部 term 命中白名单 → 交集计数（亚毫秒）；
     /// 否则返回 None（调用方回退逐词条倒排查询）。
-    pub fn inverted_bitmap_and_count(&self, terms: &[&str]) -> Option<u64> {
+    pub fn inverted_bitmap_and_count(&mut self, terms: &[&str]) -> Option<u64> {
+        self.flush_inverted_pending();
         self.inverted.bitmap_and(terms).map(|b| b.len())
     }
 
@@ -1219,6 +1256,26 @@ mod tests {
     }
 
     #[test]
+    fn inverted_batch_pending_flush() {
+        // Ex-5.3：put 攒批缓冲——未达阈值时 term 留在 pending，查询自动刷入（一致性）；
+        // inverted_mem_docids 统计含 pending；flush_inverted 后落盘、统计归零。
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        for i in 0..100u64 {
+            e.put(i, b"v".to_vec(), &["status=active"]).unwrap();
+        }
+        // 未达阈值（8192）→ pending 未刷入，但统计应含 pending
+        assert_eq!(e.inverted_mem_docids(), 100, "统计应含攒批缓冲");
+        // 查询自动刷入 → 立即可见
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 100);
+        // 查询后 pending 已清空
+        assert_eq!(e.pending_inverted.len(), 0, "查询后缓冲应清空");
+        // flush_inverted 落盘：内存归零、计数仍正确
+        e.flush_inverted().unwrap();
+        assert_eq!(e.inverted_mem_docids(), 0, "落盘后内存统计归零");
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 100);
+    }
+
+    #[test]
     fn delete_hides_doc() {
         let mut e = Engine::open(&tmp(), &cfg()).unwrap();
         e.put(7, b"x".to_vec(), &["k"]).unwrap();
@@ -1433,7 +1490,7 @@ mod tests {
         // 重启后位图从段重建，COUNT 仍正确（drop 前刷盘倒排，保证段自包含）
         e.flush_inverted().unwrap();
         drop(e);
-        let e2 = Engine::open(dir.path(), &cfg).unwrap();
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
         assert_eq!(e2.inverted_doc_count("status=active").unwrap(), 2);
     }
 
