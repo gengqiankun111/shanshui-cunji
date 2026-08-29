@@ -564,6 +564,11 @@ pub struct InvertedConfig {
     /// 倒排 term 长度上限（字节，M8-P4）：超过的 term 自动跳过（长文本/长字符串整串进字典
     /// 是纯浪费——每 term 单 posting + 字典膨胀；默认 96 = 长文本自动不建倒排，0 = 不限）。
     pub max_term_len: usize,
+    /// fulltext 分词字段（M8-P7）：声明字段做**分词建词 term 索引**（`ft:{field}:{token}`），
+    /// **取代整串 term**——长文本（>max_term_len）整串被跳过无法检索，分词后 token 短可建索引，
+    /// 支持关键词检索；与 inverted_fields 白名单正交（fulltext 字段优先分词，不生成整串）。
+    /// 空 = 关闭（默认，零开销）。
+    pub fulltext_fields: Vec<String>,
 }
 
 impl Default for InvertedConfig {
@@ -578,6 +583,7 @@ impl Default for InvertedConfig {
             inverted_fields: Vec::new(),
             exclude_fields: Vec::new(),
             max_term_len: 96,
+            fulltext_fields: Vec::new(),
         }
     }
 }

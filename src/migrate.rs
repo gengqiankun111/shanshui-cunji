@@ -182,7 +182,12 @@ fn import_csv_worker(
             .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
         let val = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| Error::Serialize(format!("JSON 解析失败: {e}")))?;
-        let terms = filter_terms(crate::server::extract_terms(&val), whitelist);
+        // M8-P7：fulltext 字段分词建词 term（与白名单正交）；其余字段整串 term 受白名单过滤
+        let whitelist_set = whitelist
+            .map(|wl| wl.iter().cloned().collect::<std::collections::HashSet<_>>());
+        let ft = engine.fulltext_fields().clone();
+        let terms =
+            crate::server::extract_terms_with_fulltext(&val, whitelist_set.as_ref(), Some(&ft));
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         match engine.put(docid, bytes, &term_refs) {
             Ok(()) => {
@@ -422,7 +427,11 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
                 }
             };
             let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(v) => crate::server::extract_terms(&v),
+                Ok(v) => crate::server::extract_terms_with_fulltext(
+                    &v,
+                    None,
+                    Some(engine.fulltext_fields()),
+                ),
                 Err(_) => {
                     failed += 1;
                     continue;
@@ -545,7 +554,13 @@ fn import_json_worker(
             }
         };
         let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(v) => filter_terms(crate::server::extract_terms(&v), whitelist),
+            Ok(v) => {
+                // M8-P7：fulltext 字段分词建词 term（与白名单正交）；其余字段整串 term 受白名单过滤
+                let whitelist_set = whitelist
+                    .map(|wl| wl.iter().cloned().collect::<std::collections::HashSet<_>>());
+                let ft = engine.fulltext_fields().clone();
+                crate::server::extract_terms_with_fulltext(&v, whitelist_set.as_ref(), Some(&ft))
+            }
             Err(_) => {
                 failed += 1;
                 continue;
@@ -643,8 +658,10 @@ pub fn import_parquet(
             let val = serde_json::Value::Object(obj);
             let bytes = serde_json::to_vec(&val)
                 .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
-            // 生成前字段过滤 + 引擎运行时过滤（白名单/黑名单/超长 term）双重兜底
-            let terms = crate::server::extract_terms_filtered(&val, include.as_ref());
+            // 生成前字段过滤 + 引擎运行时过滤（白名单/黑名单/超长 term）双重兜底；
+            // M8-P7：fulltext 字段分词建词 term（与白名单正交），其余字段整串 term 受白名单过滤
+            let terms =
+                crate::server::extract_terms_with_fulltext(&val, include.as_ref(), Some(engine.fulltext_fields()));
             let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             match engine.put_nosync(docid, bytes, &term_refs) {
                 Ok(()) => {

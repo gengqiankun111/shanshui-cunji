@@ -55,6 +55,8 @@ pub struct Engine {
     inverted_exclude: std::collections::HashSet<String>,
     /// 倒排 term 长度上限（M8-P4）：超过自动跳过（长文本整串不进字典）；0 = 不限。
     max_term_len: usize,
+    /// fulltext 分词字段（M8-P7）：声明字段做分词建词 term 索引（`ft:{field}:{token}`）。
+    fulltext_fields: std::collections::HashSet<String>,
     /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
     /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
     skip_hotcache: bool,
@@ -150,6 +152,7 @@ impl Engine {
             },
             inverted_exclude: cfg.inverted.exclude_fields.iter().cloned().collect(),
             max_term_len: cfg.inverted.max_term_len,
+            fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
             skip_hotcache: false,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
@@ -488,6 +491,17 @@ impl Engine {
         Ok(out)
     }
 
+    /// fulltext 分词检索（M8-P7）：按字段 + 关键词构造词 term `ft:{field}:{word}` 查询
+    /// （词 term 由 fulltext_fields 声明字段分词生成）。命中 posting 合并 → 回表取文档。
+    pub fn fulltext_search(&mut self, field: &str, word: &str) -> Result<Vec<QueryRow>> {
+        self.search_term(&format!("ft:{field}:{word}"))
+    }
+
+    /// fulltext 分词字段集合（M8-P7）：供 term 提取层判断字段是否走分词索引。
+    pub fn fulltext_fields(&self) -> &std::collections::HashSet<String> {
+        &self.fulltext_fields
+    }
+
     /// 主键范围扫描。
     pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<QueryRow>> {
         self.primary.scan_range(start, end)
@@ -719,6 +733,37 @@ mod tests {
         e.put_nosync(4, b"doc-4".to_vec(), &["t"]).unwrap();
         assert_eq!(e.hotcache.len(), 2);
         assert_eq!(e.get(4).unwrap().unwrap(), b"doc-4");
+    }
+
+    // ---------- fulltext 分词索引（M8-P7） ----------
+
+    #[test]
+    fn fulltext_search_finds_long_text_and_persists() {
+        // 核心动机：>96B 长文本整串被 max_term_len 跳过，分词词 term 短 → 长文本可检索
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["big_text".into()];
+        let val = serde_json::json!({"docid": 42, "status": "active", "big_text": format!("{:<300}", "rec-00000042-msg-777")});
+        let ft = c.inverted.fulltext_fields.iter().cloned().collect();
+        let terms =
+            crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        {
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            e.put(42, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+            e.flush_inverted().unwrap();
+            // 词 term 可检索（整串 300B > max_term_len=96 会被跳过，词 term 不受影响）
+            assert_eq!(e.fulltext_search("big_text", "rec").unwrap().len(), 1);
+            assert_eq!(e.fulltext_search("big_text", "777").unwrap().len(), 1);
+            // 非 fulltext 字段整串 term 照常
+            assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        }
+        // 刷盘 + 重开：词 term 持久化可查（倒排段已落盘）
+        let mut e2 = Engine::open(dir.path(), &c).unwrap();
+        assert_eq!(e2.fulltext_search("big_text", "777").unwrap().len(), 1);
+        let hits = e2.fulltext_search("big_text", "00000042").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 42);
     }
 
     #[test]

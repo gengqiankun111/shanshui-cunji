@@ -207,9 +207,70 @@ pub fn extract_terms_filtered(
     val: &Value,
     include: Option<&std::collections::HashSet<String>>,
 ) -> Vec<String> {
+    extract_terms_with_fulltext(val, include, None)
+}
+
+/// fulltext 分词索引（M8-P7）：`extract_terms_filtered` 的超集——
+/// `fulltext` 集合中声明的字段做**分词建词 term**（`ft:{field}:{token}`）**取代整串 term**：
+/// 长文本整串（>max_term_len）会被跳过无法检索；分词后 token 短可建索引、支持关键词检索。
+/// 其余字段维持整串 term（受 include 白名单过滤）；两者命名空间不冲突（`ft:` 前缀独立）。
+pub fn extract_terms_with_fulltext(
+    val: &Value,
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
     let mut terms = Vec::new();
-    collect_strings(val, &mut terms, &[], include);
+    collect_strings(val, &mut terms, &[], include, fulltext);
     terms
+}
+
+/// 简单分词（M8-P7）：按非字母数字边界切分，字母小写归一，过滤空 token。
+/// ASCII 文本（如 `rec-00000001-msg-73-tag42`）→ `rec/00000001/msg/73/tag42`；
+/// Unicode 字母/数字（含中文）视为 token 字符，连续中文串 = 单 token（完整中文分词留后续）。
+pub fn tokenize(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            cur.push(c.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 由分词结果生成 fulltext 词 term：`ft:{field}:{token}`；同一字段值内重复 token 去重
+/// （避免 posting 重复 docid 浪费内存）。
+pub fn fulltext_terms(field: &str, text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tokenize(text)
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .map(|t| format!("ft:{field}:{t}"))
+        .collect()
+}
+
+/// 单字段 term 生成：fulltext 字段 → 分词词 term（不建整串）；否则整串 term（受白名单过滤）。
+fn push_field_term(
+    out: &mut Vec<String>,
+    field: &str,
+    s: &str,
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+) {
+    if let Some(ft) = fulltext {
+        if ft.contains(field) {
+            out.extend(fulltext_terms(field, s));
+            return;
+        }
+    }
+    if include.map_or(true, |inc| inc.contains(field)) {
+        out.push(format!("{field}={s}"));
+    }
 }
 
 fn collect_strings(
@@ -217,14 +278,12 @@ fn collect_strings(
     out: &mut Vec<String>,
     path: &[&str],
     include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
 ) {
     match val {
         Value::String(s) => {
             // 数组元素等叶子字符串：用完整路径生成 term（白名单非空时仅保留声明字段）
-            let field = path.join(".");
-            if include.map_or(true, |inc| inc.contains(&field)) {
-                out.push(format!("{}={}", field, s));
-            }
+            push_field_term(out, &path.join("."), s, include, fulltext);
         }
         Value::Object(map) => {
             for (k, v) in map {
@@ -234,12 +293,9 @@ fn collect_strings(
                 let mut p = path.to_vec();
                 p.push(k.as_str());
                 if let Value::String(s) = v {
-                    let field = p.join(".");
-                    if include.map_or(true, |inc| inc.contains(&field)) {
-                        out.push(format!("{}={}", field, s));
-                    }
+                    push_field_term(out, &p.join("."), s, include, fulltext);
                 } else {
-                    collect_strings(v, out, &p, include);
+                    collect_strings(v, out, &p, include, fulltext);
                 }
             }
         }
@@ -248,7 +304,7 @@ fn collect_strings(
                 let mut p = path.to_vec();
                 let idx = i.to_string();
                 p.push(&idx);
-                collect_strings(v, out, &p, include);
+                collect_strings(v, out, &p, include, fulltext);
             }
         }
         _ => {}
@@ -272,6 +328,7 @@ fn route_request(
         ("POST", "/patch") => handle_patch(engine, body),
         ("GET", "/get") => handle_get(engine, query),
         ("GET", "/search") => handle_search(engine, query),
+        ("GET", "/fulltext") => handle_fulltext(engine, query),
         ("GET", "/range") => handle_range(engine, query),
         ("GET", "/count") => handle_count(engine, query),
         ("GET", "/groupby") => handle_group_by(engine, query),
@@ -459,7 +516,7 @@ fn handle_put(engine: &mut Engine, body: &[u8]) -> (u16, String) {
             json!({"error": "docid 超出倒排索引支持范围（< 2^32）"}).to_string(),
         );
     }
-    let terms = extract_terms(&val);
+    let terms = extract_terms_with_fulltext(&val, None, Some(engine.fulltext_fields()));
     let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
     match engine.put(docid, body.to_vec(), &term_refs) {
         Ok(()) => (
@@ -496,6 +553,27 @@ fn handle_search(engine: &mut Engine, query: &str) -> (u16, String) {
         return (400, json!({"error": "缺少 filter 参数"}).to_string());
     };
     match execute_filter(engine, &filter) {
+        Ok(rows) => (200, rows_payload(&rows).to_string()),
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// fulltext 分词检索（M8-P7）：`GET /fulltext?field=big_text_a&word=rec` →
+/// 命中该字段分词 term `ft:{field}:{word}` 的文档列表（posting 合并 → 回表）。
+fn handle_fulltext(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let field = params
+        .iter()
+        .find(|(k, _)| k == "field")
+        .map(|(_, v)| v.clone());
+    let word = params
+        .iter()
+        .find(|(k, _)| k == "word")
+        .map(|(_, v)| v.clone());
+    let (Some(field), Some(word)) = (field, word) else {
+        return (400, json!({"error": "缺少 field/word 参数"}).to_string());
+    };
+    match engine.fulltext_search(&field, &word) {
         Ok(rows) => (200, rows_payload(&rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
@@ -749,6 +827,60 @@ mod tests {
         let terms = extract_terms(&v);
         assert!(terms.contains(&"tags.0=hot".to_string()));
         assert!(terms.contains(&"tags.1=new".to_string()));
+    }
+
+    // ---------- fulltext 分词索引（M8-P7） ----------
+
+    #[test]
+    fn tokenize_fulltext_boundaries() {
+        // ASCII 典型文本（gen_dataset big_text 格式）
+        assert_eq!(
+            tokenize("rec-00000001-msg-73-tag42"),
+            vec!["rec", "00000001", "msg", "73", "tag42"]
+        );
+        // 大小写归一 / 空串 / 纯分隔符 / 重复分隔符
+        assert_eq!(tokenize("Hello World!"), vec!["hello", "world"]);
+        assert_eq!(tokenize("ABC-def"), vec!["abc", "def"]);
+        assert!(tokenize("").is_empty());
+        assert!(tokenize("---").is_empty());
+        assert_eq!(tokenize("a--b--"), vec!["a", "b"]);
+        // Unicode：连续中文字符 = 单 token（完整中文分词留后续）
+        assert_eq!(tokenize("山水存迹数据库"), vec!["山水存迹数据库"]);
+    }
+
+    #[test]
+    fn extract_fulltext_terms_field_precedence() {
+        let v: Value =
+            serde_json::from_str(r#"{"docid":1,"status":"active","big_text":"rec-0001-msg-77"}"#)
+                .unwrap();
+        let ft: std::collections::HashSet<String> =
+            ["big_text".to_string()].into_iter().collect();
+        let terms = extract_terms_with_fulltext(&v, None, Some(&ft));
+        // fulltext 字段：分词建词 term（含去重），不建整串
+        assert!(terms.contains(&"ft:big_text:rec".to_string()));
+        assert!(terms.contains(&"ft:big_text:0001".to_string()));
+        assert!(terms.contains(&"ft:big_text:77".to_string()));
+        assert!(
+            !terms.iter().any(|t| t == "big_text=rec-0001-msg-77"),
+            "fulltext 字段不应建整串 term"
+        );
+        // 非 fulltext 字段整串 term 不受影响
+        assert!(terms.contains(&"status=active".to_string()));
+    }
+
+    #[test]
+    fn extract_fulltext_orthogonal_to_whitelist() {
+        let v: Value =
+            serde_json::from_str(r#"{"docid":1,"status":"active","big_text":"rec-0001"}"#).unwrap();
+        let include: std::collections::HashSet<String> =
+            ["status".to_string()].into_iter().collect();
+        let ft: std::collections::HashSet<String> =
+            ["big_text".to_string()].into_iter().collect();
+        let terms = extract_terms_with_fulltext(&v, Some(&include), Some(&ft));
+        // fulltext 字段不受白名单影响（正交）：分词词 term 保留
+        assert!(terms.iter().any(|t| t.starts_with("ft:big_text:")));
+        // 非 fulltext 字段受白名单过滤：big_text 整串 / 其他字段整串被剔除
+        assert!(!terms.iter().any(|t| t.starts_with("big_text=")));
     }
 
     #[test]
