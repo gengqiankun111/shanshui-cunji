@@ -830,12 +830,19 @@ impl Engine {
         };
         let cf_count = 1 + usize::from(self.cidx.is_some()) + 1; // primary + (cidx) + delta
         let threads = parallel.min(cf_count);
-        // Ex-5.6：位图不可变借用（与 primary/cidx/delta 的 &mut 拆分借用互不冲突）
+        // Ex-5.6/5.8：位图不可变借用（与 primary/cidx/delta 的 &mut 拆分借用互不冲突）。
+        // 位图无已删 docid 时无过滤 → primary 走 Ex-5.8 无重叠块级复用压实（数据块零解压复用、
+        // 只重建元数据区）；位图有已删 docid 时按位图物理丢弃（全量合并路径）。
         let bm = self.deletion_bitmap.as_ref();
+        let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
         let filter = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
         if threads <= 1 {
             // 串行（含 cidx/delta 无输入时 no-op，行为与旧版一致）
-            let mut rep = self.primary.compact_filtered(&filter)?;
+            let mut rep = if needs_filter {
+                self.primary.compact_filtered(&filter)?
+            } else {
+                self.primary.compact()?
+            };
             if let Some(c) = self.cidx.as_mut() {
                 let r = c.compact()?;
                 merge_report(&mut rep, &r);
@@ -847,7 +854,11 @@ impl Engine {
         // 并行：三列族独立 &mut 借用（字段拆分）→ thread::scope 并发压实，聚合返回
         let (p, c, d) = (&mut self.primary, self.cidx.as_mut(), &mut self.delta);
         let merged = std::thread::scope(|s| -> Result<crate::column_family::CompactReport> {
-            let h1 = s.spawn(move || p.compact_filtered(&filter));
+            let h1 = if needs_filter {
+                s.spawn(move || p.compact_filtered(&filter))
+            } else {
+                s.spawn(move || p.compact())
+            };
             let h3 = s.spawn(move || d.compact());
             let h2 = c.map(|cf| s.spawn(move || cf.compact()));
             let r1 = h1.join().unwrap()?;
