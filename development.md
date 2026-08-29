@@ -1139,6 +1139,25 @@ impl RuntimePools {
    ring 4MB+gc 55,570 → +24%）；wal 模块 20 测试全绿（含环形崩溃恢复/回绕/混沌）；
    测试 311 全绿（无新增单测——合并 fsync 由既有崩溃恢复测试覆盖，demo 4 测试验证语义）。
 
+### 7.21 M8-P13 jieba 完整中文词典分词（`[inverted] cjk_segmenter`）
+
+> 背景（7.17 已知限制）：bigram（M8-P9）对中文是**字符碎片**索引——"数据库" → ["数据","据库"]，
+> 查询需两个 bigram AND 交集；jieba 词典分词输出**语义词**（"数据库" → ["数据库"]），单词精确
+> 命中、索引词数更少。jieba-rs 0.10（MIT，`default-dict` 内置词典 ~2-3.5MB 压缩嵌入，无外部文件）。
+
+1. ~~**依赖与 feature**~~ ✅（2026-08-29）：`jieba-rs = "0.10"` optional + feature `cjk-jieba`
+   （默认开启；`--no-default-features` 可去除，中文分词回退 bigram）；deny.toml 许可白名单
+   （MIT/Apache-2.0）覆盖 jieba 全部依赖。
+2. ~~**demo 研究（src/demo/cjk-jieba/，gitignore 不提交）**~~ ✅：语义词切分 / HMM 未登录词 /
+   索引膨胀对比（jieba 词数 ≤ bigram 碎片）/ 中英混合 / 端到端检索 / 词典加载+切词性能；6 测试全绿。
+3. ~~**kernel 整合**~~ ✅：`[inverted] cjk_segmenter = "bigram"(默认) | "jieba"`；
+   `server::tokenize_seg / fulltext_terms_seg / extract_terms_with_fulltext_seg`（参数传分词器，
+   无全局状态——并发测试安全）；`Engine::use_jieba()`；写路径（HTTP put / parquet / CSV / JSON /
+   mysqldump）统一接入；feature 关闭时自动回退 bigram。
+4. ~~**验证**~~ ✅：HTTP 实测——PUT 3 条中文（terms=6/8/5 语义词），`fulltext 数据库` 单 term
+   精确命中 2 条；测试 313 全绿（+2：tokenize_seg 语义词/混合/标点、engine jieba 端到端单 term
+   命中）；feature 关闭编译回退验证通过。
+
 ---
 
 ## 8. 编码规范

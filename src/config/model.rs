@@ -569,6 +569,9 @@ pub struct InvertedConfig {
     /// 支持关键词检索；与 inverted_fields 白名单正交（fulltext 字段优先分词，不生成整串）。
     /// 空 = 关闭（默认，零开销）。
     pub fulltext_fields: Vec<String>,
+    /// 中文分词器（M8-P13）：`bigram`（默认，M8-P9 字符碎片，零依赖）/ `jieba`（完整中文
+    /// 词典分词——语义词精确命中、索引词数更少；需 `cjk-jieba` feature，关闭时回退 bigram）。
+    pub cjk_segmenter: String,
 }
 
 impl Default for InvertedConfig {
@@ -584,6 +587,7 @@ impl Default for InvertedConfig {
             exclude_fields: Vec::new(),
             max_term_len: 96,
             fulltext_fields: Vec::new(),
+            cjk_segmenter: "bigram".into(),
         }
     }
 }

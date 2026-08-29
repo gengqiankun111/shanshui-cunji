@@ -174,8 +174,12 @@ fn import_csv_worker(
         let whitelist_set = whitelist
             .map(|wl| wl.iter().cloned().collect::<std::collections::HashSet<_>>());
         let ft = engine.fulltext_fields().clone();
-        let terms =
-            crate::server::extract_terms_with_fulltext(&val, whitelist_set.as_ref(), Some(&ft));
+        let terms = crate::server::extract_terms_with_fulltext_seg(
+            &val,
+            whitelist_set.as_ref(),
+            Some(&ft),
+            engine.use_jieba(),
+        );
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         match engine.put(docid, bytes, &term_refs) {
             Ok(()) => {
@@ -415,10 +419,11 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
                 }
             };
             let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(v) => crate::server::extract_terms_with_fulltext(
+                Ok(v) => crate::server::extract_terms_with_fulltext_seg(
                     &v,
                     None,
                     Some(engine.fulltext_fields()),
+                    engine.use_jieba(),
                 ),
                 Err(_) => {
                     failed += 1;
@@ -547,7 +552,12 @@ fn import_json_worker(
                 let whitelist_set = whitelist
                     .map(|wl| wl.iter().cloned().collect::<std::collections::HashSet<_>>());
                 let ft = engine.fulltext_fields().clone();
-                crate::server::extract_terms_with_fulltext(&v, whitelist_set.as_ref(), Some(&ft))
+                crate::server::extract_terms_with_fulltext_seg(
+                    &v,
+                    whitelist_set.as_ref(),
+                    Some(&ft),
+                    engine.use_jieba(),
+                )
             }
             Err(_) => {
                 failed += 1;
@@ -648,8 +658,12 @@ pub fn import_parquet(
                 .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
             // 生成前字段过滤 + 引擎运行时过滤（白名单/黑名单/超长 term）双重兜底；
             // M8-P7：fulltext 字段分词建词 term（与白名单正交），其余字段整串 term 受白名单过滤
-            let terms =
-                crate::server::extract_terms_with_fulltext(&val, include.as_ref(), Some(engine.fulltext_fields()));
+            let terms = crate::server::extract_terms_with_fulltext_seg(
+                &val,
+                include.as_ref(),
+                Some(engine.fulltext_fields()),
+                engine.use_jieba(),
+            );
             let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             match engine.put_nosync(docid, bytes, &term_refs) {
                 Ok(()) => {

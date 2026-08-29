@@ -57,6 +57,9 @@ pub struct Engine {
     max_term_len: usize,
     /// fulltext 分词字段（M8-P7）：声明字段做分词建词 term 索引（`ft:{field}:{token}`）。
     fulltext_fields: std::collections::HashSet<String>,
+    /// 中文分词器（M8-P13）：true = jieba 完整词典分词（需 cjk-jieba feature）；
+    /// false = bigram（M8-P9）。来自 `[inverted] cjk_segmenter`。
+    use_jieba: bool,
     /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
     /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
     skip_hotcache: bool,
@@ -162,6 +165,7 @@ impl Engine {
             inverted_exclude: cfg.inverted.exclude_fields.iter().cloned().collect(),
             max_term_len: cfg.inverted.max_term_len,
             fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
+            use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
             skip_hotcache: false,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
@@ -543,6 +547,11 @@ impl Engine {
         &self.fulltext_fields
     }
 
+    /// 中文分词器开关（M8-P13）：true = jieba 完整词典分词，false = bigram。
+    pub fn use_jieba(&self) -> bool {
+        self.use_jieba
+    }
+
     /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
     /// 不随扫描总量膨胀（旧实现先全量收集 O(total) 再截断）；`total` = 范围行数
     /// （全扫计数，limit 取满页后仅计数不回表，语义与全量一致）。
@@ -905,6 +914,37 @@ mod tests {
         // fulltext_search 回表
         let hits = e.fulltext_search("content", "数据").unwrap();
         assert!(hits.iter().any(|(id, _)| *id == 1 || *id == 2));
+    }
+
+    #[test]
+    fn jieba_fulltext_meaningful_word_hit() {
+        // M8-P13：jieba 词典分词——"数据库"单 term 精确命中（bigram 需 数据+据库 AND）
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["content".into()];
+        c.inverted.cjk_segmenter = "jieba".into();
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        assert!(e.use_jieba(), "cjk_segmenter=jieba 应启用 jieba 分词");
+        let docs = [
+            (1u64, "山水存迹数据库存储引擎"),
+            (2u64, "基于Rust的LSM树文档数据库"),
+            (3u64, "分布式缓存系统设计"),
+        ];
+        for (id, content) in docs {
+            let val = serde_json::json!({"docid": id, "content": content});
+            let ft = e.fulltext_fields().clone();
+            let terms =
+                crate::server::extract_terms_with_fulltext_seg(&val, None, Some(&ft), e.use_jieba());
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(id, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+        // jieba 词典词"数据库"单 term 精确命中 2 个文档
+        assert_eq!(e.inverted_posting("ft:content:数据库").unwrap().len(), 2);
+        let hits = e.fulltext_search("content", "数据库").unwrap();
+        assert_eq!(hits.len(), 2);
+        // 无该词 → 0
+        assert_eq!(e.fulltext_search("content", "缓存系统").unwrap().len(), 0);
     }
 
     // ---------- 分页查询（M8-P8） ----------

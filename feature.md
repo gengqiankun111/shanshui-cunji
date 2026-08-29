@@ -38,7 +38,7 @@
 | 字段白名单 / 黑名单 / 长文本保护（max_term_len，防字典膨胀） | ✅ | M8-P4 `cde4f18`（字典压缩 45 万倍） |
 | fulltext 分词索引（长文本可检索，`ft:field:token`） | ✅ | M8-P7 `545682f` |
 | 中文 bigram 分词（中英混合文本检索） | ✅ | M8-P9 `72badfe` |
-| 完整中文词典分词（jieba 级别，需 vendor 化 ~2MB 词典） | ⏳ | 可选（bigram 已满足基础检索） |
+| **jieba 完整中文词典分词**（`cjk_segmenter`，语义词精确命中） | ✅ | M8-P13（`cjk-jieba` feature + `tokenize_seg`） |
 | 倒排 posting 流式输出（大结果集已由分页解决） | ⏳ | 评估中 |
 
 ## D. 查询执行 / 缓存 / MVCC
@@ -124,8 +124,9 @@
   50M 库翻页 164-682ms（旧 total 模式全库 70s）
 - **M8-P12 环形 WAL 头部 tail 合并 fsync**：sync 单次原子提交（消除冗余第二次 fsync）——
   ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
+- **M8-P13 jieba 完整中文词典分词**：`[inverted] cjk_segmenter="jieba"`（`cjk-jieba` feature，
+  词典嵌入默认开）——中文语义词精确命中（"数据库"单 term），索引词数 ≤ bigram 碎片
 
 ## 下一候选
 
-- 完整中文词典分词（jieba vendor 化，可选）
 - 倒排 posting 压缩探索（Roaring 已用，Gorilla/变长评估）

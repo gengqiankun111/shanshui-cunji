@@ -25,6 +25,7 @@ csv = "1"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 parquet = "59.2.0"
 arrow = "59.2.0"
+jieba-rs = { version = "0.10", optional = true }
 
 [[bin]]
 name = "shanshui-cunji-migrate"
@@ -52,10 +53,13 @@ path = "src/bin/gen_dataset.rs"
 
 [features]
 # 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；
-# `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）
-default = ["alloc-mimalloc"]
+# `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）；
+# `cjk-jieba` 开启 jieba 完整中文词典分词（~2-3.5MB 词典嵌入二进制，M8-P13）；
+#   关闭时中文分词回退 bigram（M8-P9，零依赖）
+default = ["alloc-mimalloc", "cjk-jieba"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
+cjk-jieba = ["dep:jieba-rs"]
 
 [dependencies.tikv-jemallocator]
 version = "0.5"

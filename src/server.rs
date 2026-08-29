@@ -214,22 +214,111 @@ pub fn extract_terms_filtered(
 /// `fulltext` 集合中声明的字段做**分词建词 term**（`ft:{field}:{token}`）**取代整串 term**：
 /// 长文本整串（>max_term_len）会被跳过无法检索；分词后 token 短可建索引、支持关键词检索。
 /// 其余字段维持整串 term（受 include 白名单过滤）；两者命名空间不冲突（`ft:` 前缀独立）。
+/// 中文分词用 bigram（M8-P9）；需 jieba 词典分词请用 `extract_terms_with_fulltext_seg`。
 pub fn extract_terms_with_fulltext(
     val: &Value,
     include: Option<&std::collections::HashSet<String>>,
     fulltext: Option<&std::collections::HashSet<String>>,
 ) -> Vec<String> {
+    extract_terms_with_fulltext_seg(val, include, fulltext, false)
+}
+
+/// 同 `extract_terms_with_fulltext`，但可指定中文分词器（M8-P13）：
+/// `use_jieba=true` 时 fulltext 字段中文用 jieba 完整词典分词（语义词，非 bigram 碎片）。
+pub fn extract_terms_with_fulltext_seg(
+    val: &Value,
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+    use_jieba: bool,
+) -> Vec<String> {
     let mut terms = Vec::new();
-    collect_strings(val, &mut terms, &[], include, fulltext);
+    collect_strings(val, &mut terms, &[], include, fulltext, use_jieba);
     terms
 }
 
-/// 分词（M8-P7 + 中文 bigram M8-P9）：按字符类分段——
+/// 分词（bigram，M8-P7 + M8-P9）：ASCII 字母数字 → 单词（小写归一）；
+/// 连续中文/非 ASCII → bigram（相邻 2 字，单字回退 unigram），零依赖。
+/// jieba 词典分词请用 `tokenize_seg(text, true)`。
+pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_seg(text, false)
+}
+
+/// 分词并按中文分词器选择（M8-P13）：`use_jieba` → jieba 完整词典分词（需 cjk-jieba feature，
+/// 关闭时回退 bigram）；否则 bigram。
+pub fn tokenize_seg(text: &str, use_jieba: bool) -> Vec<String> {
+    #[cfg(feature = "cjk-jieba")]
+    {
+        if use_jieba {
+            return tokenize_jieba(text);
+        }
+    }
+    tokenize_bigram(text)
+}
+
+#[cfg(feature = "cjk-jieba")]
+static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cjk-jieba")]
+fn jieba() -> &'static jieba_rs::Jieba {
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
+}
+
+/// jieba 完整中文词典分词（M8-P13）：ASCII 字母数字 → 单词（小写归一，同 bigram 规则）；
+/// 中文/非 ASCII 块 → jieba 词典切分（语义词，非 bigram 碎片）；过滤标点/空白 token。
+#[cfg(feature = "cjk-jieba")]
+fn tokenize_jieba(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut ascii_word = String::new();
+    let mut cjk = String::new();
+    let j = jieba();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            if !cjk.is_empty() {
+                out.extend(jieba_cut(j, &cjk));
+                cjk.clear();
+            }
+            ascii_word.push(c.to_ascii_lowercase());
+        } else if c.is_alphanumeric() {
+            // 非 ASCII 字母数字（CJK 等）：结束 ASCII 单词，进入中文块
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            cjk.push(c);
+        } else {
+            // 分隔符
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            if !cjk.is_empty() {
+                out.extend(jieba_cut(j, &cjk));
+                cjk.clear();
+            }
+        }
+    }
+    if !ascii_word.is_empty() {
+        out.push(ascii_word);
+    }
+    if !cjk.is_empty() {
+        out.extend(jieba_cut(j, &cjk));
+    }
+    out
+}
+
+#[cfg(feature = "cjk-jieba")]
+fn jieba_cut(j: &jieba_rs::Jieba, text: &str) -> Vec<String> {
+    j.cut(text, true)
+        .into_iter()
+        .map(|t| t.word.to_string())
+        .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+        .collect()
+}
+
+/// bigram 分词（M8-P7 + 中文 bigram M8-P9）：按字符类分段——
 /// **ASCII 字母数字** → 单词 token（按非字母数字边界切分 + 小写归一，原有行为）；
 /// **连续中文/非 ASCII 字母数字** → bigram（相邻 2 字一个 token，单字回退 unigram）——
 /// 中文整串当单 token 无法检索（7.14 已知限制），bigram 与 Elasticsearch ngram /
 /// Lucene CJKAnalyzer 同款（中文检索事实标准），零依赖、无词典、索引膨胀 ≈ 字数。
-pub fn tokenize(text: &str) -> Vec<String> {
+pub fn tokenize_bigram(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut ascii_word = String::new();
     let mut cjk = String::new();
@@ -276,10 +365,15 @@ fn cjk_bigram(s: &str) -> Vec<String> {
 }
 
 /// 由分词结果生成 fulltext 词 term：`ft:{field}:{token}`；同一字段值内重复 token 去重
-/// （避免 posting 重复 docid 浪费内存）。
+/// （避免 posting 重复 docid 浪费内存）。中文分词 bigram（M8-P9）。
 pub fn fulltext_terms(field: &str, text: &str) -> Vec<String> {
+    fulltext_terms_seg(field, text, false)
+}
+
+/// 同 `fulltext_terms`，可指定中文分词器（M8-P13）：`use_jieba` → jieba 词典分词。
+pub fn fulltext_terms_seg(field: &str, text: &str, use_jieba: bool) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    tokenize(text)
+    tokenize_seg(text, use_jieba)
         .into_iter()
         .filter(|t| seen.insert(t.clone()))
         .map(|t| format!("ft:{field}:{t}"))
@@ -293,10 +387,11 @@ fn push_field_term(
     s: &str,
     include: Option<&std::collections::HashSet<String>>,
     fulltext: Option<&std::collections::HashSet<String>>,
+    use_jieba: bool,
 ) {
     if let Some(ft) = fulltext {
         if ft.contains(field) {
-            out.extend(fulltext_terms(field, s));
+            out.extend(fulltext_terms_seg(field, s, use_jieba));
             return;
         }
     }
@@ -311,11 +406,12 @@ fn collect_strings(
     path: &[&str],
     include: Option<&std::collections::HashSet<String>>,
     fulltext: Option<&std::collections::HashSet<String>>,
+    use_jieba: bool,
 ) {
     match val {
         Value::String(s) => {
             // 数组元素等叶子字符串：用完整路径生成 term（白名单非空时仅保留声明字段）
-            push_field_term(out, &path.join("."), s, include, fulltext);
+            push_field_term(out, &path.join("."), s, include, fulltext, use_jieba);
         }
         Value::Object(map) => {
             for (k, v) in map {
@@ -325,9 +421,9 @@ fn collect_strings(
                 let mut p = path.to_vec();
                 p.push(k.as_str());
                 if let Value::String(s) = v {
-                    push_field_term(out, &p.join("."), s, include, fulltext);
+                    push_field_term(out, &p.join("."), s, include, fulltext, use_jieba);
                 } else {
-                    collect_strings(v, out, &p, include, fulltext);
+                    collect_strings(v, out, &p, include, fulltext, use_jieba);
                 }
             }
         }
@@ -336,7 +432,7 @@ fn collect_strings(
                 let mut p = path.to_vec();
                 let idx = i.to_string();
                 p.push(&idx);
-                collect_strings(v, out, &p, include, fulltext);
+                collect_strings(v, out, &p, include, fulltext, use_jieba);
             }
         }
         _ => {}
@@ -548,7 +644,8 @@ fn handle_put(engine: &mut Engine, body: &[u8]) -> (u16, String) {
             json!({"error": "docid 超出倒排索引支持范围（< 2^32）"}).to_string(),
         );
     }
-    let terms = extract_terms_with_fulltext(&val, None, Some(engine.fulltext_fields()));
+    let terms =
+        extract_terms_with_fulltext_seg(&val, None, Some(engine.fulltext_fields()), engine.use_jieba());
     let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
     match engine.put(docid, body.to_vec(), &term_refs) {
         Ok(()) => (
@@ -957,6 +1054,28 @@ mod tests {
         assert_eq!(tokenize("hello山水world"), vec!["hello", "山水", "world"]);
         // 中文 + 标点分隔
         assert_eq!(tokenize("山水，存迹"), vec!["山水", "存迹"]);
+    }
+
+    #[test]
+    fn jieba_tokenize_seg_meaningful_words() {
+        // M8-P13：jieba 完整词典分词——语义词整体切出（非 bigram 碎片）
+        let words = tokenize_seg("山水存迹数据库存储引擎", true);
+        assert!(
+            words.contains(&"数据库".to_string()),
+            "词典词应整体切出: {words:?}"
+        );
+        // 同文本 bigram 对比：碎片更多
+        let bg = tokenize_seg("山水存迹数据库存储引擎", false);
+        assert!(bg.contains(&"数据".to_string()) && bg.contains(&"据库".to_string()));
+        assert!(bg.len() >= words.len(), "jieba 词数应 ≤ bigram 碎片数");
+        // 中英混合：英文单词保留 + 中文词典词
+        let mixed = tokenize_seg("基于Rust的LSM树文档数据库", true);
+        assert!(mixed.contains(&"rust".to_string()), "英文单词应保留: {mixed:?}");
+        assert!(mixed.contains(&"数据库".to_string()));
+        // 标点/空白过滤
+        assert!(tokenize_seg("，。！ ", true).is_empty());
+        // 默认 tokenize = bigram（不受 jieba 影响）
+        assert_eq!(tokenize("数据库"), vec!["数据", "据库"]);
     }
 
     #[test]
