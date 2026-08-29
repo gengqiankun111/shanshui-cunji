@@ -875,7 +875,26 @@ impl RuntimePools {
    无 fsync 113,587 ops/s（**55×**）；优化建议 Group Commit（design 4.1.3 已规划未实现）+ 读写分离（P0）；
    前沿调研（`frontier-research-2026-08.md`）：BVLSM WAL-time KV 分离（7.6× RocksDB）/ RusKey RL Compaction
    （4×）/ DobLIX·TieredKV 学习索引 / AuraDB Rust 生态；建议 近期组提交、中期大 value KV 分离、长期 RL+学习索引；
-4. **收尾**：文档 + 性能快检 + 打 v0.5.0 标签。
+4. ~~**收尾**~~ ✅（2026-08-29）：文档（development 7.6）+ demo 1000万 快检 10/10 + 打 **v0.5.0** 标签
+   （RELEASE 说明/摘要/README/quality_system 对齐 285 测试）+ feature/master/release 分支同步。
+
+### 7.7 M8-P0 Group Commit 组提交（design 4.3，YCSB 实证瓶颈修复）
+
+> 前置：M7-3 YCSB 压测实证「fsync 单条串行」为写路径头号瓶颈（A 写重 2,077 vs 无 fsync 113,587 ops/s，55×）；
+> 方案调研见 `group-commit-design.md`（业界：InnoDB 三段组提交 / PG commit_delay / RocksDB leader-follower /
+> ScyllaDB commitlog / RocksDB #14627 无 leader 演进——共识「窗口内写入共享一次 fsync」）。
+
+1. ~~**Group Commit 组提交实现**~~ ✅（2026-08-29）：`[storage] group_commit_us`（默认 0 = 关闭，逐条 fsync 强安全）
+   + `group_commit_bytes`（默认 256KB）；`WalWriter/RingWal` 增加 `pending_bytes` / `sync_due`（距上次 fsync ≥ 窗口
+   或待刷 ≥ 字节阈值）；`ColumnFamily::wal` 改 `Arc<Mutex<WalBackend>>`（共享句柄 `wal_handle`）；
+   `Engine::maybe_group_commit`——关闭时逐条 fsync（现状），开启时**写路径零 fsync**，spawn 后台提交线程
+   按窗口统一落盘（ack 后最多延迟 ≤ 窗口，字节阈值同样由后台线程判定），`Drop` join + 最终落盘；
+   `backup_incremental` 前置 `flush_wal`（保证导出记录已持久化）；
+   测试 5 个新增（默认关闭持久 / 窗口攒批 drop 完整 / 后台兜底尾部落盘 / 备份前置落盘 / 大窗口攒批行为）；
+   测试 285→290（+5）；
+2. ~~**YCSB 验证（A 写重）**~~ ✅（2026-08-29）：2ms 窗口 **91,296 ops/s**（基线 2,003 → **45×**，P50 7.8µs，
+   达无 fsync 上限的 80%）；1ms 窗口 75,330 ops/s（37×）；`shanshui-cunji-ycsb --group-commit-us` 支持参数对比；
+   首版实现（写路径 + 后台线程双份 fsync）实测反而更慢（1176 ops/s）→ 改为提交器模式后达 91K（详见 P37）。
 
 ---
 

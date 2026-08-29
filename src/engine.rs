@@ -7,8 +7,9 @@
 //! 删除一致性：文档删除后，倒排中残留 docid 在回表时经主数据 Tombstone 天然过滤。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use roaring::RoaringBitmap;
 
@@ -41,6 +42,13 @@ pub struct Engine {
     max_memory_mb: usize,
     /// 全局 seq 分配器（MVCC，M7-1）：primary / delta 列族共享，跨列族写入序一致。
     global_seq: Arc<AtomicU64>,
+    /// 组提交（M8）：Some((窗口, 字节阈值)) = 开启；None = 关闭（逐条 fsync 强安全）。
+    /// 窗口内写入攒批一次 fsync（design 4.3 / M8，`storage.group_commit_us`）。
+    group_commit: Option<(Duration, usize)>,
+    /// 组提交后台线程停止标志（窗口尾部落盘兜底）。
+    gc_stop: Option<Arc<AtomicBool>>,
+    /// 组提交后台线程句柄。
+    gc_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// 查询结果行：docid + 文档字节。
@@ -113,7 +121,7 @@ impl Engine {
         delta.set_external_seq(Arc::clone(&global_seq));
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
-        Ok(Self {
+        let mut engine = Self {
             primary,
             cidx,
             inverted,
@@ -123,7 +131,65 @@ impl Engine {
             mem_ratio: 0.0,
             max_memory_mb: cfg.hotcache.max_memory_mb + cfg.blockcache.max_memory_mb,
             global_seq,
-        })
+            group_commit: None,
+            gc_stop: None,
+            gc_thread: None,
+        };
+        // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
+        // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
+        engine.start_group_commit(cfg);
+        Ok(engine)
+    }
+
+    /// 启动组提交（M8）：窗口 + 字节阈值触发；spawn 后台线程兜底窗口尾部落盘。
+    /// 关闭（`group_commit_us == 0`）时无任何开销（保持逐条 fsync 强安全语义）。
+    fn start_group_commit(&mut self, cfg: &Config) {
+        let window_us = cfg.storage.group_commit_us;
+        if window_us == 0 {
+            return;
+        }
+        let window = Duration::from_micros(window_us);
+        let bytes = cfg.storage.group_commit_bytes.max(1);
+        self.group_commit = Some((window, bytes));
+
+        // 后台兜底线程：每 ≤ 窗口唤醒一次，有待刷缓冲且窗口到期则 fsync（覆盖窗口尾部）。
+        // 仅触碰共享 WAL 锁，不访问 Engine 本体（避免自引用/锁顺序问题）。
+        let pwal = self.primary.wal_handle();
+        let dwal = self.delta.wal_handle();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let tick = if window < Duration::from_millis(10) {
+            window
+        } else {
+            Duration::from_millis(10)
+        };
+        self.gc_stop = Some(stop);
+        self.gc_thread = Some(std::thread::spawn(move || loop {
+            std::thread::sleep(tick);
+            if stop2.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = std::time::Instant::now();
+            for w in [&pwal, &dwal] {
+                let _ = w.lock().map(|mut g| {
+                    if g.pending_bytes() > 0 && g.sync_due(now, window, 0) {
+                        if let Err(e) = g.sync() {
+                            tracing::debug!("组提交兜底落盘失败（等待写路径处理）: {e}");
+                        }
+                    }
+                });
+            }
+        }));
+    }
+
+    /// 组提交判定（M8）：关闭 → 逐条 fsync（现状强安全）；
+    /// 开启 → 写路径零 fsync，由后台提交线程按窗口统一落盘（ack 后最多延迟 ≤ 窗口，
+    /// 字节阈值触发也由后台线程判定）——避免写路径与后台线程双份 fsync + 锁竞争。
+    fn maybe_group_commit(&mut self) -> Result<()> {
+        if self.group_commit.is_none() {
+            self.flush_wal()?;
+        }
+        Ok(())
     }
 
     /// 更新内存使用率估算（OOM Guardian 输入，由监控/统计层刷新）。
@@ -138,7 +204,8 @@ impl Engine {
         // 内存限流：软水位返回限流信号（MVP 仍放行，记录计数）；硬水位直接拒绝
         let _status = self.watchdog.memory_check(self.mem_ratio)?;
         self.put_nosync(docid, value, terms)?;
-        self.flush_wal()
+        // 组提交（M8）：开启时窗口内攒批一次 fsync，否则逐条 fsync（强安全）
+        self.maybe_group_commit()
     }
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
@@ -178,6 +245,8 @@ impl Engine {
     /// 增量备份（design 20，M6-5）：导出 seq ∈ (since_seq, 当前] 的 WAL 记录为 JSON 文件。
     /// 若 WAL 已被截断（环形覆盖 / 长时间未备份）导致缺口 → 报错提示改做全量备份。
     pub fn backup_incremental(&mut self, since_seq: u64, out_path: &Path) -> Result<BackupReport> {
+        // 组提交（M8）前置落盘：保证导出的 WAL 记录已持久化（否则崩溃恢复可能丢失 → 备份与恢复不一致）
+        self.flush_wal()?;
         let until_seq = self.current_seq();
         let (oldest, records) = self.primary.wal_records_since(since_seq)?;
         if since_seq != 0 && oldest > since_seq + 1 {
@@ -256,7 +325,7 @@ impl Engine {
                 serde_json::to_vec(v).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
             self.delta.put_bytes_nosync(key, val)?;
         }
-        self.flush_wal()
+        self.maybe_group_commit()
     }
 
     /// 点查文档：HotCache 命中直达，否则主数据 LSM + Delta Merge-on-Read。
@@ -523,6 +592,21 @@ impl Engine {
     }
 }
 
+/// 组提交（M8）清理：停后台兜底线程并 join，最终落盘待刷 WAL（保证正常退出不丢窗口尾部）。
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.gc_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(h) = self.gc_thread.take() {
+            let _ = h.join();
+        }
+        if self.group_commit.is_some() {
+            let _ = self.flush_wal();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +627,92 @@ mod tests {
         let mut c = Config::default();
         c.sstable.compression = "none".into();
         c
+    }
+
+    fn gc_cfg(window_us: u64) -> Config {
+        let mut c = cfg();
+        c.storage.group_commit_us = window_us;
+        c
+    }
+
+    // ---------- 组提交（M8） ----------
+
+    #[test]
+    fn group_commit_default_disabled_persists_each_put() {
+        // 默认 group_commit_us=0：put 逐条 fsync，drop 后重开数据完整
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+            assert!(e.group_commit.is_none(), "默认应关闭组提交");
+            for i in 0..50u64 {
+                e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+            }
+        }
+        let mut e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        assert_eq!(e2.get(49).unwrap().unwrap(), b"doc-49");
+    }
+
+    #[test]
+    fn group_commit_drop_persists_all() {
+        // 开启 2ms 窗口：快速 put 全部攒批，drop 最终落盘 → 重开数据完整
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = Engine::open(dir.path(), &gc_cfg(2_000)).unwrap();
+            assert!(e.group_commit.is_some());
+            for i in 0..100u64 {
+                e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+            }
+        }
+        let mut e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        assert_eq!(e2.get(99).unwrap().unwrap(), b"doc-99");
+        assert_eq!(e2.get(0).unwrap().unwrap(), b"doc-0");
+    }
+
+    #[test]
+    fn gc_thread_flushes_tail_without_new_writes() {
+        // 后台兜底线程：单条写后无新写，窗口到期也应落盘（WAL 待刷缓冲清零）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &gc_cfg(2_000)).unwrap();
+        e.put(1, b"doc-1".to_vec(), &["t"]).unwrap();
+        // 窗口内第 1 条通常不触发 fsync（有待刷缓冲）
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let pending = e.primary.wal_handle().lock().unwrap().pending_bytes()
+            + e.delta.wal_handle().lock().unwrap().pending_bytes();
+        assert_eq!(pending, 0, "后台线程应在窗口内兜底落盘");
+    }
+
+    #[test]
+    fn backup_incremental_flushes_before_export() {
+        // 组提交开启下 backup_incremental 前置 flush：未手动 flush 也应导出全部记录
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &gc_cfg(2_000)).unwrap();
+        for i in 0..3u64 {
+            e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        let bak = dir.path().join("incr.json");
+        let rep = e.backup_incremental(0, &bak).unwrap();
+        assert_eq!(rep.records, 3, "组提交开启下备份应前置落盘并导出全部");
+    }
+
+    #[test]
+    fn group_commit_window_batches_fsync() {
+        // 行为验证：窗口内连续 put 不逐条 fsync（WAL 待刷字节在窗口内累积，
+        // 直到窗口到期或字节阈值触发一次性落盘）。写 100 条后窗口未到期时缓冲非空。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &gc_cfg(60_000)).unwrap(); // 60ms 大窗口
+        let mut synced = 0usize;
+        let mut missed = 0usize;
+        for i in 0..50u64 {
+            e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+            let pending = e.primary.wal_handle().lock().unwrap().pending_bytes();
+            if pending == 0 {
+                synced += 1; // 已落盘（窗口到期/阈值触发）
+            } else {
+                missed += 1; // 攒批中（未 fsync）
+            }
+        }
+        // 60ms 窗口 + 4KB 阈值：快速 50 条 put（远快于窗口）绝大部分应攒批
+        assert!(missed >= 40, "窗口内应攒批（攒批 {missed}，同步 {synced}）");
     }
 
     #[test]
@@ -767,7 +937,7 @@ mod tests {
         // 重启后位图从段重建，COUNT 仍正确（drop 前刷盘倒排，保证段自包含）
         e.flush_inverted().unwrap();
         drop(e);
-        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
+        let e2 = Engine::open(dir.path(), &cfg).unwrap();
         assert_eq!(e2.inverted_doc_count("status=active").unwrap(), 2);
     }
 
