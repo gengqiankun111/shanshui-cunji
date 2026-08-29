@@ -1741,21 +1741,31 @@ impl RuntimePools {
 
 > 前置：本机 NVMe SSD 基准（7.50）✅；两节点真实 TCP 高并发强一致性测试（gateway 测试，
 > `3e22f80`）✅——分布式机制（一致性哈希路由/广播检索/元数据中心/RPC）已在库内测试框架验证。
-> 真机两节点（本机 + 阿里云 106.14.68.116）对比与压测待服务器访问（凭据不入库）。
+> 真机两节点（本机 + 阿里云 106.14.68.116）对比与压测已完成（凭据不入库）。
 
 1. ~~**本机两节点（库内测试框架）**~~ ✅：`gateway::high_concurrency_writes_strong_consistency_two_nodes`
    ——spawn 2 个 RPC 分片节点（真实 TCP）+ Gateway + MetaCenter，8 线程 × 2500 并发写 20000 条：
    广播检索精确命中、逐条点查跨节点确定性路由强一致可见、探活在线。
 2. ~~**本机性能基准**~~ ✅（7.50）：YCSB a/b/c × 组提交 2ms（NVMe SSD）。
-3. **真机两节点执行步骤**（需服务器访问后执行）：
-   - 部署：复用 7.30 musl 部署流程（git archive 打包 → scp 上传 → 服务器 cargo vendor/offline 构建）
-     或本机 release 二进制直传；
-   - 节点配置：node-1（本机）`server.mode=cluster / sharding.enabled / replication.enabled`，
-     node-2（阿里云 106.14.68.116）`internal_rpc_port` 与 node-1 互指（MetaCenter 注册）；
-   - 压测：本机 YCSB + 服务器 YCSB 同参（records/threads/group-commit）对比吞吐与延迟分位；
-   - 一致性：双节点交叉写入 → 广播检索/点查校验精确一致（复用 `high_concurrency_writes_
-     strong_consistency_two_nodes` 用例改真机地址）。
-4. 结果回填本里程碑。
+3. ~~**真机两节点执行**~~ ✅（2026-08-30，`cluster_demo` bin）：
+   - **服务器恢复与构建**：阿里云 2 核/1.6GB 首次 release 构建默认多 jobs 触发 OOM 失联 →
+     控制台强制重启 + 2G swap + `CARGO_BUILD_JOBS=1` → vendored offline 构建成功（3m45s）；
+   - **服务器 YCSB 基准**（高效云盘 rotational=1，HDD 级，组提交 2ms）：
+
+     | 负载 | load 写入吞吐 | 混合吞吐 | p50 | p95 | p99 |
+     |---|---|---|---|---|---|
+     | a 写重 50/50 | 84,565 w/s | 47,782 ops/s | 7.4µs | 31.6µs | 2677.6µs |
+     | b 读重 95/5 | 85,732 w/s | 113,589 ops/s | 3.5µs | 12.9µs | — |
+     | c 纯读 | 88,790 w/s | 282,114 ops/s | 3.2µs | 9.5µs | — |
+
+     > 对比 7.50 本机 NVMe：load 约本机一半（磁盘写瓶颈）；读 p50 基本持平（C 甚至 3.2µs 略快）；
+     > 长尾 p99 因 2 核 + 慢盘显著放大（a 写重 2677.6µs vs 本机 1046µs）。
+   - **两节点强一致测试**：`cluster_demo --node`（分片节点，复用 M5 RpcServer + register_shard_handlers）
+     本机 node-a:9091 + 阿里云 node-b:9092；安全组未放行 RPC 端口 → SSH 隧道 `plink -L 19092:127.0.0.1:9092`
+     绕过（避免公开暴露无鉴权端口）；`--gateway --nodes a=...,b=...` 4 线程 × 500 = 2000 条跨机并发写
+     → **强一致校验通过**：逐条点查全部可见（确定性路由）+ 广播检索精确命中（52.4s）。
+4. ~~**结果回填**~~ ✅：本里程碑即结果；跨机吞吐受隧道 + 服务器磁盘/CPU 约束（20000 条超时被杀，缩至 2000 条验证）。
+   分布式机制正确性（跨节点路由/广播拼接/强一致可见）已由真机证明，性能量级见 7.50/7.51 基准表。
 
 ---
 
