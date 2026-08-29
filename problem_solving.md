@@ -361,6 +361,20 @@
 - **结果**：336 测试全绿（+1：multi_ssd_striping_places_files）；demo 三盘模拟全通；
   提交 `e6a5610`（Ex-5.10）。
 
+### P47. PerCpuCounter 槽位分配：thread_local 首访 + 原子递增模槽数（线程数 > 槽数分摊）
+- **问题**：按核拆分的计数器需要"每线程固定槽位"。std 无稳定线程 id → usize 映射。
+- **方案**：`thread_local` 静态槽位 + 全局 `NEXT_SLOT` 原子递增模槽数——每线程首访分配并
+  固定；线程数 > 槽数时自然分摊（多个线程共槽，退化为轻度竞争，可接受）。
+- **结果**：demo 8 线程写 2.1×；339 测试全绿；提交 `c5fa66c`（Ex-7.1）。
+
+### P48. 绑核与 seqlock flaky：core_affinity 依赖引入 + 并行负载下测试敏感
+- **问题**：①绑核需 core_affinity（unsafe 依赖，memmap 同策略——仅依赖内部 unsafe，主库
+  零 unsafe 不变）；②seqlock `low_frequency_write_low_retry_rate` 在 342 测试并行负载下
+  重试率超 1% 断言（写间隔 20µs 在调度抖动下与读重叠率高）。
+- **修复**：①core_affinity = "0.8"（跨 Windows/Linux/macOS），绑核失败忽略 + taskset 兜底，
+  配置可关闭；②测试写间隔 20→100µs（更符合"低频写"语义，负载稳定）。
+- **结果**：344 测试全绿；提交 `b294532`（Ex-7.2）、`fd0b519`（Ex-7.3）。
+
 ---
 
 ## 环境备忘（不入库）

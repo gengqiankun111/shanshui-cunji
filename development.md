@@ -1477,6 +1477,43 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **336 全绿**（+1：multi_ssd_striping_places_files 落位 + 跨重启）；
    demo 1 测试全绿；clippy 零警告；提交 `e6a5610`。⚠️ 多盘吞吐收益需在 **SSD 多盘环境**实测。
 
+### 7.38 Ex-7.1 PerCpuCounter 缓存伪共享（design_extension v0.5 第 12 章 P0）
+
+> 背景：多核高频 `AtomicU64::fetch_add` 同一计数器 → 核间缓存行乒乓（伪共享），吞吐随核数
+> 不升反降。
+
+1. ~~**demo 研究（src/demo/per-cpu-counter/，gitignore 不提交）**~~ ✅：3 测试全绿——CpuSlot
+   size=align=64（缓存行隔离）；**8 线程 ×200 万写：单 AtomicU64 347ms vs PerCpuCounter 166ms
+   （2.1×）**；6 线程并发写汇总正确 + reset 归零。
+2. ~~**kernel 整合**~~ ✅：`src/per_cpu.rs`——`PerCpuCounter`（槽位数组 `#[repr(align(64))]` +
+   `thread_local` 首访分配槽位，线程数 > 槽数自然分摊；零 unsafe）；倒排 `mem_docids`（add/
+   add_batch/flush 判断/重置）与 SST `heat`（Ex-5.9）改 PerCpuCounter。
+3. ~~**验证**~~ ✅：`cargo test` **339 全绿**（+3：缓存行隔离/往返/并发写）；demo 3 测试全绿；
+   clippy 零警告；提交 `c5fa66c`。
+
+### 7.39 Ex-7.2 绑核默认开启（design_extension v0.5 第 12.2 P1）
+
+> 背景：多核机器线程调度抖动 → P99 毛刺；三池（网络/计算/IO）绑物理核分区稳定延迟。
+
+1. ~~**kernel 整合**~~ ✅：`[affinity]` 配置（enabled 默认 true；network/compute/io 核列表，
+   空 = 自动分区：network=核0、compute=中部、io=尾部，1 核退化 no-op）+ `src/affinity.rs`
+   （`plan_partition` 纯函数 + `bind_current` 用 core_affinity crate 绑当前线程，跨
+   Windows/Linux/macOS；失败忽略，taskset 兜底）——server 主线程绑 network、Compaction
+   并行线程绑 compute、组提交后台绑 io。
+2. ~~**验证**~~ ✅：`cargo test` **342 全绿**（+3：分区/禁用/显式覆盖）；顺带修复 seqlock
+   低频写测试并行负载 flaky（写间隔 20→100µs）；提交 `b294532`。⚠️ P99 收益需 **SSD 多核
+   环境**实测。
+
+### 7.40 Ex-7.3 io_uring SQPOLL + 多队列（design_extension v0.5 第 12.3 P1）
+
+> 背景：NVMe 多硬件队列下 WAL 与 SSTable 分队列、WAL fsync 与刷盘并行，避免单队列拥塞。
+
+1. ~~**kernel 整合**~~ ✅：`src/io_queue.rs` IO 队列抽象——`IoClass`（Wal/Sst/Inverted）→
+   队列号 0/1/2（与 Ex-5.10 wal_dir/sst_dir/inverted_dir 多盘条带化对齐）；`io_uring_enabled`
+   仅 Linux 且配置开启时生效（Windows 恒 false）。io_uring 本体为 unsafe 依赖（memmap 同策略），
+   待独立 crate 封装后接入 SQPOLL 后端（接入点：`IoClass::queue_id()` 路由）。
+2. ~~**验证**~~ ✅：`cargo test` **344 全绿**（+2：队列号互异 + io_uring 平台门控）；提交 `fd0b519`。
+
 ---
 
 ## 8. 编码规范
