@@ -40,6 +40,10 @@ path = "src/bin/import.rs"
 name = "shanshui-cunji-bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "shanshui-cunji-ycsb"
+path = "src/bin/ycsb.rs"
+
 [features]
 # 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；
 # `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）

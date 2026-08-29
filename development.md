@@ -868,7 +868,13 @@ impl RuntimePools {
    `Engine::inverted_doc_count` / `inverted_group_by` 命中白名单走位图、否则回退倒排段扫描，
    新增 `inverted_bitmap_and_count` 组合筛选；测试验证 内存写入 / 重启从段重建（drop 前刷盘）/ 引擎级快速路径；
    测试 281→285（+4）；
-3. **YCSB 压测定位瓶颈 + 前沿调研报告（design 22）**；
+3. ~~**YCSB 压测定位瓶颈 + 前沿调研报告（design 22）**~~ ✅（2026-08-29）：新增 `shanshui-cunji-ycsb`
+   （src/bin/ycsb.rs，YCSB 规范负载 a/b/c/f，自实现 splitmix64 伪随机 + 延迟分位数统计）；
+   压测结论（详见 `images/perf-0.5.0/验证记录.md`）：冷读 18 万 ops/s（P50≈5µs）、热缓存 87 万 ops/s、
+   100 万数据 SST 分层后读不掉速；**fsync 单条串行为写路径头号瓶颈**——A 写重带 fsync 仅 2,077 ops/s、
+   无 fsync 113,587 ops/s（**55×**）；优化建议 Group Commit（design 4.1.3 已规划未实现）+ 读写分离（P0）；
+   前沿调研（`frontier-research-2026-08.md`）：BVLSM WAL-time KV 分离（7.6× RocksDB）/ RusKey RL Compaction
+   （4×）/ DobLIX·TieredKV 学习索引 / AuraDB Rust 生态；建议 近期组提交、中期大 value KV 分离、长期 RL+学习索引；
 4. **收尾**：文档 + 性能快检 + 打 v0.5.0 标签。
 
 ---
