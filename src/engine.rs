@@ -92,12 +92,14 @@ impl Engine {
         query_timeout: std::time::Duration,
     ) -> Result<Self> {
         let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
-        let inverted = InvertedIndex::open_with_gc(
+        let mut inverted = InvertedIndex::open_with_gc(
             &data_dir.join("inverted"),
             1_000_000,
             &cfg.inverted.engine,
             cfg.inverted.segment_max_size_mb * 1024 * 1024,
         )?;
+        // 位图索引（design 5.2.4，M7-2）：白名单非空时全量重建内存位图
+        inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
         // MVCC 全局 seq（M7-1）：以各列族 WAL 恢复后的 next_seq 取最大作为全局起点，
@@ -453,13 +455,30 @@ impl Engine {
     }
 
     /// 倒排某词条命中的文档数（COUNT 聚合，<0.1ms）。
+    /// 位图索引快速路径（design 5.2.4，M7-2）：term 命中 `bitmap_fields` 白名单 → 内存位图计数；
+    /// 否则回退倒排段扫描。
     pub fn inverted_doc_count(&self, term: &str) -> Result<u64> {
+        if let Some((field, value)) = term.split_once('=') {
+            if let Some(n) = self.inverted.bitmap_count(field, value) {
+                return Ok(n);
+            }
+        }
         self.inverted.doc_count(term)
     }
 
     /// 按字段前缀分组（GROUP BY 聚合）：返回 `field=value` 各分组的文档数。
+    /// 位图索引快速路径（M7-2）：字段命中白名单 → 内存位图分组；否则回退倒排段扫描。
     pub fn inverted_group_by(&self, field: &str) -> Result<Vec<(String, u64)>> {
+        if let Some(rows) = self.inverted.bitmap_group_by(field) {
+            return Ok(rows);
+        }
         self.inverted.group_by(field)
+    }
+
+    /// 内存位图组合 AND 计数（design 5.2.4，M7-2）：全部 term 命中白名单 → 交集计数（亚毫秒）；
+    /// 否则返回 None（调用方回退逐词条倒排查询）。
+    pub fn inverted_bitmap_and_count(&self, terms: &[&str]) -> Option<u64> {
+        self.inverted.bitmap_and(terms).map(|b| b.len())
     }
 
     /// 基础 Compaction（design 4.5，阶段 3）：主数据列族全量合并。
@@ -712,6 +731,44 @@ mod tests {
         let bak = dir.path().join("incr-all.json");
         let rep = e.backup_incremental(0, &bak).unwrap();
         assert_eq!(rep.records, 2, "since=0 应导出全部记录（含已刷盘）");
+    }
+
+    // ---------- 位图索引（design 5.2.4，M7-2） ----------
+
+    #[test]
+    fn bitmap_index_fast_path_for_count_group_and() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.bitmap_fields = vec!["status".into(), "city".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, status: &str, city: &str| {
+            let val = json!({"docid": docid, "status": status, "city": city});
+            let bytes = serde_json::to_vec(&val).unwrap();
+            let terms = crate::server::extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(docid, bytes, &t).unwrap();
+        };
+        put_doc(&mut e, 1, "active", "beijing");
+        put_doc(&mut e, 2, "inactive", "beijing");
+        put_doc(&mut e, 3, "active", "shanghai");
+        // COUNT 快速路径（内存位图）
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 2);
+        assert_eq!(e.inverted_doc_count("city=beijing").unwrap(), 2);
+        // AND 交集快速路径
+        assert_eq!(
+            e.inverted_bitmap_and_count(&["status=active", "city=beijing"])
+                .unwrap(),
+            1
+        );
+        // GROUP BY 快速路径
+        let g = e.inverted_group_by("status").unwrap();
+        assert!(g.contains(&("active".to_string(), 2)));
+        assert!(g.contains(&("inactive".to_string(), 1)));
+        // 重启后位图从段重建，COUNT 仍正确（drop 前刷盘倒排，保证段自包含）
+        e.flush_inverted().unwrap();
+        drop(e);
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(e2.inverted_doc_count("status=active").unwrap(), 2);
     }
 
     #[test]

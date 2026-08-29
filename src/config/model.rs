@@ -544,6 +544,10 @@ pub struct InvertedConfig {
     pub max_posting_scan: u64,
     /// 倒排段 GC 阈值（MB，design 5.2.2 / 5.2.4⑤）：段文件总量超此值触发后台合并。
     pub segment_max_size_mb: u64,
+    /// 位图索引字段白名单（design 5.2.4，M7-2）：枚举/离散字段名（如 status / city），
+    /// 命中字段的值位图**常驻内存**（term → RoaringBitmap），COUNT / GROUP BY / AND 组合筛选
+    /// 走内存位图快速路径（亚毫秒）；空 = 关闭（默认，零额外开销）。
+    pub bitmap_fields: Vec<String>,
 }
 
 impl Default for InvertedConfig {
@@ -554,6 +558,7 @@ impl Default for InvertedConfig {
             max_memory_bytes: 12 * 1024 * 1024 * 1024,
             max_posting_scan: 1_000_000,
             segment_max_size_mb: 1024,
+            bitmap_fields: Vec::new(),
         }
     }
 }

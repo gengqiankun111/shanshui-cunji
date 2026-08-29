@@ -860,7 +860,14 @@ impl RuntimePools {
    不可见，null 删除 / Tombstone 均按快照点判定）——补全 M6-3 遗留的跨列族快照隔离；
    `begin_snapshot` / `current_seq` 读全局计数；重启后从各列族 WAL 恢复全局起点；
    测试验证 快照隔离 Delta / null 删除 / 跨重启 seq 接续；测试 279→281（+2）；
-2. **位图索引增强（design 5.2.4/7.2）**：枚举字段内存位图加速 COUNT/GROUP/AND；
+2. ~~**位图索引增强（design 5.2.4/7.2）**~~ ✅（2026-08-29）：枚举字段**内存位图加速**
+   COUNT/GROUP/AND——`[inverted] bitmap_fields` 白名单（默认关闭零开销）+ `InvertedConfig::bitmap_fields`；
+   `InvertedIndex::with_bitmap_fields` 启动时全量重建（遍历内存 + 各段 posting，term 拆分 `field=value`
+   命中白名单 → 内存 `field → (value → RoaringBitmap)` 常驻）；写路径 `add` 同步维护；快速路径
+   `bitmap_count`（COUNT 亚毫秒）/ `bitmap_group_by`（GROUP BY 各值计数）/ `bitmap_and`（组合 AND 交集）；
+   `Engine::inverted_doc_count` / `inverted_group_by` 命中白名单走位图、否则回退倒排段扫描，
+   新增 `inverted_bitmap_and_count` 组合筛选；测试验证 内存写入 / 重启从段重建（drop 前刷盘）/ 引擎级快速路径；
+   测试 281→285（+4）；
 3. **YCSB 压测定位瓶颈 + 前沿调研报告（design 22）**；
 4. **收尾**：文档 + 性能快检 + 打 v0.5.0 标签。
 
