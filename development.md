@@ -1579,6 +1579,35 @@ impl RuntimePools {
 
 ---
 
+### 7.44 Ex-2 SAGA 编排 + 补偿状态机（design_extension v0.1 L2）
+
+> 背景：分布式事务 L2 = 跨分片业务事务（一笔操作涉及多个 docid 落在不同分片）。
+> 决策：SAGA 编排（docid 级本地事务为步骤 + 反向补偿），不做 2PC/TCC；补偿须覆盖
+> 超时分支（宁可多发由屏障空转）；补偿幂等是硬前提。
+
+1. ~~**demo**~~ ✅（src/demo/saga/，6 测试）：正向前进全成功 / 中段失败反向补偿 /
+   超时分支屏障空转（空回滚防护）/ 终态拒迟到正向（悬挂防护）/ 崩溃恢复续跑 /
+   补偿失败重试 + 幂等。
+2. ~~**kernel 整合**~~ ✅：
+   - **步骤状态机**（src/saga.rs）：`SagaStatus`（Init→Executing→Succeeded/Failed→
+     Compensating→Compensated）+ `SagaState`（tx_id、executed_steps、compensated_steps、
+     last_error）；`SagaStep` trait + `ClosureStep`（正向/补偿闭包）；
+   - **协调器**：`SagaCoordinator::run`（启动/续跑；Failed/Compensating 自动转补偿）、
+     `compensate`（对已登记分支逆序补偿，任一失败保持 Compensating 重试）；
+   - **屏障（Barrier）**：分支登记（正向成功后记录 executed_steps）先于补偿——空回滚
+     防护（未登记分支不补偿）+ 悬挂防护（终态/已补偿分支拒绝迟到正向）+ 补偿幂等键
+     （tx_id+step）；`status`/`all_states` 回查接口持久化 transactionId→status；
+   - **持久化**：JSON tmp+rename 原子写（saga-{tx_id}.json，复用 MvScheduler 模式），
+     重启加载全部续跑。
+3. ~~**验证**~~ ✅：`cargo test` **362 全绿**（+6：正向成功无补偿 / 中段失败逆序补偿 /
+   重启恢复终态 / 终态拒绝重复正向 / 补偿重试 3 次成功 / 重复登记被拒）；提交 `990bf6b`。
+   ⚠️ Ex-2.5 网关 `/saga/start|status|compensate` HTTP API 与 2 节点跨分片端到端联调
+   留待分布式构建阶段。
+   顺带：seqlock P48 补强——低频写间隔 100→200µs，消除并行负载 flaky（`low_frequency
+   write_low_retry_rate` 偶发 >1% 阈值）。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

@@ -91,6 +91,7 @@
 | 物化视图调度器（Count/Sum/Avg + 增量刷新） | ✅ | M5 `8bcc077` |
 | 四层看门狗（写停滞检测 + 心跳 Sidecar） | ✅ | M5 `df8e9d4` |
 | 本地消息表 + 幂等消费（Outbox，Ex-1） | ✅ | `7348acd`（列族 outbox：业务写+待办同一本地事务、投递器、按 (docid,seq) 幂等 apply、排空校验；异步索引补偿/扩容衔接基础） |
+| SAGA 编排 + 补偿状态机（Ex-2） | ✅ | `990bf6b`（src/saga.rs SagaCoordinator：SagaStep trait + 状态机 + 屏障防空回滚/悬挂 + JSON 持久化续跑 + 补偿幂等；Ex-2.5 网关 /saga/* HTTP 留待分布式阶段） |
 | 读写分离（Mutex/RwLock/COW 快照读） | ⏸ | M8-P1 `be09a07` demo 结论暂缓（组提交已解决读被写拖垮） |
 | 高并发查询优化（design 9.5 目标） | ⏳ | M6 后留待 |
 
@@ -157,6 +158,9 @@
 - **Ex-1 本地消息表 + 幂等消费**（`7348acd`）：src/outbox.rs Outbox 列族（docid+seq 复合键），
   业务写 + 待办同一本地事务（共享全局 seq 与 fsync 点）、投递器 dispatch、IdempotentConsumer
   按 (docid,seq) 去重、排空校验——分布式事务 L1 首选方案落地，双写扩容/异步索引补偿衔接基础
+- **Ex-2 SAGA 编排 + 补偿状态机**（`990bf6b`）：src/saga.rs SagaCoordinator——SagaStep trait +
+  状态机（init→executing→succeeded/failed→compensating→compensated）+ JSON 持久化续跑 +
+  屏障（分支登记先于补偿/空回滚/悬挂防护/补偿幂等）+ 回查接口——L2 跨分片业务事务基础
 - **M8-P12 环形 WAL 头部 tail 合并 fsync**：sync 单次原子提交（消除冗余第二次 fsync）——
   ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
 - **M8-P13 jieba 完整中文词典分词**：`[inverted] cjk_segmenter="jieba"`（`cjk-jieba` feature，

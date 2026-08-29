@@ -49,21 +49,26 @@
 
 ### 任务分解
 
-- [ ] **Ex-2.1 步骤状态机**：`src/saga.rs`——Saga 定义（步骤 + 补偿 + 幂等键），
+- [x] **Ex-2.1 步骤状态机**：`src/saga.rs`——`SagaStep` trait + `ClosureStep`（正向/补偿闭包），
      状态机（init → executing → succeeded/failed → compensating → compensated），
-     持久化到 meta 存储（复用现有 JSON 持久化模式，如 MvScheduler）。
-- [ ] **Ex-2.2 协调器**：驻留网关（已有元数据中心）——按序执行步骤（docid 本地事务），
-     任一步失败反向补偿；**补偿覆盖超时分支**（宁可多发由屏障空转）。
-- [ ] **Ex-2.3 屏障（Barrier）**：空回滚/悬挂防护——分支登记先于执行；补偿幂等键；
-     回查接口持久化 transactionId→status（复用 Ex-1 outbox 机制）。
-- [ ] **Ex-2.4 执行引擎**：Saga 执行器（同步/异步步骤 + 重试），与现有 RPC（`rpc.rs`）衔接。
-- [ ] **Ex-2.5 API**：网关 `/saga/start` `/saga/status` `/saga/compensate`（HTTP，参照 DTM 无侵入协议）。
+     持久化 JSON tmp+rename（saga-{tx_id}.json，复用 MvScheduler 原子写模式）。
+- [x] **Ex-2.2 协调器**：`SagaCoordinator`——按序执行步骤（docid 本地事务），
+     任一步失败反向补偿；补偿失败保持 Compensating 续跑重试（**补偿覆盖超时分支**由屏障空转）。
+- [x] **Ex-2.3 屏障（Barrier）**：空回滚/悬挂防护——分支登记（正向成功后记录）先于执行；
+     补偿幂等键（tx_id+step）；回查接口 `status`/`all_states` 持久化 transactionId→status。
+- [x] **Ex-2.4 执行引擎**：`run`（启动/续跑，Failed/Compensating 自动转补偿）+
+     `compensate`（逆序补偿），与现有 RPC 衔接由业务方实现 `SagaStep`。
+- [ ] **Ex-2.5 API**：网关 `/saga/start` `/saga/status` `/saga/compensate`（HTTP，参照 DTM 无侵入协议，
+     待网关路由接入时落地）。
 
 ### 验证
 
-- demo（src/demo/saga/）：正向前进全成功 / 中段失败反向补偿 / 超时分支补偿（屏障空转）/
-  协调器崩溃恢复状态机续跑 / 幂等；单元 + 边界测试。
-- kernel 集成：2 节点真实 TCP（复用 M5 分片测试框架）跨分片 Saga 端到端。
+- demo（src/demo/saga/，6 测试）：正向前进全成功 / 中段失败反向补偿 / 超时分支屏障空转 /
+  终态拒迟到正向（悬挂防护）/ 崩溃恢复状态机续跑 / 补偿失败重试 + 幂等。
+- kernel 集成（src/saga.rs 6 测试）：正向成功无补偿 / 中段失败逆序补偿 / 重启恢复终态 /
+  终态拒绝重复正向 / 补偿重试 3 次成功 / 重复登记被拒。
+- ✅ 完成：`cargo test` **362 全绿**（含 saga 6）；提交 `990bf6b`。
+  注：Ex-2.5 网关 HTTP API 与 2 节点跨分片端到端联调留待分布式构建阶段。
 
 ### 依赖
 
@@ -231,7 +236,7 @@ Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension 
 |---|---|---|---|
 | L0 | 写路径单分片本地事务 + Group Commit | ✅ 已有 | `648d9bd` 等 |
 | Ex-1 | 本地消息表 + 幂等消费 | ✅ | `7348acd` |
-| Ex-2 | SAGA 编排 + 补偿状态机 | ⏳ | — |
+| Ex-2 | SAGA 编排 + 补偿状态机 | ✅ | `990bf6b`（Ex-2.5 网关 HTTP API 留待分布式阶段） |
 | Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
 | Ex-5 | SSD 原生迁移（P0 ✅ + P1 环形 WAL/删除位图/FST/解耦 ✅ + P2 冷热/条带化 ✅） | ✅ | `e6a5610` 等 |
