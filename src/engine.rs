@@ -543,8 +543,9 @@ impl Engine {
         &self.fulltext_fields
     }
 
-    /// 主键范围扫描分页（M8-P8）：顺序扫描后截断当前页——JSON 构造 O(limit)；
-    /// 注意扫描本身仍全量收集（顺序读路径，大范围仍吃内存，后续可流式化）。
+    /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
+    /// 不随扫描总量膨胀（旧实现先全量收集 O(total) 再截断）；`total` = 范围行数
+    /// （全扫计数，limit 取满页后仅计数不回表，语义与全量一致）。
     pub fn scan_range_paged(
         &mut self,
         start: Option<u64>,
@@ -552,13 +553,28 @@ impl Engine {
         limit: Option<u64>,
         offset: u64,
     ) -> Result<PagedRows> {
-        let all = self.primary.scan_range(start, end)?;
-        let total = all.len() as u64;
-        let rows: Vec<QueryRow> = all
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit.unwrap_or(u64::MAX) as usize)
-            .collect();
+        let cap = limit.unwrap_or(u64::MAX);
+        let sk = start.map(|s| crate::keys::encode_docid(s).to_vec());
+        let ek = end.map(|e| crate::keys::encode_docid(e).to_vec());
+        let mut rows = Vec::new();
+        let mut skipped = 0u64;
+        let mut total = 0u64;
+        self.primary
+            .scan_stream(sk.as_deref(), ek.as_deref(), |key, val| {
+                total += 1;
+                if skipped < offset {
+                    skipped += 1;
+                    return Ok(());
+                }
+                if rows.len() as u64 >= cap {
+                    return Ok(()); // 页已取满：仅继续计数 total，不再收集
+                }
+                let docid = crate::keys::decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+                })?;
+                rows.push((docid, val.to_vec()));
+                Ok(())
+            })?;
         Ok(PagedRows { total, rows })
     }
 

@@ -1078,6 +1078,31 @@ impl RuntimePools {
    `fulltext 数据` → total=2（含"数据库"文档 5000001/5000002）、`fulltext 山水` → total=1；
    测试 308 全绿（+1：engine 中文 bigram 端到端；tokenize 测试更新为 bigram 断言）。
 
+### 7.18 M8-P10 scan 范围扫描流式化（k-way merge，内存 O(page) 防全量收集 OOM）
+
+> 背景（7.16 已知限制）：`scan_range_paged` 先 `scan_range` 全量收集（HashMap 合并 + 排序，
+> 内存 O(total)）再截断——全库 scan（5000 万行）会收集 ~35GB 内存 OOM。方案：k-way merge
+> 流式归并（memtable 双缓冲 + 各 SST 有序源，同 key 取最大 seq、Tombstone 跳过），
+> 配合分页 skip/take 提前终止，内存 O(page)。
+
+1. ~~**demo 研究（src/demo/scan-stream/，gitignore 不提交）**~~ ✅：归并算法验证——
+   单源直通 / 多源交错升序 / 同 key 最新 seq / tombstone 隐藏旧版 / 空边界 / 流式分页==全量；
+   6 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `SstReader::SstRangeIter`（块级惰性迭代 + Zone Map 剪枝，与 scan_range 语义一致）；
+   - `MemTable::MemRangeIter` / `MemTableBuffer::iter_range`（skiplist range 惰性迭代，
+     owned 查询键免借用）；
+   - `ColumnFamily::scan_stream`（k-way merge：BinaryHeap 最小堆 O(N log K)，避免每轮
+     线性扫源 O(N·K)——202 SST × 50M 行实测超时 → 堆优化）；
+   - `Engine::scan_range_paged` 改流式（skip/take + total 全扫计数，内存 O(page)）。
+3. ~~**验证**~~ ✅：50M 库全库 `/range?limit=10` → total=5,000,000 精确、**server WS 691MB**
+   （旧实现全量收集 50M 行会 OOM）；小范围翻页 `/range?start..end&limit=20&offset=40`
+   117ms（total=101 首条 docid=10000040）；全库 scan ~70s 为 total 计数 + 读全 SST 的固有代价；
+   测试 310 全绿（+2：scan_stream vs scan_raw_range 一致性含覆盖/删除/范围过滤、SstRangeIter
+   vs scan_range 一致性）。
+4. **已知限制**：全库 scan 的 `total` 计数需扫完全部（无 limit 提前终止的 total 语义），
+   后续可加「仅需前 N 条」的无 total 模式 / 游标续扫。
+
 ---
 
 ## 8. 编码规范
