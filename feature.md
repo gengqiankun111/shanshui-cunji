@@ -109,7 +109,7 @@
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
-| 环形 WAL 头部 tail 免 fsync | ⏳ | M8 候选 |
+| 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
 | 读写分离 / 双写加速 | ⏸ | 评估中 |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ⏳ | 评估中 |
 
@@ -122,6 +122,8 @@
   `scan_range_paged` 内存 O(page)——50M 库全库分页查询 WS 691MB（旧实现全量收集会 OOM）
 - **M8-P11 scan 游标续扫**：`scan_after` + `/range?after`——全库遍历每页 O(limit)，
   50M 库翻页 164-682ms（旧 total 模式全库 70s）
+- **M8-P12 环形 WAL 头部 tail 合并 fsync**：sync 单次原子提交（消除冗余第二次 fsync）——
+  ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
 
 ## 下一候选
 

@@ -472,8 +472,12 @@ impl RingWal {
         Ok(())
     }
 
-    /// 落盘：构建写计划（必要时回绕）→ 写记录区 fsync → 更新头部 tail fsync → 维护索引。
+    /// 落盘：构建写计划（必要时回绕）→ 头部 tail 与记录区**同一次 fsync 原子提交**（M8-P12）→ 维护索引。
     /// 回绕覆盖未刷盘记录时返回 WalFull（上层 Flush + `set_flushed_seq` 后重试）。
+    ///
+    /// 崩溃安全（M8-P12 合并 fsync 后）：头部 tail 与记录区写入 page cache 后单次 `sync_all`
+    /// 原子提交——tail 与记录**同时可见** → tail 永不指向未落盘记录（与两阶段版保证相同）；
+    /// 崩溃于 fsync 前：头尾均未落盘 → 恢复上次提交状态（本次未提交记录忽略，安全）。
     pub fn sync(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -499,14 +503,13 @@ impl RingWal {
             pos += rec.len();
         }
         let file = self.file.as_mut().unwrap();
+        self.tail = pos;
+        write_ring_header(file, self.tail)?; // 写头部 tail（page cache）
         for (off, bytes) in &plan {
             file.seek(std::io::SeekFrom::Start(*off as u64))?;
             file.write_all(bytes)?;
         }
-        file.sync_all()?; // 阶段①：记录区落盘
-        self.tail = pos;
-        write_ring_header(file, self.tail)?;
-        file.sync_all()?; // 阶段②：头部 tail 落盘
+        file.sync_all()?; // 单次 fsync：头部 tail + 记录区原子提交（消除冗余第二次 fsync）
         for (off, rec) in &plan {
             let seq = u64::from_le_bytes(rec[8..16].try_into().unwrap());
             self.index.push((*off, seq));

@@ -1122,6 +1122,23 @@ impl RuntimePools {
    深页 `after=49999990&limit=10` **164ms**（docid 49999991-49999999 共 9 条）、server WS
    696MB；测试 311 全绿（+1：scan_after 遍历一致性/边界/提前终止/上界）。
 
+### 7.20 M8-P12 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交）
+
+> 背景（M8-P1 候选优化）：`RingWal::sync` 两阶段——写记录区 `sync_all` + 写头部 tail
+> `sync_all`（每次提交 2 次 fsync），ring+gc 2ms 仅 30,270 ops/s vs append+gc 91,296。
+> 优化：头部 tail 与记录区**合并为同一次 `sync_all`**（同一文件一次原子提交）。
+
+1. ~~**demo 研究（src/demo/ring-tail-fsync/，gitignore 不提交）**~~ ✅：提交/崩溃语义验证——
+   已 sync 记录完整恢复 / 未 sync 记录崩溃丢弃 / 多次提交+回绕恢复最新周期 / WalBackend
+   分发语义；4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：`RingWal::sync`——先写头部 tail（page cache）
+   再写记录区，**单次 `sync_all`** 原子提交两者。崩溃安全不变：fsync 前崩溃 → 头尾均未
+   落盘，恢复上次提交状态（未提交记录忽略）；fsync 后 → 头尾同时可见，**tail 永不指向
+   未落盘记录**（与两阶段版保证相同）。
+3. ~~**验证**~~ ✅：ycsb A 写重 ring+gc 2ms **68,756 ops/s**（M8-P1 基线 30,270 → **2.3×**；
+   ring 4MB+gc 55,570 → +24%）；wal 模块 20 测试全绿（含环形崩溃恢复/回绕/混沌）；
+   测试 311 全绿（无新增单测——合并 fsync 由既有崩溃恢复测试覆盖，demo 4 测试验证语义）。
+
 ---
 
 ## 8. 编码规范
