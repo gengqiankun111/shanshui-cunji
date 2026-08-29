@@ -88,6 +88,35 @@ demo 对比数据 + 决策报告（记录到 development_extension.md 状态）�
 
 ---
 
+## Ex-4 倒排索引字段策略落地（v0.2，2026-08-29）
+
+> 对应 design_extension.md 第 9 章。目的：把字段倒排三准则（枚举建 / 高基数排除 / 长文本分词）
+> 落到**现有 50M 正式库（db-50m）**——排除 note 后 inverted 2.2GB → ~200MB，构建时间同步下降，
+> 查询不变。机制（M8-P4 白名单/黑名单 + P38 max_term_len + M8-P7 fulltext）均已落地，
+> 本里程碑是**配置实践 + 重建验证 + 文档固化**。
+
+### 任务分解
+
+- [ ] **Ex-4.1 重建 50M 倒排**：用 9.4 配置模板（`inverted_fields` 7 枚举 + `exclude_fields=["note"]`
+      + `max_term_len=96`）重建 db-50m（保留主数据，重导/重刷倒排）——记录 inverted 大小、
+      段构建时间 vs 现状（2.2GB）。
+- [ ] **Ex-4.2 验证**：`status=active`=16,666,667、`city=beijing`=10,000,000、`tag_b=x`=25,000,000
+      计数不变；点查 docid=0/25M/49999999 命中；倒排体积与导入总耗时对比报告。
+- [ ] **Ex-4.3 配置模板固化**：`src/config/model.rs` 注释引用 design_extension 9.4；提供一个
+      `config.import-example.toml`（gitignore 除外）或文档示例供实际开发复制。
+- [ ] **Ex-4.4 更新文档**：feature.md C 模块状态、problem_solving.md（若遇新问题 P#）、
+      design_extension.md 9.5 量化收益回填实测值。
+
+### 验证
+
+重建后 db-50m 倒排体积/构建时间对比 + 计数/点查断言全过（复用现有集成测试断言）。
+
+### 依赖
+
+M8-P4/P38/M8-P7 机制（已落地 ✅）、import 工具（`--inverted-engine hash` + config）。
+
+---
+
 ## 里程碑状态跟踪
 
 | 里程碑 | 内容 | 状态 | 提交 |
@@ -96,11 +125,13 @@ demo 对比数据 + 决策报告（记录到 development_extension.md 状态）�
 | Ex-1 | 本地消息表 + 幂等消费 | ⏳ | — |
 | Ex-2 | SAGA 编排 + 补偿状态机 | ⏳ | — |
 | Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
+| Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
 
 ## 与本项目其他文档关系
 
-- **design_extension.md**：本计划的设计依据（技术全景/借鉴/更快思考/分层决策）。
+- **design_extension.md**：本计划的设计依据（v0.1 分布式事务技术全景/分层决策；v0.2 倒排字段策略
+  三准则/配置模板）。
 - **feature.md**：主项目功能清单（L0 对应 M8-P0 等）；Ex-1/2 落地后同步更新 feature.md 的
-  G 模块（分布式/网关）状态。
+  G 模块（分布式/网关）状态；Ex-4 对应 C 模块（倒排全文）状态。
 - **development.md 7.x**：Ex-* 里程碑落地后按 7.x 续编（Ex-1 → 7.22 等）。
 - **problem_solving.md**：落地过程中问题闭环 P# 记录。

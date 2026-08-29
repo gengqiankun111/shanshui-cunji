@@ -1,10 +1,8 @@
-# 设计扩展：分布式事务（design_extension.md）
+# 设计扩展（design_extension.md）
 
-> 版本：v0.1（2026-08-29）· 关联：design.md（主设计）、development_extension.md（开发扩展计划）
-> 定位：调研分布式事务技术全景 → 明确借鉴点 → 思考"如何更快" → 给出山水存迹的决策。
-> 前置事实：山水存迹已有分布式基础（M5 阶段 2）——一致性哈希分片路由（单分片确定性写）、
-> 主从复制（ReplicationLog 异步）、网关广播检索（Chunk 直拼）、TDS 术语字典热备、
-> 无损扩容协议（双写→追平→原子切换）、物化视图调度器。
+> 版本：v0.2（2026-08-29）· 多主题扩展文档：
+> **v0.1 分布式事务**（第 1~8 章）· **v0.2 倒排索引字段策略**（第 9 章，2026-08-29 增补）
+> 关联：design.md（主设计）、development_extension.md（开发扩展计划，Ex-1/2/3 分布式 + Ex-4 倒排策略）
 
 ---
 
@@ -124,3 +122,58 @@
 - **幂等是硬前提**：所有跨节点写必须幂等键（docid+全局 seq），否则补偿重试会叠加。
 - **屏障（Barrier）**：空回滚/悬挂防护（分支登记先于执行；补偿幂等；回查持久化状态）。
 - **不引入 Java 栈协调器**：保持 Rust 单栈；dtmrs 协议仅作参考，不依赖其二进制。
+
+---
+
+# 9. 倒排索引字段策略（v0.2，2026-08-29）
+
+> 主题：**字段是否建倒排、建多少字段、term 基数与构建成本/磁盘的关系**——给出可执行准则
+> 与配置模板。前置机制均已落地：M8-P4 白名单/黑名单（`inverted_fields`/`exclude_fields`）、
+> P38 长文本保护（`max_term_len=96`）、M8-P7 fulltext 分词（`fulltext_fields`）。
+
+## 9.1 问题
+
+50M 数据集（20 字段）实测暴露两个现象：
+1. **高基数字段撑爆字典**：`note-{i}` 每行唯一 → 50M 个 term，占 inverted 2.2GB 大头
+   （实测 `status=active` 仅 16.6M posting，note 却有 50M 个 term）；
+2. 字段多≠都该建倒排——20 字段中实际只有 9 个字符串字段生成 term（数值/布尔 11 个不走倒排、
+   2 个 256 字符长文本被 max_term_len 跳过）。
+
+## 9.2 成本分析：term 基数 M 与构建成本/磁盘
+
+- **构建**：写入插入 O(N·F) 线性；**段构建排序 O(M·log M)**（M=唯一 term 数）——M 从 3 到 50M，
+  排序成本超线性爆炸；高基数 term 的 posting 追加/内存同样更高。
+- **磁盘**：倒排 = term 字典 + posting（Roaring）。**term 数越多，字典占大头**
+  （每 term 字符串/哈希/偏移 ~10-20B）——note 的 50M term 即 2.2GB 大头来源。
+- **核心指标是 posting 密度 = N/M（行数/唯一 term 数）**，不是 term 个数本身：
+
+| 密度 N/M | 含义 | 判断 |
+|---|---|---|
+| 大（>1K/term） | 枚举/低基数，位图密集，Roaring 压缩 + 与/或高效 | ✅ 建倒排 |
+| 中（10~1K/term） | 理想过滤区间 | ✅ 建倒排 |
+| 小（≈1，term 数≈行数） | 唯一值字段（note）——字典膨胀 + 构建慢 + 查询退化点查 | ❌ **排除** |
+
+## 9.3 决策：字段倒排策略三准则
+
+1. **枚举/低基数**（唯一值 <1K）→ 建倒排 ✓（status/city/tag 等）；
+2. **高基数/唯一**（note/user_id/时间戳/订单号）→ `exclude_fields` 排除 ✗；
+3. **长文本**（>max_term_len）→ `fulltext_fields` 分词建词索引（不整串）。
+
+建倒排字段数 **≤20**（M8-P4 原则：100 字段的表倒排不超过 20）。写入成本 O(N·F) 随字段数线性，
+字段多不是瓶颈；**瓶颈是建倒排字段的 term 基数与数量**。
+
+## 9.4 配置模板（实际开发）
+
+```toml
+[inverted]
+engine = "hash"            # 免 FST 编译（无前缀检索需求时）
+inverted_fields = ["status", "city", "tag_a", "tag_b", "region", "device", "channel"]  # 白名单 ≤20
+fulltext_fields = ["title", "content", "remark"]   # 长文本分词
+exclude_fields = ["note"]                          # 高基数/唯一字段
+max_term_len = 96                                  # 超长自动跳过（兜底）
+```
+
+## 9.5 量化收益（db-50m 优化重建）
+
+按 9.3/9.4 排除 note 并白名单锁定后：inverted 2.2GB → **~200MB 量级**，段构建时间同步下降，
+`status/city` 等查询不变。落地任务见 development_extension.md **Ex-4**。
