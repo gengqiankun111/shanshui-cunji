@@ -263,6 +263,14 @@
   长文本存主数据可主键/扫描查询，后续可加 `fulltext` 分词建词 term 索引（与 inverted:false 正交）。
 - **提交**：`cde4f18`（M8-P4）
 
+### P39. WAL 无限增长：6.5GB wal.log 每 100 万行 fsync 拖垮导入
+- **现象**：5000 万导入中 wal.log 达 6.5GB 不回收；导入在 400 万行后长时间卡顿（CPU 满、磁盘 0 写入）；磁盘写入双倍（WAL + SST）。
+- **根因**：append 模式 WAL 在 SST flush 后**不截断**——每次 `flush_wal`（每 100 万行）fsync 6.5GB 大文件的全部脏页 → 单次 fsync 数十秒；WAL 文件持续增长。
+- **修复**（M8-P5）：flush 成功后 `truncate_and_reset` 清空 WAL 并写**文件头（magic + next_seq）**持久化 seq 接续（重开不冲突）；`open_append` 读头 / `recover` 跳头 16B / 旧无头 WAL 兼容；`WalWriter` 打开模式 append → read+write（Windows append 句柄不允许 `set_len(0)`，PermissionDenied）+ sync 前 seek 末尾。
+- **语义变更**：增量备份只导出 WAL 未刷盘记录（已刷盘由全量备份覆盖，与环形 WAL 一致）；缺口检测仍有效。
+- **结果**：WAL 保持小文件，导入卡顿消除、速度稳定 100 万/分钟（SST 构建 + 倒排段排序主导）。
+- **提交**：`<M8-P5>`（M8-P5）
+
 ---
 
 ## 环境备忘（不入库）

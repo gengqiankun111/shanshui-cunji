@@ -228,8 +228,11 @@ impl ColumnFamily {
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
         let max_seq = cf.replay_records(&wal_records)?;
-        // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）
-        cf.wal.lock().unwrap().resume_seq(max_seq + 1);
+        // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）。
+        // 截断后重建的 WAL 含头（持久化 next_seq，M8-P5）且无回放记录 → 保持头值不覆盖。
+        if max_seq > 0 {
+            cf.wal.lock().unwrap().resume_seq(max_seq + 1);
+        }
         Ok(cf)
     }
 
@@ -520,6 +523,9 @@ impl ColumnFamily {
             self.flush_buckets(&imm)?;
         }
         self.wal.lock().unwrap().set_flushed_seq(flushed_max);
+        // WAL 截断（M8-P5）：append 模式 flush 后全部记录已刷盘，清空 WAL 保持小文件
+        // （避免无限增长 + 大文件 fsync 拖慢写入）；ring 模式自带覆盖回收（no-op）
+        self.wal.lock().unwrap().truncate_and_reset()?;
         Ok(())
     }
 
@@ -1042,6 +1048,91 @@ mod tests {
         cfg.blockcache.block_size_kb = 1;
         cfg.sstable.compression = "none".into();
         cfg
+    }
+
+    // ---------- WAL 截断（M8-P5） ----------
+
+    #[test]
+    fn wal_truncated_after_flush_keeps_data() {
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let wal_path = dir.join(WAL_FILE);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 0..5_000u64 {
+                cf.put_bytes_nosync(i.to_be_bytes().to_vec(), format!("doc-{i}").into_bytes())
+                    .unwrap();
+            }
+            cf.sync_wal().unwrap();
+            let before = std::fs::metadata(&wal_path).unwrap().len();
+            cf.switch_and_flush().unwrap(); // flush → WAL 截断
+            let after = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                after < before && after < 64,
+                "flush 后 WAL 应截断为小文件（before={before} after={after}）"
+            );
+        }
+        // 重开：数据完整（从 SST + WAL 恢复），seq 接续
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.get(0).unwrap().unwrap().0, b"doc-0");
+        assert_eq!(cf2.get(4_999).unwrap().unwrap().0, b"doc-4999");
+        // 新写入 seq 接续（不回到 1）：头持久化 next_seq
+        let next = cf2.wal_next_seq();
+        assert!(
+            next >= 5_001,
+            "重开后 next_seq 应接续（>=5001），实际 {next}"
+        );
+    }
+
+    #[test]
+    fn wal_header_persists_next_seq_across_restart() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let wal_path = dir.join(WAL_FILE);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for i in 0..300u64 {
+            cf.put_bytes_nosync(i.to_be_bytes().to_vec(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        cf.sync_wal().unwrap();
+        cf.switch_and_flush().unwrap(); // 截断，头写入 next_seq=301
+        let first_after_flush = cf.wal_next_seq();
+        drop(cf);
+        // 重开：next_seq 从头恢复（>300），而非 1
+        let cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(
+            cf2.wal_next_seq(),
+            first_after_flush,
+            "重开 next_seq 应接续（头持久化）"
+        );
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() < 64,
+            "WAL 保持小文件"
+        );
+    }
+
+    #[test]
+    fn old_wal_without_header_still_recovers() {
+        // 兼容：旧格式 WAL（无头，M8-P5 之前）照常回放恢复
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let wal_path = dir.join(WAL_FILE);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 0..100u64 {
+                cf.put_bytes_nosync(i.to_be_bytes().to_vec(), format!("v{i}").into_bytes())
+                    .unwrap();
+            }
+            cf.sync_wal().unwrap();
+            // 不 flush：WAL 保留记录（旧格式无头）
+        }
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(
+            cf2.get(99).unwrap().unwrap().0,
+            b"v99",
+            "旧格式 WAL 应回放恢复"
+        );
+        assert!(cf2.wal_next_seq() >= 101, "旧 WAL 回放后 seq 接续");
     }
 
     #[test]

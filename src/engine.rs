@@ -1003,11 +1003,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
         e.put(1, b"a".to_vec(), &["a"]).unwrap();
-        e.flush_primary().unwrap(); // 刷盘不影响 WAL 记录
+        e.flush_primary().unwrap(); // flush → WAL 截断（M8-P5）：已刷盘记录 1 从 WAL 删除
         e.put(2, b"b".to_vec(), &["b"]).unwrap();
         let bak = dir.path().join("incr-all.json");
         let rep = e.backup_incremental(0, &bak).unwrap();
-        assert_eq!(rep.records, 2, "since=0 应导出全部记录（含已刷盘）");
+        assert_eq!(
+            rep.records, 1,
+            "since=0 导出当前 WAL 全部记录（截断后 = 未刷盘记录 2；记录 1 已入 SST 由全量备份覆盖）"
+        );
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------

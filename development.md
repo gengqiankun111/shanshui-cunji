@@ -961,6 +961,24 @@ impl RuntimePools {
    倒排字典从 ~1 亿单 posting term 降为 8 个枚举字段；重导到 `D:\shanshui-data\db-50m-clean`
    （旧半成品 db-50m 19GB 保留未删——含 big_text 膨胀索引，弃用）。
 
+### 7.12 M8-P5 WAL 截断（append 模式 flush 后回收，防无限增长）
+
+> 背景：5000 万导入发现 `wal.log` 无限增长（6.5GB）——每 100 万行 fsync 大文件极慢、导入卡顿；
+> 磁盘写入翻倍（WAL + SST 双写）。append 模式 WAL 在 SST flush 后不回收。
+
+1. ~~**实现**~~ ✅（2026-08-29）：**WAL 文件头**（magic + next_seq，16B）——`truncate_and_reset` 在
+   `switch_and_flush` 成功后执行（flush 后全部记录已刷盘，清空 WAL 写头持久化 next_seq，
+   重开 seq 接续不冲突）；`open_append` 读头恢复 next_seq（旧无头 WAL 兼容回放）；
+   `WalReader::recover` 识别头跳 16B；`WalWriter` 打开模式 append → read+write
+   （`set_len(0)` 需要写权限，Windows append 句柄不允许）+ sync 前 seek 末尾；
+   环形 WAL 自带覆盖回收（no-op 不截断）；`resume_seq` 条件化（max_seq>0 才覆盖头值）；
+2. ~~**语义影响**~~ ✅：**增量备份**只导出 WAL 未刷盘记录（已刷盘由全量备份覆盖，与环形 WAL 一致）；
+   缺口检测仍有效（WAL 截断后旧 seq 缺失 → 提示全量）；
+3. ~~**测试**~~ ✅：column_family 3 个新增（flush 后 WAL 变小 + 重开数据完整 seq 接续 /
+   头持久化 next_seq 跨重启 / 旧无头 WAL 兼容回放）；engine 1 个更新（增量备份 since=0 导出
+   未刷盘记录）；测试 294→297（+3）；5000 万重导验证：WAL 保持小文件、卡顿消除、速度稳定
+   100 万/分钟（SST 构建 + 倒排排序主导）。
+
 ---
 
 ## 8. 编码规范
