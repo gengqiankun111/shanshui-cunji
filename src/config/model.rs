@@ -528,6 +528,11 @@ pub struct StorageConfig {
     /// （SSD 并发 IO 强，demo 实测 3 CF 并行 2.14×）；0 = 自动（min(4, 核数/2)）；
     /// 1 = 串行；>1 = 指定并行数。
     pub compaction_parallel: usize,
+    /// 删除位图（Ex-5.6，design 4.6 / 4.8.3 阶段二）：独立于 LSM 的按 DocId 1bit 删除位图
+    /// （4KB 页对齐）——删除仅写 1bit + fsync 1 页（-99% IO），查询 O(1) 跳过已删文档，
+    /// 墓碑不再污染 LSM 层级；compaction 按位图物理删除，put 清位复活。
+    /// true = 开启（默认）；false = 回退传统 Tombstone 路径。
+    pub deletion_bitmap_enabled: bool,
 }
 
 impl Default for StorageConfig {
@@ -549,6 +554,9 @@ impl Default for StorageConfig {
             group_commit_us: 0,
             group_commit_bytes: 256 * 1024,
             compaction_parallel: 0, // 0 = 自动（并行）
+            // Ex-5.6（design 4.6）：SSD 原生删除位图默认开启——删除 1bit+1 页 fsync（-99% IO），
+            // 查询 O(1) 跳过，墓碑不污染 LSM；关闭回退传统 Tombstone 路径。
+            deletion_bitmap_enabled: true,
         }
     }
 }
@@ -882,6 +890,7 @@ mod tests {
         assert_eq!(cfg.hotcache.eviction_policy, "lfu");
         assert_eq!(cfg.sstable.compression, "zstd");
         assert_eq!(cfg.storage.l0_stall_threshold, 12);
+        assert!(cfg.storage.deletion_bitmap_enabled, "删除位图默认开启（Ex-5.6）");
     }
 
     #[test]

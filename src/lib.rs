@@ -17,6 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 pub mod admin;
+pub mod bitmap;
 pub mod blockcache;
 pub mod bloom;
 pub mod column_family;

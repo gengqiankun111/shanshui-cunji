@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use roaring::RoaringBitmap;
 
+use crate::bitmap::DeletionBitmap;
 use crate::column_family::ColumnFamily;
 use crate::config::model::Config;
 use crate::error::Result;
@@ -71,6 +72,9 @@ pub struct Engine {
     /// Compaction 并行度（Ex-5.4）：并行压实 primary/cidx/delta 三列族；
     /// 0 = 自动（min(4, 核数/2)），1 = 串行，>1 = 指定并行数。
     compaction_parallel: usize,
+    /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
+    /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
+    deletion_bitmap: Option<DeletionBitmap>,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -151,6 +155,12 @@ impl Engine {
         inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
+        // 删除位图（Ex-5.6）：开启时加载/创建独立位图文件（4KB 页对齐，见 bitmap.rs）
+        let deletion_bitmap = if cfg.storage.deletion_bitmap_enabled {
+            Some(DeletionBitmap::open(&data_dir.join("deletion.bitmap"))?)
+        } else {
+            None
+        };
         // MVCC 全局 seq（M7-1）：以各列族 WAL 恢复后的 next_seq 取最大作为全局起点，
         // 此后 primary / delta 写入共享同一计数器（跨列族快照隔离正确）。
         let global_seq = Arc::new(AtomicU64::new(
@@ -187,6 +197,7 @@ impl Engine {
             skip_hotcache: false,
             pending_inverted: Vec::new(),
             compaction_parallel: cfg.storage.compaction_parallel,
+            deletion_bitmap,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -278,6 +289,11 @@ impl Engine {
         self.primary
             .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         self.delta.delete_prefix(&encode_docid(docid))?;
+        // ②.5 删除位图复活（Ex-5.6）：put 覆盖 delete → 清位（O(1) 内存，位未置时零 IO）；
+        //     持久性与 WAL 同步（flush_wal 先刷位图后刷 WAL）
+        if let Some(bm) = &mut self.deletion_bitmap {
+            bm.clear(docid);
+        }
         // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
         //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
         for t in terms {
@@ -310,7 +326,12 @@ impl Engine {
     }
 
     /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
+    /// Ex-5.6：删除位图脏页**先于** WAL fsync 落盘——若崩溃发生在 WAL fsync 之后、
+    /// 环形 WAL 截断推进之前，位图已持久（删除不丢）；反之位图先持久、WAL 回放重删幂等。
     pub fn flush_wal(&mut self) -> Result<()> {
+        if let Some(bm) = &mut self.deletion_bitmap {
+            bm.flush()?;
+        }
         self.primary.sync_wal()?;
         self.delta.sync_wal()?;
         Ok(())
@@ -390,11 +411,24 @@ impl Engine {
         Ok(applied)
     }
 
-    /// 删除文档：主数据 Tombstone + 失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
+    /// 删除文档：失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
+    /// Ex-5.6：删除位图开启时**仅写 1bit + WAL 删除记录**（不写 memtable Tombstone，
+    /// 不逐条 fsync——墓碑不进入 LSM 层级，-99% IO）；WAL 记录供增量备份导出/崩溃回放
+    /// （回放转本函数重新置位，幂等）。关闭时回退传统 Tombstone 路径。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.hotcache.invalidate(docid);
-        self.primary.delete(docid)?;
-        self.delta.delete_prefix(&encode_docid(docid))?;
+        match &mut self.deletion_bitmap {
+            Some(bm) => {
+                bm.mark_deleted(docid);
+                self.primary
+                    .delete_record_wal(encode_docid(docid).to_vec())?;
+                self.delta.delete_prefix(&encode_docid(docid))?;
+            }
+            None => {
+                self.primary.delete(docid)?;
+                self.delta.delete_prefix(&encode_docid(docid))?;
+            }
+        }
         Ok(())
     }
 
@@ -413,7 +447,13 @@ impl Engine {
     }
 
     /// 点查文档：HotCache 命中直达，否则主数据 LSM + Delta Merge-on-Read。
+    /// Ex-5.6：删除位图开启时先 O(1) 判定，已删文档直接返回 None（零 LSM 读）。
     pub fn get(&mut self, docid: u64) -> Result<Option<Vec<u8>>> {
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.is_deleted(docid) {
+                return Ok(None);
+            }
+        }
         if let Some(v) = self.hotcache.get(docid) {
             return Ok(Some(v));
         }
@@ -464,7 +504,14 @@ impl Engine {
     /// **Delta 增量按全局 seq 过滤**（M7-1：跨列族共享 seq 分配，快照后的字段级热更不可见；
     /// null 删除字段 / Tombstone 均按快照点判定）。
     /// 不走 HotCache（避免快照读污染热缓存）。
+    /// Ex-5.6：删除位图开启时已删文档在任何快照点均不可见（位图删除为立即/全局语义，
+    /// 快照隔离仅保证更新可见性；位图置位后该 docid 视为物理删除）。
     pub fn get_at(&mut self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.is_deleted(docid) {
+                return Ok(None);
+            }
+        }
         let found = self
             .primary
             .get_bytes_at(&encode_docid(docid), snapshot_seq)?;
@@ -772,6 +819,7 @@ impl Engine {
     /// 基础 Compaction（design 4.5，阶段 3；Ex-5.4 并行化）：primary/cidx/delta 三列族压实。
     /// 并行度 `compaction_parallel`：0 = 自动（min(4, 核数/2)）；1 = 串行；>1 = 指定。
     /// 并行压实利用 SSD 并发 IO（demo 实测 3 CF 并行 2.14×）；每列族独立压实（&mut 字段拆分借用）。
+    /// Ex-5.6：删除位图开启时 primary 压实按位图**物理丢弃**已删 docid 的旧数据（墓碑不污染层级）。
     pub fn compact(&mut self) -> Result<crate::column_family::CompactReport> {
         let parallel = if self.compaction_parallel == 0 {
             std::thread::available_parallelism()
@@ -782,9 +830,12 @@ impl Engine {
         };
         let cf_count = 1 + usize::from(self.cidx.is_some()) + 1; // primary + (cidx) + delta
         let threads = parallel.min(cf_count);
+        // Ex-5.6：位图不可变借用（与 primary/cidx/delta 的 &mut 拆分借用互不冲突）
+        let bm = self.deletion_bitmap.as_ref();
+        let filter = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
         if threads <= 1 {
             // 串行（含 cidx/delta 无输入时 no-op，行为与旧版一致）
-            let mut rep = self.primary.compact()?;
+            let mut rep = self.primary.compact_filtered(&filter)?;
             if let Some(c) = self.cidx.as_mut() {
                 let r = c.compact()?;
                 merge_report(&mut rep, &r);
@@ -796,7 +847,7 @@ impl Engine {
         // 并行：三列族独立 &mut 借用（字段拆分）→ thread::scope 并发压实，聚合返回
         let (p, c, d) = (&mut self.primary, self.cidx.as_mut(), &mut self.delta);
         let merged = std::thread::scope(|s| -> Result<crate::column_family::CompactReport> {
-            let h1 = s.spawn(move || p.compact());
+            let h1 = s.spawn(move || p.compact_filtered(&filter));
             let h3 = s.spawn(move || d.compact());
             let h2 = c.map(|cf| s.spawn(move || cf.compact()));
             let r1 = h1.join().unwrap()?;
@@ -872,6 +923,10 @@ impl Drop for Engine {
         }
         if self.group_commit.is_some() {
             let _ = self.flush_wal();
+        }
+        // Ex-5.6：正常退出兜底落盘删除位图脏页（组提交关闭时 flush_wal 不执行，位图独立 flush）
+        if let Some(bm) = &mut self.deletion_bitmap {
+            let _ = bm.flush();
         }
     }
 }
@@ -1455,15 +1510,26 @@ mod tests {
 
     #[test]
     fn get_at_returns_none_after_delete_before_snapshot() {
+        // Ex-5.6 语义拆分：
+        // ① 删除位图开启（默认）：删除为立即/全局语义——已删 docid 在任何快照点均不可见
         let mut e = Engine::open(&tmp(), &cfg()).unwrap();
         e.put(1, b"v1".to_vec(), &["k"]).unwrap();
         let s_before_delete = e.begin_snapshot();
         e.flush_primary().unwrap();
-        e.delete(1).unwrap(); // Tombstone seq > s_before_delete
-                              // 删除前快照 → v1 仍可见
-        assert_eq!(e.get_at(1, s_before_delete).unwrap().unwrap(), b"v1");
-        // 删除后最新读 → 不存在
+        e.delete(1).unwrap(); // 位图置位（快照点前后均不可见）
+        assert!(e.get_at(1, s_before_delete).unwrap().is_none(), "位图删除对旧快照同样隐藏");
         assert!(e.get(1).unwrap().is_none());
+
+        // ② 删除位图关闭：回退传统 Tombstone + MVCC 语义——删除前快照仍可见 v1
+        let mut c = cfg();
+        c.storage.deletion_bitmap_enabled = false;
+        let mut e2 = Engine::open(&tmp(), &c).unwrap();
+        e2.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        let s2 = e2.begin_snapshot();
+        e2.flush_primary().unwrap();
+        e2.delete(1).unwrap(); // Tombstone seq > s2
+        assert_eq!(e2.get_at(1, s2).unwrap().unwrap(), b"v1", "关闭位图保留 Tombstone 快照语义");
+        assert!(e2.get(1).unwrap().is_none(), "删除后最新读 → 不存在");
     }
 
     // ---------- 增量备份（design 20，M6-5） ----------
@@ -1689,6 +1755,120 @@ mod tests {
         e.patch(1, &[("note", serde_json::json!("x"))]).unwrap();
         e.delete(1).unwrap();
         assert!(e.get(1).unwrap().is_none(), "删除后 Delta 不应复活文档");
+    }
+
+    // ---------- Ex-5.6 删除位图 ----------
+
+    #[test]
+    fn deletion_bitmap_persists_across_restart() {
+        // 删除 → flush_wal（位图落盘）→ 重启 → 位图文件加载，已删 docid 仍不可见
+        let dir = tmp();
+        let cfg = cfg();
+        let bitmap_path = dir.join("deletion.bitmap");
+        {
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+            e.put(2, b"v2".to_vec(), &["k"]).unwrap();
+            e.flush_wal().unwrap();
+            e.delete(1).unwrap();
+            e.flush_wal().unwrap(); // 位图脏页落盘
+        }
+        let meta = std::fs::metadata(&bitmap_path).unwrap();
+        assert_eq!(meta.len() % 4096, 0, "位图文件 4KB 页对齐");
+        let mut e2 = Engine::open(&dir, &cfg).unwrap();
+        assert!(e2.get(1).unwrap().is_none(), "重启后位图加载，删除持久");
+        assert!(e2.get(2).unwrap().is_some(), "未删文档不受影响");
+    }
+
+    #[test]
+    fn deletion_bitmap_put_resurrects() {
+        // delete → put 复活：put 清位，文档重新可见
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        e.delete(1).unwrap();
+        assert!(e.get(1).unwrap().is_none());
+        e.put(1, b"v2".to_vec(), &["k"]).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v2", "put 复活后可见新值");
+    }
+
+    #[test]
+    fn deletion_bitmap_compaction_drops_deleted_data() {
+        // 位图开启：delete 不写 LSM 墓碑 → compaction 按位图物理丢弃已删 docid 旧数据；
+        // 重启后位图 + 压实结果均一致（已删不可见、存活可见）
+        let dir = tmp();
+        let cfg = cfg();
+        {
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            for d in 1..=4u64 {
+                e.put(d, format!("doc{d}").into_bytes(), &["k"]).unwrap();
+            }
+            e.flush_primary().unwrap(); // L0 第 1 段
+            e.put(5, b"doc5".to_vec(), &["k"]).unwrap();
+            e.flush_primary().unwrap(); // L0 第 2 段 → 触发 compaction 条件
+            e.delete(2).unwrap();
+            e.delete(4).unwrap();
+            let rep = e.compact().unwrap();
+            assert!(rep.merged_ssts >= 2, "L0 压实应合并多段");
+            assert!(e.get(2).unwrap().is_none());
+            assert!(e.get(4).unwrap().is_none());
+            assert!(e.get(1).unwrap().is_some());
+            assert!(e.get(5).unwrap().is_some());
+        }
+        let mut e2 = Engine::open(&dir, &cfg).unwrap();
+        for d in 1..=5u64 {
+            let deleted = matches!(d, 2 | 4);
+            assert_eq!(e2.get(d).unwrap().is_none(), deleted, "重启后 docid {d} 状态一致");
+        }
+    }
+
+    #[test]
+    fn deletion_bitmap_disabled_uses_tombstone_path() {
+        // 位图关闭：delete 走传统 Tombstone（primary.delete + 逐条 fsync），get 仍返回 None
+        let mut c = cfg();
+        c.storage.deletion_bitmap_enabled = false;
+        let dir = tmp();
+        {
+            let mut e = Engine::open(&dir, &c).unwrap();
+            e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+            e.delete(1).unwrap();
+            assert!(e.get(1).unwrap().is_none());
+        }
+        assert!(
+            !dir.join("deletion.bitmap").exists(),
+            "位图关闭时不应生成位图文件"
+        );
+        let mut e2 = Engine::open(&dir, &c).unwrap();
+        assert!(e2.get(1).unwrap().is_none(), "Tombstone 路径跨重启删除一致");
+    }
+
+    #[test]
+    fn deletion_bitmap_incremental_backup_captures_delete() {
+        // 位图开启：delete 写 primary WAL 删除记录 → 增量备份导出含删除 → 恢复后删除保持
+        let dir = tmp();
+        let cfg = cfg();
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, v: &str| {
+            e.put(docid, v.as_bytes().to_vec(), &["k"]).unwrap();
+        };
+        put_doc(&mut e, 1, "v1");
+        put_doc(&mut e, 2, "v2");
+        let since = e.current_seq();
+        e.delete(1).unwrap();
+        let bak_dir = tempfile::tempdir().unwrap();
+        let bak = bak_dir.path().join("incr.json");
+        let rep = e.backup_incremental(since, &bak).unwrap();
+        assert!(rep.records >= 1, "增量备份应包含删除记录");
+        drop(e);
+
+        // 恢复到全新引擎（位图开启）：删除记录回放 → 重新置位 → doc 1 不可见
+        let dir2 = tmp();
+        let mut e2 = Engine::open(&dir2, &cfg).unwrap();
+        put_doc(&mut e2, 1, "v1");
+        put_doc(&mut e2, 2, "v2");
+        let n = e2.restore_incremental(&bak).unwrap();
+        assert!(n >= 1);
+        assert!(e2.get(1).unwrap().is_none(), "增量恢复后删除保持");
+        assert!(e2.get(2).unwrap().is_some());
     }
 
     #[test]

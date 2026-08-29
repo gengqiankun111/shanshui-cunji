@@ -331,6 +331,20 @@ impl ColumnFamily {
         self.delete_bytes(encode_docid(docid).to_vec())
     }
 
+    /// 仅写 WAL 删除记录（Ex-5.6 删除位图路径）：不写 memtable Tombstone、不逐条 fsync
+    /// （由 `sync_wal`/组提交统一提交）——墓碑不进入 LSM 层级；
+    /// 记录保留用于增量备份导出与崩溃回放（Engine 层回放转 `Engine::delete` 重新置位，幂等）。
+    pub fn delete_record_wal(&mut self, key: Vec<u8>) -> Result<u64> {
+        match self.wal_append(OP_DELETE, &key, None) {
+            Ok(s) => Ok(s),
+            Err(Error::WalFull(_)) => {
+                self.ensure_wal_room()?;
+                self.wal_append(OP_DELETE, &key, None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 删除原始字节键。
     pub fn delete_bytes(&mut self, key: Vec<u8>) -> Result<u64> {
         let seq = match self.wal_append(OP_DELETE, &key, None) {
@@ -696,15 +710,23 @@ impl ColumnFamily {
         Ok(())
     }
 
+    /// 基础 Compaction（无删除位图过滤，等价于 `compact_filtered(&|_| false)`）。
+    pub fn compact(&mut self) -> Result<CompactReport> {
+        self.compact_filtered(&|_| false)
+    }
+
     /// Leveled-Compaction（design 4.5 二期 / M6-2）：分层压实，限制单次压实量。
     ///
     /// - **L0 → L1**：有 L0 段（刷盘产物，允许重叠）时合并 L0 → 单个 L1 段（不合并既有 L1，
     ///   单次压实量 = 单个刷盘批次，有界）；L1 文件数达到层上限时改合并 L0 + 全部 L1（收敛）；
     /// - **L1 → L2**：L0 为空且 L1 段数 > 1 时，合并全部 L1 → 单个 L2 段（压实下沉）；
     /// - 合并语义：按 (key 升序, seq 降序) 排序去重，后写覆盖先写，Tombstone 保留；
+    /// - **Ex-5.6 删除位图过滤**：`drop_key` 返回 true 的 key **物理丢弃**（不保留数据、
+    ///   不写 Tombstone）——位图已删文档的旧数据在合并时直接回收（墓碑不污染层级；
+    ///   位图标记保留，put 复活时清位）；
     /// - 崩溃安全：新段写入 → fsync → 原子更新 Manifest → 删除旧段；
     /// - 后台 IO 限速：写完后按实际文件字节 acquire。
-    pub fn compact(&mut self) -> Result<CompactReport> {
+    pub fn compact_filtered(&mut self, drop_key: &dyn Fn(&[u8]) -> bool) -> Result<CompactReport> {
         let (sel, out_level) = select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold);
         if sel.len() <= 1 {
             return Ok(CompactReport {
@@ -726,6 +748,10 @@ impl ColumnFamily {
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         let kept_keys = rows.len();
         rows.dedup_by(|a, b| a.0 == b.0);
+        // ②.5 Ex-5.6：位图已删 key 物理丢弃（去重后全版本同删）
+        let dropped_keys = rows.len();
+        rows.retain(|(k, _, _)| !drop_key(k));
+        let dropped_keys = dropped_keys - rows.len();
 
         // ③ 写新段（读路径新文件插最前）
         let sst_id = self.next_sst_id;
@@ -789,13 +815,23 @@ impl ColumnFamily {
             let _ = std::fs::remove_file(r.path());
         }
         let freed_bytes = old_bytes.saturating_sub(self.sst_bytes());
-        info!(
-            "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → 1（保留 {} 键，释放 {} 字节）",
-            self.name,
-            old_count,
-            rows.len(),
-            freed_bytes
-        );
+        if dropped_keys > 0 {
+            info!(
+                "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → 1（保留 {} 键，位图物理丢弃 {dropped_keys} 键，释放 {} 字节）",
+                self.name,
+                old_count,
+                rows.len(),
+                freed_bytes
+            );
+        } else {
+            info!(
+                "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → 1（保留 {} 键，释放 {} 字节）",
+                self.name,
+                old_count,
+                rows.len(),
+                freed_bytes
+            );
+        }
         Ok(CompactReport {
             merged_ssts: old_count,
             kept_keys: kept_keys.saturating_sub(rows.len()),
@@ -1390,6 +1426,62 @@ mod tests {
         assert_eq!(cf2.sst_count(), 1);
         assert_eq!(cf2.get(2).unwrap().unwrap().0, b"v2b");
         assert!(cf2.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_filtered_physically_drops_deleted_keys() {
+        // Ex-5.6：删除位图过滤——合并时按 drop_key 物理丢弃（不保留数据、不写 Tombstone），
+        // 位图已删 docid 的旧数据随压实直接回收（墓碑不污染层级）。
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.put(1, b"v1".to_vec()).unwrap();
+        cf.put(2, b"v2".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST1
+        cf.put(3, b"v3".to_vec()).unwrap();
+        cf.put(4, b"v4".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST2
+
+        // 模拟删除位图：docid 2、4 已删（主键为 8 字节大端）
+        let deleted = |k: &[u8]| {
+            k.len() == 8
+                && matches!(u64::from_be_bytes(k.try_into().unwrap()), 2 | 4)
+        };
+        let rep = cf.compact_filtered(&deleted).unwrap();
+        assert!(rep.merged_ssts >= 2, "应合并多段: {}", rep.merged_ssts);
+        assert_eq!(cf.sst_count(), 1);
+
+        // 已删 key 物理消失：读不到、扫描无记录（数据不在磁盘，非内存过滤）
+        assert!(cf.get(2).unwrap().is_none());
+        assert!(cf.get(4).unwrap().is_none());
+        let rows = cf.scan_range(None, None).unwrap();
+        assert_eq!(rows, vec![(1, b"v1".to_vec()), (3, b"v3".to_vec())]);
+
+        // 重启后同样物理消失（新段 Manifest 不含已删键）
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        let rows = cf2.scan_range(None, None).unwrap();
+        assert_eq!(rows, vec![(1, b"v1".to_vec()), (3, b"v3".to_vec())]);
+        assert!(cf2.get(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_filtered_keeps_other_tombstones() {
+        // Ex-5.6：过滤只丢弃位图已删 key；其他 Tombstone（非位图路径写入）语义保留
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.put(1, b"v1".to_vec()).unwrap();
+        cf.put(2, b"v2".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST1
+        cf.delete(2).unwrap(); // 传统 Tombstone（位图未删 docid 2 的场景不在此测——仅验证 Tombstone 保留）
+        cf.put(3, b"v3".to_vec()).unwrap();
+        cf.switch_and_flush().unwrap(); // SST2
+
+        let deleted = |_k: &[u8]| false; // 空过滤（无位图删除）
+        cf.compact_filtered(&deleted).unwrap();
+        assert_eq!(cf.get(1).unwrap().unwrap().0, b"v1");
+        assert!(cf.get(2).unwrap().is_none(), "Tombstone 语义保留");
+        assert_eq!(cf.get(3).unwrap().unwrap().0, b"v3");
     }
 
     #[test]
