@@ -1420,6 +1420,30 @@ impl RuntimePools {
    提交 `442981c`。⚠️ 冷启动收益需在 **SSD 环境**实测（HDD 不压测；真实 1.18 亿 term 规模
    FST 数百 MB 时 mmap 收益放大）。
 
+### 7.35 Ex-5.8 元数据-数据解耦（design 4.8.3 P1）
+
+> 背景：SST 文件内元数据区（Block Index/Bloom/Footer）与数据块区已物理分离，但 Compaction
+> 合并时仍读全部输入行 → 排序去重 → 重分块重压缩（写放大 + 压缩 CPU + 读放大）。
+> Ex-5.8 = 无重叠输入段合并时**数据块级复用**（原样拷贝数据块，只重建元数据区）。
+
+1. ~~**demo 研究（src/demo/meta-data-separation/，gitignore 不提交）**~~ ✅：3 测试全绿——
+   **元数据占比 2.59%**（400K 键×100B：数据块 50.2MB / 索引+布隆 1333KB）——元数据本身小，
+   收益不来自"只写元数据字节"，而来自**数据块免重压**；无重叠合并对比：全量重写 51.5MB/
+   4041ms（读入 40 万行解压重压）vs 块级复用数据块 50.2MB（零解压）；块边界对齐验证
+   （A 末键 < B 首键、拼接后偏移线性平移正确）。
+2. ~~**kernel 整合**~~ ✅：
+   - `SstWriter::add_raw_block(raw, compressed)`：原样写压缩字节 + 重建 trailer/索引/分区布隆
+     （行式块 kind=0；PAX 块返回 Unsupported → 调用方回退全量）；
+   - `SstReader::block_raw(e)`：读块原始压缩字节 + 解码内容（供复用拷贝）；
+   - `ColumnFamily::compact`：先 `try_meta_only_compact`——行式列族（pax_hot_fields 空）+
+     相邻段 key 无重叠（前段 max < 后段 min）→ 数据块区按 key 序原样拼接 + 只重建元数据；
+     否则回退全量合并（`compact_merge`，抽公共 `finalize_compact` 收尾）；
+   - `Engine::compact`：位图无已删 docid 时 primary 走 `compact()`（触发块级复用）；
+     位图有已删 docid 时走 `compact_filtered`（物理丢弃需全量）。
+3. ~~**验证**~~ ✅：`cargo test` **333 全绿**（+3：sstable raw_block_reuse_roundtrip /
+   column_family 无重叠复用 + 有重叠回退）；demo 3 测试全绿（见 1）；clippy 新代码零警告；
+   提交 `cd00d85`。⚠️ 写放大收益需在 **SSD 环境**实测（HDD 不压测；无重叠 L0 段比例越高收益越大）。
+
 ---
 
 ## 8. 编码规范
