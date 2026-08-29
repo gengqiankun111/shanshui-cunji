@@ -1330,7 +1330,23 @@ impl RuntimePools {
    gitignore 不提交）：全局锁 vs 读写分离（主写+从读同步复制）——读 P95 3µs→2µs（1.5×）、
    吞吐持平（写瓶颈在 fsync 非锁）、同步复制读己之写强一致、异步最终一致窗口验证。
    读写分离收益定位：**读延迟改善，写吞吐不增**（写瓶颈磁盘 fsync）——整合决策待定
-   （feature.md I 模块 ⏸，Ex-6.2/6.3 前置）。
+    （feature.md I 模块 ⏸，Ex-6.2/6.3 前置）。
+
+### 7.31 Ex-5.4 Compaction 参数调优（design 4.8.3 P0-4）
+
+> 背景：SSD-only 下 Compaction 从"避免空间放大"转向"允许空间放大换取写放大降低"——
+> L0→L1 触发放宽、层级跨度大、并行压实（SSD 并发 IO）。**P0 四项至此全部完成。**
+
+1. ~~**demo 研究（src/demo/compaction-tune/，gitignore 不提交）**~~ ✅：2 测试全绿——
+   l0_stall_threshold 权衡（8 批×2000 条：l0=4 压实 1 次 vs l0=8/12 压实 0 次，大阈值降压实
+   频率=低写放大；数据正确性抽查全过）；多 CF 并行压实 **2.14×**（3 CF 串行 30ms → 并行 14ms，
+   SSD 并发 IO）。
+2. ~~**kernel 整合**~~ ✅：`l0_stall_threshold` 默认 8→12（空间放大 1.2×→1.8× 换写放大
+   15~25×→6~10×）；新增 `[storage] compaction_parallel`（0=自动 min(4,核数/2) / 1=串行 /
+   >1=指定）——`Engine::compact` 并行压实 primary/cidx/delta 三列族（&mut 字段拆分借用 +
+   thread::scope；CompactReport 聚合，out_level 取 primary）；串行路径含三列族压实（兼容旧版）。
+3. ~~**验证**~~ ✅：`cargo test` **318 全绿**（l0 断言 8→12 更新）；demo 2 测试全绿（见 1）；
+   提交 `624ce9e`。⚠️ 性能收益（写放大/压实时长）需在 **SSD 环境**实测（HDD 不压测）。
 
 ---
 

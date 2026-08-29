@@ -124,7 +124,7 @@
 | SSTable 4KB 块 + 两级索引（block_size_kb 16→4，回表读放大 -75%） | P0 | ✅ Ex-5.1 `056b21d`（实测读放大 1257B→413B -67%，L1 摘要内存不膨胀） |
 | 倒排分片锁（Term Hash 256 分区，锁竞争 P99 -40%） | P0 | ✅ Ex-5.2 `c7ebe72`（Term 字典 4→256 shards，低基数并发 1.39×；位图索引按 field 分 256 片） |
 | 倒排更新批处理（同 Term 攒批批量追加，CPU -60%） | P0 | ✅ Ex-5.3 `d38e8ab`（add_batch 按 term 聚合 + Engine 攒批缓冲，20 字段导入 1.7×） |
-| Compaction 参数调优（层级 20× + 并行 2~4，写放大 -60%） | P0 | ⏳ Ex-5.4 |
+| Compaction 参数调优（层级 20× + 并行 2~4，写放大 -60%） | P0 | ✅ Ex-5.4 `624ce9e`（l0 阈值 8→12 空间换写放大 + compaction_parallel 三列族并行 2.14×；**P0 全部完成**） |
 | 环形大文件 WAL 规模化（预分配 + 磨损均衡，WAL P99 -60%） | P1 | ⏳ Ex-5.5 |
 | 删除位图（Deletion Bitmap，删除 IO -99%） | P1 | ⏳ Ex-5.6 |
 | 倒排 FST + Mmap 字典（冷启动 8s→50ms） | P1 | ⏳ Ex-5.7 |
