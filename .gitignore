@@ -15,5 +15,8 @@ data/
 # cargo vendor 离线包（服务器构建用，本机临时产物不入库）
 vendor/
 
+# 开发点独立研究 demo（demo-first 流程：src/demo/<点>/* 研究跑通后再整合进 kernel，不提交）
+src/demo/
+
 # Cargo.lock 是二进制项目的一部分，必须入库以锁定依赖版本
 # Cargo.lock
