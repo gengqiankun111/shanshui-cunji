@@ -91,6 +91,7 @@
 | TDS 术语字典热备 + 无损扩容协议（双写→追平→切换） | ✅ | M5 `fda44a6` |
 | 物化视图调度器（Count/Sum/Avg + 增量刷新） | ✅ | M5 `8bcc077` |
 | 四层看门狗（写停滞检测 + 心跳 Sidecar） | ✅ | M5 `df8e9d4` |
+| 两节点真实 TCP 高并发强一致性测试（8 线程并发写 → 广播精确命中/跨节点路由可见） | ✅ | `3e22f80`（gateway `high_concurrency_writes_strong_consistency_two_nodes`） |
 | 本地消息表 + 幂等消费（Outbox，Ex-1） | ✅ | `7348acd`（列族 outbox：业务写+待办同一本地事务、投递器、按 (docid,seq) 幂等 apply、排空校验；异步索引补偿/扩容衔接基础） |
 | SAGA 编排 + 补偿状态机（Ex-2） | ✅ | `990bf6b`（src/saga.rs SagaCoordinator：SagaStep trait + 状态机 + 屏障防空回滚/悬挂 + JSON 持久化续跑 + 补偿幂等；Ex-2.5 网关 /saga/* HTTP 留待分布式阶段） |
 | Calvin 确定性事务评估（Ex-3，L3） | 🔍 | demo `src/demo/calvin`：确定性序零锁等待/无协调往返/吞吐与跨分区比例无关；**评估结论不进入 kernel**（单 docid 路由天然不分片 + L1/L2 已覆盖，远期触发再落地） |

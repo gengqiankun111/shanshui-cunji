@@ -1737,6 +1737,28 @@ impl RuntimePools {
 
 ---
 
+### 7.51 两节点分布式（本机 + 阿里云）测试指引
+
+> 前置：本机 NVMe SSD 基准（7.50）✅；两节点真实 TCP 高并发强一致性测试（gateway 测试，
+> `3e22f80`）✅——分布式机制（一致性哈希路由/广播检索/元数据中心/RPC）已在库内测试框架验证。
+> 真机两节点（本机 + 阿里云 106.14.68.116）对比与压测待服务器访问（凭据不入库）。
+
+1. ~~**本机两节点（库内测试框架）**~~ ✅：`gateway::high_concurrency_writes_strong_consistency_two_nodes`
+   ——spawn 2 个 RPC 分片节点（真实 TCP）+ Gateway + MetaCenter，8 线程 × 2500 并发写 20000 条：
+   广播检索精确命中、逐条点查跨节点确定性路由强一致可见、探活在线。
+2. ~~**本机性能基准**~~ ✅（7.50）：YCSB a/b/c × 组提交 2ms（NVMe SSD）。
+3. **真机两节点执行步骤**（需服务器访问后执行）：
+   - 部署：复用 7.30 musl 部署流程（git archive 打包 → scp 上传 → 服务器 cargo vendor/offline 构建）
+     或本机 release 二进制直传；
+   - 节点配置：node-1（本机）`server.mode=cluster / sharding.enabled / replication.enabled`，
+     node-2（阿里云 106.14.68.116）`internal_rpc_port` 与 node-1 互指（MetaCenter 注册）；
+   - 压测：本机 YCSB + 服务器 YCSB 同参（records/threads/group-commit）对比吞吐与延迟分位；
+   - 一致性：双节点交叉写入 → 广播检索/点查校验精确一致（复用 `high_concurrency_writes_
+     strong_consistency_two_nodes` 用例改真机地址）。
+4. 结果回填本里程碑。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
