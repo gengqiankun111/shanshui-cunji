@@ -1364,6 +1364,38 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **319 全绿**（+1 wal 规模化回归）；demo 4 测试全绿（见 1）；
    提交 `4974ef3`。⚠️ WAL P99 收益需在 **SSD 环境**实测（HDD 不压测）。
 
+### 7.33 Ex-5.6 删除位图（design 4.6 / 4.8.3 P1 阶段二）
+
+> 背景：删除语义 MVP 走 Tombstone 写主数据——每次 delete 触发 WAL append + **逐条 fsync**
+> （`delete_bytes` 内 `sync_wal`）+ memtable 墓碑 + 后续各层级传播，删除 IO 重且墓碑污染 LSM。
+> Ex-5.6 = 独立于 LSM 的按 DocId 1bit 删除位图（design 4.6 "SSD 原生"段）。
+
+1. ~~**demo 研究（src/demo/deletion-bitmap/，gitignore 不提交）**~~ ✅：6 测试全绿——
+   位语义置位/清位/查询 O(1)；**4KB 页对齐**（docid 32768 边界正确分页，文件按页增长）；
+   **持久性**：flush=durable / 未 flush=崩溃丢失（由 WAL 回放重建）；页首/页尾批量恢复；
+   **IO 经济性**：同页 1000 次删除 = 1 页 4KB + 1 次 fsync（对比 LSM Tombstone 全链路 -99%）；
+   compaction 过滤语义：已删 key 物理丢弃 + put 清位复活。
+2. ~~**kernel 整合**~~ ✅：
+   - `src/bitmap.rs`：稠密 `Vec<u64>` 位图（1.5 亿 docid ≈ 19MB）+ 脏页集合 + 4KB 页对齐
+     文件（纯位数组无头，按页增长）；`mark_deleted/clear/is_deleted/is_deleted_key/flush`；
+     置位/清位仅在位真正翻转时标脏（重复删除 / 未删 put 清位 = 零 IO）；零 unsafe
+     （mmap 与 inverted FST 同策略：文件 read/write 替代，保留页粒度 IO 本质）；
+   - `Engine::delete`：位图开启时**仅写 1bit + primary WAL 删除记录**（`delete_record_wal`，
+     不写 memtable Tombstone、不逐条 fsync）——墓碑不进入 LSM 层级；WAL 记录供增量备份
+     导出与崩溃回放（回放转 `Engine::delete` 重新置位，幂等）；
+   - `Engine::get/get_at`：位图 O(1) 判定先于 HotCache/LSM（已删文档零 LSM 读）；
+   - `Engine::put_nosync`：put 覆盖 delete → 清位复活（位未置零 IO）；
+   - `Engine::flush_wal`：位图脏页**先于** WAL fsync 落盘（崩溃时序安全：位图持久早于
+     环形 WAL 截断推进，删除不丢）；
+   - `ColumnFamily::compact_filtered(drop_key)`：compaction 按位图**物理丢弃**已删 key
+     （不保留数据、不写 Tombstone，旧数据随压实直接回收）；`compact()` 委托空过滤；
+   - `[storage] deletion_bitmap_enabled = true` 默认开启（design 4.8.4 模板）；关闭回退
+     传统 Tombstone 路径（MVCC 快照隔离仅限关闭模式保留——位图删除为立即/全局语义）。
+3. ~~**验证**~~ ✅：`cargo test` **330 全绿**（+10：bitmap 4 + engine 5 + column_family 2；
+   `get_at_returns_none_after_delete_before_snapshot` 按 Ex-5.6 语义拆分：位图开启=旧快照
+   同样隐藏 / 关闭=保留 Tombstone MVCC）；demo 6 测试全绿（见 1）；clippy 新代码零警告；
+   提交 `e615071`。⚠️ 删除 IO 收益需在 **SSD 环境**实测（HDD 不压测）。
+
 ---
 
 ## 8. 编码规范

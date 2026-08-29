@@ -299,6 +299,22 @@
   （命中 5M 行 → 10GB+），API 无 limit/分页 → 后续加 limit/游标分页。
 - **提交**：`5a937ea`（P41）
 
+### P42. 删除位图：仅写 1bit 会丢增量备份删除 → WAL-only 删除记录；MVCC 快照语义拆分
+- **现象**：Ex-5.6 按设计"删除仅写 1bit"实现时，`backup_incremental`（只导出 primary WAL
+  记录）漏掉删除——位图删除不写 primary WAL → 增量备份/恢复后已删 docid 复活（数据完整性缺陷）；
+  且 `get_at`（快照读）对位图已删 docid 走主数据读到旧数据，与 `get` 返回 None 不一致。
+- **根因**：①删除只置位图时，删除操作不进 primary WAL（增量备份 `wal_records_since` 读不到）
+  → 恢复流丢失删除；②位图不记删除 seq，快照读无法像 Tombstone 那样按 seq 过滤——若 `get_at`
+  不查位图，已删文档在快照里"复活"。
+- **修复**：①`ColumnFamily::delete_record_wal`——位图删除**额外写一条 primary WAL 删除记录**
+  （不写 memtable Tombstone、不逐条 fsync，墓碑不进入 LSM；记录供增量备份导出 + 崩溃回放
+  转 `Engine::delete` 重新置位，幂等）；②`Engine::get/get_at` 均先查位图 O(1) 跳过——位图
+  删除为**立即/全局语义**；MVCC 快照隔离（删除前快照可见）仅保留在位图关闭的 Tombstone 路径，
+  测试 `get_at_returns_none_after_delete_before_snapshot` 按此拆分双语义断言。
+- **结果**：增量备份导出含删除（`deletion_bitmap_incremental_backup_captures_delete` 回归）；
+  330 测试全绿（+10：bitmap 4 + engine 5 + column_family 2）；demo 6 测试全绿。
+- **提交**：`e615071`（Ex-5.6）
+
 ---
 
 ## 环境备忘（不入库）
