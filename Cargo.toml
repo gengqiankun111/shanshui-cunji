@@ -28,6 +28,9 @@ csv = "1"
 # Ex-7.2（design_extension v0.5 第 12.2）：CPU 绑核（网络/计算/IO 三池物理核分区，
 # 跳过超线程虚拟核由显式核列表配置；core_affinity 跨 Windows/Linux/macOS）
 core_affinity = "0.8"
+# Ex-6.2/6.3（design_extension v0.4 第 11 章）：原子指针发布（ArcSwap）——倒排段清单/FST
+# 字典读路径拿 Arc 快照无锁（flush/gc 更新 rcu 发布；unsafe 在依赖内部，主库零 unsafe 不变）
+arc-swap = "1"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 parquet = "59.2.0"
 arrow = "59.2.0"

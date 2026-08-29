@@ -24,7 +24,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -61,11 +63,15 @@ pub struct InvertedIndex {
     /// 多核并发写 posting 时消除原子计数器伪共享（demo 实测 2.1×）。
     mem_docids: PerCpuCounter,
     /// 段文件列表（新→旧，仅含文件名）。
-    segments: Vec<String>,
+    /// Ex-6.2：ArcSwap 原子发布——flush/gc 更新（rcu/store），search/iter_terms 读快照无锁
+    /// （读线程持 &InvertedIndex 时无需外部锁；快照一致性：旧 Arc 在发布后仍有效）。
+    segments: ArcSwap<Vec<String>>,
     /// 段 → FST 术语字典（term → 段内条目字节偏移）；engine=fst 且存在 .fst 时填充。
     /// Ex-5.7：mmap 只读映射（MmapFile 安全封装，P23 unsafe 白名单）——冷启动零堆分配、
     /// 物理页按需缺页加载（design 5.2.4.1），替代旧 fs::read 全量读入。
-    dicts: HashMap<String, fst::Map<MmapFile>>,
+    /// Ex-6.3：值 `Arc<fst::Map>`（MmapFile 不可 Clone，Arc 使 HashMap 可整体 Clone 供
+    /// rcu 发布）——查询拿 Arc 快照零拷贝。
+    dicts: ArcSwap<HashMap<String, Arc<fst::Map<MmapFile>>>>,
     next_seg_id: u64,
     /// 刷盘阈值：内存累计 posting 达此值整段落盘。
     flush_threshold: u64,
@@ -144,7 +150,7 @@ impl InvertedIndex {
                         })
                     {
                         Ok(map) => {
-                            dicts.insert(seg.clone(), map);
+                            dicts.insert(seg.clone(), Arc::new(map)); // Ex-6.3：Arc 值
                         }
                         Err(e) => {
                             info!("FST 字典加载失败，该段回退线性扫描: {fst_name}: {e}")
@@ -162,8 +168,9 @@ impl InvertedIndex {
             // dashmap 要求 shard 数为 2 的幂（256 = 2^8）。
             mem: DashMap::with_capacity_and_shard_amount(0, 256),
             mem_docids: PerCpuCounter::new(),
-            segments,
-            dicts,
+            // Ex-6.2/6.3：ArcSwap 原子发布（读路径 load 拿 Arc 快照无锁）
+            segments: ArcSwap::new(Arc::new(segments)),
+            dicts: ArcSwap::new(Arc::new(dicts)),
             next_seg_id,
             flush_threshold,
             gc_threshold_bytes,
@@ -359,11 +366,22 @@ impl InvertedIndex {
         // FST 术语字典（design 5.2.4.1）：term → 段内条目字节偏移，原子写
         if self.engine == "fst" {
             let map = self.write_fst_dict(seg_id, &term_offsets)?;
-            self.dicts.insert(fname.clone(), map);
+            // Ex-6.3：rcu 原子发布（Arc 值 → HashMap 可 Clone；闭包 FnMut 用克隆捕获）
+            let map_arc = Arc::new(map);
+            self.dicts.rcu(|m| {
+                let mut n = (**m).clone();
+                n.insert(fname.clone(), map_arc.clone());
+                n
+            });
         }
 
         // 更新 Manifest（原子）
-        self.segments.insert(0, fname.clone());
+        // Ex-6.2：rcu 原子发布段清单快照
+        self.segments.rcu(|v| {
+            let mut n = (**v).clone();
+            n.insert(0, fname.clone());
+            n
+        });
         self.persist_manifest()?;
 
         // 清空内存
@@ -408,8 +426,9 @@ impl InvertedIndex {
     }
 
     fn persist_manifest(&self) -> Result<()> {
+        let segs = self.segments.load(); // Ex-6.2：快照
         let m = SegmentManifest {
-            segments: self.segments.clone(),
+            segments: segs.as_ref().clone(),
             next_seg_id: self.next_seg_id,
         };
         let text = serde_json::to_string_pretty(&m)
@@ -428,7 +447,8 @@ impl InvertedIndex {
             result.extend(docids.iter().map(|d| *d as u32));
         }
         // 各段（新→旧，bitmap 合并天然去重）
-        for seg in &self.segments {
+        let segs = self.segments.load(); // Ex-6.2：读快照无锁
+        for seg in segs.iter() {
             let posting = self.read_segment_posting(seg, term)?;
             result |= posting;
         }
@@ -444,7 +464,8 @@ impl InvertedIndex {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
         // FST 精确查找：term → 段内条目字节偏移
-        if let Some(map) = self.dicts.get(seg) {
+        let dicts = self.dicts.load(); // Ex-6.3：Arc 快照零拷贝
+        if let Some(map) = dicts.get(seg) {
             return match map.get(term.as_bytes()) {
                 Some(offset) => parse_posting_at(&data, offset as usize),
                 None => Ok(RoaringBitmap::new()),
@@ -466,12 +487,12 @@ impl InvertedIndex {
 
     /// 当前磁盘段数。
     pub fn segment_count(&self) -> usize {
-        self.segments.len()
+        self.segments.load().len()
     }
 
     /// 当前加载的 FST 术语字典数（测试 / 监控）。
     pub fn fst_dict_count(&self) -> usize {
-        self.dicts.len()
+        self.dicts.load().len()
     }
 
     /// 某 term 命中的文档数（COUNT 原子操作，<0.1ms，design 5.17）。
@@ -491,7 +512,8 @@ impl InvertedIndex {
             *e |= bitmap;
         }
         // 各段（新→旧）
-        for seg in &self.segments {
+        let segs = self.segments.load(); // Ex-6.2：读快照无锁
+        for seg in segs.iter() {
             for (term, posting) in self.read_segment_terms(seg)? {
                 let e = map.entry(term).or_default();
                 *e |= posting;
@@ -572,8 +594,8 @@ impl InvertedIndex {
 
     /// 全部磁盘段文件总字节数。
     pub fn segment_bytes(&self) -> u64 {
-        self.segments
-            .iter()
+        let segs = self.segments.load(); // Ex-6.2：快照
+        segs.iter()
             .filter_map(|s| std::fs::metadata(self.dir.join(s)).ok().map(|m| m.len()))
             .sum()
     }
@@ -581,7 +603,7 @@ impl InvertedIndex {
     /// 是否需要 GC：开启（阈值 > 0）且段数 > 1 且总量 ≥ 阈值。
     pub fn should_gc(&self) -> bool {
         self.gc_threshold_bytes > 0
-            && self.segments.len() > 1
+            && self.segments.load().len() > 1
             && self.segment_bytes() >= self.gc_threshold_bytes
     }
 
@@ -593,13 +615,14 @@ impl InvertedIndex {
             return Ok(GcReport {
                 merged: 0,
                 freed_bytes: 0,
-                segment_count: self.segments.len(),
+                segment_count: self.segments.load().len(),
             });
         }
         // ① 读取全部段的所有 term 最新 posting（bitmap 合并天然去重）
         let mut map: std::collections::BTreeMap<String, RoaringBitmap> =
             std::collections::BTreeMap::new();
-        for seg in &self.segments {
+        let segs = self.segments.load(); // Ex-6.2：快照
+        for seg in segs.iter() {
             for (term, posting) in self.read_segment_terms(seg)? {
                 let e = map.entry(term).or_default();
                 *e |= posting;
@@ -640,23 +663,24 @@ impl InvertedIndex {
         };
 
         // ④ 原子更新 Manifest（先 Manifest 后删旧文件，崩溃安全）
-        let old_segments = std::mem::take(&mut self.segments);
+        let old_segments = self.segments.load_full(); // Ex-6.2：旧快照（删旧文件依据）
         let old_bytes: u64 = old_segments
             .iter()
             .filter_map(|s| std::fs::metadata(self.dir.join(s)).ok().map(|m| m.len()))
             .sum();
-        self.segments = vec![fname.clone()];
+        // Ex-6.2/6.3：store 发布新段清单 + 新字典（释放旧映射 → Windows 可删旧文件）
+        self.segments.store(Arc::new(vec![fname.clone()]));
+        let mut new_dicts: HashMap<String, Arc<fst::Map<MmapFile>>> = HashMap::new();
+        if let Some(m) = new_dict {
+            new_dicts.insert(fname.clone(), Arc::new(m));
+        }
+        self.dicts.store(Arc::new(new_dicts));
         self.persist_manifest()?;
 
-        // ⑤ 重建内存字典 → 释放旧段 mmap 映射后再删旧文件（Ex-5.7：Windows 下已映射
-        //    文件无法删除；旧段孤儿无害，启动不加载）
-        self.dicts.clear();
-        for seg in &old_segments {
+        // ⑤ 删旧段与旧 FST（Ex-5.7：已发布新快照后旧映射被释放）
+        for seg in old_segments.iter() {
             let _ = std::fs::remove_file(self.dir.join(seg));
             let _ = std::fs::remove_file(self.dir.join(seg.replace(".seg", ".fst")));
-        }
-        if let Some(m) = new_dict {
-            self.dicts.insert(fname, m);
         }
 
         let freed_bytes = old_bytes.saturating_sub(self.segment_bytes());
@@ -1008,6 +1032,102 @@ mod tests {
         let idx2 = InvertedIndex::open(&dir, 1).unwrap();
         assert_eq!(idx2.fst_dict_count(), 0);
         assert!(idx2.search("k=1").unwrap().contains(1));
+    }
+
+    // ---- Ex-6.2/6.3 并发读优化（ArcSwap 原子发布）----
+
+    #[test]
+    fn arc_swap_snapshot_consistency_after_flush() {
+        // Ex-6.2：load_full 旧快照在 flush 发布新快照后仍有效（快照一致性：
+        // 旧段文件未删前旧快照仍可查）
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+        idx.add("a=1", 1);
+        idx.add("b=2", 2);
+        idx.flush_segment().unwrap();
+        assert_eq!(idx.segment_count(), 1);
+        let old_snapshot = idx.segments.load_full(); // 旧快照（段 1）
+        // 再 flush 一段 → 发布新快照
+        idx.add("c=3", 3);
+        idx.flush_segment().unwrap();
+        assert_eq!(idx.segment_count(), 2);
+        // 旧快照独立不变、新快照已更新
+        assert_eq!(old_snapshot.len(), 1, "旧快照发布后不变");
+        assert_eq!(idx.segments.load().len(), 2, "新快照已更新");
+        // 旧快照中的段仍可查（文件未删）
+        assert_eq!(idx.search("a=1").unwrap().len(), 1);
+        assert_eq!(idx.search("c=3").unwrap().len(), 1);
+        // FST 字典同样快照化（Ex-6.3）：flush 后新段字典可见
+        assert!(idx.dicts.load().contains_key("inverted-00000002.seg"));
+    }
+
+    #[test]
+    fn concurrent_readers_safe_on_shared_index() {
+        // Ex-6.2/6.3：&self 读方法（search/segment_count/fst_dict_count）可被多线程
+        // 同时调用——ArcSwap 读路径无锁（InvertedIndex: Sync）
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 1).unwrap();
+        for i in 0..1000u64 {
+            idx.add(&format!("f={}", i % 10), i);
+        }
+        idx.flush_segment().unwrap();
+        let shared = Arc::new(idx);
+        let mut hs = Vec::new();
+        for t in 0..8u64 {
+            let s = Arc::clone(&shared);
+            hs.push(std::thread::spawn(move || {
+                for i in 0..200u64 {
+                    let _ = s.search(&format!("f={}", (i + t) % 10)).unwrap();
+                    let _ = s.segment_count();
+                    let _ = s.fst_dict_count();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        // 并发读后状态一致
+        assert_eq!(shared.segment_count(), 1);
+        assert_eq!(shared.search("f=3").unwrap().len(), 100);
+    }
+
+    #[test]
+    fn flush_interleaved_with_reads_consistent() {
+        // Ex-6.2/6.3：flush 发布新快照与读交替执行，读结果始终一致（旧快照期间
+        // 旧段仍可查——发布不破坏进行中的读）
+        let dir = tmp();
+        let idx = Arc::new(std::sync::Mutex::new(
+            InvertedIndex::open(&dir, 1).unwrap(),
+        ));
+        {
+            let mut g = idx.lock().unwrap();
+            for i in 0..100u64 {
+                g.add(&format!("k={}", i % 10), i);
+            }
+            g.flush_segment().unwrap();
+        }
+        let mut hs = Vec::new();
+        for t in 0..4u64 {
+            let idx = Arc::clone(&idx);
+            hs.push(std::thread::spawn(move || {
+                for i in 0..60u64 {
+                    if i % 4 == 0 {
+                        let mut g = idx.lock().unwrap();
+                        g.add(&format!("new={}", (i + t) % 10), i + t);
+                        let _ = g.flush_segment();
+                    } else {
+                        let g = idx.lock().unwrap();
+                        let _ = g.search(&format!("k={}", (i + t) % 10));
+                    }
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let g = idx.lock().unwrap();
+        assert!(g.segment_count() >= 1, "读写交替后段数正常");
+        assert_eq!(g.search("k=5").unwrap().len(), 10, "历史段数据保持可查");
     }
 
     // ---- 预分片 Chunk（design 5.2.1，阶段 2）----
