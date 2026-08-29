@@ -408,17 +408,18 @@ impl ColumnFamily {
     }
 
     /// 查询（主键点查，便捷封装）。返回 (value, seq)，已过滤 Tombstone。
-    pub fn get(&mut self, docid: u64) -> Result<Option<(Vec<u8>, u64)>> {
+    /// `&self`：读写分离读路径（Ex-7.1 PerCpuCounter / BlockCache 已内部同步）。
+    pub fn get(&self, docid: u64) -> Result<Option<(Vec<u8>, u64)>> {
         self.get_bytes(&encode_docid(docid))
     }
 
     /// 查询原始字节键。返回 (value, seq)，已过滤 Tombstone。
-    pub fn get_bytes(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+    pub fn get_bytes(&self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         if let Some(e) = self.memtable.get(key) {
             return Ok(e.value.map(|v| (v, e.seq)));
         }
         let cache = Arc::clone(&self.block_cache);
-        for sst in &mut self.ssts {
+        for sst in &self.ssts {
             match get_from_sst(sst, &cache, key)? {
                 // 命中：最新版本。value=None 为 Tombstone → 视为不存在
                 Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
@@ -433,7 +434,7 @@ impl ColumnFamily {
     /// （快照点已删除；快照点之前的历史版本仍可见）。
     /// 局限：MemTable 仅保留每 key 最新版本，未刷盘覆盖的历史版本无法回读（多版本保留留后续）。
     pub fn get_bytes_at(
-        &mut self,
+        &self,
         key: &[u8],
         snapshot_seq: u64,
     ) -> Result<Option<(Vec<u8>, u64)>> {
@@ -444,7 +445,7 @@ impl ColumnFamily {
             }
         }
         let cache = Arc::clone(&self.block_cache);
-        for sst in &mut self.ssts {
+        for sst in &self.ssts {
             if let Some((value, seq)) = get_from_sst(sst, &cache, key)? {
                 if seq <= snapshot_seq && best.as_ref().map_or(true, |(s, _)| seq > *s) {
                     best = Some((seq, value));
@@ -1205,7 +1206,7 @@ fn merge_candidate_bytes(
 /// 单 SST 等值查询（布隆剪枝 → 二分定位块 → 块缓存/读盘 → 块内扫描）。
 /// 返回 `(value, seq)`：value=None 表示 Tombstone；整体 None 表示该 SST 无此 key。
 fn get_from_sst(
-    sst: &mut SstReader,
+    sst: &SstReader,
     cache: &BlockCache,
     key: &[u8],
 ) -> Result<Option<(Option<Vec<u8>>, u64)>> {

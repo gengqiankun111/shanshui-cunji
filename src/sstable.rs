@@ -26,6 +26,22 @@
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+/// 位置读（`&File` 可并发，读写分离读路径基础）：Windows `seek_read` / Unix `read_at`，
+/// 不移动文件游标——多线程可同时对同一 SST 的不同块做读取。
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> crate::error::Result<()> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset).map_err(crate::error::Error::Io)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> crate::error::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset).map_err(crate::error::Error::Io)?;
+    Ok(())
+}
+
 use crate::bloom::BloomFilter;
 use crate::error::{Error, Result};
 use crate::keys::{decode_varint, decode_varlen, encode_varint, encode_varlen};
@@ -1008,17 +1024,14 @@ impl SstReader {
         Ok(Some((idx, self.block_entry(idx)?)))
     }
 
-    /// 读取并解压数据块，校验 CRC。
-    pub fn read_block(&mut self, e: &IndexEntry) -> Result<Vec<u8>> {
+    /// 读取并解压数据块，校验 CRC（位置读：`&self` 可并发，读写分离读路径基础）。
+    pub fn read_block(&self, e: &IndexEntry) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; e.comp_len as usize];
-        self.file
-            .seek(std::io::SeekFrom::Start(e.offset))
-            .map_err(Error::Io)?;
-        self.file.read_exact(&mut comp).map_err(Error::Io)?;
+        read_at(&self.file, &mut comp, e.offset)?;
 
         // 读 Trailer 校验
         let mut trailer = vec![0u8; TRAILER_LEN];
-        self.file.read_exact(&mut trailer).map_err(Error::Io)?;
+        read_at(&self.file, &mut trailer, e.offset + e.comp_len as u64)?;
         let raw_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as usize;
         let comp_len = u32::from_le_bytes(trailer[4..8].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(trailer[8..12].try_into().unwrap());
