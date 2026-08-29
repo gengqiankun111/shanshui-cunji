@@ -515,6 +515,11 @@ pub struct StorageConfig {
     pub wal_mode: String,
     /// 环形 WAL 预分配大小（MB，默认 64）。环形满且未刷盘时强制 Flush 腾空。
     pub wal_ring_size_mb: u64,
+    /// 组提交窗口（µs，design 4.3 / M8）：0 = 关闭（保持逐条 fsync 强安全，默认）；
+    /// >0 = 窗口内所有写入攒批，一次 fsync 覆盖（延迟耐久：崩溃最多丢 ≤ 窗口数据）。
+    pub group_commit_us: u64,
+    /// 组提交字节阈值：WAL 待刷缓冲 ≥ 此值立即 fsync（不等窗口）。
+    pub group_commit_bytes: usize,
 }
 
 impl Default for StorageConfig {
@@ -529,6 +534,8 @@ impl Default for StorageConfig {
             io_rate_limit_mb: 0,
             wal_mode: "append".into(),
             wal_ring_size_mb: 64,
+            group_commit_us: 0,
+            group_commit_bytes: 256 * 1024,
         }
     }
 }

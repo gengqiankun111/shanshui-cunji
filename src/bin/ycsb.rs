@@ -57,6 +57,7 @@ fn main() {
         .unwrap_or_else(|| "a".into());
     let warm = args.iter().any(|a| a == "--warm");
     let no_fsync = args.iter().any(|a| a == "--no-fsync");
+    let group_commit_us = get("--group-commit-us", 0);
     let dir = args
         .iter()
         .position(|a| a == "--dir")
@@ -68,12 +69,13 @@ fn main() {
     }
     println!(
         "[ycsb] workload={workload} records={records} ops/thread={ops} threads={threads} \
-         warm={warm} fsync={} dir={}",
+         warm={warm} fsync={} group_commit_us={group_commit_us} dir={}",
         !no_fsync,
         dir.display()
     );
 
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    cfg.storage.group_commit_us = group_commit_us;
     let mut engine = Engine::open(&dir, &cfg).unwrap();
 
     // ---------- load 阶段 ----------

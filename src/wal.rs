@@ -38,6 +38,8 @@ pub struct WalWriter {
     /// perf 模式：批量攒到一定字节数才 fsync（牺牲极小安全换吞吐）。
     perf_mode: bool,
     pending_bytes: usize,
+    /// 上次 fsync 时刻（组提交窗口判定，M8）。
+    last_sync: std::time::Instant,
 }
 
 const GROUP_COMMIT_FSYNC_BYTES: usize = 4 * 1024 * 1024; // perf 模式攒满 4MB 才 fsync
@@ -56,6 +58,7 @@ impl WalWriter {
             buf: Vec::new(),
             perf_mode,
             pending_bytes: 0,
+            last_sync: std::time::Instant::now(),
         })
     }
 
@@ -76,6 +79,7 @@ impl WalWriter {
             buf: Vec::new(),
             perf_mode,
             pending_bytes: 0,
+            last_sync: std::time::Instant::now(),
         })
     }
 
@@ -128,7 +132,23 @@ impl WalWriter {
         if !self.perf_mode {
             file.sync_all()?;
         }
+        self.last_sync = std::time::Instant::now();
         Ok(())
+    }
+
+    /// 待刷盘缓冲字节数（组提交窗口判定，M8）。
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    /// 组提交是否到期（M8）：距上次 fsync ≥ 窗口，或待刷缓冲 ≥ 字节阈值。
+    pub fn sync_due(
+        &self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+        bytes: usize,
+    ) -> bool {
+        now.duration_since(self.last_sync) >= window || self.pending_bytes >= bytes
     }
 
     /// perf 模式下的按需 fsync（攒满阈值或显式调用）。
@@ -264,6 +284,8 @@ pub struct RingWal {
     index: Vec<(usize, u64)>,
     /// 已落盘记录最大 seq。
     max_written_seq: u64,
+    /// 上次 fsync 时刻（组提交窗口判定，M8）。
+    last_sync: std::time::Instant,
 }
 
 /// 环形 WAL 头长度（魔数 4 + 保留 8 + tail 8）。
@@ -299,6 +321,7 @@ impl RingWal {
                 pending_bytes: 0,
                 index: Vec::new(),
                 max_written_seq: 0,
+                last_sync: std::time::Instant::now(),
             };
             write_ring_header(ring.file.as_mut().unwrap(), ring.tail)?;
             ring.fsync_file()?;
@@ -320,6 +343,7 @@ impl RingWal {
             pending_bytes: 0,
             index: Vec::new(),
             max_written_seq: 0,
+            last_sync: std::time::Instant::now(),
         };
         ring.tail = ring.read_tail()?;
         let (recs, index) = ring.scan_ring()?;
@@ -448,7 +472,23 @@ impl RingWal {
         self.max_written_seq = self.index.iter().map(|(_, s)| *s).max().unwrap_or(0);
         self.pending.clear();
         self.pending_bytes = 0;
+        self.last_sync = std::time::Instant::now();
         Ok(())
+    }
+
+    /// 待刷盘缓冲字节数（组提交窗口判定，M8）。
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    /// 组提交是否到期（M8）：距上次 fsync ≥ 窗口，或待刷缓冲 ≥ 字节阈值。
+    pub fn sync_due(
+        &self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+        bytes: usize,
+    ) -> bool {
+        now.duration_since(self.last_sync) >= window || self.pending_bytes >= bytes
     }
 
     /// 上报已刷盘的最大 seq：覆盖安全边界前移（Flush 完成后调用）。
@@ -563,6 +603,27 @@ impl WalBackend {
         match self {
             WalBackend::Append(w) => w.sync(),
             WalBackend::Ring(r) => r.sync(),
+        }
+    }
+
+    /// 待刷盘缓冲字节数（组提交窗口判定，M8）。
+    pub fn pending_bytes(&self) -> usize {
+        match self {
+            WalBackend::Append(w) => w.pending_bytes(),
+            WalBackend::Ring(r) => r.pending_bytes(),
+        }
+    }
+
+    /// 组提交是否到期（M8）：距上次 fsync ≥ 窗口，或待刷缓冲 ≥ 字节阈值。
+    pub fn sync_due(
+        &self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+        bytes: usize,
+    ) -> bool {
+        match self {
+            WalBackend::Append(w) => w.sync_due(now, window, bytes),
+            WalBackend::Ring(r) => r.sync_due(now, window, bytes),
         }
     }
 

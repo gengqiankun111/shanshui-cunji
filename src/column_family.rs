@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -85,7 +85,8 @@ pub struct ColumnFamily {
     /// 下一个 SST 文件 id（跨重启由 Manifest 恢复，防止覆盖旧文件）。
     next_sst_id: u64,
     /// 当前 WAL 写入器（append 追加 / ring 环形，design 4.3 阶段 3）。
-    wal: WalBackend,
+    /// `Arc<Mutex>` 共享：组提交后台线程（M8）可独立触发落盘兜底。
+    wal: Arc<Mutex<WalBackend>>,
     /// 外部全局 seq（MVCC，engine 层统一分配，M7-1）：Some 时写入走外部计数（跨列族一致）；
     /// None = 独立列族（测试 / 单 CF 场景）用内部 WAL seq。
     external_seq: Option<Arc<AtomicU64>>,
@@ -221,15 +222,20 @@ impl ColumnFamily {
             block_cache,
             seq: AtomicU64::new(1),
             next_sst_id,
-            wal,
+            wal: Arc::new(Mutex::new(wal)),
             external_seq: None,
         };
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
         let max_seq = cf.replay_records(&wal_records)?;
         // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）
-        cf.wal.resume_seq(max_seq + 1);
+        cf.wal.lock().unwrap().resume_seq(max_seq + 1);
         Ok(cf)
+    }
+
+    /// 共享 WAL 句柄（组提交后台线程落盘兜底，M8）。
+    pub fn wal_handle(&self) -> Arc<Mutex<WalBackend>> {
+        Arc::clone(&self.wal)
     }
 
     /// 回放 WAL 记录：重建 MemTable 并推进 seq。返回已回放的最大 seq（无记录为 0）。
@@ -291,7 +297,10 @@ impl ColumnFamily {
             // 环形 WAL 缓冲满：先落盘腾空（必要时强制 Flush）再重试
             Err(Error::WalFull(_)) => {
                 self.ensure_wal_room()?;
-                self.wal.append(OP_PUT, &key, Some(&value))?
+                self.wal
+                    .lock()
+                    .unwrap()
+                    .append(OP_PUT, &key, Some(&value))?
             }
             Err(e) => return Err(e),
         };
@@ -303,11 +312,12 @@ impl ColumnFamily {
     /// 统一提交 WAL 缓冲（批量写入结束时调用）。
     /// 环形 WAL 落盘若需回绕覆盖未刷盘记录 → 强制 Flush 后重试。
     pub fn sync_wal(&mut self) -> Result<()> {
-        match self.wal.sync() {
+        let r = self.wal.lock().unwrap().sync();
+        match r {
             Ok(()) => Ok(()),
             Err(Error::WalFull(_)) => {
                 self.switch_and_flush()?;
-                self.wal.sync()
+                self.wal.lock().unwrap().sync()
             }
             Err(e) => Err(e),
         }
@@ -335,11 +345,12 @@ impl ColumnFamily {
 
     /// 环形 WAL 满处理：先落盘缓冲；仍满（回绕需覆盖未刷盘记录）则强制 Flush 后重试。
     fn ensure_wal_room(&mut self) -> Result<()> {
-        match self.wal.sync() {
+        let r = self.wal.lock().unwrap().sync();
+        match r {
             Ok(()) => Ok(()),
             Err(Error::WalFull(_)) => {
                 self.switch_and_flush()?;
-                self.wal.sync()
+                self.wal.lock().unwrap().sync()
             }
             Err(e) => Err(e),
         }
@@ -508,7 +519,7 @@ impl ColumnFamily {
         } else {
             self.flush_buckets(&imm)?;
         }
-        self.wal.set_flushed_seq(flushed_max);
+        self.wal.lock().unwrap().set_flushed_seq(flushed_max);
         Ok(())
     }
 
@@ -810,7 +821,7 @@ impl ColumnFamily {
 
     /// 当前 WAL 下一可分配 seq（Engine 快照点来源，design 4.7 MVCC）。
     pub fn wal_next_seq(&self) -> u64 {
-        self.wal.next_seq()
+        self.wal.lock().unwrap().next_seq()
     }
 
     /// 接入外部全局 seq 计数器（MVCC，engine 层统一分配，M7-1）。
@@ -824,10 +835,10 @@ impl ColumnFamily {
         match &self.external_seq {
             Some(ext) => {
                 let seq = ext.fetch_add(1, Ordering::Relaxed);
-                self.wal.append_at(op, key, value, seq)?;
+                self.wal.lock().unwrap().append_at(op, key, value, seq)?;
                 Ok(seq)
             }
-            None => self.wal.append(op, key, value),
+            None => self.wal.lock().unwrap().append(op, key, value),
         }
     }
 
@@ -838,7 +849,7 @@ impl ColumnFamily {
         &mut self,
         since_seq: u64,
     ) -> Result<(u64, Vec<crate::wal::WalRecord>)> {
-        let recs = self.wal.recover_records()?;
+        let recs = self.wal.lock().unwrap().recover_records()?;
         let oldest = recs.iter().map(|r| r.seq).min().unwrap_or(u64::MAX);
         let filtered: Vec<_> = recs.into_iter().filter(|r| r.seq > since_seq).collect();
         Ok((oldest, filtered))
