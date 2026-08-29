@@ -1554,6 +1554,31 @@ impl RuntimePools {
 
 ---
 
+### 7.43 Ex-1 本地消息表 + 幂等消费（design_extension v0.1 L1 首选方案）
+
+> 背景：分布式事务写路径决策 = 单分片本地事务（无需 2PC）。L1 本地消息表 + 幂等消费为
+> 首选落地（解决双写扩容衔接 / 异步索引补偿 / 跨节点异步写）。复用 ReplicationLog 的
+> seq 游标 + 幂等 apply 思想。
+
+1. ~~**demo**~~ ✅（src/demo/outbox/，4 测试）：消息表与业务写原子性（崩溃恢复 outbox 不丢/
+   不重复）、投递重试、幂等消费（重复投递不叠加）、排空校验。
+2. ~~**kernel 整合**~~ ✅：
+   - **Outbox 存储**（src/outbox.rs）：`Outbox` 包装列族 "outbox"，key = docid ++ seq
+     （to_be_bytes），value = [status u8] ++ payload——`enqueue`（put_bytes_nosync，与业务写
+     共享全局 seq 与 fsync 点，天然本地原子）、`scan_docid`/`scan_all`、`mark_done`、
+     `dispatch`（投递器回调）、`pending_count`/`drained`（排空校验）、`wal_next_seq`/
+     `sync_wal`（纳入 Engine::flush_wal 落盘，pending 重启存活）；
+   - **幂等消费**：`IdempotentConsumer` 按 (docid, seq) applied 集合去重，防重复投递叠加；
+   - **Engine 集成**：`outbox: Option<Outbox>`（OutboxConfig.enabled 默认关，零额外开销）、
+     open 时打开 outbox 列族、global_seq 取 max 含 outbox、flush_wal 同步 outbox WAL、
+     新 API `enqueue_outbox` / `dispatch_outbox`（投递后 flush_wal 防重投）/ `outbox_pending` /
+     `outbox_drained`。
+3. ~~**验证**~~ ✅：`cargo test` **356 全绿**（+7：demo 4 + engine 3——e2e enqueue→dispatch→drain、
+   pending 重启存活、默认关闭）；提交 `7348acd`。Ex-1.5（与 M5 双写扩容协议衔接）留待真实
+   扩容联调时落地。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

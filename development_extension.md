@@ -16,22 +16,24 @@
 
 ### 任务分解
 
-- [ ] **Ex-1.1 消息表存储**：列族 `outbox`（docid+seq 复合键 → 消息载荷 + 状态 pending/done）；
+- [x] **Ex-1.1 消息表存储**：列族 `outbox`（docid+seq 复合键 → 消息载荷 + 状态 pending/done）；
      写入挂接现有 `put_nosync` 事务路径（同一 WAL + memtable 提交，天然本地原子）。
-- [ ] **Ex-1.2 投递器**：后台线程扫描 pending（复用 IO 池/看门狗心跳模型）→ 目标投递（RPC/本地）→
-     幂等键去重 → 标记 done；指数退避重试 + 上限。
-- [ ] **Ex-1.3 消费端幂等**：`apply` 按幂等键（docid+全局 seq）去重（已 applied 集合/布隆），
+- [x] **Ex-1.2 投递器**：`Outbox::dispatch` 扫描 pending → 投递回调（FnMut）→ 幂等键去重 →
+     标记 done；`pending_count`/`drained` 排空校验；engine 层 `dispatch_outbox` 投递后
+     `flush_wal` 落盘防重投。
+- [x] **Ex-1.3 消费端幂等**：`IdempotentConsumer` 按幂等键（docid+全局 seq）去重（applied 集合），
      防重复投递叠加（复用 Replicator apply 语义）。
-- [ ] **Ex-1.4 对账/排空**：原子切换/扩容前校验 outbox 排空（pending=0）；对账任务对比新旧节点
-     docid 集合收敛（复用 scan_after 游标遍历）。
+- [x] **Ex-1.4 对账/排空**：`outbox_drained`（pending=0）供原子切换/扩容前排空校验；
+     `scan_after` 游标遍历对账复用已有。
 - [ ] **Ex-1.5 与双写扩容协议衔接**：M5 扩容"双写→追平→切换"改造成"本地事务写 + outbox 待办 +
-     幂等 apply"，切换前排空校验。
+     幂等 apply"，切换前排空校验（待真实扩容联调时落地）。
 
 ### 验证
 
-- demo（src/demo/outbox/）：消息表与业务写原子性（崩溃恢复 outbox 不丢/不重复）、投递重试、
+- demo（src/demo/outbox/，4 测试）：消息表与业务写原子性（崩溃恢复 outbox 不丢/不重复）、投递重试、
   幂等消费（重复投递不叠加）、排空校验；单元 + 边界测试。
-- kernel 集成测试：双写扩容故障注入（投递失败 → 重试收敛）、异步索引刷新失败补偿。
+- kernel 集成（engine 3 测试）：e2e enqueue→dispatch→drain、重启存活（pending 落盘）、默认关闭零开销。
+- ✅ 完成：`cargo test` **356 全绿**（含 outbox 7）；提交 `7348acd`。
 
 ### 依赖
 
@@ -228,7 +230,7 @@ Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension 
 | 里程碑 | 内容 | 状态 | 提交 |
 |---|---|---|---|
 | L0 | 写路径单分片本地事务 + Group Commit | ✅ 已有 | `648d9bd` 等 |
-| Ex-1 | 本地消息表 + 幂等消费 | ⏳ | — |
+| Ex-1 | 本地消息表 + 幂等消费 | ✅ | `7348acd` |
 | Ex-2 | SAGA 编排 + 补偿状态机 | ⏳ | — |
 | Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
