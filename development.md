@@ -941,6 +941,26 @@ impl RuntimePools {
 4. 依赖说明：新增 `arrow` / `parquet`（59.2，Apache-2.0 合规，deny.toml 白名单内）——数据集生成与
    parquet 导入必需；编译体积增大但仅作用于导入/生成路径。
 
+### 7.11 M8-P4 倒排字段白名单 / 黑名单 / 长文本保护（防字典膨胀）
+
+> 背景：100 字段表全字段建倒排——高基数 ID / 长文本字段每 term 单 posting 纯浪费。
+> demo 研究（src/demo/inverted-whitelist/，gitignore 不提交）实测 10 万文档 × 100 字段：
+> 全字段 550 万唯一 term / 246MB vs 白名单 20 字段 **12 个唯一 term / 3.5MB**——**字典压缩 45 万倍、
+> 写放大 27.7 倍**（100 字段表倒排 ≤ 20 的经验准则成立）；用户确认：字段级 inverted 默认 true
+> + 全局白名单；长文本不建倒排。
+
+1. ~~**配置与实现**~~ ✅（2026-08-29）：`[inverted] inverted_fields`（白名单，非空 = 只建声明字段倒排，
+   MySQL 建表式字段声明的运行时等价）/ `exclude_fields`（黑名单）/ `max_term_len`（term 长度上限，
+   默认 96B，**超长 term 自动跳过 = 长文本整串不进字典**，0 = 不限）；
+   `Engine::inverted_allowed` 写路径统一过滤（put/put_nosync 前检查：白名单 → 黑名单 → 超长）——
+   覆盖所有写入路径（HTTP / demo / import），与 import-schema 的 term_filter 正交叠加；
+   与 M7-2 `bitmap_fields`（位图白名单）独立；
+2. ~~**测试**~~ ✅：engine 4 个新增（白名单只建声明字段 / 黑名单剔除 / 超长 term 自动跳过 / 默认全建兼容）；
+   测试 290→294（+4）；
+3. ~~**5000 万导入优化**~~ ✅（进行中）：ds-50m 数据集的 2×256 字符 big_text 自动跳过（max_term_len=96），
+   倒排字典从 ~1 亿单 posting term 降为 8 个枚举字段；重导到 `D:\shanshui-data\db-50m-clean`
+   （旧半成品 db-50m 19GB 保留未删——含 big_text 膨胀索引，弃用）。
+
 ---
 
 ## 8. 编码规范

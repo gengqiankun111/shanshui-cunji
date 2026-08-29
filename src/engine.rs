@@ -49,6 +49,12 @@ pub struct Engine {
     gc_stop: Option<Arc<AtomicBool>>,
     /// 组提交后台线程句柄。
     gc_thread: Option<std::thread::JoinHandle<()>>,
+    /// 倒排字段白名单（M8-P4）：Some = 只建声明字段倒排；None = 全部（黑名单仍生效）。
+    inverted_include: Option<std::collections::HashSet<String>>,
+    /// 倒排字段黑名单（M8-P4）：这些字段不建倒排（白名单非空时忽略）。
+    inverted_exclude: std::collections::HashSet<String>,
+    /// 倒排 term 长度上限（M8-P4）：超过自动跳过（长文本整串不进字典）；0 = 不限。
+    max_term_len: usize,
 }
 
 /// 查询结果行：docid + 文档字节。
@@ -134,6 +140,13 @@ impl Engine {
             group_commit: None,
             gc_stop: None,
             gc_thread: None,
+            inverted_include: if cfg.inverted.inverted_fields.is_empty() {
+                None
+            } else {
+                Some(cfg.inverted.inverted_fields.iter().cloned().collect())
+            },
+            inverted_exclude: cfg.inverted.exclude_fields.iter().cloned().collect(),
+            max_term_len: cfg.inverted.max_term_len,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -216,13 +229,30 @@ impl Engine {
         self.primary
             .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         self.delta.delete_prefix(&encode_docid(docid))?;
-        // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）
+        // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）；
+        //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
         for t in terms {
-            self.inverted.add(t, docid);
+            if self.inverted_allowed(t) {
+                self.inverted.add(t, docid);
+            }
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中）
         self.hotcache.put(docid, value);
         Ok(())
+    }
+
+    /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
+    /// term 编码 `field=value`，field 为 JSON 字段路径（嵌套用 `.` 连接）。
+    fn inverted_allowed(&self, term: &str) -> bool {
+        // 超长 term（长文本整串）自动跳过：防止误配下字典膨胀
+        if self.max_term_len > 0 && term.len() > self.max_term_len {
+            return false;
+        }
+        let field = term.split('=').next().unwrap_or("");
+        if let Some(include) = &self.inverted_include {
+            return include.contains(field);
+        }
+        !self.inverted_exclude.contains(field)
     }
 
     /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
@@ -713,6 +743,83 @@ mod tests {
         }
         // 60ms 窗口 + 4KB 阈值：快速 50 条 put（远快于窗口）绝大部分应攒批
         assert!(missed >= 40, "窗口内应攒批（攒批 {missed}，同步 {synced}）");
+    }
+
+    // ---------- 倒排字段白名单/黑名单/长文本（M8-P4） ----------
+
+    #[test]
+    fn inverted_whitelist_only_indexes_declared_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.inverted_fields = vec!["status".into(), "city".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "city": "beijing", "name": "alice"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        // 白名单字段可查
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        assert_eq!(e.inverted_doc_count("city=beijing").unwrap(), 1);
+        // 非白名单字段不建倒排
+        assert_eq!(e.inverted_doc_count("name=alice").unwrap(), 0);
+    }
+
+    #[test]
+    fn inverted_exclude_skips_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.exclude_fields = vec!["big_text".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "big_text": "hello world"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        assert_eq!(
+            e.inverted_doc_count("big_text=hello world").unwrap(),
+            0,
+            "黑名单字段不建倒排"
+        );
+    }
+
+    #[test]
+    fn inverted_max_term_len_skips_long_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.max_term_len = 16; // 16 字节以上 term 自动跳过（长文本整串保护）
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let long = "x".repeat(100);
+        let doc = json!({"docid": 1, "status": "active", "payload": long});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(
+            e.inverted_doc_count("status=active").unwrap(),
+            1,
+            "短字段仍建"
+        );
+        assert_eq!(
+            e.inverted_doc_count("payload=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").unwrap(),
+            0,
+            "超长 term 自动跳过（防长文本膨胀）"
+        );
+    }
+
+    #[test]
+    fn inverted_default_all_fields_built() {
+        // 默认配置（白名单空）：短字符串字段全建；仅超长 term（>96）自动跳过
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "city": "beijing"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        assert_eq!(e.inverted_doc_count("city=beijing").unwrap(), 1);
     }
 
     #[test]

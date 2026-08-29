@@ -6,7 +6,9 @@
 
 use std::time::Instant;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::engine::Engine;
@@ -578,12 +580,15 @@ pub fn import_parquet(
     whitelist: Option<&[String]>,
 ) -> Result<ImportReport> {
     let t = Instant::now();
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::Migrate(format!("Parquet 打开失败: {e}")))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Migrate(format!("Parquet 打开失败: {e}")))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::Migrate(format!("Parquet 元数据解析失败: {e}")))?;
     let schema_fields = builder.schema().fields().clone();
     let docid_idx = schema_fields.iter().position(|f| f.name() == "docid");
+    // 生成前字段过滤（M8-P4）：import-schema 白名单直接传给 extract（不匹配 term 不分配）
+    let include: Option<std::collections::HashSet<String>> =
+        whitelist.map(|wl| wl.iter().cloned().collect());
     let reader = builder
         .build()
         .map_err(|e| Error::Migrate(format!("Parquet reader 构建失败: {e}")))?;
@@ -629,11 +634,11 @@ pub fn import_parquet(
                     d
                 }
             };
-            let bytes = serde_json::to_vec(&serde_json::Value::Object(obj))
+            let val = serde_json::Value::Object(obj);
+            let bytes = serde_json::to_vec(&val)
                 .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
-            let val: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::Serialize(format!("JSON 解析失败: {e}")))?;
-            let terms = filter_terms(crate::server::extract_terms(&val), whitelist);
+            // 生成前字段过滤 + 引擎运行时过滤（白名单/黑名单/超长 term）双重兜底
+            let terms = crate::server::extract_terms_filtered(&val, include.as_ref());
             let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             match engine.put_nosync(docid, bytes, &term_refs) {
                 Ok(()) => {
@@ -643,9 +648,7 @@ pub fn import_parquet(
                         engine.flush_wal()?;
                         engine.flush_inverted()?; // 倒排 posting 定期刷段，控制内存
                         since_flush = 0;
-                        println!(
-                            "[import-parquet] 已导入 {rows} 行（倒排段已刷盘）",
-                        );
+                        println!("[import-parquet] 已导入 {rows} 行（倒排段已刷盘）",);
                     }
                 }
                 Err(_) => failed += 1,
@@ -669,19 +672,29 @@ pub fn import_parquet(
 /// 从 arrow 数组取第 row 行的值（Int64/Int32/Float64/Boolean/Utf8 → serde_json Value）。
 fn arr_value(col: &ArrayRef, row: usize) -> Option<serde_json::Value> {
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        return a.is_valid(row).then(|| serde_json::Value::from(a.value(row)));
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::from(a.value(row)));
     }
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        return a.is_valid(row).then(|| serde_json::Value::from(a.value(row)));
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::from(a.value(row)));
     }
     if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        return a.is_valid(row).then(|| serde_json::Value::from(a.value(row)));
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::from(a.value(row)));
     }
     if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
-        return a.is_valid(row).then(|| serde_json::Value::Bool(a.value(row)));
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::Bool(a.value(row)));
     }
     if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return a.is_valid(row).then(|| serde_json::Value::String(a.value(row).to_string()));
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::String(a.value(row).to_string()));
     }
     None
 }

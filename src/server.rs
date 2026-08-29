@@ -198,16 +198,30 @@ pub fn parse_filter(filter: &str) -> Vec<(String, String)> {
 /// term 编码：`{字段路径}={值}`（如 `status=active`、`meta.device=ios`），
 /// 路径用 `.` 连接——带字段维度，供 COUNT / GROUP BY 按字段聚合（development 5.17）。
 pub fn extract_terms(val: &Value) -> Vec<String> {
+    extract_terms_filtered(val, None)
+}
+
+/// 提取倒排词条并按字段白名单过滤（M8-P4）：`include` 非空时只生成声明字段的 term
+/// （不匹配字段的 term **不分配**——长文本/高基数字段整串 term 的分配浪费在生成前消除）。
+pub fn extract_terms_filtered(val: &Value, include: Option<&std::collections::HashSet<String>>) -> Vec<String> {
     let mut terms = Vec::new();
-    collect_strings(val, &mut terms, &[]);
+    collect_strings(val, &mut terms, &[], include);
     terms
 }
 
-fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
+fn collect_strings(
+    val: &Value,
+    out: &mut Vec<String>,
+    path: &[&str],
+    include: Option<&std::collections::HashSet<String>>,
+) {
     match val {
         Value::String(s) => {
-            // 数组元素等叶子字符串：用完整路径生成 term
-            out.push(format!("{}={}", path.join("."), s));
+            // 数组元素等叶子字符串：用完整路径生成 term（白名单非空时仅保留声明字段）
+            let field = path.join(".");
+            if include.map_or(true, |inc| inc.contains(&field)) {
+                out.push(format!("{}={}", field, s));
+            }
         }
         Value::Object(map) => {
             for (k, v) in map {
@@ -217,9 +231,12 @@ fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
                 let mut p = path.to_vec();
                 p.push(k.as_str());
                 if let Value::String(s) = v {
-                    out.push(format!("{}={}", p.join("."), s));
+                    let field = p.join(".");
+                    if include.map_or(true, |inc| inc.contains(&field)) {
+                        out.push(format!("{}={}", field, s));
+                    }
                 } else {
-                    collect_strings(v, out, &p);
+                    collect_strings(v, out, &p, include);
                 }
             }
         }
@@ -228,7 +245,7 @@ fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
                 let mut p = path.to_vec();
                 let idx = i.to_string();
                 p.push(&idx);
-                collect_strings(v, out, &p);
+                collect_strings(v, out, &p, include);
             }
         }
         _ => {}

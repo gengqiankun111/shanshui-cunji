@@ -555,6 +555,15 @@ pub struct InvertedConfig {
     /// 命中字段的值位图**常驻内存**（term → RoaringBitmap），COUNT / GROUP BY / AND 组合筛选
     /// 走内存位图快速路径（亚毫秒）；空 = 关闭（默认，零额外开销）。
     pub bitmap_fields: Vec<String>,
+    /// 倒排字段白名单（M8-P4）：非空时**只对声明字段建立倒排词条**（其余字段不索引）——
+    /// 高基数 ID / 长文本字段建倒排是纯浪费（每 term 单 posting，字典膨胀 45 万倍，实测）；
+    /// 经验准则：100 字段表倒排字段 ≤ 20（枚举/标签类）；空 = 全部字符串字段建（默认兼容）。
+    pub inverted_fields: Vec<String>,
+    /// 倒排字段黑名单（M8-P4）：这些字段**不建倒排**（白名单非空时黑名单忽略）。
+    pub exclude_fields: Vec<String>,
+    /// 倒排 term 长度上限（字节，M8-P4）：超过的 term 自动跳过（长文本/长字符串整串进字典
+    /// 是纯浪费——每 term 单 posting + 字典膨胀；默认 96 = 长文本自动不建倒排，0 = 不限）。
+    pub max_term_len: usize,
 }
 
 impl Default for InvertedConfig {
@@ -566,6 +575,9 @@ impl Default for InvertedConfig {
             max_posting_scan: 1_000_000,
             segment_max_size_mb: 1024,
             bitmap_fields: Vec::new(),
+            inverted_fields: Vec::new(),
+            exclude_fields: Vec::new(),
+            max_term_len: 96,
         }
     }
 }

@@ -37,9 +37,7 @@ fn main() {
         .position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("ds-{rows}.parquet"))
-        });
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("ds-{rows}.parquet")));
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p).expect("创建输出目录");
     }
@@ -76,8 +74,8 @@ fn main() {
         .set_compression(parquet::basic::Compression::SNAPPY)
         .build();
     let file = std::fs::File::create(&out).expect("创建 parquet 文件");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
-        .expect("创建 ArrowWriter");
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("创建 ArrowWriter");
 
     let t0 = std::time::Instant::now();
     let mut written: u64 = 0;
@@ -98,7 +96,9 @@ fn main() {
         }
     }
     writer.close().expect("关闭 writer");
-    let size_mb = std::fs::metadata(&out).map(|m| m.len() / 1024 / 1024).unwrap_or(0);
+    let size_mb = std::fs::metadata(&out)
+        .map(|m| m.len() / 1024 / 1024)
+        .unwrap_or(0);
     println!(
         "[gen] ✅ 完成: {rows} 条 → {}（{size_mb} MB）· {:.1}s",
         out.display(),
@@ -110,23 +110,58 @@ fn main() {
 fn build_batch(schema: &Arc<Schema>, start: u64, n: u64, seed: u64) -> RecordBatch {
     let docid: Vec<i64> = (start..start + n).map(|i| i as i64).collect();
     let user_id: Vec<i64> = docid.iter().map(|&i| 1_000_000 + (i % 9_999_999)).collect();
-    let amount: Vec<i64> = docid.iter().map(|&i| (i as u64).wrapping_mul(2654435761) % 1_000_000).map(|v| v as i64).collect();
+    let amount: Vec<i64> = docid
+        .iter()
+        .map(|&i| (i as u64).wrapping_mul(2654435761) % 1_000_000)
+        .map(|v| v as i64)
+        .collect();
     let age: Vec<i32> = docid.iter().map(|&i| 18 + (i % 60) as i32).collect();
     let score: Vec<f64> = docid.iter().map(|&i| (i % 1000) as f64 / 10.0).collect();
-    let ts: Vec<i64> = docid.iter().map(|&i| 1_700_000_000 + (i % 31_536_000)).collect();
-    let status: Vec<String> = docid.iter().map(|&i| ["active", "inactive", "pending"][(i % 3) as usize].into()).collect();
-    let city: Vec<String> = docid.iter().map(|&i| ["beijing", "shanghai", "shenzhen", "hangzhou", "chengdu"][(i % 5) as usize].into()).collect();
+    let ts: Vec<i64> = docid
+        .iter()
+        .map(|&i| 1_700_000_000 + (i % 31_536_000))
+        .collect();
+    let status: Vec<String> = docid
+        .iter()
+        .map(|&i| ["active", "inactive", "pending"][(i % 3) as usize].into())
+        .collect();
+    let city: Vec<String> = docid
+        .iter()
+        .map(|&i| {
+            ["beijing", "shanghai", "shenzhen", "hangzhou", "chengdu"][(i % 5) as usize].into()
+        })
+        .collect();
     let big_text_a: Vec<String> = docid.iter().map(|&i| text256(i as u64, seed)).collect();
     let big_text_b: Vec<String> = docid
         .iter()
-        .map(|&i| text256((i as u64).wrapping_mul(7).wrapping_add(seed), seed ^ 0x9E3779B9))
+        .map(|&i| {
+            text256(
+                (i as u64).wrapping_mul(7).wrapping_add(seed),
+                seed ^ 0x9E3779B9,
+            )
+        })
         .collect();
-    let tag_a: Vec<String> = docid.iter().map(|&i| ["A", "B", "C"][(i % 3) as usize].into()).collect();
-    let tag_b: Vec<String> = docid.iter().map(|&i| ["x", "y"][(i % 2) as usize].into()).collect();
+    let tag_a: Vec<String> = docid
+        .iter()
+        .map(|&i| ["A", "B", "C"][(i % 3) as usize].into())
+        .collect();
+    let tag_b: Vec<String> = docid
+        .iter()
+        .map(|&i| ["x", "y"][(i % 2) as usize].into())
+        .collect();
     let note: Vec<String> = docid.iter().map(|&i| format!("note-{i}")).collect();
-    let region: Vec<String> = docid.iter().map(|&i| ["east", "west", "south", "north"][(i % 4) as usize].into()).collect();
-    let device: Vec<String> = docid.iter().map(|&i| ["pc", "mobile", "tablet"][(i % 3) as usize].into()).collect();
-    let channel: Vec<String> = docid.iter().map(|&i| ["web", "app", "api"][(i % 3) as usize].into()).collect();
+    let region: Vec<String> = docid
+        .iter()
+        .map(|&i| ["east", "west", "south", "north"][(i % 4) as usize].into())
+        .collect();
+    let device: Vec<String> = docid
+        .iter()
+        .map(|&i| ["pc", "mobile", "tablet"][(i % 3) as usize].into())
+        .collect();
+    let channel: Vec<String> = docid
+        .iter()
+        .map(|&i| ["web", "app", "api"][(i % 3) as usize].into())
+        .collect();
     let flag: Vec<bool> = docid.iter().map(|&i| i % 2 == 0).collect();
     let active_days: Vec<i32> = docid.iter().map(|&i| (i % 365) as i32).collect();
     let visit_count: Vec<i64> = docid.iter().map(|&i| i % 10_000).collect();
