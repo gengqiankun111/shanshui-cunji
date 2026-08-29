@@ -315,6 +315,20 @@
   330 测试全绿（+10：bitmap 4 + engine 5 + column_family 2）；demo 6 测试全绿。
 - **提交**：`e615071`（Ex-5.6）
 
+### P43. FST mmap 落地：Windows 两坑 + unsafe 白名单独立 crate（P23 兑现）
+- **现象**：Ex-5.7 把 FST 字典从 `fs::read` 全量加载改为 mmap 按需加载时，本机（Windows）全量
+  测试大面积 `PermissionDenied`；且按旧 gc 顺序（先删旧 .fst 再清字典）Windows 下删除静默失败。
+- **根因**：①**只读句柄 `sync_all()` 被拒**——Windows `FlushFileBuffers` 要求句柄带写权限，
+  `File::open`（只读）调用 `sync_all` 返回 code 5；②**已映射文件无法删除/改名**——mmap 持文件
+  句柄期间 `remove_file`/`rename` 失败（Unix 无此限制，Windows 专属）。
+- **修复**：①fsync 改在**写句柄**上进行（BufWriter 借用 File，flush 后仍持写句柄 `sync_all`）；
+  ②发布顺序改为「fsync → rename → mmap」；gc 改为**先 `dicts.clear()` 释放旧映射、再删旧文件**
+  （双端一致）；③mmap unsafe 依 P23 决策隔离到**独立 crate** `crates/mmap-file/`（只读 `MmapFile`
+  + `unsafe impl Send/Sync` 完整论证：只读无写逃逸 + FST 文件不可变约定 + fd 生命周期解耦），
+  主库 `#![forbid(unsafe_code)]` 保持零 unsafe 承诺。
+- **结果**：330 测试全绿（既有 FST/GC 测试全部走 mmap 路径）；mmap-file crate 3 测试全绿；
+  demo 实测冷启动 fs::read 堆分配 17.3MB vs mmap 0B + 0.14ms；提交 `442981c`（Ex-5.7）。
+
 ---
 
 ## 环境备忘（不入库）

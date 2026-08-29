@@ -1396,6 +1396,30 @@ impl RuntimePools {
    同样隐藏 / 关闭=保留 Tombstone MVCC）；demo 6 测试全绿（见 1）；clippy 新代码零警告；
    提交 `e615071`。⚠️ 删除 IO 收益需在 **SSD 环境**实测（HDD 不压测）。
 
+### 7.34 Ex-5.7 倒排 FST + Mmap 字典（design 5.2.4.1 / 4.8.3 P1 阶段二）
+
+> 背景：FST 术语字典（term → 段内偏移）M4 已落地但受零 unsafe 约束用 `fs::read` 全量读入
+> （P23：mmap 留待独立 crate 封装 unsafe 白名单后落地）。Ex-5.7 = 落地 mmap 按需加载——
+> 冷启动零堆分配（design 5.2.4.1：mmap 仅建虚拟地址映射，物理页缺页按需加载）。
+
+1. ~~**demo 研究（src/demo/fst-mmap/，gitignore 不提交）**~~ ✅：4 测试全绿（计数分配器实测）——
+   `fst::Map<Mmap>` 可行（泛型 AsRef<[u8]>）；100 万 term 原始 24MB → FST 17.3MB；
+   **冷启动对比**：fs::read 堆分配 17.3MB（全量读入）vs mmap 0B + 0.14ms（按需）；
+   **按需分页**：100 次查表堆分配 0B（物理页在 OS Page Cache，RSS 与访问量成正比）；
+   查表两版（fs::read / mmap）完全一致 + 全量 30 万 term 命中正确。
+2. ~~**kernel 整合**~~ ✅：
+   - **crates/mmap-file/**（新独立 crate = P23 unsafe 白名单）：`MmapFile` 只读 mmap 安全封装
+     （`open` → `Deref<[u8]>` + `AsRef<[u8]>`）；`unsafe impl Send + Sync` 附完整论证
+     （只读映射无写逃逸 + 文件不可变约定 + fd 生命周期解耦）；主库 `#![forbid(unsafe_code)]` 不变；
+   - `inverted.rs`：`dicts` 改 `HashMap<String, fst::Map<MmapFile>>`——open 加载与
+     `write_fst_dict`（先 fsync → rename → mmap）均走 mmap；gc **先清字典释放映射再删旧文件**
+     （Windows 已映射文件无法删除）；
+   - 修复 Windows 坑：只读句柄 `sync_all()` 被拒（FlushFileBuffers 需写权限）→ 写句柄上 fsync。
+3. ~~**验证**~~ ✅：`cargo test` **330 全绿**（既有 FST/GC 测试全部走 mmap 路径，Windows 本机
+   验证映射释放顺序）；mmap-file crate 3 测试全绿；demo 4 测试全绿（见 1）；clippy 零警告；
+   提交 `442981c`。⚠️ 冷启动收益需在 **SSD 环境**实测（HDD 不压测；真实 1.18 亿 term 规模
+   FST 数百 MB 时 mmap 收益放大）。
+
 ---
 
 ## 8. 编码规范
