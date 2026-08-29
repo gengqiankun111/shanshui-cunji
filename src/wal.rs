@@ -88,6 +88,14 @@ impl WalWriter {
     pub fn append(&mut self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.append_at(op, key, value, seq)?;
+        Ok(seq)
+    }
+
+    /// 以**指定 seq** 追加记录（MVCC 全局 seq，engine 层统一分配，M7-1）。
+    /// 内部 next_seq 同步推进到 seq+1（保证崩溃恢复接续单调）。
+    pub fn append_at(&mut self, op: u8, key: &[u8], value: Option<&[u8]>, seq: u64) -> Result<()> {
+        self.next_seq = self.next_seq.max(seq + 1);
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&seq.to_le_bytes());
@@ -105,7 +113,7 @@ impl WalWriter {
         self.buf.extend_from_slice(&crc.to_le_bytes());
         self.buf.extend_from_slice(&payload);
         self.pending_bytes += 8 + payload.len();
-        Ok(seq)
+        Ok(())
     }
 
     /// 组提交：将缓冲整批写盘并 fsync（标准模式每次提交都 fsync）。
@@ -366,6 +374,13 @@ impl RingWal {
     pub fn append(&mut self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.append_at(op, key, value, seq)?;
+        Ok(seq)
+    }
+
+    /// 以**指定 seq** 追加记录（MVCC 全局 seq，M7-1）；next_seq 同步推进保持单调。
+    pub fn append_at(&mut self, op: u8, key: &[u8], value: Option<&[u8]>, seq: u64) -> Result<()> {
+        self.next_seq = self.next_seq.max(seq + 1);
         let mut payload = Vec::new();
         payload.extend_from_slice(&seq.to_le_bytes());
         payload.push(op);
@@ -387,7 +402,7 @@ impl RingWal {
         }
         self.pending_bytes += rec.len();
         self.pending.push(rec);
-        Ok(seq)
+        Ok(())
     }
 
     /// 落盘：构建写计划（必要时回绕）→ 写记录区 fsync → 更新头部 tail fsync → 维护索引。
@@ -533,6 +548,14 @@ impl WalBackend {
         match self {
             WalBackend::Append(w) => w.append(op, key, value),
             WalBackend::Ring(r) => r.append(op, key, value),
+        }
+    }
+
+    /// 以指定 seq 追加记录（MVCC 全局 seq，M7-1）。
+    pub fn append_at(&mut self, op: u8, key: &[u8], value: Option<&[u8]>, seq: u64) -> Result<()> {
+        match self {
+            WalBackend::Append(w) => w.append_at(op, key, value, seq),
+            WalBackend::Ring(r) => r.append_at(op, key, value, seq),
         }
     }
 

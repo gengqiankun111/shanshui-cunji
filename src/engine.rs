@@ -7,6 +7,8 @@
 //! 删除一致性：文档删除后，倒排中残留 docid 在回表时经主数据 Tombstone 天然过滤。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
@@ -37,6 +39,8 @@ pub struct Engine {
     mem_ratio: f64,
     /// 内存硬上限（MB，`memory.max_memory_mb`，供 admin status）。
     max_memory_mb: usize,
+    /// 全局 seq 分配器（MVCC，M7-1）：primary / delta 列族共享，跨列族写入序一致。
+    global_seq: Arc<AtomicU64>,
 }
 
 /// 查询结果行：docid + 文档字节。
@@ -96,6 +100,15 @@ impl Engine {
         )?;
         let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
         let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
+        // MVCC 全局 seq（M7-1）：以各列族 WAL 恢复后的 next_seq 取最大作为全局起点，
+        // 此后 primary / delta 写入共享同一计数器（跨列族快照隔离正确）。
+        let global_seq = Arc::new(AtomicU64::new(
+            primary.wal_next_seq().max(delta.wal_next_seq()),
+        ));
+        let mut primary = primary;
+        primary.set_external_seq(Arc::clone(&global_seq));
+        let mut delta = delta;
+        delta.set_external_seq(Arc::clone(&global_seq));
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
         Ok(Self {
@@ -107,6 +120,7 @@ impl Engine {
             watchdog,
             mem_ratio: 0.0,
             max_memory_mb: cfg.hotcache.max_memory_mb + cfg.blockcache.max_memory_mb,
+            global_seq,
         })
     }
 
@@ -156,7 +170,7 @@ impl Engine {
 
     /// 当前已分配的最大 seq（全量备份点 / 增量备份游标基础）。
     pub fn current_seq(&self) -> u64 {
-        self.primary.wal_next_seq().saturating_sub(1)
+        self.global_seq.load(Ordering::Relaxed).saturating_sub(1)
     }
 
     /// 增量备份（design 20，M6-5）：导出 seq ∈ (since_seq, 当前] 的 WAL 记录为 JSON 文件。
@@ -290,10 +304,10 @@ impl Engine {
         self.primary.wal_next_seq().saturating_sub(1)
     }
 
-    /// 快照读（design 4.7 二期 MVCC，M6-3）：返回 **seq ≤ `snapshot_seq`** 的文档视图。
+    /// 快照读（design 4.7 MVCC）：返回 **seq ≤ `snapshot_seq`** 的文档视图。
     /// 主数据取快照点最新版本（MemTable + SST 按 seq 过滤，Tombstone 语义保留）；
-    /// Delta 字段级热更为独立 seq 空间，快照读即时叠加（基础版语义：快照隔离覆盖主数据版本，
-    /// 字段级热更不做隔离——完整跨列族全局 seq 一致性留后续）。
+    /// **Delta 增量按全局 seq 过滤**（M7-1：跨列族共享 seq 分配，快照后的字段级热更不可见；
+    /// null 删除字段 / Tombstone 均按快照点判定）。
     /// 不走 HotCache（避免快照读污染热缓存）。
     pub fn get_at(&mut self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
         let found = self
@@ -313,19 +327,32 @@ impl Engine {
         let start = encode_docid(docid).to_vec();
         let mut end = start.clone();
         end.extend_from_slice(&[0xFF; 4]);
-        let rows = self.delta.scan_raw_range(Some(&start), Some(&end))?;
-        for (k, v) in rows {
+        let rows = self
+            .delta
+            .scan_raw_range_with_seq(Some(&start), Some(&end))?;
+        for (k, seq, v) in rows {
+            if seq > snapshot_seq {
+                continue; // 快照点之后的增量不可见
+            }
             if !k.starts_with(&start) || k.len() < 12 {
                 continue;
             }
             let field = String::from_utf8(k[12..].to_vec())
                 .map_err(|_| crate::error::Error::Corrupted("Delta 字段名非法 UTF-8".into()))?;
-            let val: serde_json::Value = serde_json::from_slice(&v)
-                .map_err(|e| crate::error::Error::Corrupted(format!("Delta 值解析失败: {e}")))?;
-            if val.is_null() {
-                map.shift_remove(&field);
-            } else {
-                map.insert(field, val);
+            match v {
+                Some(bytes) => {
+                    let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                        crate::error::Error::Corrupted(format!("Delta 值解析失败: {e}"))
+                    })?;
+                    if val.is_null() {
+                        map.shift_remove(&field);
+                    } else {
+                        map.insert(field, val);
+                    }
+                }
+                None => {
+                    map.shift_remove(&field); // 增量删除字段（Tombstone）
+                }
             }
         }
         let merged =
@@ -577,15 +604,53 @@ mod tests {
         // 快照之后主数据覆盖 + Delta 热更
         e.put(1, br#"{"k":"later"}"#.to_vec(), &["k"]).unwrap();
         e.patch(1, &[("extra", json!("x"))]).unwrap();
-        // 快照读：主数据仍为 base（快照隔离）；Delta 字段级热更即时可见（基础版语义）
+        // 快照读：主数据仍为 base，Delta 增量也隔离（M7-1 全局 seq）
         let snap: serde_json::Value =
             serde_json::from_slice(&e.get_at(1, s).unwrap().unwrap()).unwrap();
         assert_eq!(snap["k"], "base", "快照应隔离主数据后续覆盖");
-        assert_eq!(snap["extra"], "x");
+        assert!(snap.get("extra").is_none(), "快照应隔离快照后的 Delta 热更");
         // 最新读：later + delta 叠加
         let cur: serde_json::Value = serde_json::from_slice(&e.get(1).unwrap().unwrap()).unwrap();
         assert_eq!(cur["k"], "later");
         assert_eq!(cur["extra"], "x");
+    }
+
+    #[test]
+    fn get_at_delta_isolated_by_global_seq() {
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, br#"{"a":1,"b":1}"#.to_vec(), &["k"]).unwrap();
+        let s = e.begin_snapshot();
+        // 快照后 Delta 修改字段 a（null 删除 b）
+        e.patch(1, &[("a", json!(2)), ("b", json!(null))]).unwrap();
+        // 快照读：a=1、b 仍存在（快照后增量不可见）
+        let snap: serde_json::Value =
+            serde_json::from_slice(&e.get_at(1, s).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["a"], 1, "快照应读回 a=1");
+        assert_eq!(snap["b"], 1, "快照应保留被删除的 b");
+        // 最新读：a=2、b 被 null 删除
+        let cur: serde_json::Value = serde_json::from_slice(&e.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(cur["a"], 2);
+        assert!(cur.get("b").is_none(), "最新读 b 应被 null 删除");
+    }
+
+    #[test]
+    fn global_seq_resumes_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        e.put(1, br#"{"a":1}"#.to_vec(), &["k"]).unwrap();
+        let s = e.begin_snapshot();
+        e.patch(1, &[("a", json!(2))]).unwrap();
+        // 重启：全局 seq 从 WAL 恢复
+        drop(e);
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
+        // 快照点之前的读不受影响（重启后快照序号语义保持）
+        let snap: serde_json::Value =
+            serde_json::from_slice(&e2.get_at(1, s).unwrap().unwrap()).unwrap();
+        assert_eq!(snap["a"], 1);
+        let cur: serde_json::Value = serde_json::from_slice(&e2.get(1).unwrap().unwrap()).unwrap();
+        assert_eq!(cur["a"], 2);
+        assert!(e2.begin_snapshot() >= s, "重启后全局 seq 应接续");
     }
 
     #[test]

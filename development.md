@@ -851,6 +851,19 @@ impl RuntimePools {
 6. **收尾**：✅ 性能回归快检（2026-08-28，1000万 10/10，插入 38.6 万条/s 无回归，`images/perf-0.4.0/`）；
    M6 全部 5 项功能完成、测试 279 全绿；打 v0.4.0 标签待确认（版本号 + RELEASE 说明 + 分支同步）。
 
+### 7.6 M7 深度优化二阶段（design 4.7/5.2.4/22）
+
+1. ~~**MVCC 全局 seq 一致性（design 4.7 完善）**~~ ✅（2026-08-28）：`Engine` 增加**全局 seq 分配器**
+   （`Arc<AtomicU64>`，primary / delta 列族共享）——`ColumnFamily::set_external_seq` 接入后所有写入
+   （put / delete / patch / delta 清理）从全局计数分配 seq（`WalWriter/RingWal::append_at` 指定 seq，
+   内部 next_seq 同步推进保持单调）；`get_at` 的 **Delta 增量按全局 seq 过滤**（快照后的字段级热更
+   不可见，null 删除 / Tombstone 均按快照点判定）——补全 M6-3 遗留的跨列族快照隔离；
+   `begin_snapshot` / `current_seq` 读全局计数；重启后从各列族 WAL 恢复全局起点；
+   测试验证 快照隔离 Delta / null 删除 / 跨重启 seq 接续；测试 279→281（+2）；
+2. **位图索引增强（design 5.2.4/7.2）**：枚举字段内存位图加速 COUNT/GROUP/AND；
+3. **YCSB 压测定位瓶颈 + 前沿调研报告（design 22）**；
+4. **收尾**：文档 + 性能快检 + 打 v0.5.0 标签。
+
 ---
 
 ## 8. 编码规范
