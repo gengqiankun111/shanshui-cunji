@@ -128,5 +128,4 @@
 ## 下一候选
 
 - 完整中文词典分词（jieba vendor 化，可选）
-- 环形 WAL 头部 tail 免 fsync
 - 倒排 posting 压缩探索（Roaring 已用，Gorilla/变长评估）
