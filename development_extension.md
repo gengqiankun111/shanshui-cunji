@@ -171,8 +171,9 @@ v0.6 存储内核（环形 WAL/倒排/compaction 已有基础）、design 4.8 �
 
 ### 任务分解
 
-- [ ] **Ex-6.1 Seqlock 原语**：`src/seqlock.rs`（~100 行）——版本号（AtomicU64，奇偶语义）+
-      快照模板方法（读循环校验重试）；单元测试（写不阻塞读/读重试/并发正确性）。
+- [x] **Ex-6.1 Seqlock 原语** ✅ `1946161`：`src/seqlock.rs`（零 unsafe：AtomicU64 版本号奇偶 +
+      RwLock 写短锁 + 读 try_read 立即重试不阻塞写）；`retries()` 重试监控；单元测试 4
+      （并发不撕裂/可见性/低频写重试率 0.015%/版本奇偶）——测试 318 全绿（+4）。
 - [ ] **Ex-6.2 倒排段清单 Seqlock/Arc**：`segments: Vec<String>` → 版本化快照或
       `Arc<Vec<String>>` + ArcSwap（原子指针发布）——`flush_segment`/`gc` 更新发布，
       `search`/`doc_count`/`iter_terms` 读快照无锁。
@@ -202,7 +203,7 @@ Seqlock 单元测试（并发写读交错）+ 倒排端到端（flush/gc 并发 
 | Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
 | Ex-5 | SSD 原生迁移（P0 4KB 块/分片锁/批处理/compaction → P1 环形 WAL/删除位图/FST/解耦 → P2 冷热/条带化） | ⏳ | — |
-| Ex-6 | 并发读优化（Seqlock 原语 + 倒排段清单/FST 字典 Arc，依赖读写分离） | ⏳ | — |
+| Ex-6 | 并发读优化（Ex-6.1 Seqlock 原语 ✅ → 倒排段清单/FST 字典 Arc，依赖读写分离） | 🔄 | `1946161` |
 
 ## 与本项目其他文档关系
 

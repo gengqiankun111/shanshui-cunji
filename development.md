@@ -1275,6 +1275,22 @@ impl RuntimePools {
    I 模块 ⏸）——全局锁下写与读仍串行，Seqlock 无收益；原语（Ex-6.1）可独立先行（不与全局锁
    冲突，~100 行 + 单元测试）。代码落地待读写分离评估后再启。
 
+### 7.28 Ex-6.1 Seqlock 原语（design_extension v0.4 第 11.3）
+
+> 背景：倒排段清单/FST 字典指针需要"读不阻塞写、写不阻塞读"的无锁读。项目
+> `#![forbid(unsafe_code)]` 红线排除标准 UnsafeCell 实现 → 采用**零 unsafe 方案**：
+> AtomicU64 版本号（奇偶语义）+ RwLock 数据（写持锁窗口极短，读 try_read 立即失败重试）。
+
+1. ~~**demo 研究（src/demo/seqlock/，gitignore 不提交）**~~ ✅：4 测试全绿——2 写 × 4 读 ×
+   10 万交错 **0 撕裂**；10K 写 218us（0.02us/次，写不阻塞）；低频写（20µs 间隔）vs 高频读
+   （1100 万次）：重试 1647 次，**率 0.015%**（<0.1% 目标）；写后立即可见。已知边界：写频率
+   极高时读饥饿（重试率飙升）——倒排 flush/gc 为低频写，不触达。
+2. ~~**kernel 整合**~~ ✅：新增 `src/seqlock.rs`——`Seqlock<T>`（`read`/`write`/`version`/
+   `retries`，read 用 `Fn` 支持重试循环，write 用 `FnOnce`）；零 unsafe；lib.rs 导出；
+   单元测试 4（并发不撕裂/可见性/低频重试率/版本奇偶）。
+3. ~~**验证**~~ ✅：`cargo test` **318 全绿**（+4 seqlock）；demo 4 测试全绿（见 1）；
+   提交 `1946161`。倒排段清单/FST 字典接入（Ex-6.2/6.3）待读写分离解除 Engine 全局锁。
+
 ---
 
 ## 8. 编码规范
