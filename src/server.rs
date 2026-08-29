@@ -616,18 +616,38 @@ fn handle_fulltext(engine: &mut Engine, query: &str) -> (u16, String) {
 
 fn handle_range(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);
-    let start = params
-        .iter()
-        .find(|(k, _)| k == "start")
-        .and_then(|(_, v)| v.parse::<u64>().ok());
     let end = params
         .iter()
         .find(|(k, _)| k == "end")
         .and_then(|(_, v)| v.parse::<u64>().ok());
+    let after = params
+        .iter()
+        .find(|(k, _)| k == "after")
+        .and_then(|(_, v)| v.parse::<u64>().ok());
     let (limit, offset) = parse_paging(query);
-    match engine.scan_range_paged(start, end, limit, offset) {
-        Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
-        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    // 游标续扫模式（M8-P11）：`GET /range?after=LAST&limit=N`——取满即止、无 total 全扫，
+    // 每页返回 rows（用末条 docid 作下一页 after），全库遍历每页 O(limit)。
+    if let Some(after) = after {
+        let cap = limit.unwrap_or(u64::MAX);
+        match engine.scan_after(Some(after), end, cap) {
+            Ok(rows) => (
+                200,
+                json!({
+                    "rows": rows.iter().map(|(d, v)| value_row(*d, v)).collect::<Vec<_>>()
+                })
+                .to_string(),
+            ),
+            Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+        }
+    } else {
+        let start = params
+            .iter()
+            .find(|(k, _)| k == "start")
+            .and_then(|(_, v)| v.parse::<u64>().ok());
+        match engine.scan_range_paged(start, end, limit, offset) {
+            Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
+            Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+        }
     }
 }
 

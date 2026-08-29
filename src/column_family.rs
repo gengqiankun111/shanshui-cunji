@@ -478,9 +478,9 @@ impl ColumnFamily {
 
     /// 流式范围扫描（M8-P10）：k-way merge（memtable 双缓冲 + 各 SST 有序源）按 key 升序
     /// 回调 `f(key, value)`——同 key 取最大 seq（最新版本），Tombstone 跳过。
-    /// 内存 O(块) 不随扫描总量膨胀（对比 `scan_raw_range` 全量收集 O(total)），
-    /// 配合分页 skip/take 可提前终止。语义与 `scan_raw_range` 完全一致。
-    pub fn scan_stream<F: FnMut(&[u8], &[u8]) -> Result<()>>(
+    /// 回调返回 `bool`：true=继续，**false=提前终止**（M8-P11 游标续扫：取满页即停，
+    /// 不再全扫计数 total）。内存 O(块) 不随扫描总量膨胀，语义与 `scan_raw_range` 一致。
+    pub fn scan_stream<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -548,7 +548,9 @@ impl ColumnFamily {
             }
             // Tombstone（最新版本 value=None）→ 该 key 视为删除，不输出
             if let Some(v) = best_val {
-                f(min_key.as_slice(), &v)?;
+                if !f(min_key.as_slice(), &v)? {
+                    break; // 提前终止（游标续扫取满页）
+                }
             }
         }
         Ok(())
@@ -1157,7 +1159,7 @@ mod tests {
         let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         cf.scan_stream(None, None, |k, v| {
             streamed.push((k.to_vec(), v.to_vec()));
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         assert_eq!(streamed.len(), all.len(), "流式行数应与全量一致");
@@ -1182,7 +1184,7 @@ mod tests {
             Some(&b"k00001010"[..]),
             |k, v| {
                 rs.push((k.to_vec(), v.to_vec()));
-                Ok(())
+                Ok(true)
             },
         )
         .unwrap();

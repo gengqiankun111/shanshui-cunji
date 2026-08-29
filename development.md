@@ -1103,6 +1103,25 @@ impl RuntimePools {
 4. **已知限制**：全库 scan 的 `total` 计数需扫完全部（无 limit 提前终止的 total 语义），
    后续可加「仅需前 N 条」的无 total 模式 / 游标续扫。
 
+### 7.19 M8-P11 scan 游标续扫（after + 提前终止，全库遍历每页 O(limit)）
+
+> 背景（7.18 已知限制）：`/range` 的 `total` 计数需全扫（50M 库 ~70s）；offset 翻页每页
+> 累积跳过。方案：**游标续扫**——每页只扫「after 之后」部分（start=after+1 定位 + Zone Map
+> 剪枝），取满 `limit` 即**提前终止**（无 total 全扫），全库遍历每页 O(limit) + 游标定位。
+
+1. ~~**demo 研究（src/demo/cursor-pagination/，gitignore 不提交）**~~ ✅：游标语义验证——
+   遍历一致性（游标翻页拼接 == 全量升序）/ after 首尾边界 / 删除覆盖下 docid 稳定 /
+   上界限定 / 深页与 offset 等价；4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `ColumnFamily::scan_stream` 回调改为返回 `bool`（false=**提前终止**，取满页即停）；
+   - `Engine::scan_after(after, end, limit)`：from after+1 定位，取满 limit 提前终止，
+     无 total 全扫；
+   - HTTP `GET /range?after=LAST&limit=N` 游标模式（返回 `{"rows":[...]}`，用末条 docid
+     作下页 after；`after` 为**严格之后**语义，首页如需含 docid 0 请用 start/total 模式）。
+3. ~~**验证**~~ ✅：50M 库游标翻页——首页 `after=0&limit=10` **682ms**（旧 total 模式全库 70s）、
+   深页 `after=49999990&limit=10` **164ms**（docid 49999991-49999999 共 9 条）、server WS
+   696MB；测试 311 全绿（+1：scan_after 遍历一致性/边界/提前终止/上界）。
+
 ---
 
 ## 8. 编码规范

@@ -564,18 +564,45 @@ impl Engine {
                 total += 1;
                 if skipped < offset {
                     skipped += 1;
-                    return Ok(());
+                    return Ok(true);
                 }
                 if rows.len() as u64 >= cap {
-                    return Ok(()); // 页已取满：仅继续计数 total，不再收集
+                    return Ok(true); // 页已取满：仅继续计数 total，不再收集
                 }
                 let docid = crate::keys::decode_docid(key).map_err(|_| {
                     crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
                 })?;
                 rows.push((docid, val.to_vec()));
-                Ok(())
+                Ok(true)
             })?;
         Ok(PagedRows { total, rows })
+    }
+
+    /// scan 游标续扫（M8-P11）：从 `after`（上次最后 docid，None=从头）之后取 `limit` 条，
+    /// **取满即提前终止**（不做 total 全扫）——全库遍历每页 O(limit) + 游标定位，
+    /// 避免 offset 翻页的累积跳过与 total 全扫开销（7.18 已知限制）。
+    /// 语义：docid 升序、不含 after 本身；配合 end 上界可限定范围。
+    pub fn scan_after(
+        &mut self,
+        after: Option<u64>,
+        end: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<QueryRow>> {
+        let start = after.map(|a| encode_docid(a.saturating_add(1)).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        let mut rows = Vec::new();
+        self.primary
+            .scan_stream(start.as_deref(), ek.as_deref(), |key, val| {
+                if rows.len() as u64 >= limit {
+                    return Ok(false); // 取满页：提前终止（不再扫后续）
+                }
+                let docid = crate::keys::decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+                })?;
+                rows.push((docid, val.to_vec()));
+                Ok(true)
+            })?;
+        Ok(rows)
     }
 
     /// 主键范围扫描。
@@ -944,6 +971,61 @@ mod tests {
         assert_eq!(sc.total, 41);
         assert_eq!(sc.rows.len(), 5);
         assert_eq!(sc.rows[0].0, 10);
+    }
+
+    #[test]
+    fn scan_after_cursor_traversal() {
+        // M8-P11：游标续扫——遍历一致性 / 边界 / 提前终止（无 total 全扫）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=100u64 {
+            let val = serde_json::json!({"docid": i, "v": i});
+            e.put_nosync(i, serde_json::to_vec(&val).unwrap(), &[]).unwrap();
+            if i % 25 == 0 {
+                e.flush_primary().unwrap();
+            }
+        }
+        e.flush_primary().unwrap();
+        // 游标遍历：limit=10 逐页续扫，拼接 == 全量升序
+        let mut merged: Vec<u64> = Vec::new();
+        let mut after: Option<u64> = None;
+        loop {
+            let page: Vec<u64> = e
+                .scan_after(after, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            merged.extend(page.iter().copied());
+            after = Some(*page.last().unwrap());
+        }
+        assert_eq!(merged.len(), 100);
+        assert_eq!(merged, (1..=100).collect::<Vec<u64>>(), "游标遍历覆盖全部且升序");
+        // 边界：after=0 → 从 1 起；after=100 → 空；尾部不足 limit
+        let from0: Vec<u64> = e
+            .scan_after(Some(0), None, 3)
+            .unwrap()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(from0, vec![1, 2, 3]);
+        assert!(e.scan_after(Some(100), None, 10).unwrap().is_empty());
+        assert_eq!(
+            e.scan_after(Some(97), None, 10).unwrap().len(),
+            3,
+            "尾部不足一页取剩余"
+        );
+        // 上界限定：after=0 & end=50 → 1..=50
+        let bounded: Vec<u64> = e
+            .scan_after(Some(0), Some(50), 100)
+            .unwrap()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(bounded, (1..=50).collect::<Vec<u64>>());
     }
 
     #[test]

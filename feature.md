@@ -51,7 +51,8 @@
 | 热点缓存 HotCache（LRU/LFU + 保护区自动晋升） | ✅ | M6-4 `e34ea87` |
 | HotCache 内存缺陷修复（stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴） | ✅ | P41 `5a937ea` |
 | 查询分页（limit/offset/total，防大结果集内存爆炸） | ✅ | M8-P8 `45c3a54`（5M 命中 WS 10GB→221MB） |
-| **scan 范围扫描流式化**（见模块 A） | 🔄 | M8-P10（本次） |
+| **scan 范围扫描流式化**（见模块 A） | ✅ | M8-P10 `516643f` |
+| **scan 游标续扫**（after + 提前终止，全库遍历每页 O(limit)） | ✅ | M8-P11（`scan_after` + `/range?after`） |
 | 类 SQL 解析（query::sql，降低迁移成本） | ⏳ | 阶段 1.5 规划，未启动 |
 | 写入 Enrich（预连接） | ⏳ | 阶段 1.5 规划，未启动 |
 
@@ -117,11 +118,13 @@
 ## 近期里程碑（按完成顺序）
 
 - **M8-P9 中文 bigram 分词**（`72badfe`）：tokenize 字符类分段，中文 fulltext 可检索（2-4 字关键词 bigram AND 精确命中）
-- **M8-P10 scan 范围扫描流式化**：k-way merge（BinaryHeap 最小堆 O(N log K)），
+- **M8-P10 scan 范围扫描流式化**（`516643f`）：k-way merge（BinaryHeap 最小堆 O(N log K)），
   `scan_range_paged` 内存 O(page)——50M 库全库分页查询 WS 691MB（旧实现全量收集会 OOM）
+- **M8-P11 scan 游标续扫**：`scan_after` + `/range?after`——全库遍历每页 O(limit)，
+  50M 库翻页 164-682ms（旧 total 模式全库 70s）
 
 ## 下一候选
 
-- 全库 scan 的「无 total」模式 / 游标续扫（7.18 已知限制）
 - 完整中文词典分词（jieba vendor 化，可选）
 - 环形 WAL 头部 tail 免 fsync
+- 倒排 posting 压缩探索（Roaring 已用，Gorilla/变长评估）
