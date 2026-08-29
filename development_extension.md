@@ -83,15 +83,26 @@
 
 ### 任务分解
 
-- [ ] **Ex-3.1 调研**：Calvin（Yale）/ 确定性并发控制论文要点（事务调度与执行分离、按序无锁执行、
-     确定性冲突检测）——输出对比报告。
-- [ ] **Ex-3.2 demo 可行性**：src/demo/calvin/——单分片内"全局事务序"批量执行 vs 2PC 模拟对比
-     （吞吐/延迟/锁等待）；评估与 docid 确定性路由的契合度。
-- [ ] **Ex-3.3 决策**：基于 demo 数据决定是否进入 kernel（状态机/日志复制衔接 ReplicationLog）。
+- [x] **Ex-3.1 调研**：Calvin（Yale, Thomson & Abadi SIGMOD'12 / IEEE'13）要点——三阶段
+     流水线（logging→scheduling→execution）、确定性锁（读/写集**预声明**、按确定序一次
+     申请全部锁、无跨网络锁等待）、请求先落持久化复制日志、执行等价于按日志序串行（副本
+     无分歧 → 无提交协议）；代价：读写集须执行前声明（依赖读需侦察）、排除交互式多语句会话。
+- [x] **Ex-3.2 demo 可行性**：src/demo/calvin/（4 测试，tick 模拟时钟）——高冲突
+     （键域 40/N=400）2PC 锁等待显著、Calvin 确定性序**零等待**；低冲突（键域 10 万/N=2000）
+     2PC 每事务下限 = 2×RTT（固定往返）vs Calvin 无协调往返；跨分区占比 10%/50%/90%：
+     2PC 105k/125k/145k ticks vs Calvin 恒定 11k（**吞吐与跨分区比例无关**）；确定性序执行
+     副本间状态一致（无分歧）。
+- [x] **Ex-3.3 决策**：🔍 **评估完成——不进入 kernel（远期方向保留）**。理由：
+     ① 本项目写路径 = docid 一致性哈希确定性路由 → **单 docid 事务天然不分片**，跨分片
+     场景极少（多 docid 批量事务）；② 现有 L1 outbox + L2 SAGA 已覆盖异步/最终一致需求；
+     ③ Calvin 需全局事务序协调器（单点）+ 读写集预声明（倒排词表难静态预声明）——投入产出
+     不匹配。**触发条件**：出现强一致多 docid 跨分区事务需求时，再按"全局事务序 + 状态机
+     衔接 ReplicationLog"落地。
 
 ### 验证
 
-demo 对比数据 + 决策报告（记录到 development_extension.md 状态）。
+demo 对比数据 + 决策报告（记录到 development_extension.md 状态）。✅ 完成。
+- demo（src/demo/calvin/，4 测试）全绿；数据见 Ex-3.2 摘要。
 
 ---
 
@@ -237,7 +248,7 @@ Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension 
 | L0 | 写路径单分片本地事务 + Group Commit | ✅ 已有 | `648d9bd` 等 |
 | Ex-1 | 本地消息表 + 幂等消费 | ✅ | `7348acd` |
 | Ex-2 | SAGA 编排 + 补偿状态机 | ✅ | `990bf6b`（Ex-2.5 网关 HTTP API 留待分布式阶段） |
-| Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
+| Ex-3 | Calvin 确定性事务评估 | ✅ 评估完成（🔍 不进入 kernel，远期方向保留） | demo `src/demo/calvin` |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
 | Ex-5 | SSD 原生迁移（P0 ✅ + P1 环形 WAL/删除位图/FST/解耦 ✅ + P2 冷热/条带化 ✅） | ✅ | `e6a5610` 等 |
 | Ex-6 | 并发读优化（Ex-6.1 Seqlock 原语 ✅ → 6.2 段清单 ArcSwap ✅ / 6.3 FST 字典 Arc ✅，依赖读写分离解除全局锁） | 🔄 | `c8183cf` |
