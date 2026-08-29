@@ -8,22 +8,23 @@
 
 ---
 
-## 📦 最新发布：v0.5.0（2026-08-29）
+## 📦 最新发布：v0.6.0（2026-08-29）
 
-> 核心亮点：**MVCC 全局 seq 一致性** + **位图索引增强** + **YCSB 压测定位瓶颈** + **前沿调研**。
+> 核心亮点：**Group Commit 组提交（45×）** + **倒排索引体系**（过滤/fulltext/中文 jieba 分词） + **查询流式化 + 游标续扫** + **50M 批量导入 6 万行/s**。
 
 | 维度 | 数据 |
 | --- | --- |
-| 纯读（冷缓存）| 18 万 ops/s（P50≈5µs，100 万 SST 分层不掉速）|
-| 纯读（热缓存）| 87 万 ops/s（P50 0.9µs）|
-| 写重瓶颈 | fsync 单条串行（55×）→ Group Commit 列入下里程碑 |
-| 质量 | 285 测试全绿、demo 10/10、unsafe=0 |
+| 写入（A 写重）| 组提交 2ms **91,296 ops/s**（45× 于关闭 2,003，P50 7.8µs）|
+| 环形 WAL | 头部 tail 合并 fsync，ring+gc 68,756 ops/s（2.3×）|
+| 50M 批量导入 | 60,507 行/s（全功能含倒排，827,950ms）|
+| 大库扫描 | 流式化 WS 691MB（旧全量收集 OOM），游标翻页 164–682ms（旧 70s）|
+| 质量 | 313 测试全绿、unsafe=0 |
 
-- **MVCC 全局 seq 一致性（design 4.7）**：primary/delta 共享全局 seq，`get_at` Delta 增量按全局 seq 过滤——跨列族快照隔离正确化（快照后字段级热更不可见）；
-- **位图索引增强（design 5.2.4/7.2）**：`[inverted] bitmap_fields` 枚举字段白名单 → 内存 RoaringBitmap 常驻，COUNT/GROUP/AND 亚毫秒快速路径（默认关闭零开销）；
-- **YCSB 压测（design 22.2）**：新增 `shanshui-cunji-ycsb` 工具，实证写路径头号瓶颈 = fsync 单条串行（A 写重 2,077 vs 无 fsync 113,587 ops/s）；
-- **前沿调研（design 22）**：BVLSM / RusKey / DobLIX / TieredKV / AuraDB → 近期组提交、中期大 value KV 分离、长期 RL+学习索引；
-- 完整发布说明见 [RELEASE-v0.5.0.md](./RELEASE-v0.5.0.md)，性能快检存档见 `images/perf-0.5.0/`，前沿调研见 `frontier-research-2026-08.md`。
+- **Group Commit（design 4.1.3）**：写路径零 fsync + 后台提交线程窗口统一落盘，达无 fsync 上限 80%；
+- **倒排索引体系（design 5.2.4 + design_extension v0.2）**：字段白名单/黑名单 + 长文本保护 + fulltext 分词 + HotCache 修复；posting 密度 N/M 三档策略，50M 倒排 2.2GB→~200MB；
+- **中文全文检索**：bigram → **jieba 语义词精确命中**（`cjk_segmenter="jieba"`，`fulltext 数据库` 单 term）；
+- **查询流式化**：k-way merge + 分页 + `scan_after` 游标续扫，50M 全库翻页内存 O(page)；
+- 完整发布说明见 [RELEASE-v0.6.0.md](./RELEASE-v0.6.0.md)，v0.5.0 发布见 [RELEASE-v0.5.0.md](./RELEASE-v0.5.0.md)。
 
 ---
 
