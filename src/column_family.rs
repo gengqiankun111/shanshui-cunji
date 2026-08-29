@@ -86,6 +86,9 @@ pub struct ColumnFamily {
     next_sst_id: u64,
     /// 当前 WAL 写入器（append 追加 / ring 环形，design 4.3 阶段 3）。
     wal: WalBackend,
+    /// 外部全局 seq（MVCC，engine 层统一分配，M7-1）：Some 时写入走外部计数（跨列族一致）；
+    /// None = 独立列族（测试 / 单 CF 场景）用内部 WAL seq。
+    external_seq: Option<Arc<AtomicU64>>,
 }
 
 /// Compaction 结果报告（design 4.5 阶段 3 / 二期 Leveled，M6-2）。
@@ -219,6 +222,7 @@ impl ColumnFamily {
             seq: AtomicU64::new(1),
             next_sst_id,
             wal,
+            external_seq: None,
         };
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
@@ -282,7 +286,7 @@ impl ColumnFamily {
     /// 批量写入（不逐条 fsync，由调用方最终 `sync_wal` 统一提交）。
     /// 供亿级数据压测/导入使用；强安全模式逐条写请用 `put_bytes`。
     pub fn put_bytes_nosync(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
-        let seq = match self.wal.append(OP_PUT, &key, Some(&value)) {
+        let seq = match self.wal_append(OP_PUT, &key, Some(&value)) {
             Ok(s) => s,
             // 环形 WAL 缓冲满：先落盘腾空（必要时强制 Flush）再重试
             Err(Error::WalFull(_)) => {
@@ -316,11 +320,11 @@ impl ColumnFamily {
 
     /// 删除原始字节键。
     pub fn delete_bytes(&mut self, key: Vec<u8>) -> Result<u64> {
-        let seq = match self.wal.append(OP_DELETE, &key, None) {
+        let seq = match self.wal_append(OP_DELETE, &key, None) {
             Ok(s) => s,
             Err(Error::WalFull(_)) => {
                 self.ensure_wal_room()?;
-                self.wal.append(OP_DELETE, &key, None)?
+                self.wal_append(OP_DELETE, &key, None)?
             }
             Err(e) => return Err(e),
         };
@@ -453,6 +457,31 @@ impl ColumnFamily {
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = merged
             .into_iter()
             .filter_map(|(key, (_seq, value))| value.map(|v| (key, v)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// 范围扫描并保留 seq 与 Tombstone（MVCC 快照 Delta 隔离用，M7-1）：
+    /// 返回升序 `(key, seq, value)`，value=None 表示删除标记；每 key 仅保留最大 seq 版本。
+    pub fn scan_raw_range_with_seq(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, u64, Option<Vec<u8>>)>> {
+        let mut merged: std::collections::HashMap<Vec<u8>, (u64, Option<Vec<u8>>)> =
+            std::collections::HashMap::new();
+        self.memtable.scan_range(start, end, |key, e| {
+            merge_candidate_bytes(&mut merged, key.to_vec(), e.seq, e.value.clone());
+        });
+        for sst in &mut self.ssts {
+            sst.scan_range(start, end, |k, v, seq| {
+                merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
+            })?;
+        }
+        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = merged
+            .into_iter()
+            .map(|(key, (seq, value))| (key, seq, value))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
@@ -782,6 +811,24 @@ impl ColumnFamily {
     /// 当前 WAL 下一可分配 seq（Engine 快照点来源，design 4.7 MVCC）。
     pub fn wal_next_seq(&self) -> u64 {
         self.wal.next_seq()
+    }
+
+    /// 接入外部全局 seq 计数器（MVCC，engine 层统一分配，M7-1）。
+    /// 在 WAL 回放完成（内部 seq 已推进）后调用，此后写入走外部计数，跨列族一致。
+    pub fn set_external_seq(&mut self, seq: Arc<AtomicU64>) {
+        self.external_seq = Some(seq);
+    }
+
+    /// 分配 seq 并追加 WAL 记录：外部全局 seq 优先（engine MVCC），否则内部自增。
+    fn wal_append(&mut self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
+        match &self.external_seq {
+            Some(ext) => {
+                let seq = ext.fetch_add(1, Ordering::Relaxed);
+                self.wal.append_at(op, key, value, seq)?;
+                Ok(seq)
+            }
+            None => self.wal.append(op, key, value),
+        }
     }
 
     /// 取 WAL 中 seq > `since_seq` 的记录（增量备份，M6-5）。
