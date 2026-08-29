@@ -55,6 +55,9 @@ pub struct Engine {
     inverted_exclude: std::collections::HashSet<String>,
     /// 倒排 term 长度上限（M8-P4）：超过自动跳过（长文本整串不进字典）；0 = 不限。
     max_term_len: usize,
+    /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
+    /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
+    skip_hotcache: bool,
 }
 
 /// 查询结果行：docid + 文档字节。
@@ -147,6 +150,7 @@ impl Engine {
             },
             inverted_exclude: cfg.inverted.exclude_fields.iter().cloned().collect(),
             max_term_len: cfg.inverted.max_term_len,
+            skip_hotcache: false,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -210,6 +214,13 @@ impl Engine {
         self.mem_ratio = ratio.clamp(0.0, 1.0);
     }
 
+    /// 批量导入模式开关（P40）：开启后 `put_nosync` 跳过 HotCache 失效/回填。
+    /// 批量导入只写不读，回填缓存纯浪费内存（默认 4GB 预算会把文档全部塞入，
+    /// 叠加桌面负载触发页面颠簸 → 行速崩塌）。导入结束后应关闭恢复常规缓存语义。
+    pub fn set_bulk_import(&mut self, on: bool) {
+        self.skip_hotcache = on;
+    }
+
     /// 写入文档（docid + 序列化字节 + 该文档涉及的倒排词条）。
     /// 写失效链：先失效 HotCache 与组合索引旧条目，最后写 LSM（design 6.6）。
     /// OOM Guardian：写入前按水位限流/熔断（design 14.1.1）。
@@ -223,8 +234,10 @@ impl Engine {
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
     pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
-        // ① 失效 HotCache 该 docid
-        self.hotcache.invalidate(docid);
+        // ① 失效 HotCache 该 docid（批量导入模式跳过：只写不读，避免缓存膨胀挤爆内存，P40）
+        if !self.skip_hotcache {
+            self.hotcache.invalidate(docid);
+        }
         // ② 主数据（权威源，WAL 攒批不逐条 fsync）；全量覆盖 → 清空该 docid 的增量（避免旧 patch 覆盖新数据）
         self.primary
             .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
@@ -236,8 +249,10 @@ impl Engine {
                 self.inverted.add(t, docid);
             }
         }
-        // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中）
-        self.hotcache.put(docid, value);
+        // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中；批量导入模式跳过，P40）
+        if !self.skip_hotcache {
+            self.hotcache.put(docid, value);
+        }
         Ok(())
     }
 
@@ -680,6 +695,30 @@ mod tests {
         }
         let mut e2 = Engine::open(dir.path(), &cfg()).unwrap();
         assert_eq!(e2.get(49).unwrap().unwrap(), b"doc-49");
+    }
+
+    // ---------- 批量导入模式（P40） ----------
+
+    #[test]
+    fn bulk_import_skips_hotcache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 默认：写后回填 HotCache
+        e.put_nosync(1, b"doc-1".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 1, "默认写后应回填热缓存");
+        // 批量导入模式：只写不读，跳过回填（P40 防缓存膨胀挤爆内存）
+        e.set_bulk_import(true);
+        e.put_nosync(2, b"doc-2".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 1, "批量导入模式不应回填热缓存");
+        // 关闭后恢复常规语义
+        e.set_bulk_import(false);
+        e.put_nosync(3, b"doc-3".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 2, "关闭后应恢复回填");
+        // 主数据不受影响：批量写入的文档仍可正常读取
+        e.set_bulk_import(true);
+        e.put_nosync(4, b"doc-4".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 2);
+        assert_eq!(e.get(4).unwrap().unwrap(), b"doc-4");
     }
 
     #[test]

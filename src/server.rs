@@ -203,7 +203,10 @@ pub fn extract_terms(val: &Value) -> Vec<String> {
 
 /// 提取倒排词条并按字段白名单过滤（M8-P4）：`include` 非空时只生成声明字段的 term
 /// （不匹配字段的 term **不分配**——长文本/高基数字段整串 term 的分配浪费在生成前消除）。
-pub fn extract_terms_filtered(val: &Value, include: Option<&std::collections::HashSet<String>>) -> Vec<String> {
+pub fn extract_terms_filtered(
+    val: &Value,
+    include: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
     let mut terms = Vec::new();
     collect_strings(val, &mut terms, &[], include);
     terms

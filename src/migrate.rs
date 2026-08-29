@@ -102,6 +102,8 @@ fn import_csv_worker(
     cp_path: Option<&std::path::Path>,
 ) -> Result<ImportReport> {
     let t = Instant::now();
+    // P40：批量导入只写不读，跳过 HotCache 回填/失效
+    engine.set_bulk_import(true);
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -477,6 +479,8 @@ fn import_json_worker(
     cp_path: Option<&std::path::Path>,
 ) -> Result<ImportReport> {
     let t = Instant::now();
+    // P40：批量导入只写不读，跳过 HotCache 回填/失效
+    engine.set_bulk_import(true);
     let text = std::fs::read_to_string(path)?;
     let mut rows = 0u64;
     let mut failed = 0u64;
@@ -580,6 +584,8 @@ pub fn import_parquet(
     whitelist: Option<&[String]>,
 ) -> Result<ImportReport> {
     let t = Instant::now();
+    // P40：批量导入只写不读，跳过 HotCache 回填/失效（避免 4GB 缓存灌满挤爆内存触发页面颠簸）
+    engine.set_bulk_import(true);
     let file =
         std::fs::File::open(path).map_err(|e| Error::Migrate(format!("Parquet 打开失败: {e}")))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -644,11 +650,33 @@ pub fn import_parquet(
                 Ok(()) => {
                     rows += 1;
                     since_flush += 1;
+                    // 细粒度进度（每 10 万行，定位卡点行区间用）
+                    if rows % 100_000 == 0 {
+                        use std::io::Write;
+                        println!(
+                            "  [progress] {rows} 行 · 累计 {:.0}s · {:.0} 行/s",
+                            t.elapsed().as_secs_f64(),
+                            rows as f64 / t.elapsed().as_secs_f64()
+                        );
+                        std::io::stdout().flush().ok();
+                    }
                     if since_flush >= FLUSH_EVERY {
+                        let t0 = std::time::Instant::now();
                         engine.flush_wal()?;
+                        let t1 = std::time::Instant::now();
                         engine.flush_inverted()?; // 倒排 posting 定期刷段，控制内存
+                        let t2 = std::time::Instant::now();
+                        engine.flush_primary()?; // 主数据强制刷盘（防 memtable 异常累积卡顿）
+                        let t3 = std::time::Instant::now();
                         since_flush = 0;
-                        println!("[import-parquet] 已导入 {rows} 行（倒排段已刷盘）",);
+                        println!(
+                            "[import-parquet] 已导入 {rows} 行（WAL {:.1}s / 倒排 {:.1}s / 主 {:.1}s）",
+                            t1.duration_since(t0).as_secs_f64(),
+                            t2.duration_since(t1).as_secs_f64(),
+                            t3.duration_since(t2).as_secs_f64()
+                        );
+                        use std::io::Write;
+                        std::io::stdout().flush().ok(); // 实时进度（管道缓冲）
                     }
                 }
                 Err(_) => failed += 1,
