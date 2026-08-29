@@ -1632,6 +1632,25 @@ impl RuntimePools {
 
 ---
 
+### 7.46 Ex-4 倒排字段策略落地（design_extension 9.4，db-50m 重建验证 + 配置固化）
+
+> 背景：9.3 三准则（枚举建倒排 / 高基数排除 / 长文本分词）与 9.4 模板已设计，本里程碑
+> 落到 50M 正式库验证 + 配置模板固化。
+
+1. ~~**重建**~~ ✅（Ex-4.1）：`config-ex4.toml`（`inverted_fields` 7 枚举 + `exclude_fields=
+   ["note"]` + `max_term_len=96`）重导到 `D:\shanshui-data\db-50m-opt`（新建目录，不动既有
+   数据资产）——50,000,000 行成功 / 0 失败，**838,208 ms**（59.7k rows/s，含倒排 FST 构建）；
+   **inverted 2231.8MB → 144.3MB（-93.5%，16.9×）**，优于 ~200MB 预估。
+2. ~~**验证**~~ ✅（Ex-4.2，CLI count + HTTP /get）：`status=active`=16,666,667 ✓、
+   `city=beijing`=10,000,000 ✓、`tag_b=x`=25,000,000 ✓；点查 docid=0 / 25,000,000 /
+   49,999,999 全部命中（含边界 0 与末条）。⚠️ 注意：db-50m-clean 实为 **4M 条**中间产物
+   （status=active=1,333,334），非 50M 基线——基线取原始 db-50m（inverted 2231.8MB）。
+3. ~~**固化**~~ ✅（Ex-4.3/4.4）：仓库新增 `config.import-example.toml`（9.4 模板 + 实测收益）；
+   `src/config/model.rs` `inverted_fields` 注释引用 9.4；design_extension 9.5 回填实测；
+   feature.md C 模块 + 近期里程碑更新。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

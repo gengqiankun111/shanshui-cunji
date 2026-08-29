@@ -175,10 +175,14 @@ exclude_fields = ["note"]                          # 高基数/唯一字段
 max_term_len = 96                                  # 超长自动跳过（兜底）
 ```
 
-## 9.5 量化收益（db-50m 优化重建）
+## 9.5 量化收益（db-50m 优化重建，Ex-4 ✅ 实测回填）
 
-按 9.3/9.4 排除 note 并白名单锁定后：inverted 2.2GB → **~200MB 量级**，段构建时间同步下降，
-`status/city` 等查询不变。落地任务见 development_extension.md **Ex-4**。
+按 9.3/9.4 排除 note 并白名单锁定后，Ex-4 重导到 `D:\shanshui-data\db-50m-opt` 实测：
+- **inverted 2231.8MB → 144.3MB（-93.5%，16.9×）**，优于 ~200MB 预估（FST 字典 + 7 枚举低基数
+  posting 密集压缩）；
+- 导入 50M 行 **838,208 ms**（59.7k rows/s，含倒排段构建）；`status/city/tag` 等计数与点查
+  全部不变（status=active 16,666,667 / city=beijing 10,000,000 / tag_b=x 25,000,000）；
+- 配置模板：仓库 `config.import-example.toml`；落地任务 development_extension.md **Ex-4** ✅。
 
 ---
 

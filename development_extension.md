@@ -115,19 +115,25 @@ demo 对比数据 + 决策报告（记录到 development_extension.md 状态）�
 
 ### 任务分解
 
-- [ ] **Ex-4.1 重建 50M 倒排**：用 9.4 配置模板（`inverted_fields` 7 枚举 + `exclude_fields=["note"]`
-      + `max_term_len=96`）重建 db-50m（保留主数据，重导/重刷倒排）——记录 inverted 大小、
-      段构建时间 vs 现状（2.2GB）。
-- [ ] **Ex-4.2 验证**：`status=active`=16,666,667、`city=beijing`=10,000,000、`tag_b=x`=25,000,000
-      计数不变；点查 docid=0/25M/49999999 命中；倒排体积与导入总耗时对比报告。
-- [ ] **Ex-4.3 配置模板固化**：`src/config/model.rs` 注释引用 design_extension 9.4；提供一个
-      `config.import-example.toml`（gitignore 除外）或文档示例供实际开发复制。
-- [ ] **Ex-4.4 更新文档**：feature.md C 模块状态、problem_solving.md（若遇新问题 P#）、
-      design_extension.md 9.5 量化收益回填实测值。
+- [x] **Ex-4.1 重建 50M 倒排**：用 9.4 配置模板（`inverted_fields` 7 枚举 + `exclude_fields=["note"]`
+      + `max_term_len=96`）重导到 **`D:\shanshui-data\db-50m-opt`**（新建，不动既有库）——
+      `shanshui-cunji-import --parquet ds-50m.parquet --config config-ex4.toml`：
+      50,000,000 行成功 / 0 失败，**838,208 ms**（59.7k rows/s，含倒排 FST 构建）；
+      **inverted 2231.8MB → 144.3MB（-93.5%，16.9×）**，优于 ~200MB 预估。
+- [x] **Ex-4.2 验证**（CLI count + HTTP /get）：
+      `status=active`=**16,666,667** ✓、`city=beijing`=**10,000,000** ✓、`tag_b=x`=**25,000,000** ✓
+      计数与优化前一致；点查 docid=0/25,000,000/49,999,999 全部命中（含边界 0 与末条）；
+      注：db-50m-clean 实为 4M 条中间产物（status=active=1,333,334），非 50M 基线，基线取原始
+      db-50m（primary 3.7GB + inverted 2231.8MB）。
+- [x] **Ex-4.3 配置模板固化**：仓库新增 `config.import-example.toml`（9.4 模板 + 实测收益注释）；
+      `src/config/model.rs` `InvertedConfig::inverted_fields` 注释引用 design_extension 9.4。
+- [x] **Ex-4.4 更新文档**：design_extension.md 9.5 回填实测（2231.8MB → 144.3MB）；feature.md
+      C 模块状态；development.md 7.46。
 
 ### 验证
 
-重建后 db-50m 倒排体积/构建时间对比 + 计数/点查断言全过（复用现有集成测试断言）。
+重建后 db-50m 倒排体积/构建时间对比 + 计数/点查断言全过（复用现有集成测试断言）。✅ 完成。
+- inverted **2231.8 → 144.3MB**（-93.5%）；导入 838s 含倒排段构建（逐字段倒排追加 0.1s/百万级）；计数/点查全命中。
 
 ### 依赖
 
@@ -249,7 +255,7 @@ Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension 
 | Ex-1 | 本地消息表 + 幂等消费 | ✅ | `7348acd` |
 | Ex-2 | SAGA 编排 + 补偿状态机 | ✅ | `990bf6b`（Ex-2.5 网关 HTTP API 留待分布式阶段） |
 | Ex-3 | Calvin 确定性事务评估 | ✅ 评估完成（🔍 不进入 kernel，远期方向保留） | demo `src/demo/calvin` |
-| Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
+| Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ✅ | `db-50m-opt`（inverted 2231.8→144.3MB） |
 | Ex-5 | SSD 原生迁移（P0 ✅ + P1 环形 WAL/删除位图/FST/解耦 ✅ + P2 冷热/条带化 ✅） | ✅ | `e6a5610` 等 |
 | Ex-6 | 并发读优化（Ex-6.1 Seqlock 原语 ✅ → 6.2 段清单 ArcSwap ✅ / 6.3 FST 字典 Arc ✅，依赖读写分离解除全局锁） | 🔄 | `c8183cf` |
 | Ex-7 | 多核优化（Ex-7.1 PerCpuCounter ✅ / 7.2 绑核 ✅ / 7.3 io_uring 队列抽象 ✅ / 7.4 动态限流 ✅） | ✅ | `ddbc20e` 等 |

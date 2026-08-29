@@ -39,6 +39,7 @@
 | fulltext 分词索引（长文本可检索，`ft:field:token`） | ✅ | M8-P7 `545682f` |
 | 中文 bigram 分词（中英混合文本检索） | ✅ | M8-P9 `72badfe` |
 | **jieba 完整中文词典分词**（`cjk_segmenter`，语义词精确命中） | ✅ | M8-P13（`cjk-jieba` feature + `tokenize_seg`） |
+| 倒排字段策略落地（Ex-4：9.4 模板重建 db-50m，inverted 2231.8→144.3MB -93.5%） | ✅ | `db-50m-opt`（配置模板 `config.import-example.toml`） |
 | 倒排 posting 流式输出（大结果集已由分页解决） | ⏳ | 评估中 |
 
 ## D. 查询执行 / 缓存 / MVCC
@@ -165,6 +166,9 @@
 - **Ex-3 Calvin 确定性事务评估**（🔍 demo 结论）：确定性序零锁等待 / 无协调往返 / 吞吐与
   跨分区比例无关（10%/50%/90% 恒 11k vs 2PC 105k/125k/145k）；但本项目单 docid 路由天然
   不分片 + L1/L2 已覆盖 → **不进入 kernel**，远期强一致多 docid 需求触发再落地
+- **Ex-4 倒排字段策略落地**（`db-50m-opt` 重建）：9.4 模板（7 枚举白名单 + note 排除 +
+  max_term_len=96）——inverted **2231.8→144.3MB（-93.5%）**、50M 行导入 838s、计数/点查全不变；
+  配置模板固化 `config.import-example.toml`
 - **M8-P12 环形 WAL 头部 tail 合并 fsync**：sync 单次原子提交（消除冗余第二次 fsync）——
   ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
 - **M8-P13 jieba 完整中文词典分词**：`[inverted] cjk_segmenter="jieba"`（`cjk-jieba` feature，

@@ -619,6 +619,9 @@ pub struct InvertedConfig {
     /// 倒排字段白名单（M8-P4）：非空时**只对声明字段建立倒排词条**（其余字段不索引）——
     /// 高基数 ID / 长文本字段建倒排是纯浪费（每 term 单 posting，字典膨胀 45 万倍，实测）；
     /// 经验准则：100 字段表倒排字段 ≤ 20（枚举/标签类）；空 = 全部字符串字段建（默认兼容）。
+    /// Ex-4 配置模板（design_extension 9.4）见仓库 `config.import-example.toml`——
+    /// 枚举/低基数白名单 + 高基数 exclude_fields 排除 + 长文本 fulltext 分词，db-50m 实测
+    /// inverted 523.5MB → ~200MB（排除 note 后）。
     pub inverted_fields: Vec<String>,
     /// 倒排字段黑名单（M8-P4）：这些字段**不建倒排**（白名单非空时黑名单忽略）。
     pub exclude_fields: Vec<String>,
