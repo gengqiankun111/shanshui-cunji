@@ -198,16 +198,220 @@ pub fn parse_filter(filter: &str) -> Vec<(String, String)> {
 /// term 编码：`{字段路径}={值}`（如 `status=active`、`meta.device=ios`），
 /// 路径用 `.` 连接——带字段维度，供 COUNT / GROUP BY 按字段聚合（development 5.17）。
 pub fn extract_terms(val: &Value) -> Vec<String> {
+    extract_terms_filtered(val, None)
+}
+
+/// 提取倒排词条并按字段白名单过滤（M8-P4）：`include` 非空时只生成声明字段的 term
+/// （不匹配字段的 term **不分配**——长文本/高基数字段整串 term 的分配浪费在生成前消除）。
+pub fn extract_terms_filtered(
+    val: &Value,
+    include: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    extract_terms_with_fulltext(val, include, None)
+}
+
+/// fulltext 分词索引（M8-P7）：`extract_terms_filtered` 的超集——
+/// `fulltext` 集合中声明的字段做**分词建词 term**（`ft:{field}:{token}`）**取代整串 term**：
+/// 长文本整串（>max_term_len）会被跳过无法检索；分词后 token 短可建索引、支持关键词检索。
+/// 其余字段维持整串 term（受 include 白名单过滤）；两者命名空间不冲突（`ft:` 前缀独立）。
+/// 中文分词用 bigram（M8-P9）；需 jieba 词典分词请用 `extract_terms_with_fulltext_seg`。
+pub fn extract_terms_with_fulltext(
+    val: &Value,
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    extract_terms_with_fulltext_seg(val, include, fulltext, false)
+}
+
+/// 同 `extract_terms_with_fulltext`，但可指定中文分词器（M8-P13）：
+/// `use_jieba=true` 时 fulltext 字段中文用 jieba 完整词典分词（语义词，非 bigram 碎片）。
+pub fn extract_terms_with_fulltext_seg(
+    val: &Value,
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+    use_jieba: bool,
+) -> Vec<String> {
     let mut terms = Vec::new();
-    collect_strings(val, &mut terms, &[]);
+    collect_strings(val, &mut terms, &[], include, fulltext, use_jieba);
     terms
 }
 
-fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
+/// 分词（bigram，M8-P7 + M8-P9）：ASCII 字母数字 → 单词（小写归一）；
+/// 连续中文/非 ASCII → bigram（相邻 2 字，单字回退 unigram），零依赖。
+/// jieba 词典分词请用 `tokenize_seg(text, true)`。
+pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_seg(text, false)
+}
+
+/// 分词并按中文分词器选择（M8-P13）：`use_jieba` → jieba 完整词典分词（需 cjk-jieba feature，
+/// 关闭时回退 bigram）；否则 bigram。
+pub fn tokenize_seg(text: &str, use_jieba: bool) -> Vec<String> {
+    #[cfg(feature = "cjk-jieba")]
+    {
+        if use_jieba {
+            return tokenize_jieba(text);
+        }
+    }
+    tokenize_bigram(text)
+}
+
+#[cfg(feature = "cjk-jieba")]
+static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cjk-jieba")]
+fn jieba() -> &'static jieba_rs::Jieba {
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
+}
+
+/// jieba 完整中文词典分词（M8-P13）：ASCII 字母数字 → 单词（小写归一，同 bigram 规则）；
+/// 中文/非 ASCII 块 → jieba 词典切分（语义词，非 bigram 碎片）；过滤标点/空白 token。
+#[cfg(feature = "cjk-jieba")]
+fn tokenize_jieba(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut ascii_word = String::new();
+    let mut cjk = String::new();
+    let j = jieba();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            if !cjk.is_empty() {
+                out.extend(jieba_cut(j, &cjk));
+                cjk.clear();
+            }
+            ascii_word.push(c.to_ascii_lowercase());
+        } else if c.is_alphanumeric() {
+            // 非 ASCII 字母数字（CJK 等）：结束 ASCII 单词，进入中文块
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            cjk.push(c);
+        } else {
+            // 分隔符
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            if !cjk.is_empty() {
+                out.extend(jieba_cut(j, &cjk));
+                cjk.clear();
+            }
+        }
+    }
+    if !ascii_word.is_empty() {
+        out.push(ascii_word);
+    }
+    if !cjk.is_empty() {
+        out.extend(jieba_cut(j, &cjk));
+    }
+    out
+}
+
+#[cfg(feature = "cjk-jieba")]
+fn jieba_cut(j: &jieba_rs::Jieba, text: &str) -> Vec<String> {
+    j.cut(text, true)
+        .into_iter()
+        .map(|t| t.word.to_string())
+        .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+        .collect()
+}
+
+/// bigram 分词（M8-P7 + 中文 bigram M8-P9）：按字符类分段——
+/// **ASCII 字母数字** → 单词 token（按非字母数字边界切分 + 小写归一，原有行为）；
+/// **连续中文/非 ASCII 字母数字** → bigram（相邻 2 字一个 token，单字回退 unigram）——
+/// 中文整串当单 token 无法检索（7.14 已知限制），bigram 与 Elasticsearch ngram /
+/// Lucene CJKAnalyzer 同款（中文检索事实标准），零依赖、无词典、索引膨胀 ≈ 字数。
+pub fn tokenize_bigram(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut ascii_word = String::new();
+    let mut cjk = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            if !cjk.is_empty() {
+                out.extend(cjk_bigram(&cjk));
+                cjk.clear();
+            }
+            ascii_word.push(c.to_ascii_lowercase());
+        } else if c.is_alphanumeric() {
+            // 非 ASCII 字母数字（CJK 等）：结束 ASCII 单词，进入中文块
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            cjk.push(c);
+        } else {
+            // 分隔符
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            if !cjk.is_empty() {
+                out.extend(cjk_bigram(&cjk));
+                cjk.clear();
+            }
+        }
+    }
+    if !ascii_word.is_empty() {
+        out.push(ascii_word);
+    }
+    if !cjk.is_empty() {
+        out.extend(cjk_bigram(&cjk));
+    }
+    out
+}
+
+/// 中文块 bigram：长度 1 → 单字 unigram（保证单字可查）；≥2 → 相邻 2 字。
+fn cjk_bigram(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() == 1 {
+        return vec![chars[0].to_string()];
+    }
+    chars.windows(2).map(|w| w.iter().collect()).collect()
+}
+
+/// 由分词结果生成 fulltext 词 term：`ft:{field}:{token}`；同一字段值内重复 token 去重
+/// （避免 posting 重复 docid 浪费内存）。中文分词 bigram（M8-P9）。
+pub fn fulltext_terms(field: &str, text: &str) -> Vec<String> {
+    fulltext_terms_seg(field, text, false)
+}
+
+/// 同 `fulltext_terms`，可指定中文分词器（M8-P13）：`use_jieba` → jieba 词典分词。
+pub fn fulltext_terms_seg(field: &str, text: &str, use_jieba: bool) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tokenize_seg(text, use_jieba)
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .map(|t| format!("ft:{field}:{t}"))
+        .collect()
+}
+
+/// 单字段 term 生成：fulltext 字段 → 分词词 term（不建整串）；否则整串 term（受白名单过滤）。
+fn push_field_term(
+    out: &mut Vec<String>,
+    field: &str,
+    s: &str,
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+    use_jieba: bool,
+) {
+    if let Some(ft) = fulltext {
+        if ft.contains(field) {
+            out.extend(fulltext_terms_seg(field, s, use_jieba));
+            return;
+        }
+    }
+    if include.map_or(true, |inc| inc.contains(field)) {
+        out.push(format!("{field}={s}"));
+    }
+}
+
+fn collect_strings(
+    val: &Value,
+    out: &mut Vec<String>,
+    path: &[&str],
+    include: Option<&std::collections::HashSet<String>>,
+    fulltext: Option<&std::collections::HashSet<String>>,
+    use_jieba: bool,
+) {
     match val {
         Value::String(s) => {
-            // 数组元素等叶子字符串：用完整路径生成 term
-            out.push(format!("{}={}", path.join("."), s));
+            // 数组元素等叶子字符串：用完整路径生成 term（白名单非空时仅保留声明字段）
+            push_field_term(out, &path.join("."), s, include, fulltext, use_jieba);
         }
         Value::Object(map) => {
             for (k, v) in map {
@@ -217,9 +421,9 @@ fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
                 let mut p = path.to_vec();
                 p.push(k.as_str());
                 if let Value::String(s) = v {
-                    out.push(format!("{}={}", p.join("."), s));
+                    push_field_term(out, &p.join("."), s, include, fulltext, use_jieba);
                 } else {
-                    collect_strings(v, out, &p);
+                    collect_strings(v, out, &p, include, fulltext, use_jieba);
                 }
             }
         }
@@ -228,7 +432,7 @@ fn collect_strings(val: &Value, out: &mut Vec<String>, path: &[&str]) {
                 let mut p = path.to_vec();
                 let idx = i.to_string();
                 p.push(&idx);
-                collect_strings(v, out, &p);
+                collect_strings(v, out, &p, include, fulltext, use_jieba);
             }
         }
         _ => {}
@@ -252,6 +456,7 @@ fn route_request(
         ("POST", "/patch") => handle_patch(engine, body),
         ("GET", "/get") => handle_get(engine, query),
         ("GET", "/search") => handle_search(engine, query),
+        ("GET", "/fulltext") => handle_fulltext(engine, query),
         ("GET", "/range") => handle_range(engine, query),
         ("GET", "/count") => handle_count(engine, query),
         ("GET", "/groupby") => handle_group_by(engine, query),
@@ -439,7 +644,8 @@ fn handle_put(engine: &mut Engine, body: &[u8]) -> (u16, String) {
             json!({"error": "docid 超出倒排索引支持范围（< 2^32）"}).to_string(),
         );
     }
-    let terms = extract_terms(&val);
+    let terms =
+        extract_terms_with_fulltext_seg(&val, None, Some(engine.fulltext_fields()), engine.use_jieba());
     let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
     match engine.put(docid, body.to_vec(), &term_refs) {
         Ok(()) => (
@@ -475,25 +681,70 @@ fn handle_search(engine: &mut Engine, query: &str) -> (u16, String) {
     else {
         return (400, json!({"error": "缺少 filter 参数"}).to_string());
     };
-    match execute_filter(engine, &filter) {
-        Ok(rows) => (200, rows_payload(&rows).to_string()),
+    let (limit, offset) = parse_paging(query);
+    match execute_filter_paged(engine, &filter, limit, offset) {
+        Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
+        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    }
+}
+
+/// fulltext 分词检索（M8-P7）：`GET /fulltext?field=big_text_a&word=rec` →
+/// 命中该字段分词 term `ft:{field}:{word}` 的文档列表（posting 合并 → 回表）。
+/// M8-P8：支持 `limit`/`offset` 分页（大结果集防内存爆炸），`total` = 全量命中数。
+fn handle_fulltext(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let field = params
+        .iter()
+        .find(|(k, _)| k == "field")
+        .map(|(_, v)| v.clone());
+    let word = params
+        .iter()
+        .find(|(k, _)| k == "word")
+        .map(|(_, v)| v.clone());
+    let (Some(field), Some(word)) = (field, word) else {
+        return (400, json!({"error": "缺少 field/word 参数"}).to_string());
+    };
+    let (limit, offset) = parse_paging(query);
+    match engine.fulltext_search_paged(&field, &word, limit, offset) {
+        Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
 }
 
 fn handle_range(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);
-    let start = params
-        .iter()
-        .find(|(k, _)| k == "start")
-        .and_then(|(_, v)| v.parse::<u64>().ok());
     let end = params
         .iter()
         .find(|(k, _)| k == "end")
         .and_then(|(_, v)| v.parse::<u64>().ok());
-    match engine.scan_range(start, end) {
-        Ok(rows) => (200, rows_payload(&rows).to_string()),
-        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+    let after = params
+        .iter()
+        .find(|(k, _)| k == "after")
+        .and_then(|(_, v)| v.parse::<u64>().ok());
+    let (limit, offset) = parse_paging(query);
+    // 游标续扫模式（M8-P11）：`GET /range?after=LAST&limit=N`——取满即止、无 total 全扫，
+    // 每页返回 rows（用末条 docid 作下一页 after），全库遍历每页 O(limit)。
+    if let Some(after) = after {
+        let cap = limit.unwrap_or(u64::MAX);
+        match engine.scan_after(Some(after), end, cap) {
+            Ok(rows) => (
+                200,
+                json!({
+                    "rows": rows.iter().map(|(d, v)| value_row(*d, v)).collect::<Vec<_>>()
+                })
+                .to_string(),
+            ),
+            Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+        }
+    } else {
+        let start = params
+            .iter()
+            .find(|(k, _)| k == "start")
+            .and_then(|(_, v)| v.parse::<u64>().ok());
+        match engine.scan_range_paged(start, end, limit, offset) {
+            Ok(page) => (200, rows_payload_total(page.total, &page.rows).to_string()),
+            Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+        }
     }
 }
 
@@ -526,53 +777,94 @@ fn value_row(docid: u64, raw: &[u8]) -> Value {
     }
 }
 
-/// 将查询结果组装为 `{"total":N,"rows":[...]}`。
-fn rows_payload(rows: &[(u64, Vec<u8>)]) -> Value {
+/// 分页响应（M8-P8）：`total` = 全量命中数（≠ 当前页行数，供客户端计算总页数）。
+fn rows_payload_total(total: u64, rows: &[(u64, Vec<u8>)]) -> Value {
     let items: Vec<Value> = rows.iter().map(|(d, v)| value_row(*d, v)).collect();
-    json!({"total": items.len(), "rows": items})
+    json!({"total": total, "rows": items})
 }
 
 // ---------------------------------------------------------------------------
 // 查询执行（CLI 与 HTTP 共用内核路径）
 // ---------------------------------------------------------------------------
 
+/// 解析分页参数：`limit`（>0 生效，缺省/≤0 = 不限制）、`offset`（默认 0）。
+fn parse_paging(query: &str) -> (Option<u64>, u64) {
+    let params = parse_query(query);
+    let limit = params
+        .iter()
+        .find(|(k, _)| k == "limit")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .filter(|l| *l > 0);
+    let offset = params
+        .iter()
+        .find(|(k, _)| k == "offset")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    (limit, offset)
+}
+
 /// 按 filter 执行查询：
 /// - `docid=N` → 主键点查；
 /// - 单条件 → 倒排词条查询（term 编码 `field=value`，与 extract_terms 一致）；
 /// - 多条件（AND）→ 各词条位图交集后回表。
 pub fn execute_filter(engine: &mut Engine, filter: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+    Ok(execute_filter_paged(engine, filter, None, 0)?.rows)
+}
+
+/// 按 filter 分页执行（M8-P8）：倒排命中数很大时只回表当前页（`limit`/`offset`），
+/// `total` = 全量命中数——防大结果集全量回表 + JSON 构造内存爆炸。
+pub fn execute_filter_paged(
+    engine: &mut Engine,
+    filter: &str,
+    limit: Option<u64>,
+    offset: u64,
+) -> Result<crate::engine::PagedRows> {
     let conds = parse_filter(filter);
     if conds.is_empty() {
-        return engine.scan_range(None, None);
+        return engine.scan_range_paged(None, None, limit, offset);
     }
     // 主键条件优先
     if let Some((_, v)) = conds.iter().find(|(f, _)| f == "docid") {
         let docid: u64 = v
             .parse()
             .map_err(|_| Error::Unsupported(format!("docid 非法: {v}")))?;
-        return Ok(engine
+        let rows = engine
             .get(docid)?
             .map(|val| (docid, val))
             .into_iter()
-            .collect());
+            .collect::<Vec<_>>();
+        return Ok(crate::engine::PagedRows {
+            total: rows.len() as u64,
+            rows,
+        });
     }
     // field=value 编码成倒排 term
     let terms: Vec<String> = conds.iter().map(|(f, v)| format!("{f}={v}")).collect();
     if terms.len() == 1 {
-        return engine.search_term(&terms[0]);
+        return engine.search_term_paged(&terms[0], limit, offset);
     }
-    // 多条件 AND：位图交集（RoaringBitmap）→ 回表
+    // 多条件 AND：位图交集（RoaringBitmap）→ 分页回表
     let mut bitmap = engine.inverted_posting(&terms[0])?;
     for t in &terms[1..] {
         bitmap &= engine.inverted_posting(t)?;
     }
-    let mut out = Vec::new();
+    let total = bitmap.len() as u64;
+    let mut rows = Vec::new();
+    let cap = limit.unwrap_or(u64::MAX);
+    let mut skipped = 0u64;
     for docid in bitmap {
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        if rows.len() as u64 >= cap {
+            break;
+        }
         if let Some(val) = engine.get(docid as u64)? {
-            out.push((docid as u64, val));
+            rows.push((docid as u64, val));
         }
     }
-    Ok(out)
+    Ok(crate::engine::PagedRows { total, rows })
 }
 
 /// COUNT(field=value)：读倒排 term 的 doc_count 直接返回（<0.1ms，development 5.17）。
@@ -729,6 +1021,131 @@ mod tests {
         let terms = extract_terms(&v);
         assert!(terms.contains(&"tags.0=hot".to_string()));
         assert!(terms.contains(&"tags.1=new".to_string()));
+    }
+
+    // ---------- fulltext 分词索引（M8-P7） ----------
+
+    #[test]
+    fn tokenize_fulltext_boundaries() {
+        // ASCII 典型文本（gen_dataset big_text 格式）
+        assert_eq!(
+            tokenize("rec-00000001-msg-73-tag42"),
+            vec!["rec", "00000001", "msg", "73", "tag42"]
+        );
+        // 大小写归一 / 空串 / 纯分隔符 / 重复分隔符
+        assert_eq!(tokenize("Hello World!"), vec!["hello", "world"]);
+        assert_eq!(tokenize("ABC-def"), vec!["abc", "def"]);
+        assert!(tokenize("").is_empty());
+        assert!(tokenize("---").is_empty());
+        assert_eq!(tokenize("a--b--"), vec!["a", "b"]);
+        // Unicode：连续中文字符 → bigram（M8-P9；单字回退 unigram）
+        assert_eq!(
+            tokenize("山水存迹数据库"),
+            vec!["山水", "水存", "存迹", "迹数", "数据", "据库"]
+        );
+        assert_eq!(tokenize("山"), vec!["山"], "单字中文回退 unigram");
+        // 混合：ASCII 单词独立 + 中文 bigram
+        assert_eq!(tokenize("Rust数据库"), vec!["rust", "数据", "据库"]);
+        assert_eq!(tokenize("hello山水world"), vec!["hello", "山水", "world"]);
+        // 中文 + 标点分隔
+        assert_eq!(tokenize("山水，存迹"), vec!["山水", "存迹"]);
+    }
+
+    #[test]
+    fn jieba_tokenize_seg_meaningful_words() {
+        // M8-P13：jieba 完整词典分词——语义词整体切出（非 bigram 碎片）
+        let words = tokenize_seg("山水存迹数据库存储引擎", true);
+        assert!(
+            words.contains(&"数据库".to_string()),
+            "词典词应整体切出: {words:?}"
+        );
+        // 同文本 bigram 对比：碎片更多
+        let bg = tokenize_seg("山水存迹数据库存储引擎", false);
+        assert!(bg.contains(&"数据".to_string()) && bg.contains(&"据库".to_string()));
+        assert!(bg.len() >= words.len(), "jieba 词数应 ≤ bigram 碎片数");
+        // 中英混合：英文单词保留 + 中文词典词
+        let mixed = tokenize_seg("基于Rust的LSM树文档数据库", true);
+        assert!(mixed.contains(&"rust".to_string()), "英文单词应保留: {mixed:?}");
+        assert!(mixed.contains(&"数据库".to_string()));
+        // 标点/空白过滤
+        assert!(tokenize_seg("，。！ ", true).is_empty());
+        // 默认 tokenize = bigram（不受 jieba 影响）
+        assert_eq!(tokenize("数据库"), vec!["数据", "据库"]);
+    }
+
+    #[test]
+    fn extract_fulltext_terms_field_precedence() {
+        let v: Value =
+            serde_json::from_str(r#"{"docid":1,"status":"active","big_text":"rec-0001-msg-77"}"#)
+                .unwrap();
+        let ft: std::collections::HashSet<String> =
+            ["big_text".to_string()].into_iter().collect();
+        let terms = extract_terms_with_fulltext(&v, None, Some(&ft));
+        // fulltext 字段：分词建词 term（含去重），不建整串
+        assert!(terms.contains(&"ft:big_text:rec".to_string()));
+        assert!(terms.contains(&"ft:big_text:0001".to_string()));
+        assert!(terms.contains(&"ft:big_text:77".to_string()));
+        assert!(
+            !terms.iter().any(|t| t == "big_text=rec-0001-msg-77"),
+            "fulltext 字段不应建整串 term"
+        );
+        // 非 fulltext 字段整串 term 不受影响
+        assert!(terms.contains(&"status=active".to_string()));
+    }
+
+    #[test]
+    fn extract_fulltext_orthogonal_to_whitelist() {
+        let v: Value =
+            serde_json::from_str(r#"{"docid":1,"status":"active","big_text":"rec-0001"}"#).unwrap();
+        let include: std::collections::HashSet<String> =
+            ["status".to_string()].into_iter().collect();
+        let ft: std::collections::HashSet<String> =
+            ["big_text".to_string()].into_iter().collect();
+        let terms = extract_terms_with_fulltext(&v, Some(&include), Some(&ft));
+        // fulltext 字段不受白名单影响（正交）：分词词 term 保留
+        assert!(terms.iter().any(|t| t.starts_with("ft:big_text:")));
+        // 非 fulltext 字段受白名单过滤：big_text 整串 / 其他字段整串被剔除
+        assert!(!terms.iter().any(|t| t.starts_with("big_text=")));
+    }
+
+    // ---------- 分页查询（M8-P8） ----------
+
+    #[test]
+    fn execute_filter_paged_returns_total_and_limit() {
+        let dir = tmp();
+        let mut e = crate::engine::Engine::open(&dir, &cfg()).unwrap();
+        for i in 0..100u64 {
+            let status = ["active", "inactive", "pending"][(i % 3) as usize];
+            let val = serde_json::json!({"docid": i, "status": status});
+            let terms = extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(i, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+        // 单条件分页：total = 全量命中，rows = 当前页
+        let p = execute_filter_paged(&mut e, "status=active", Some(10), 0).unwrap();
+        assert_eq!(p.total, 34);
+        assert_eq!(p.rows.len(), 10);
+        let last = execute_filter_paged(&mut e, "status=active", Some(10), 30).unwrap();
+        assert_eq!(last.rows.len(), 4, "尾页不足一页");
+        // 多条件 AND 分页
+        let and = execute_filter_paged(&mut e, "status=active AND status=active", Some(5), 0).unwrap();
+        assert_eq!(and.total, 34);
+        assert_eq!(and.rows.len(), 5);
+        // docid 点查不受分页影响
+        let point = execute_filter_paged(&mut e, "docid=7", Some(1), 0).unwrap();
+        assert_eq!(point.total, 1);
+        assert_eq!(point.rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_paging_query_params() {
+        assert_eq!(parse_paging(""), (None, 0));
+        assert_eq!(parse_paging("limit=10"), (Some(10), 0));
+        assert_eq!(parse_paging("limit=0"), (None, 0), "limit=0 视为不限制");
+        assert_eq!(parse_paging("limit=10&offset=20"), (Some(10), 20));
+        assert_eq!(parse_paging("offset=5"), (None, 5));
+        assert_eq!(parse_paging("limit=abc&offset=xyz"), (None, 0), "非法参数忽略");
     }
 
     #[test]

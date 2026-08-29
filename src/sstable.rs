@@ -1021,6 +1021,89 @@ impl SstReader {
     }
 }
 
+/// SST 范围扫描**流式迭代器**（M8-P10 scan 流式化）：块级惰性读取 + Zone Map 剪枝，
+/// 逐条 yield `(key, value, seq)`（value=None = Tombstone）。与 `scan_range` 语义一致，
+/// 但可暂停/推进（k-way merge 多源归并用），内存 O(块) 而非 O(全量)。
+pub struct SstRangeIter<'a> {
+    reader: &'a mut SstReader,
+    index: Vec<IndexEntry>,
+    block_idx: usize,
+    rows: Vec<DecodedRow>,
+    row_idx: usize,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+}
+
+impl<'a> SstRangeIter<'a> {
+    pub fn new(
+        reader: &'a mut SstReader,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Self> {
+        Ok(Self {
+            index: reader.index(),
+            reader,
+            block_idx: 0,
+            rows: Vec::new(),
+            row_idx: 0,
+            start: start.map(|s| s.to_vec()),
+            end: end.map(|e| e.to_vec()),
+        })
+    }
+
+    /// 推进到下一个候选块（Zone Map 剪枝），加载并解码；无更多块返回 false。
+    fn advance_block(&mut self) -> Result<bool> {
+        while self.block_idx < self.index.len() {
+            let e = self.index[self.block_idx].clone();
+            self.block_idx += 1;
+            // Zone Map 剪枝（与 scan_range 相同）
+            if let Some(s) = &self.start {
+                if e.max_key.as_slice() < s.as_slice() {
+                    continue;
+                }
+            }
+            if let Some(en) = &self.end {
+                if e.first_key.as_slice() > en.as_slice() {
+                    return Ok(false); // 索引按 key 有序，后续块更大
+                }
+            }
+            let data = self.reader.read_block(&e)?;
+            self.rows = decode_data_block(&data, self.reader.format)?;
+            self.row_idx = 0;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+impl<'a> Iterator for SstRangeIter<'a> {
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>, u64)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.row_idx >= self.rows.len() {
+                match self.advance_block() {
+                    Ok(true) => continue,
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            let (k, v, seq) = &self.rows[self.row_idx];
+            self.row_idx += 1;
+            if let Some(s) = &self.start {
+                if k.as_slice() < s.as_slice() {
+                    continue;
+                }
+            }
+            if let Some(en) = &self.end {
+                if k.as_slice() > en.as_slice() {
+                    return None; // 升序，后续更大
+                }
+            }
+            return Some(Ok((k.clone(), v.clone(), *seq)));
+        }
+    }
+}
+
 /// 解码块索引字节流。`version` 决定是否解析字段级 Zone Map（v3 无，v4 有）。
 fn decode_index(ib: &[u8], version: u16) -> Result<Vec<IndexEntry>> {
     let mut cur = 0usize;
@@ -1230,6 +1313,42 @@ mod tests {
             w.add(&k, &v, i).unwrap();
         }
         w.finish().unwrap()
+    }
+
+    #[test]
+    fn sst_range_iter_matches_scan_range() {
+        // M8-P10 流式迭代器：与 scan_range 输出完全一致（全量 + 范围过滤 + 升序）
+        let path = tmp();
+        write_sample(&path, 100);
+        let mut r = SstReader::open(&path).unwrap();
+        // 全量
+        let mut it_all: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        for row in SstRangeIter::new(&mut r, None, None).unwrap() {
+            it_all.push(row.unwrap());
+        }
+        let mut sc_all: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        r.scan_range(None, None, |k, v, seq| {
+            sc_all.push((k.to_vec(), v.map(|x| x.to_vec()), seq))
+        })
+        .unwrap();
+        assert_eq!(it_all, sc_all, "迭代器应与 scan_range 全量一致");
+        // 范围过滤（含 Zone Map 剪枝路径）
+        let lo = b"user-00000030".as_slice();
+        let hi = b"user-00000040".as_slice();
+        let mut it_rng: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        for row in SstRangeIter::new(&mut r, Some(lo), Some(hi)).unwrap() {
+            it_rng.push(row.unwrap());
+        }
+        let mut sc_rng: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        r.scan_range(Some(lo), Some(hi), |k, v, seq| {
+            sc_rng.push((k.to_vec(), v.map(|x| x.to_vec()), seq))
+        })
+        .unwrap();
+        assert_eq!(it_rng, sc_rng, "范围过滤迭代器应与 scan_range 一致");
+        // 升序
+        for w in it_all.windows(2) {
+            assert!(w[0].0 < w[1].0, "迭代必须按 key 升序");
+        }
     }
 
     #[test]

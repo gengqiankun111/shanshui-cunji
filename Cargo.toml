@@ -1,6 +1,6 @@
 [package]
 name = "shanshui-cunji"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "山水存迹数据库（shanshui-cunji）：高性能海量文档数据库，LSM-Tree 高吞吐写入 + 倒排检索 + 文档模型 + 运维体系"
 license = "Apache-2.0"
@@ -23,6 +23,9 @@ fst = "0.4"
 memmap2 = "0.9"
 csv = "1"
 mimalloc = { version = "0.1", default-features = false, optional = true }
+parquet = "59.2.0"
+arrow = "59.2.0"
+jieba-rs = { version = "0.10", optional = true }
 
 [[bin]]
 name = "shanshui-cunji-migrate"
@@ -44,12 +47,19 @@ path = "src/bin/bench.rs"
 name = "shanshui-cunji-ycsb"
 path = "src/bin/ycsb.rs"
 
+[[bin]]
+name = "shanshui-cunji-gen-dataset"
+path = "src/bin/gen_dataset.rs"
+
 [features]
 # 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；
-# `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）
-default = ["alloc-mimalloc"]
+# `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）；
+# `cjk-jieba` 开启 jieba 完整中文词典分词（~2-3.5MB 词典嵌入二进制，M8-P13）；
+#   关闭时中文分词回退 bigram（M8-P9，零依赖）
+default = ["alloc-mimalloc", "cjk-jieba"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
+cjk-jieba = ["dep:jieba-rs"]
 
 [dependencies.tikv-jemallocator]
 version = "0.5"

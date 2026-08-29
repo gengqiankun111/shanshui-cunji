@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_skiplist::SkipMap;
 
+use crate::error::Result;
+
 /// 单条内存记录：`None` = Tombstone（删除标记）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemTableEntry {
@@ -135,6 +137,51 @@ impl Default for MemTable {
     }
 }
 
+/// MemTable 范围扫描**流式迭代器**（M8-P10 scan 流式化）：skiplist range 惰性迭代，
+/// 逐条 yield `(key, value, seq)`（value=None = Tombstone），内存 O(1)。
+pub struct MemRangeIter<'a> {
+    iter: Box<dyn Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>, u64)>> + 'a>,
+    end: Option<Vec<u8>>,
+}
+
+impl<'a> MemRangeIter<'a> {
+    pub fn new(mem: &'a MemTable, start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
+        use std::ops::Bound;
+        // owned Vec 作为 range 查询键：Range 持有 owned 值，迭代器生命周期只绑 mem（'a）
+        let range: (Bound<Vec<u8>>, Bound<Vec<u8>>) = match start {
+            Some(s) => (Bound::Included(s.to_vec()), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let map_row =
+            |e: crossbeam_skiplist::map::Entry<'a, Vec<u8>, MemTableEntry>| {
+                Ok((e.key().clone(), e.value().value.clone(), e.value().seq))
+            };
+        let iter: Box<dyn Iterator<Item = Result<(Vec<u8>, Option<Vec<u8>>, u64)>> + 'a> =
+            Box::new(mem.inner.range::<Vec<u8>, _>(range).map(map_row));
+        Self {
+            iter,
+            end: end.map(|e| e.to_vec()),
+        }
+    }
+}
+
+impl<'a> Iterator for MemRangeIter<'a> {
+    type Item = Result<(Vec<u8>, Option<Vec<u8>>, u64)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = self.iter.next()?;
+        let (k, v, seq) = match row {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Some(en) = &self.end {
+            if k.as_slice() > en.as_slice() {
+                return None; // 升序，后续更大
+            }
+        }
+        Some(Ok((k, v, seq)))
+    }
+}
+
 /// 双缓冲：Mutable 接收写入，Immutable 冻结待刷盘。
 pub struct MemTableBuffer {
     mutable: MemTable,
@@ -180,6 +227,21 @@ impl MemTableBuffer {
     /// 当前 Immutable（冻结中待刷盘）引用；无则返回 None。
     pub fn immutable(&self) -> Option<&MemTable> {
         self.immutable.as_ref()
+    }
+
+    /// 双缓冲范围流式迭代器（M8-P10）：immutable + mutable 各一个 `MemRangeIter`
+    /// （同 key 以 seq 去重由 k-way merge 调用方负责）。
+    pub fn iter_range<'a>(
+        &'a self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<MemRangeIter<'a>> {
+        let mut out = Vec::new();
+        if let Some(imm) = &self.immutable {
+            out.push(MemRangeIter::new(imm, start, end));
+        }
+        out.push(MemRangeIter::new(&self.mutable, start, end));
+        out
     }
 
     /// 范围扫描：遍历 Immutable 与 Mutable 两表（同 key 以 seq 去重由调用方负责）。

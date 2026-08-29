@@ -896,6 +896,293 @@ impl RuntimePools {
    达无 fsync 上限的 80%）；1ms 窗口 75,330 ops/s（37×）；`shanshui-cunji-ycsb --group-commit-us` 支持参数对比；
    首版实现（写路径 + 后台线程双份 fsync）实测反而更慢（1176 ops/s）→ 改为提交器模式后达 91K（详见 P37）。
 
+### 7.8 M8-P1 读写分离研究（demo-first 流程首例，结论：暂缓）
+
+> 流程验证：按用户规范，先在 `src/demo/rw-separation/`（独立 mini crate，gitignore 不提交）研究三种并发模型，
+> 单元 + 边界测试跑通后，再决策是否整合 kernel。
+
+1. ~~**研究 demo（Mutex / RwLock / COW 快照读）**~~ ✅（2026-08-29）：`DocStore` 统一接口三实现 +
+   并发正确性测试 6 个 + 边界测试 4 个（单 key 高频覆盖 / 冷启动并发 / 多快照独立 / 并发写无丢失）+
+   release 压测（读重 90/10、写重 50/50，4 线程）；
+2. ~~**研究结论**~~ ✅：**读写分离暂缓实施**——
+   - 压测：纯内存路径 Mutex vs RwLock 吞吐几乎无差（3.87M vs 4.22M ops/s）——锁开销可忽略，收益不来自网关锁；
+   - COW 快照读**不可行**：全量 map 拷贝写放大（写重仅 3.4K ops/s）；
+   - 真实引擎验证（B 负载）：组提交 2ms 后 **18,987 → 149,539 ops/s（7.9×）**，P95 1050µs→64µs——
+     「读被写拖垮」根因是 put 带 fsync 阻塞全局锁，**组提交零 fsync 后已解决**（B 达纯读 83%）；
+   - 结论：RwLock 网关锁剩余收益 <20%，而 Engine 方法 &self 化改动面大——**不作为下一步**；
+3. 边界发现（demo 内测试暴露）：COW 并发写丢更新两类竞态（clone 在写锁外 / clone-swap 两次加锁）——
+   正确写法须单次写锁全程持有 clone-modify-swap；此类坑已记录供后续若引入 COW 快照参考。
+
+### 7.9 M8-P2 环形 WAL + 组提交组合（demo-first，结论：功能正确，性能定位「WAL 空间有界」）
+
+1. ~~**组合研究 demo（src/demo/ring-wal-gc/，gitignore 不提交）**~~ ✅（2026-08-29）：path 依赖主体 lib，
+   4 测试全绿——高写超容量触发强制 Flush+回绕不丢、崩溃恢复（mem::forget 模拟，窗口内未 fsync 丢失 ≤ 窗口）、
+   显式 Flush 前移 flushed_seq 覆盖安全、极小环形高刷频无 panic；
+2. ~~**YCSB 组合压测**~~ ✅：append+gc 2ms **91,296 ops/s（最优）**；ring+gc 关 564（环形 sync 双 fsync——
+   记录区+头部 tail，逐条成本翻倍）；ring+gc 2ms 30,270；ring 4MB+gc 2ms 55,570（小环形更早强制 Flush）；
+   `shanshui-cunji-ycsb` 增加 `--wal-mode` / `--ring-size-mb` 参数；
+3. ~~**结论**~~ ✅：组合**功能正确无需修复**；环形 + 组提交定位「WAL 空间有界」可选组合，
+   默认推荐 append + 组提交（性能最优）；后续可优化点：环形头部 tail 不必每次 fsync
+   （scan_ring 容忍 tail 略旧，不会读到垃圾——列入候选优化）。
+
+### 7.10 5000 万条 Parquet 数据集 + 数据库导入（数据资产，保留不删）
+
+1. ~~**数据集生成器（shanshui-cunji-gen-dataset）**~~ ✅（2026-08-29）：分块流式生成 Parquet
+   （arrow 59 + parquet 59，Snappy 压缩），**5000 万条 × 20 字段**（9 数值型：Int64×7/Int32×2/Float64×1 +
+   2×256 字符文本 big_text_a/b + 8 短字符串枚举 + Boolean），内存恒定、每 100 万条进度输出（可后台运行）；
+   `--rows/--batch/--seed/--out`；实测 5000 万条 → 3,437 MB / 314.6s（~15.9 万 rows/s）；
+   数据资产：`D:\shanshui-data\ds-50m.parquet`（**建立后不删**，除非改存储/结构）；
+2. ~~**Parquet 批量导入（import_parquet）**~~ ✅：`migrate::import_parquet` 读 parquet → `put_nosync`
+   批量写（每 50 万条统一 fsync + 结尾统一提交，5000 万条逐条 fsync 需数小时、批量分钟级）；
+   主键 docid 列优先否则递增；20 字段类型 roundtrip（Int64/Int32/Float64/Boolean/Utf8，null 列容忍）；
+   `shanshui-cunji-import --parquet <in.parquet> [--data-dir]`；导入数据库：`D:\shanshui-data\db-50m`；
+3. ~~**dataset-test demo（src/demo/dataset-test/，gitignore 不提交）**~~ ✅：4 测试全绿——含 docid 导入
+   roundtrip（行数/点查/倒排计数/数值类型/256 字符长度）、无 docid 自动分配、null 列容忍、导入后重启持久化；
+4. 依赖说明：新增 `arrow` / `parquet`（59.2，Apache-2.0 合规，deny.toml 白名单内）——数据集生成与
+   parquet 导入必需；编译体积增大但仅作用于导入/生成路径。
+
+### 7.11 M8-P4 倒排字段白名单 / 黑名单 / 长文本保护（防字典膨胀）
+
+> 背景：100 字段表全字段建倒排——高基数 ID / 长文本字段每 term 单 posting 纯浪费。
+> demo 研究（src/demo/inverted-whitelist/，gitignore 不提交）实测 10 万文档 × 100 字段：
+> 全字段 550 万唯一 term / 246MB vs 白名单 20 字段 **12 个唯一 term / 3.5MB**——**字典压缩 45 万倍、
+> 写放大 27.7 倍**（100 字段表倒排 ≤ 20 的经验准则成立）；用户确认：字段级 inverted 默认 true
+> + 全局白名单；长文本不建倒排。
+
+1. ~~**配置与实现**~~ ✅（2026-08-29）：`[inverted] inverted_fields`（白名单，非空 = 只建声明字段倒排，
+   MySQL 建表式字段声明的运行时等价）/ `exclude_fields`（黑名单）/ `max_term_len`（term 长度上限，
+   默认 96B，**超长 term 自动跳过 = 长文本整串不进字典**，0 = 不限）；
+   `Engine::inverted_allowed` 写路径统一过滤（put/put_nosync 前检查：白名单 → 黑名单 → 超长）——
+   覆盖所有写入路径（HTTP / demo / import），与 import-schema 的 term_filter 正交叠加；
+   与 M7-2 `bitmap_fields`（位图白名单）独立；
+2. ~~**测试**~~ ✅：engine 4 个新增（白名单只建声明字段 / 黑名单剔除 / 超长 term 自动跳过 / 默认全建兼容）；
+   测试 290→294（+4）；
+3. ~~**5000 万导入优化**~~ ✅（进行中）：ds-50m 数据集的 2×256 字符 big_text 自动跳过（max_term_len=96），
+   倒排字典从 ~1 亿单 posting term 降为 8 个枚举字段；重导到 `D:\shanshui-data\db-50m-clean`
+   （旧半成品 db-50m 19GB 保留未删——含 big_text 膨胀索引，弃用）。
+
+### 7.12 M8-P5 WAL 截断（append 模式 flush 后回收，防无限增长）
+
+> 背景：5000 万导入发现 `wal.log` 无限增长（6.5GB）——每 100 万行 fsync 大文件极慢、导入卡顿；
+> 磁盘写入翻倍（WAL + SST 双写）。append 模式 WAL 在 SST flush 后不回收。
+
+1. ~~**实现**~~ ✅（2026-08-29）：**WAL 文件头**（magic + next_seq，16B）——`truncate_and_reset` 在
+   `switch_and_flush` 成功后执行（flush 后全部记录已刷盘，清空 WAL 写头持久化 next_seq，
+   重开 seq 接续不冲突）；`open_append` 读头恢复 next_seq（旧无头 WAL 兼容回放）；
+   `WalReader::recover` 识别头跳 16B；`WalWriter` 打开模式 append → read+write
+   （`set_len(0)` 需要写权限，Windows append 句柄不允许）+ sync 前 seek 末尾；
+   环形 WAL 自带覆盖回收（no-op 不截断）；`resume_seq` 条件化（max_seq>0 才覆盖头值）；
+2. ~~**语义影响**~~ ✅：**增量备份**只导出 WAL 未刷盘记录（已刷盘由全量备份覆盖，与环形 WAL 一致）；
+   缺口检测仍有效（WAL 截断后旧 seq 缺失 → 提示全量）；
+3. ~~**测试**~~ ✅：column_family 3 个新增（flush 后 WAL 变小 + 重开数据完整 seq 接续 /
+   头持久化 next_seq 跨重启 / 旧无头 WAL 兼容回放）；engine 1 个更新（增量备份 since=0 导出
+   未刷盘记录）；测试 294→297（+3）；5000 万重导验证：WAL 保持小文件、卡顿消除、速度稳定
+   100 万/分钟（SST 构建 + 倒排排序主导）。
+
+### 7.13 M8-P6 批量导入模式（HotCache 跳过回填，防内存崩溃）
+
+> 背景：P39 WAL 截断修复后 5000 万导入**仍**确定性卡死——0-4M 行 60K 行/s 正常，之后行速
+> 指数级崩塌（4M-5M 2K/s → 8M-9M 0.9K/s → 12M 后假死；CPU 满核、磁盘 ~0.9M/s、inverted/primary
+> 停止更新）。排除算法 O(N²)（单行路径全部 O(1)/O(log n)）后锁定为**内存问题**。
+
+1. ~~**根因定位**~~ ✅：**HotCache 默认 4GB 预算被只写不读的导入文档灌满**——`put_nosync` 每行
+   `hotcache.put`，4M 行 × ~600B ≈ 2.4GB 全进缓存（导入从不读取）；叠加 LruCache 内部淘汰
+   （容量 4M 条目）不同步 `stats` HashMap（泄漏）与 `used_bytes`（虚增）、primary memtable
+   256MB、WAL 缓冲 → 进程 WS 4.9GB。本机 16GB 且桌面负载占 ~11GB → 超物理内存 →
+   **Windows 页面文件颠簸**（峰值 24.8GB）→ 每个内存访问缺页换入换出 → 行速指数恶化假死。
+   加细粒度进度（每 10 万行）+ 刷盘分阶段计时定位；磁盘 0.9M/s = 页面文件换页，非业务写入。
+2. ~~**实现**~~ ✅（2026-08-29）：`Engine::set_bulk_import(on)`——批量导入模式跳过
+   `put_nosync` 的 HotCache 失效/回填（导入只写不读，回填零收益）；`import_parquet` /
+   CSV / JSON 三个导入器入口统一开启。
+3. ~~**验证**~~ ✅：5M 复现 **80s 完成、全程稳定 63K 行/s**（越过 4.3M 卡点）；50M 正式导入
+   WS 从 4.9GB 降到 **~620-780MB**、61.7K 行/s 稳定通过旧卡点 12M；单元测试
+   `bulk_import_skips_hotcache`（默认回填 / 批量跳过 / 关闭恢复 / 主数据不受影响）；
+   测试 297→298（+1）。
+4. **遗留**：HotCache `stats` 泄漏 / `used_bytes` 虚增是独立内存缺陷（常规读写负载缓慢泄漏），
+   后续单独修复。
+
+### 7.14 M8-P7 fulltext 分词索引（长文本可检索，与 inverted:false 正交）
+
+> 背景（P38 后续方向）：长文本字段（如 big_text 256 字符）整串被 `max_term_len=96` 跳过 →
+> 长文本无法检索。方案：声明字段**分词建词 term**（`ft:{field}:{token}`），分词 token 短可建索引。
+
+1. ~~**demo 研究（src/demo/fulltext/，gitignore 不提交）**~~ ✅：分词器 `tokenize`（按非字母数字
+   边界切分 + 小写归一；中文连续字符暂为单 token，完整中文分词留后续）+ `ft:{field}:{token}`
+   编码（独立命名空间不冲突）+ 同文档 token 去重；5 测试全绿（分词边界 / 去重编码 / 端到端
+   写入查询回表 / 长文本 token 可检索 / 100K 行 perf sanity）。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `[inverted] fulltext_fields`（声明分词字段，空 = 关闭）；
+   - `server::tokenize` / `fulltext_terms` / `extract_terms_with_fulltext`（fulltext 字段分词
+     建词 term **取代整串**；其余字段整串 term 受白名单过滤——**与 inverted_fields 正交**）；
+   - `Engine::fulltext_search(field, word)`（词 term 查询 → posting 合并 → 回表）+
+     `fulltext_fields()` 访问器；HTTP `GET /fulltext?field=X&word=Y`；
+   - 写路径统一接入：HTTP put / import_parquet / CSV / JSON / mysqldump 导入。
+3. ~~**验证**~~ ✅：5M 真实数据集配 fulltext 导入（133s / 39K 行/s，分词增加 posting 量属预期），
+   HTTP 检索 `word=00000042` 精确命中 docid=42（big_text_a="rec-00000042-msg-1344-tag42"）；
+   测试 302 全绿（+4：分词边界 / 字段优先级 / 白名单正交 / 长文本端到端持久化）。
+4. **已知限制**：连续中文串 = 单 token（需 jieba/ngram 完整中文分词，留后续）；大结果集
+   （数百万行）查询无 limit/分页，server 端全量构造 JSON 会内存爆炸（见 7.15 观察）。
+
+### 7.15 P41 HotCache 内存缺陷修复（stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴）
+
+> 背景：7.14 验证时 `word=rec`（命中 5M 行）把 server 卡死——暴露 HotCache 既有缺陷。
+
+1. ~~**根因定位**~~ ✅：HotCache 容量按**条目数**（max_memory_mb/1KB）设 LruCache 容量，
+   满后 **LruCache 内部淘汰不通知 stats/used_bytes** → stats 无限泄漏、used_bytes 虚增；
+   超预算后 `evict_one` 从 stats 选 victim 但该 key 已被内部淘汰（pop=None）→ **淘汰永远失败
+   + 超预算死循环**；LFU `pick_lfu_victim` 全量扫描 stats（O(N)）→ 大批量回表（每 get 一次
+   hotcache.put）把写/查询路径卡成 O(N²)（P40 50M 导入 4M 行卡死的叠加因素）。
+2. ~~**修复**~~ ✅（2026-08-29）：容量 **unbounded**，淘汰**完全由字节预算**统一管理（stats
+   与缓存同步、used_bytes 准确）；**软水位渐进淘汰**（每 put 至多 1 个，防单次 put O(N) evict
+   风暴）；**LFU 采样近似**（主缓存前 64 条目选最小计数，O(64) 常量）。
+3. ~~**验证**~~ ✅：hotcache 14 测试全绿（+2 回归：批量 put 无泄漏/无虚增/真淘汰；
+   10K 次 512KB put 渐进淘汰 <5s）；5M 库小查询 959ms 正常（修复前 server 假死）。
+4. **观察（非本项）**：大结果集查询（数百万行）server 端全量 JSON 构造仍会内存爆炸
+   （`word=tag42` 命中全部 5M 行 → 10GB+）——API 无 limit/分页，后续加 `limit`/游标分页。
+
+### 7.16 M8-P8 大结果集查询分页（limit/offset/total，防全量回表内存爆炸）
+
+> 背景（7.15 观察）：倒排命中数百万行时（`word=rec` 命中 5M）server 端全量回表 +
+> 全量 JSON 构造内存爆炸（实测 10GB+ 卡死）。方案：倒排路径分页——RoaringBitmap 迭代
+> docid 天然升序，skip(offset) 后只回表 limit 行，内存 O(limit) 不随 total 膨胀。
+
+1. ~~**demo 研究（src/demo/pagination/，gitignore 不提交）**~~ ✅：验证分页语义与边界——
+   分页拼接 == 全量（有序稳定）、limit=0 / offset>total / 末尾不足页 / 只回表当前页；
+   4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `Engine::search_term_paged / fulltext_search_paged / scan_range_paged` → `PagedRows{total, rows}`
+     （total = bitmap.len() O(1)；scan 分页仅截断 JSON 构造，扫描本身仍全量，后续流式化）；
+   - `server::execute_filter_paged`（单条件 / 多条件 AND / docid 点查统一分页）；
+   - HTTP `/search` `/fulltext` `/range` 支持 `limit`/`offset`（limit 缺省/≤0 = 不限制，
+     兼容非分页调用）；响应 `total` = **全量命中数**（≠ 当前页行数，供客户端算总页数）。
+3. ~~**验证**~~ ✅：5M 库 `word=rec&limit=10`（命中 5M）1.1s 返回 total=5,000,000，
+   翻到 offset=4999990 页 316ms 首条 docid=4999990；`search status=active&limit=5`
+   total=1,666,667（精确）；**server WS 221MB**（修复前 10GB+ 卡死）；
+    测试 307 全绿（+3：engine 分页语义与边界 / execute_filter_paged / parse_paging）。
+
+### 7.17 M8-P9 中文 bigram 分词（fulltext 中文可检索）
+
+> 背景（7.14 已知限制）：`tokenize` 把连续中文字符当单 token（`is_alphanumeric` 全 true）→
+> 中文文本整串进倒排，长中文文本无法检索。方案对比（demo 研究）：
+> unigram（逐字，膨胀=字数）/ **bigram**（相邻 2 字，与 ES ngram / Lucene CJKAnalyzer 同款，
+> 中文检索事实标准，零依赖无词典）/ jieba（精确高但重依赖 ~2MB 词典，vendor 无、离线构建不可行）——选 **bigram**。
+
+1. ~~**demo 研究（src/demo/cjk-tokenizer/，gitignore 不提交）**~~ ✅：混合分词规则验证——
+   ASCII 字母数字 → 单词（保留原有）；连续中文/非 ASCII → bigram（单字回退 unigram）；
+   索引膨胀 ≈ 字数（≤ unigram）；2-4 字关键词 bigram AND 交集精确命中；4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：`server::tokenize` 升级为字符类分段分词
+   （`cjk_bigram`：长度 1 → unigram，≥2 → 相邻 2 字）；仅影响 fulltext 路径
+   （extract_terms 整串 term 不经 tokenize，整串倒排行为不变）；无需新配置
+   （fulltext_fields 声明即启用）。
+3. ~~**验证**~~ ✅：HTTP 实测中文检索——PUT「山水存迹数据库存储引擎」等 3 条，
+   `fulltext 数据` → total=2（含"数据库"文档 5000001/5000002）、`fulltext 山水` → total=1；
+   测试 308 全绿（+1：engine 中文 bigram 端到端；tokenize 测试更新为 bigram 断言）。
+
+### 7.18 M8-P10 scan 范围扫描流式化（k-way merge，内存 O(page) 防全量收集 OOM）
+
+> 背景（7.16 已知限制）：`scan_range_paged` 先 `scan_range` 全量收集（HashMap 合并 + 排序，
+> 内存 O(total)）再截断——全库 scan（5000 万行）会收集 ~35GB 内存 OOM。方案：k-way merge
+> 流式归并（memtable 双缓冲 + 各 SST 有序源，同 key 取最大 seq、Tombstone 跳过），
+> 配合分页 skip/take 提前终止，内存 O(page)。
+
+1. ~~**demo 研究（src/demo/scan-stream/，gitignore 不提交）**~~ ✅：归并算法验证——
+   单源直通 / 多源交错升序 / 同 key 最新 seq / tombstone 隐藏旧版 / 空边界 / 流式分页==全量；
+   6 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `SstReader::SstRangeIter`（块级惰性迭代 + Zone Map 剪枝，与 scan_range 语义一致）；
+   - `MemTable::MemRangeIter` / `MemTableBuffer::iter_range`（skiplist range 惰性迭代，
+     owned 查询键免借用）；
+   - `ColumnFamily::scan_stream`（k-way merge：BinaryHeap 最小堆 O(N log K)，避免每轮
+     线性扫源 O(N·K)——202 SST × 50M 行实测超时 → 堆优化）；
+   - `Engine::scan_range_paged` 改流式（skip/take + total 全扫计数，内存 O(page)）。
+3. ~~**验证**~~ ✅：50M 库全库 `/range?limit=10` → total=5,000,000 精确、**server WS 691MB**
+   （旧实现全量收集 50M 行会 OOM）；小范围翻页 `/range?start..end&limit=20&offset=40`
+   117ms（total=101 首条 docid=10000040）；全库 scan ~70s 为 total 计数 + 读全 SST 的固有代价；
+   测试 310 全绿（+2：scan_stream vs scan_raw_range 一致性含覆盖/删除/范围过滤、SstRangeIter
+   vs scan_range 一致性）。
+4. **已知限制**：全库 scan 的 `total` 计数需扫完全部（无 limit 提前终止的 total 语义），
+   后续可加「仅需前 N 条」的无 total 模式 / 游标续扫。
+
+### 7.19 M8-P11 scan 游标续扫（after + 提前终止，全库遍历每页 O(limit)）
+
+> 背景（7.18 已知限制）：`/range` 的 `total` 计数需全扫（50M 库 ~70s）；offset 翻页每页
+> 累积跳过。方案：**游标续扫**——每页只扫「after 之后」部分（start=after+1 定位 + Zone Map
+> 剪枝），取满 `limit` 即**提前终止**（无 total 全扫），全库遍历每页 O(limit) + 游标定位。
+
+1. ~~**demo 研究（src/demo/cursor-pagination/，gitignore 不提交）**~~ ✅：游标语义验证——
+   遍历一致性（游标翻页拼接 == 全量升序）/ after 首尾边界 / 删除覆盖下 docid 稳定 /
+   上界限定 / 深页与 offset 等价；4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：
+   - `ColumnFamily::scan_stream` 回调改为返回 `bool`（false=**提前终止**，取满页即停）；
+   - `Engine::scan_after(after, end, limit)`：from after+1 定位，取满 limit 提前终止，
+     无 total 全扫；
+   - HTTP `GET /range?after=LAST&limit=N` 游标模式（返回 `{"rows":[...]}`，用末条 docid
+     作下页 after；`after` 为**严格之后**语义，首页如需含 docid 0 请用 start/total 模式）。
+3. ~~**验证**~~ ✅：50M 库游标翻页——首页 `after=0&limit=10` **682ms**（旧 total 模式全库 70s）、
+   深页 `after=49999990&limit=10` **164ms**（docid 49999991-49999999 共 9 条）、server WS
+   696MB；测试 311 全绿（+1：scan_after 遍历一致性/边界/提前终止/上界）。
+
+### 7.20 M8-P12 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交）
+
+> 背景（M8-P1 候选优化）：`RingWal::sync` 两阶段——写记录区 `sync_all` + 写头部 tail
+> `sync_all`（每次提交 2 次 fsync），ring+gc 2ms 仅 30,270 ops/s vs append+gc 91,296。
+> 优化：头部 tail 与记录区**合并为同一次 `sync_all`**（同一文件一次原子提交）。
+
+1. ~~**demo 研究（src/demo/ring-tail-fsync/，gitignore 不提交）**~~ ✅：提交/崩溃语义验证——
+   已 sync 记录完整恢复 / 未 sync 记录崩溃丢弃 / 多次提交+回绕恢复最新周期 / WalBackend
+   分发语义；4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：`RingWal::sync`——先写头部 tail（page cache）
+   再写记录区，**单次 `sync_all`** 原子提交两者。崩溃安全不变：fsync 前崩溃 → 头尾均未
+   落盘，恢复上次提交状态（未提交记录忽略）；fsync 后 → 头尾同时可见，**tail 永不指向
+   未落盘记录**（与两阶段版保证相同）。
+3. ~~**验证**~~ ✅：ycsb A 写重 ring+gc 2ms **68,756 ops/s**（M8-P1 基线 30,270 → **2.3×**；
+   ring 4MB+gc 55,570 → +24%）；wal 模块 20 测试全绿（含环形崩溃恢复/回绕/混沌）；
+   测试 311 全绿（无新增单测——合并 fsync 由既有崩溃恢复测试覆盖，demo 4 测试验证语义）。
+
+### 7.21 M8-P13 jieba 完整中文词典分词（`[inverted] cjk_segmenter`）
+
+> 背景（7.17 已知限制）：bigram（M8-P9）对中文是**字符碎片**索引——"数据库" → ["数据","据库"]，
+> 查询需两个 bigram AND 交集；jieba 词典分词输出**语义词**（"数据库" → ["数据库"]），单词精确
+> 命中、索引词数更少。jieba-rs 0.10（MIT，`default-dict` 内置词典 ~2-3.5MB 压缩嵌入，无外部文件）。
+
+1. ~~**依赖与 feature**~~ ✅（2026-08-29）：`jieba-rs = "0.10"` optional + feature `cjk-jieba`
+   （默认开启；`--no-default-features` 可去除，中文分词回退 bigram）；deny.toml 许可白名单
+   （MIT/Apache-2.0）覆盖 jieba 全部依赖。
+2. ~~**demo 研究（src/demo/cjk-jieba/，gitignore 不提交）**~~ ✅：语义词切分 / HMM 未登录词 /
+   索引膨胀对比（jieba 词数 ≤ bigram 碎片）/ 中英混合 / 端到端检索 / 词典加载+切词性能；6 测试全绿。
+3. ~~**kernel 整合**~~ ✅：`[inverted] cjk_segmenter = "bigram"(默认) | "jieba"`；
+   `server::tokenize_seg / fulltext_terms_seg / extract_terms_with_fulltext_seg`（参数传分词器，
+   无全局状态——并发测试安全）；`Engine::use_jieba()`；写路径（HTTP put / parquet / CSV / JSON /
+   mysqldump）统一接入；feature 关闭时自动回退 bigram。
+4. ~~**验证**~~ ✅：HTTP 实测——PUT 3 条中文（terms=6/8/5 语义词），`fulltext 数据库` 单 term
+   精确命中 2 条；测试 313 全绿（+2：tokenize_seg 语义词/混合/标点、engine jieba 端到端单 term
+   命中）；feature 关闭编译回退验证通过。
+
+### 7.22 倒排 posting 压缩探索（结论：维持 Roaring，不引入新编码）
+
+> 背景：倒排段内每 term posting 用 RoaringBitmap 序列化（SEG_VERSION=2）。评估
+> delta-varint / Gorilla 变长编码能否替代——尤其是稀疏 posting（array container 2B/docid
+> 理论 1B）。demo 研究（src/demo/posting-compression/，gitignore 不提交）。
+
+1. ~~**demo 编码实现**~~ ✅：delta-varint（delta + LEB128）、简化 Gorilla（XOR + 前导零控制位）、
+   Roaring 三编码；真实分布生成：密集连续（16.6M）/ 簇状（10 簇×1M）/ 稀疏（500K/50M、5K/50M）；
+   4 测试全绿（压缩率对比 / AND 查询性能 / 稀疏紧凑性 / 密集下限）。
+2. ~~**实测数据**~~ ✅（release）：
+
+   | 场景 | Roaring | delta-varint | Gorilla | 结论 |
+   |---|---|---|---|---|
+   | 密集 16.6M 连续 | **0.13B/docid**（1bit 理论下限） | 1.00B | 2.00B | Roaring 最优 |
+   | 簇状 10 簇×1M | **0.13B/docid** | 1.00B | 2.00B | Roaring 最优 |
+   | 稀疏 1%（500K/50M） | 2.01B | **1.00B** | 2.39B | delta 省 ~0.5MB，绝对差小 |
+   | 稀疏 0.01%（5K/50M） | 3.22B | **2.00B** | 3.15B | 量级极小，无所谓 |
+   | AND 8M∩4M 查询 | **337us** | 需解码后双指针 | — | Roaring 快 20.1×（vs 线性 6.7ms） |
+
+3. ~~**决策**~~ ✅：**维持 Roaring，不引入新编码**。依据：① 密集/簇状（高频词主流场景）
+   Roaring 已达 1bit/docid 理论下限，任何变长编码（≥1B）不可能更优；② 稀疏场景 delta 省空间
+   但绝对量级小（500K docid 差 ~0.5MB），且需牺牲 Roaring 的向量化 AND/交集 20× 查询性能与
+   FST 集成；③ Roaring 库成熟（迭代/交集/并集/差集完备）。后续若出现超高频 posting 段内存
+   瓶颈，可再评估 Roaring 64 位 + 密度感知（rle 容器）。
+
 ---
 
 ## 8. 编码规范

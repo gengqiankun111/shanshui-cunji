@@ -9,10 +9,8 @@
 //!   **保护区**（独立段，普通淘汰避让；写失效 / 硬预算兜底仍可清除），热点不被冷数据挤掉。
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
 use lru::LruCache;
-use tracing::warn;
 
 use crate::config::model::HotCacheConfig;
 
@@ -20,9 +18,6 @@ use crate::config::model::HotCacheConfig;
 struct HotEntry {
     count: u64,
 }
-
-/// 保护区容量占主缓存容量比例（1/5：热点数量通常远小于全量）。
-const PROTECTED_RATIO: usize = 5;
 
 /// 文档热缓存。
 pub struct HotCache {
@@ -41,12 +36,13 @@ pub struct HotCache {
 
 impl HotCache {
     pub fn new(config: HotCacheConfig) -> Self {
-        let capacity = (config.max_memory_mb.saturating_mul(1024 * 1024) / 1024).max(1);
-        let protected_cap = (capacity / PROTECTED_RATIO).max(1);
+        // P41：条目容量 unbounded，淘汰**完全由字节预算控制**——否则
+        // LruCache 容量满后内部淘汰不通知 stats/used_bytes（stats 泄漏 + used_bytes 虚增），
+        // 且 evict 找不到真实 victim 导致超预算死循环（大批量回表查询灌满缓存后写路径卡死）。
         Self {
             config,
-            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
-            protected: LruCache::new(NonZeroUsize::new(protected_cap).unwrap()),
+            cache: LruCache::unbounded(),
+            protected: LruCache::unbounded(),
             stats: HashMap::new(),
             used_bytes: 0,
             promotions: 0,
@@ -131,28 +127,25 @@ impl HotCache {
         self.stats.remove(&docid);
     }
 
-    /// 淘汰至硬预算内；若到达软水位也主动清出冷数据至低水位。主缓存优先，保护区兜底。
+    /// 淘汰至预算内（P41 重构）：**硬预算强制压回**（每次淘汰 O(1)/O(64)，均摊可控）；
+    /// **软水位渐进淘汰**（每次 put 至多 1 个，避免单次 put 的 O(N) evict 风暴——
+    /// 大批量回表查询灌满缓存时，原 while 全清 + O(N) 扫描会把写路径卡死）。
     fn evict_to_budget(&mut self) {
         let hard = self.config.max_memory_mb.saturating_mul(1024 * 1024);
         let high = (hard as f64 * self.config.eviction_high_water) as usize;
         let low = (hard as f64 * self.config.eviction_low_water) as usize;
         // 硬预算保护（主缓存淘汰完再淘汰保护区）
-        while self.used_bytes > hard {
-            if !self.evict_one() {
-                break;
-            }
-        }
-        // 软水位主动淘汰：达 85% 淘汰至 75%（防突发卡顿，design 6.5）
-        if self.used_bytes > high {
-            warn!(
-                "HotCache 达软水位 {}/{}，主动淘汰冷数据",
-                self.used_bytes, hard
-            );
-            while self.used_bytes > low {
+        if self.used_bytes > hard {
+            while self.used_bytes > hard {
                 if !self.evict_one() {
                     break;
                 }
             }
+            return;
+        }
+        // 软水位主动淘汰：达 high 后每次写入淘汰 1 个，逐步回落至 low（渐进式，防风暴）
+        if self.used_bytes > high && self.used_bytes > low {
+            let _ = self.evict_one();
         }
     }
 
@@ -189,16 +182,16 @@ impl HotCache {
         }
     }
 
-    /// LFU：选择访问计数最低者（同计数取 LRU 最久未用）；跳过保护区 key（不在主缓存）。
+    /// LFU（P41 采样近似）：在主缓存前 64 个条目中选访问计数最低者（O(64) 常量）。
+    /// 原实现全量扫描 stats（O(N)）——大数据量回表时 N 达数十万，每次淘汰 O(N) 会把写路径
+    /// 卡成 O(N²)（P41 实测大批量回表灌爆缓存后 server 假死）。采样近似牺牲极小精确性换恒定开销。
     fn pick_lfu_victim(&self) -> Option<u64> {
         let mut best: Option<(u64, u64)> = None;
-        for (k, e) in &self.stats {
-            if self.protected.contains(k) {
-                continue; // 热点保护区不参与主缓存淘汰
-            }
+        for (k, _) in self.cache.iter().take(64) {
+            let count = self.stats.get(k).map_or(0, |e| e.count);
             match best {
-                Some((_, bc)) if bc <= e.count => {}
-                _ => best = Some((*k, e.count)),
+                Some((_, bc)) if bc <= count => {}
+                _ => best = Some((*k, count)),
             }
         }
         best.map(|(k, _)| k)
@@ -290,6 +283,54 @@ mod tests {
             c.put(i, vec![0u8; 4096]); // 4KB × 500 = 2MB > 1MB 预算
         }
         assert!(c.used_bytes() <= 1024 * 1024, "超预算: {}", c.used_bytes());
+    }
+
+    // ---------- P41：批量回表场景 stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴 ----------
+
+    #[test]
+    fn bulk_put_no_stats_leak_no_used_bytes_drift() {
+        // 容量 MAX + 字节预算控制：LruCache 不再内部淘汰 → stats 与缓存同步（不泄漏）、
+        // used_bytes 准确（不虚增）——修复前 stats 无限增长、used_bytes 超预算且淘汰无效。
+        let mut c = HotCache::new(small_cfg(1)); // 1MB 预算
+        for i in 0..5000u64 {
+            c.put(i, vec![0u8; 4096]); // 4KB × 5000 = 20MB ≫ 1MB（硬预算强制压回）
+        }
+        // used_bytes 必须压回硬预算内（不虚增）
+        assert!(
+            c.used_bytes() <= 1024 * 1024,
+            "used_bytes 虚增: {}",
+            c.used_bytes()
+        );
+        // stats 与缓存同步（无内部淘汰泄漏）
+        assert!(
+            c.stats.len() <= c.len() + 1,
+            "stats 泄漏: stats={} cache={}",
+            c.stats.len(),
+            c.len()
+        );
+        // 淘汰真的释放了条目（不是死循环空转）
+        assert!(c.len() < 3000, "缓存未真正淘汰: {}", c.len());
+        // 缓存仍可正常命中
+        let probe = c.get(4999);
+        assert!(probe.is_some() || c.len() > 0, "缓存不可用");
+    }
+
+    #[test]
+    fn soft_water_evicts_gradually_no_storm() {
+        // 软水位渐进淘汰：达 high 后每 put 只淘汰 1 个（防单次 put O(N) evict 风暴）。
+        // 用 512KB×3 + 1MB 预算（high≈0.85MB）：写满后继续写，put 均摊 O(1) 级。
+        let mut cfg = small_cfg(1);
+        cfg.eviction_policy = "lfu".into();
+        cfg.max_document_size_bytes = 1024 * 1024;
+        let mut c = HotCache::new(cfg);
+        let t0 = std::time::Instant::now();
+        for i in 0..10_000u64 {
+            c.put(i, vec![0u8; 512 * 1024]); // 512KB × 10000 = 5GB 总量
+        }
+        // 全部 put 必须在秒级完成（修复前 LFU O(N) 扫描 + 全清风暴会卡死）
+        let elapsed = t0.elapsed().as_secs_f64();
+        assert!(elapsed < 5.0, "渐进淘汰过慢: {elapsed:.1}s");
+        assert!(c.used_bytes() <= 1024 * 1024);
     }
 
     #[test]

@@ -95,7 +95,7 @@ cargo fmt --all -- --check \
 - **集成测试**证明"组合起来是对的"：Engine 全链路、HTTP-JSON 端到端、备份还原、跨重启持久化、
   倒排回表、多 CF（primary/cidx/delta）协同。
 - **要求**：测试与代码同 PR（不允许后补）；覆盖率低于 80% 的 PR 不允许合并；新功能先写测试。
-- **现状**：**285 个单元测试全绿**（`cargo test`），demo 冒烟 10/10（10 万~5000 万规模压测报告在 `images/`）。
+- **现状**：**313 个单元测试全绿**（`cargo test`），demo 冒烟 10/10（10 万~5000 万规模压测报告在 `images/`）。
 
 ### 第 5 层 · 基准测试（回答"好不好"）
 
@@ -185,6 +185,6 @@ cargo fmt --all -- --check \
 | 静态分析 | `cargo fmt --check` + `cargo clippy -D warnings`（开发机常态化）；`cargo geiger` 正式报告：**项目自身 unsafe = 0**，源码已加 `#![forbid(unsafe_code)]` 编译期强制 |
 | 架构评审 | design.md / development.md 双文档 + 每里程碑 AI 评审（quality/） |
 | 代码审查 | problem_solving.md（P1~P36 问题闭环）+ 提交前自检清单 |
-| 单元/集成测试 | **279 测试全绿** + demo 冒烟 10/10 + HTTP 端到端 |
-| 基准测试 | demo 10 项功能基准（10万~5000万压测）+ release 38.6 万条/s（v0.4.0 快检）|
+| 单元/集成测试 | **313 测试全绿** + demo 冒烟 10/10 + HTTP 端到端 |
+| 基准测试 | demo 10 项功能基准（10万~5000万压测）+ 组提交 91,296 ops/s（v0.6.0 快检）|
 | 混沌测试 | WAL 截断恢复 / SST 损坏注入 / 孤儿段忽略 / 跨重启持久化 |
