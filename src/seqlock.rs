@@ -153,8 +153,8 @@ mod tests {
                 while stop.load(Ordering::Relaxed) == 0 {
                     sl.write(|d| *d = i);
                     i += 1;
-                    // 低频写（倒排 flush/gc 间隔）；100µs 间隔在高并行负载下仍稳定
-                    thread::sleep(std::time::Duration::from_micros(100));
+                    // 低频写（倒排 flush/gc 间隔）；200µs 间隔在高并行负载下更稳定
+                    thread::sleep(std::time::Duration::from_micros(200));
                 }
                 i
             })

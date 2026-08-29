@@ -47,6 +47,7 @@ pub mod redis;
 pub mod replication;
 pub mod reshard;
 pub mod rpc;
+pub mod saga;
 pub mod schema;
 pub mod sdk_cache;
 pub mod seqlock;
