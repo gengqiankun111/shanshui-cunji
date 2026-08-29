@@ -55,7 +55,7 @@
 | **scan 范围扫描流式化**（见模块 A） | ✅ | M8-P10 `516643f` |
 | **scan 游标续扫**（after + 提前终止，全库遍历每页 O(limit)） | ✅ | M8-P11（`scan_after` + `/range?after`） |
 | 类 SQL 解析（sqlish，SELECT...WHERE AND/OR 子集，零依赖递归下降） | ✅ | `441282d`（等值走倒排/比较+BETWEEN 扫描+AND 后过滤快路径+看门狗熔断；`/sql?q=` 路由） |
-| 写入 Enrich（预连接） | ⏳ | 阶段 1.5 规划，未启动 |
+| 写入 Enrich（预连接，design 19.2 ②，join::put_with_enrich） | ✅ | `706c33b`（`[enrich] enabled && source=local` 时 /put WAL 前按 from_field→to_field 展开关联文档；fail_policy reject/degrade；`_enrich.related`） |
 
 ## E. 数据管道 / 迁移 / 导入导出
 
@@ -172,6 +172,8 @@
 - **类 SQL 解析器**（`441282d`）：src/sqlish.rs 零依赖递归下降（SELECT...WHERE AND/OR/NOT/
   括号/BETWEEN/比较/LIMIT/OFFSET）+ 引擎求值——等值走倒排、比较/BETWEEN 扫描（AND 后过滤
   快路径）+ 看门狗熔断；`GET /sql?q=...`；demo 6 测试先验证
+- **写入 Enrich 接线**（`706c33b`）：`[enrich] enabled && source=local` → /put 走
+  join::put_with_enrich（WAL 前展开关联文档 `_enrich.related`，fail_policy reject/degrade）
 - **M8-P12 环形 WAL 头部 tail 合并 fsync**：sync 单次原子提交（消除冗余第二次 fsync）——
   ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
 - **M8-P13 jieba 完整中文词典分词**：`[inverted] cjk_segmenter="jieba"`（`cjk-jieba` feature，

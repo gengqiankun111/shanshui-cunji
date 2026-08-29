@@ -1682,6 +1682,26 @@ impl RuntimePools {
 
 ---
 
+### 7.48 写入 Enrich 接线（design 19.2 方案② / 19.3，development 5.21 落地）
+
+> 背景：关联关系固定、写入时已知的场景——网络层接收后、WAL 写入前展开关联字段（预连接），
+> 查询 0 增加（不做 JOIN）。库函数 `join::put_with_enrich` + `enrich_check_local` 已存在
+> （development 5.21），本里程碑**接入 server /put 写路径**。
+
+1. ~~**demo**~~ ✅（src/demo/enrich/，4 测试）：写入富化注入关联字段 / reject 拒绝 / degrade
+   降级 / 默认关零开销。
+2. ~~**kernel 接线**~~ ✅：
+   - `[enrich] enabled && source=local` → Engine::open 记录 `enrich: Some((fail_policy,
+     from_field, to_field))`（`enrich_config()` 访问器；默认 None 零开销）；
+   - EnrichConfig 增 `from_field`（默认 user_id）/ `to_field`（默认 docid）；
+   - server `/put`：enrich 启用时改走 `join::put_with_enrich`——WAL 前按 from→to 主键点查
+     关联文档并展开 `_enrich.related`；fail_policy reject（强一致，失败拒写）/
+     degrade（可用性优先，降级写原文档）。
+3. ~~**验证**~~ ✅：`cargo test` **368 全绿**（+1 端到端：关联展开 / degrade 降级 / 配置生效）；
+   提交 `706c33b`。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
