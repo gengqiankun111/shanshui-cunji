@@ -913,6 +913,18 @@ impl RuntimePools {
 3. 边界发现（demo 内测试暴露）：COW 并发写丢更新两类竞态（clone 在写锁外 / clone-swap 两次加锁）——
    正确写法须单次写锁全程持有 clone-modify-swap；此类坑已记录供后续若引入 COW 快照参考。
 
+### 7.9 M8-P2 环形 WAL + 组提交组合（demo-first，结论：功能正确，性能定位「WAL 空间有界」）
+
+1. ~~**组合研究 demo（src/demo/ring-wal-gc/，gitignore 不提交）**~~ ✅（2026-08-29）：path 依赖主体 lib，
+   4 测试全绿——高写超容量触发强制 Flush+回绕不丢、崩溃恢复（mem::forget 模拟，窗口内未 fsync 丢失 ≤ 窗口）、
+   显式 Flush 前移 flushed_seq 覆盖安全、极小环形高刷频无 panic；
+2. ~~**YCSB 组合压测**~~ ✅：append+gc 2ms **91,296 ops/s（最优）**；ring+gc 关 564（环形 sync 双 fsync——
+   记录区+头部 tail，逐条成本翻倍）；ring+gc 2ms 30,270；ring 4MB+gc 2ms 55,570（小环形更早强制 Flush）；
+   `shanshui-cunji-ycsb` 增加 `--wal-mode` / `--ring-size-mb` 参数；
+3. ~~**结论**~~ ✅：组合**功能正确无需修复**；环形 + 组提交定位「WAL 空间有界」可选组合，
+   默认推荐 append + 组提交（性能最优）；后续可优化点：环形头部 tail 不必每次 fsync
+   （scan_ring 容忍 tail 略旧，不会读到垃圾——列入候选优化）。
+
 ---
 
 ## 8. 编码规范

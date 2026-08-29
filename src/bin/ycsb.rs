@@ -58,6 +58,13 @@ fn main() {
     let warm = args.iter().any(|a| a == "--warm");
     let no_fsync = args.iter().any(|a| a == "--no-fsync");
     let group_commit_us = get("--group-commit-us", 0);
+    let ring_size_mb = get("--ring-size-mb", 64);
+    let wal_mode = args
+        .iter()
+        .position(|a| a == "--wal-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "append".into());
     let dir = args
         .iter()
         .position(|a| a == "--dir")
@@ -69,13 +76,15 @@ fn main() {
     }
     println!(
         "[ycsb] workload={workload} records={records} ops/thread={ops} threads={threads} \
-         warm={warm} fsync={} group_commit_us={group_commit_us} dir={}",
+         warm={warm} fsync={} group_commit_us={group_commit_us} wal_mode={wal_mode} dir={}",
         !no_fsync,
         dir.display()
     );
 
     let mut cfg = Config::default();
     cfg.storage.group_commit_us = group_commit_us;
+    cfg.storage.wal_mode = wal_mode;
+    cfg.storage.wal_ring_size_mb = ring_size_mb;
     let mut engine = Engine::open(&dir, &cfg).unwrap();
 
     // ---------- load 阶段 ----------
