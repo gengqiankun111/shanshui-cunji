@@ -232,7 +232,7 @@ Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension 
 | Ex-2 | SAGA 编排 + 补偿状态机 | ⏳ | — |
 | Ex-3 | Calvin 确定性事务评估 | ⏳ | — |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ⏳ | — |
-| Ex-5 | SSD 原生迁移（P0 4KB 块/分片锁/批处理/compaction ✅ → P1 环形 WAL ✅/删除位图 ✅/FST ✅/解耦 ✅ → P2 冷热 ✅/条带化） | 🔄 | `ba709e2` 等 |
+| Ex-5 | SSD 原生迁移（P0 ✅ + P1 环形 WAL/删除位图/FST/解耦 ✅ + P2 冷热/条带化 ✅） | ✅ | `e6a5610` 等 |
 | Ex-6 | 并发读优化（Ex-6.1 Seqlock 原语 ✅ → 倒排段清单/FST 字典 Arc，依赖读写分离） | 🔄 | `1946161` |
 | Ex-7 | 多核优化（Ex-7.1 缓存伪共享 PerCpuCounter → 7.2 绑核 → 7.3 io_uring 多队列 → 7.4 compaction 动态限流） | ⏳ | — |
 

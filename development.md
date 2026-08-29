@@ -1460,6 +1460,23 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **335 全绿**（+2：热段优先选段 + 热度统计）；demo 3 测试全绿；
    clippy 新代码零警告；提交 `ba709e2`。⚠️ 热段下沉收益需在 **SSD 环境**实测。
 
+### 7.37 Ex-5.10 多 SSD 条带化（design 4.8.3 P2）
+
+> 背景：单盘布局 WAL/SST/倒排同盘竞争 IO；SSD 便宜，多盘条带化让 WAL 独占最快盘、
+> SSTable 与倒排分盘，消除 IO 争用（多盘 +3~4×）。
+
+1. ~~**demo 研究（src/demo/stripe/，gitignore 不提交）**~~ ✅：1 测试全绿——三个 tempdir 模拟
+   三块物理盘，500 文档写入 → WAL 落 wal_dir/primary、SST 落 sst_dir、倒排落 inverted_dir，
+   跨重启恢复 + 倒排检索全通；data_dir 不再承载列族数据。
+2. ~~**kernel 整合**~~ ✅：
+   - `[storage] wal_dir / sst_dir / inverted_dir`（Option<String>，默认 None = 单盘 data_dir
+     旧布局）——Engine::open 目录路由：sst_root = sst_dir‖data_dir，wal_root = wal_dir‖sst_root，
+     inverted_root = inverted_dir‖data_dir；
+   - `ColumnFamily::open_with_wal_dir(name, dir, wal_dir, cfg)`：WAL 独立盘按列族子目录
+     `wal_dir/{name}/wal.log`（多列族同名 wal.log 隔离）；旧 `open` 委托 None；
+3. ~~**验证**~~ ✅：`cargo test` **336 全绿**（+1：multi_ssd_striping_places_files 落位 + 跨重启）；
+   demo 1 测试全绿；clippy 零警告；提交 `e6a5610`。⚠️ 多盘吞吐收益需在 **SSD 多盘环境**实测。
+
 ---
 
 ## 8. 编码规范

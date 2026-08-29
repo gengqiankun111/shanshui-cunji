@@ -353,6 +353,14 @@
 - **结果**：demo 热段排序选段正确、部分合并读语义不变；335 测试全绿（+2）；提交 `ba709e2`
   （Ex-5.9）。
 
+### P46. 多 SSD 条带化：三列族 WAL 同名冲突 → 独立盘按列族分子目录
+- **现象**：Ex-5.10 给三个列族（primary/cidx/delta）配独立 WAL 盘时，若都写 `wal_dir/wal.log`
+  会互相覆盖（WAL_FILE 常量同名）。
+- **修复**：`ColumnFamily::open_with_wal_dir` 中独立盘 WAL 路径 = `wal_dir/{name}/wal.log`
+  （按列族分子目录），且 open 时 `create_dir_all(w.join(name))`。
+- **结果**：336 测试全绿（+1：multi_ssd_striping_places_files）；demo 三盘模拟全通；
+  提交 `e6a5610`（Ex-5.10）。
+
 ---
 
 ## 环境备忘（不入库）
