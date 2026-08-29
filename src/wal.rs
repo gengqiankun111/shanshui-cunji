@@ -44,13 +44,24 @@ pub struct WalWriter {
 
 const GROUP_COMMIT_FSYNC_BYTES: usize = 4 * 1024 * 1024; // perf 模式攒满 4MB 才 fsync
 
+/// WAL 文件头（append 模式截断后写入，M8-P5）：magic + next_seq。
+/// flush 后 WAL 清空重建，头持久化 next_seq 保证重开 seq 接续（不冲突）。
+const WAL_HEADER: &[u8; 8] = b"SCWAL01\0";
+const WAL_HEADER_LEN: usize = 16;
+
 impl WalWriter {
     /// 创建（截断已存在文件）。
     pub fn create(path: &Path, perf_mode: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::File::create(path)?;
+        // read+write（非 append）：truncate_and_reset 需要 set_len/seek 权限（M8-P5）
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
         Ok(Self {
             file: Some(file),
             path: path.to_path_buf(),
@@ -64,23 +75,49 @@ impl WalWriter {
 
     /// 以追加模式打开 WAL（**不截断**），用于重启恢复：回放旧记录后继续写入。
     /// `next_seq` 为接续序列号（= 已回放最大 seq + 1），避免同 key 新版本 seq 冲突。
+    /// 若文件含 WAL 头（截断后重建，M8-P5）则 next_seq 从头读取（优先级更高）。
     pub fn open_append(path: &Path, next_seq: u64, perf_mode: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
             .open(path)?;
+        // 读文件头：截断后的 WAL 持久化了 next_seq（重开接续，避免 seq 冲突）
+        let mut head = [0u8; WAL_HEADER_LEN];
+        let mut resolved = next_seq;
+        let mut f = &file;
+        if f.read_exact(&mut head).is_ok() && &head[0..8] == WAL_HEADER {
+            resolved = u64::from_le_bytes(head[8..16].try_into().unwrap());
+        }
         Ok(Self {
             file: Some(file),
             path: path.to_path_buf(),
-            next_seq,
+            next_seq: resolved,
             buf: Vec::new(),
             perf_mode,
             pending_bytes: 0,
             last_sync: std::time::Instant::now(),
         })
+    }
+
+    /// 截断重建 WAL（M8-P5）：flush 后所有记录已刷盘，清空文件并写头（magic + next_seq），
+    /// 保持 WAL 小文件（避免无限增长 + 大文件 fsync 拖慢写入）。next_seq 在内存保留递增。
+    pub fn truncate_and_reset(&mut self) -> Result<()> {
+        let next = self.next_seq;
+        let file = self.file.as_mut().unwrap();
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(WAL_HEADER)?;
+        file.write_all(&next.to_le_bytes())?;
+        file.sync_all()?; // 头 + next_seq 落盘（崩溃恢复 seq 接续依据）
+        self.buf.clear();
+        self.pending_bytes = 0;
+        self.last_sync = std::time::Instant::now();
+        Ok(())
     }
 
     /// 接续序列号（WAL 回放完成后调用，保证新写入 seq 单调递增且不冲突）。
@@ -126,6 +163,8 @@ impl WalWriter {
             return Ok(());
         }
         let file = self.file.as_mut().unwrap();
+        // 非 append 模式（read+write，M8-P5）：写入前 seek 到文件尾（头/上次记录之后）
+        file.seek(std::io::SeekFrom::End(0))?;
         file.write_all(&self.buf)?;
         self.buf.clear();
         self.pending_bytes = 0;
@@ -204,11 +243,16 @@ pub struct WalReader;
 
 impl WalReader {
     /// 回放：返回按 Seq 升序的有效记录集合；首条损坏/截断处停止。
+    /// 截断后重建的 WAL 含头（magic + next_seq，M8-P5）→ 跳过头从偏移 16 解析记录。
     pub fn recover(path: &Path) -> Result<Vec<WalRecord>> {
-        let mut buf = Vec::new();
-        std::fs::File::open(path)?.read_to_end(&mut buf)?;
+        let buf = std::fs::read(path)?;
+        let start = if buf.len() >= WAL_HEADER_LEN && &buf[0..8] == WAL_HEADER {
+            WAL_HEADER_LEN
+        } else {
+            0
+        };
         let mut records = Vec::new();
-        let mut pos = 0usize;
+        let mut pos = start;
         while pos + 8 <= buf.len() {
             let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
@@ -307,6 +351,7 @@ impl RingWal {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         if is_new {
             file.set_len(size as u64)?;
@@ -429,8 +474,12 @@ impl RingWal {
         Ok(())
     }
 
-    /// 落盘：构建写计划（必要时回绕）→ 写记录区 fsync → 更新头部 tail fsync → 维护索引。
+    /// 落盘：构建写计划（必要时回绕）→ 头部 tail 与记录区**同一次 fsync 原子提交**（M8-P12）→ 维护索引。
     /// 回绕覆盖未刷盘记录时返回 WalFull（上层 Flush + `set_flushed_seq` 后重试）。
+    ///
+    /// 崩溃安全（M8-P12 合并 fsync 后）：头部 tail 与记录区写入 page cache 后单次 `sync_all`
+    /// 原子提交——tail 与记录**同时可见** → tail 永不指向未落盘记录（与两阶段版保证相同）；
+    /// 崩溃于 fsync 前：头尾均未落盘 → 恢复上次提交状态（本次未提交记录忽略，安全）。
     pub fn sync(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -456,14 +505,13 @@ impl RingWal {
             pos += rec.len();
         }
         let file = self.file.as_mut().unwrap();
+        self.tail = pos;
+        write_ring_header(file, self.tail)?; // 写头部 tail（page cache）
         for (off, bytes) in &plan {
             file.seek(std::io::SeekFrom::Start(*off as u64))?;
             file.write_all(bytes)?;
         }
-        file.sync_all()?; // 阶段①：记录区落盘
-        self.tail = pos;
-        write_ring_header(file, self.tail)?;
-        file.sync_all()?; // 阶段②：头部 tail 落盘
+        file.sync_all()?; // 单次 fsync：头部 tail + 记录区原子提交（消除冗余第二次 fsync）
         for (off, rec) in &plan {
             let seq = u64::from_le_bytes(rec[8..16].try_into().unwrap());
             self.index.push((*off, seq));
@@ -603,6 +651,15 @@ impl WalBackend {
         match self {
             WalBackend::Append(w) => w.sync(),
             WalBackend::Ring(r) => r.sync(),
+        }
+    }
+
+    /// 截断重建（M8-P5）：append 模式 flush 后清空 WAL（写头持久化 next_seq）；
+    /// ring 模式自带覆盖回收（no-op）。
+    pub fn truncate_and_reset(&mut self) -> Result<()> {
+        match self {
+            WalBackend::Append(w) => w.truncate_and_reset(),
+            WalBackend::Ring(_) => Ok(()),
         }
     }
 

@@ -6,6 +6,11 @@
 
 use std::time::Instant;
 
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 
@@ -49,18 +54,6 @@ pub fn save_checkpoint(path: &std::path::Path, last_docid: u64) -> Result<()> {
     Ok(())
 }
 
-/// 倒排字段白名单过滤（import-schema，design 20）：term 形如 `field=value`，
-/// 白名单存在时只保留声明字段的词条；None 不过滤。
-fn filter_terms(terms: Vec<String>, whitelist: Option<&[String]>) -> Vec<String> {
-    match whitelist {
-        None => terms,
-        Some(wl) => terms
-            .into_iter()
-            .filter(|t| wl.iter().any(|f| t.starts_with(&format!("{f}="))))
-            .collect(),
-    }
-}
-
 /// CSV 全量导入：首行表头即 JSON 字段名；`docid` 列存在则用之，否则从 1 递增。
 pub fn import_csv(engine: &mut Engine, path: &std::path::Path) -> Result<ImportReport> {
     import_csv_filtered(engine, path, None)
@@ -97,6 +90,8 @@ fn import_csv_worker(
     cp_path: Option<&std::path::Path>,
 ) -> Result<ImportReport> {
     let t = Instant::now();
+    // P40：批量导入只写不读，跳过 HotCache 回填/失效
+    engine.set_bulk_import(true);
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -175,7 +170,16 @@ fn import_csv_worker(
             .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
         let val = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| Error::Serialize(format!("JSON 解析失败: {e}")))?;
-        let terms = filter_terms(crate::server::extract_terms(&val), whitelist);
+        // M8-P7：fulltext 字段分词建词 term（与白名单正交）；其余字段整串 term 受白名单过滤
+        let whitelist_set = whitelist
+            .map(|wl| wl.iter().cloned().collect::<std::collections::HashSet<_>>());
+        let ft = engine.fulltext_fields().clone();
+        let terms = crate::server::extract_terms_with_fulltext_seg(
+            &val,
+            whitelist_set.as_ref(),
+            Some(&ft),
+            engine.use_jieba(),
+        );
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         match engine.put(docid, bytes, &term_refs) {
             Ok(()) => {
@@ -415,7 +419,12 @@ pub fn import_mysqldump(engine: &mut Engine, path: &std::path::Path) -> Result<I
                 }
             };
             let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(v) => crate::server::extract_terms(&v),
+                Ok(v) => crate::server::extract_terms_with_fulltext_seg(
+                    &v,
+                    None,
+                    Some(engine.fulltext_fields()),
+                    engine.use_jieba(),
+                ),
                 Err(_) => {
                     failed += 1;
                     continue;
@@ -472,6 +481,8 @@ fn import_json_worker(
     cp_path: Option<&std::path::Path>,
 ) -> Result<ImportReport> {
     let t = Instant::now();
+    // P40：批量导入只写不读，跳过 HotCache 回填/失效
+    engine.set_bulk_import(true);
     let text = std::fs::read_to_string(path)?;
     let mut rows = 0u64;
     let mut failed = 0u64;
@@ -536,7 +547,18 @@ fn import_json_worker(
             }
         };
         let terms = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(v) => filter_terms(crate::server::extract_terms(&v), whitelist),
+            Ok(v) => {
+                // M8-P7：fulltext 字段分词建词 term（与白名单正交）；其余字段整串 term 受白名单过滤
+                let whitelist_set = whitelist
+                    .map(|wl| wl.iter().cloned().collect::<std::collections::HashSet<_>>());
+                let ft = engine.fulltext_fields().clone();
+                crate::server::extract_terms_with_fulltext_seg(
+                    &v,
+                    whitelist_set.as_ref(),
+                    Some(&ft),
+                    engine.use_jieba(),
+                )
+            }
             Err(_) => {
                 failed += 1;
                 continue;
@@ -564,6 +586,164 @@ fn import_json_worker(
         skipped,
         t.elapsed().as_millis() as u64,
     ))
+}
+
+/// Parquet 全量导入（大数据集，如 5000 万条 × 20 字段）：读 parquet → `put_nosync` 批量
+/// 写入（每 `FLUSH_EVERY` 条统一 fsync 一次 + 结尾统一提交），倒排词条自动派生。
+/// 主键：`docid` 列存在则用之，否则从 1 递增。
+pub fn import_parquet(
+    engine: &mut Engine,
+    path: &std::path::Path,
+    whitelist: Option<&[String]>,
+) -> Result<ImportReport> {
+    let t = Instant::now();
+    // P40：批量导入只写不读，跳过 HotCache 回填/失效（避免 4GB 缓存灌满挤爆内存触发页面颠簸）
+    engine.set_bulk_import(true);
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Migrate(format!("Parquet 打开失败: {e}")))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Migrate(format!("Parquet 元数据解析失败: {e}")))?;
+    let schema_fields = builder.schema().fields().clone();
+    let docid_idx = schema_fields.iter().position(|f| f.name() == "docid");
+    // 生成前字段过滤（M8-P4）：import-schema 白名单直接传给 extract（不匹配 term 不分配）
+    let include: Option<std::collections::HashSet<String>> =
+        whitelist.map(|wl| wl.iter().cloned().collect());
+    let reader = builder
+        .build()
+        .map_err(|e| Error::Migrate(format!("Parquet reader 构建失败: {e}")))?;
+
+    let mut rows = 0u64;
+    let mut failed = 0u64;
+    let mut next_id = 1u64;
+    // 批量提交：每 FLUSH_EVERY 条统一 fsync + 倒排刷盘一次（5000 万条逐条 fsync 需数小时，批量分钟级；
+    // 倒排 posting 定期刷段控制内存——100 万行 × ~10 词条 = 1 亿 posting ≈ 2-3GB，刷 20 次较优；
+    // 过频（50 万）刷段开销大拖慢导入）
+    const FLUSH_EVERY: u64 = 1_000_000;
+    let mut since_flush = 0u64;
+    for batch in reader {
+        let batch = match batch {
+            Ok(b) => b,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let n = batch.num_rows();
+        let cols: Vec<ArrayRef> = batch.columns().to_vec();
+        for r in 0..n {
+            let mut obj = serde_json::Map::new();
+            for (idx, f) in schema_fields.iter().enumerate() {
+                if let Some(v) = arr_value(&cols[idx], r) {
+                    obj.insert(f.name().clone(), v);
+                }
+            }
+            // 主键：docid 列优先，否则递增
+            let docid = match docid_idx {
+                Some(_) => match obj.get("docid").and_then(|v| v.as_i64()) {
+                    Some(d) if d >= 0 => d as u64,
+                    _ => {
+                        failed += 1;
+                        continue;
+                    }
+                },
+                None => {
+                    let d = next_id;
+                    next_id = d.wrapping_add(1);
+                    obj.insert("docid".into(), serde_json::Value::from(d));
+                    d
+                }
+            };
+            let val = serde_json::Value::Object(obj);
+            let bytes = serde_json::to_vec(&val)
+                .map_err(|e| Error::Serialize(format!("JSON 序列化失败: {e}")))?;
+            // 生成前字段过滤 + 引擎运行时过滤（白名单/黑名单/超长 term）双重兜底；
+            // M8-P7：fulltext 字段分词建词 term（与白名单正交），其余字段整串 term 受白名单过滤
+            let terms = crate::server::extract_terms_with_fulltext_seg(
+                &val,
+                include.as_ref(),
+                Some(engine.fulltext_fields()),
+                engine.use_jieba(),
+            );
+            let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            match engine.put_nosync(docid, bytes, &term_refs) {
+                Ok(()) => {
+                    rows += 1;
+                    since_flush += 1;
+                    // 细粒度进度（每 10 万行，定位卡点行区间用）
+                    if rows % 100_000 == 0 {
+                        use std::io::Write;
+                        println!(
+                            "  [progress] {rows} 行 · 累计 {:.0}s · {:.0} 行/s",
+                            t.elapsed().as_secs_f64(),
+                            rows as f64 / t.elapsed().as_secs_f64()
+                        );
+                        std::io::stdout().flush().ok();
+                    }
+                    if since_flush >= FLUSH_EVERY {
+                        let t0 = std::time::Instant::now();
+                        engine.flush_wal()?;
+                        let t1 = std::time::Instant::now();
+                        engine.flush_inverted()?; // 倒排 posting 定期刷段，控制内存
+                        let t2 = std::time::Instant::now();
+                        engine.flush_primary()?; // 主数据强制刷盘（防 memtable 异常累积卡顿）
+                        let t3 = std::time::Instant::now();
+                        since_flush = 0;
+                        println!(
+                            "[import-parquet] 已导入 {rows} 行（WAL {:.1}s / 倒排 {:.1}s / 主 {:.1}s）",
+                            t1.duration_since(t0).as_secs_f64(),
+                            t2.duration_since(t1).as_secs_f64(),
+                            t3.duration_since(t2).as_secs_f64()
+                        );
+                        use std::io::Write;
+                        std::io::stdout().flush().ok(); // 实时进度（管道缓冲）
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    engine.flush_wal()?;
+    engine.flush_inverted()?;
+    println!(
+        "[import-parquet] 完成: {rows} 行成功 / {failed} 失败 · {:.0} ms",
+        t.elapsed().as_millis() as f64
+    );
+    Ok(ImportReport::new(
+        rows,
+        failed,
+        0,
+        t.elapsed().as_millis() as u64,
+    ))
+}
+
+/// 从 arrow 数组取第 row 行的值（Int64/Int32/Float64/Boolean/Utf8 → serde_json Value）。
+fn arr_value(col: &ArrayRef, row: usize) -> Option<serde_json::Value> {
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::from(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::from(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::from(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::Bool(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return a
+            .is_valid(row)
+            .then(|| serde_json::Value::String(a.value(row).to_string()));
+    }
+    None
 }
 
 #[cfg(test)]

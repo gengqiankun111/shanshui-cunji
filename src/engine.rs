@@ -49,10 +49,33 @@ pub struct Engine {
     gc_stop: Option<Arc<AtomicBool>>,
     /// 组提交后台线程句柄。
     gc_thread: Option<std::thread::JoinHandle<()>>,
+    /// 倒排字段白名单（M8-P4）：Some = 只建声明字段倒排；None = 全部（黑名单仍生效）。
+    inverted_include: Option<std::collections::HashSet<String>>,
+    /// 倒排字段黑名单（M8-P4）：这些字段不建倒排（白名单非空时忽略）。
+    inverted_exclude: std::collections::HashSet<String>,
+    /// 倒排 term 长度上限（M8-P4）：超过自动跳过（长文本整串不进字典）；0 = 不限。
+    max_term_len: usize,
+    /// fulltext 分词字段（M8-P7）：声明字段做分词建词 term 索引（`ft:{field}:{token}`）。
+    fulltext_fields: std::collections::HashSet<String>,
+    /// 中文分词器（M8-P13）：true = jieba 完整词典分词（需 cjk-jieba feature）；
+    /// false = bigram（M8-P9）。来自 `[inverted] cjk_segmenter`。
+    use_jieba: bool,
+    /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
+    /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
+    skip_hotcache: bool,
 }
 
 /// 查询结果行：docid + 文档字节。
 pub type QueryRow = (u64, Vec<u8>);
+
+/// 分页查询结果（M8-P8）：`total` = 全量命中数（倒排 bitmap.len()，O(1)），
+/// `rows` = 当前页（只回表 limit 行，内存 O(limit) 不随 total 膨胀——
+/// 大结果集命中数百万行时全量回表 + JSON 构造会内存爆炸，实测 5M 行 → 10GB+ 卡死）。
+#[derive(Debug, Clone)]
+pub struct PagedRows {
+    pub total: u64,
+    pub rows: Vec<QueryRow>,
+}
 
 /// 增量备份文件（design 20，M6-5）：seq 游标 + WAL 记录集（JSON 持久化）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,6 +157,16 @@ impl Engine {
             group_commit: None,
             gc_stop: None,
             gc_thread: None,
+            inverted_include: if cfg.inverted.inverted_fields.is_empty() {
+                None
+            } else {
+                Some(cfg.inverted.inverted_fields.iter().cloned().collect())
+            },
+            inverted_exclude: cfg.inverted.exclude_fields.iter().cloned().collect(),
+            max_term_len: cfg.inverted.max_term_len,
+            fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
+            use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
+            skip_hotcache: false,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -197,6 +230,13 @@ impl Engine {
         self.mem_ratio = ratio.clamp(0.0, 1.0);
     }
 
+    /// 批量导入模式开关（P40）：开启后 `put_nosync` 跳过 HotCache 失效/回填。
+    /// 批量导入只写不读，回填缓存纯浪费内存（默认 4GB 预算会把文档全部塞入，
+    /// 叠加桌面负载触发页面颠簸 → 行速崩塌）。导入结束后应关闭恢复常规缓存语义。
+    pub fn set_bulk_import(&mut self, on: bool) {
+        self.skip_hotcache = on;
+    }
+
     /// 写入文档（docid + 序列化字节 + 该文档涉及的倒排词条）。
     /// 写失效链：先失效 HotCache 与组合索引旧条目，最后写 LSM（design 6.6）。
     /// OOM Guardian：写入前按水位限流/熔断（design 14.1.1）。
@@ -210,19 +250,40 @@ impl Engine {
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
     pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
-        // ① 失效 HotCache 该 docid
-        self.hotcache.invalidate(docid);
+        // ① 失效 HotCache 该 docid（批量导入模式跳过：只写不读，避免缓存膨胀挤爆内存，P40）
+        if !self.skip_hotcache {
+            self.hotcache.invalidate(docid);
+        }
         // ② 主数据（权威源，WAL 攒批不逐条 fsync）；全量覆盖 → 清空该 docid 的增量（避免旧 patch 覆盖新数据）
         self.primary
             .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         self.delta.delete_prefix(&encode_docid(docid))?;
-        // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）
+        // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）；
+        //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
         for t in terms {
-            self.inverted.add(t, docid);
+            if self.inverted_allowed(t) {
+                self.inverted.add(t, docid);
+            }
         }
-        // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中）
-        self.hotcache.put(docid, value);
+        // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中；批量导入模式跳过，P40）
+        if !self.skip_hotcache {
+            self.hotcache.put(docid, value);
+        }
         Ok(())
+    }
+
+    /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
+    /// term 编码 `field=value`，field 为 JSON 字段路径（嵌套用 `.` 连接）。
+    fn inverted_allowed(&self, term: &str) -> bool {
+        // 超长 term（长文本整串）自动跳过：防止误配下字典膨胀
+        if self.max_term_len > 0 && term.len() > self.max_term_len {
+            return false;
+        }
+        let field = term.split('=').next().unwrap_or("");
+        if let Some(include) = &self.inverted_include {
+            return include.contains(field);
+        }
+        !self.inverted_exclude.contains(field)
     }
 
     /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
@@ -433,14 +494,124 @@ impl Engine {
 
     /// 倒排词条查询：合并 posting（RoaringBitmap）→ 回表取文档。
     pub fn search_term(&mut self, term: &str) -> Result<Vec<QueryRow>> {
+        Ok(self.search_term_paged(term, None, 0)?.rows)
+    }
+
+    /// 倒排词条分页查询（M8-P8）：bitmap 迭代 docid 天然升序，skip(offset) 后只回表 limit 行。
+    /// `total` = 全量命中数（bitmap.len() O(1)）；limit=None 取全部（兼容非分页调用）。
+    pub fn search_term_paged(
+        &mut self,
+        term: &str,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<PagedRows> {
         let bitmap = self.inverted.search(term)?;
-        let mut out = Vec::new();
+        let total = bitmap.len() as u64;
+        let mut rows = Vec::new();
+        let cap = limit.unwrap_or(u64::MAX);
+        let mut skipped = 0u64;
         for docid in bitmap {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if rows.len() as u64 >= cap {
+                break;
+            }
             if let Some(v) = self.get(docid as u64)? {
-                out.push((docid as u64, v));
+                rows.push((docid as u64, v));
             }
         }
-        Ok(out)
+        Ok(PagedRows { total, rows })
+    }
+
+    /// fulltext 分词检索（M8-P7）：按字段 + 关键词构造词 term `ft:{field}:{word}` 查询
+    /// （词 term 由 fulltext_fields 声明字段分词生成）。命中 posting 合并 → 回表取文档。
+    pub fn fulltext_search(&mut self, field: &str, word: &str) -> Result<Vec<QueryRow>> {
+        self.fulltext_search_paged(field, word, None, 0).map(|p| p.rows)
+    }
+
+    /// fulltext 分词检索分页（M8-P8）：同 `search_term_paged` 语义（构造 `ft:{field}:{word}`）。
+    pub fn fulltext_search_paged(
+        &mut self,
+        field: &str,
+        word: &str,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<PagedRows> {
+        self.search_term_paged(&format!("ft:{field}:{word}"), limit, offset)
+    }
+
+    /// fulltext 分词字段集合（M8-P7）：供 term 提取层判断字段是否走分词索引。
+    pub fn fulltext_fields(&self) -> &std::collections::HashSet<String> {
+        &self.fulltext_fields
+    }
+
+    /// 中文分词器开关（M8-P13）：true = jieba 完整词典分词，false = bigram。
+    pub fn use_jieba(&self) -> bool {
+        self.use_jieba
+    }
+
+    /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
+    /// 不随扫描总量膨胀（旧实现先全量收集 O(total) 再截断）；`total` = 范围行数
+    /// （全扫计数，limit 取满页后仅计数不回表，语义与全量一致）。
+    pub fn scan_range_paged(
+        &mut self,
+        start: Option<u64>,
+        end: Option<u64>,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<PagedRows> {
+        let cap = limit.unwrap_or(u64::MAX);
+        let sk = start.map(|s| crate::keys::encode_docid(s).to_vec());
+        let ek = end.map(|e| crate::keys::encode_docid(e).to_vec());
+        let mut rows = Vec::new();
+        let mut skipped = 0u64;
+        let mut total = 0u64;
+        self.primary
+            .scan_stream(sk.as_deref(), ek.as_deref(), |key, val| {
+                total += 1;
+                if skipped < offset {
+                    skipped += 1;
+                    return Ok(true);
+                }
+                if rows.len() as u64 >= cap {
+                    return Ok(true); // 页已取满：仅继续计数 total，不再收集
+                }
+                let docid = crate::keys::decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+                })?;
+                rows.push((docid, val.to_vec()));
+                Ok(true)
+            })?;
+        Ok(PagedRows { total, rows })
+    }
+
+    /// scan 游标续扫（M8-P11）：从 `after`（上次最后 docid，None=从头）之后取 `limit` 条，
+    /// **取满即提前终止**（不做 total 全扫）——全库遍历每页 O(limit) + 游标定位，
+    /// 避免 offset 翻页的累积跳过与 total 全扫开销（7.18 已知限制）。
+    /// 语义：docid 升序、不含 after 本身；配合 end 上界可限定范围。
+    pub fn scan_after(
+        &mut self,
+        after: Option<u64>,
+        end: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<QueryRow>> {
+        let start = after.map(|a| encode_docid(a.saturating_add(1)).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        let mut rows = Vec::new();
+        self.primary
+            .scan_stream(start.as_deref(), ek.as_deref(), |key, val| {
+                if rows.len() as u64 >= limit {
+                    return Ok(false); // 取满页：提前终止（不再扫后续）
+                }
+                let docid = crate::keys::decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+                })?;
+                rows.push((docid, val.to_vec()));
+                Ok(true)
+            })?;
+        Ok(rows)
     }
 
     /// 主键范围扫描。
@@ -652,6 +823,251 @@ mod tests {
         assert_eq!(e2.get(49).unwrap().unwrap(), b"doc-49");
     }
 
+    // ---------- 批量导入模式（P40） ----------
+
+    #[test]
+    fn bulk_import_skips_hotcache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 默认：写后回填 HotCache
+        e.put_nosync(1, b"doc-1".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 1, "默认写后应回填热缓存");
+        // 批量导入模式：只写不读，跳过回填（P40 防缓存膨胀挤爆内存）
+        e.set_bulk_import(true);
+        e.put_nosync(2, b"doc-2".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 1, "批量导入模式不应回填热缓存");
+        // 关闭后恢复常规语义
+        e.set_bulk_import(false);
+        e.put_nosync(3, b"doc-3".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 2, "关闭后应恢复回填");
+        // 主数据不受影响：批量写入的文档仍可正常读取
+        e.set_bulk_import(true);
+        e.put_nosync(4, b"doc-4".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.hotcache.len(), 2);
+        assert_eq!(e.get(4).unwrap().unwrap(), b"doc-4");
+    }
+
+    // ---------- fulltext 分词索引（M8-P7） ----------
+
+    #[test]
+    fn fulltext_search_finds_long_text_and_persists() {
+        // 核心动机：>96B 长文本整串被 max_term_len 跳过，分词词 term 短 → 长文本可检索
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["big_text".into()];
+        let val = serde_json::json!({"docid": 42, "status": "active", "big_text": format!("{:<300}", "rec-00000042-msg-777")});
+        let ft = c.inverted.fulltext_fields.iter().cloned().collect();
+        let terms =
+            crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        {
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            e.put(42, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+            e.flush_inverted().unwrap();
+            // 词 term 可检索（整串 300B > max_term_len=96 会被跳过，词 term 不受影响）
+            assert_eq!(e.fulltext_search("big_text", "rec").unwrap().len(), 1);
+            assert_eq!(e.fulltext_search("big_text", "777").unwrap().len(), 1);
+            // 非 fulltext 字段整串 term 照常
+            assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        }
+        // 刷盘 + 重开：词 term 持久化可查（倒排段已落盘）
+        let mut e2 = Engine::open(dir.path(), &c).unwrap();
+        assert_eq!(e2.fulltext_search("big_text", "777").unwrap().len(), 1);
+        let hits = e2.fulltext_search("big_text", "00000042").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 42);
+    }
+
+    #[test]
+    fn cjk_fulltext_searchable_via_bigram() {
+        // M8-P9：中文整串不再当单 token（无法检索）——bigram 分词后 2-4 字关键词可检索
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["content".into()];
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        let docs = [
+            (1u64, "山水存迹数据库存储引擎"),
+            (2u64, "基于Rust的LSM树文档数据库"),
+            (3u64, "分布式缓存系统设计"),
+        ];
+        for (id, content) in docs {
+            let val = serde_json::json!({"docid": id, "content": content});
+            let ft = e.fulltext_fields().clone();
+            let terms = crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(id, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+
+        // 3 字关键词"数据库" → bigram 数据/据库（AND 交集精确命中含该词的文档 1、2）
+        let d1 = e.inverted_posting("ft:content:数据").unwrap();
+        let d2 = e.inverted_posting("ft:content:据库").unwrap();
+        let and = d1 & d2;
+        assert_eq!(and.len(), 2);
+        assert!(and.contains(1) && and.contains(2));
+        // 4 字关键词"山水存迹" → 3 个 bigram AND → 只命中 doc 1
+        let inter = e.inverted_posting("ft:content:山水").unwrap()
+            & e.inverted_posting("ft:content:水存").unwrap()
+            & e.inverted_posting("ft:content:存迹").unwrap();
+        assert_eq!(inter.len(), 1);
+        assert!(inter.contains(1));
+        // fulltext_search 回表
+        let hits = e.fulltext_search("content", "数据").unwrap();
+        assert!(hits.iter().any(|(id, _)| *id == 1 || *id == 2));
+    }
+
+    #[test]
+    fn jieba_fulltext_meaningful_word_hit() {
+        // M8-P13：jieba 词典分词——"数据库"单 term 精确命中（bigram 需 数据+据库 AND）
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["content".into()];
+        c.inverted.cjk_segmenter = "jieba".into();
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        assert!(e.use_jieba(), "cjk_segmenter=jieba 应启用 jieba 分词");
+        let docs = [
+            (1u64, "山水存迹数据库存储引擎"),
+            (2u64, "基于Rust的LSM树文档数据库"),
+            (3u64, "分布式缓存系统设计"),
+        ];
+        for (id, content) in docs {
+            let val = serde_json::json!({"docid": id, "content": content});
+            let ft = e.fulltext_fields().clone();
+            let terms =
+                crate::server::extract_terms_with_fulltext_seg(&val, None, Some(&ft), e.use_jieba());
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(id, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+        // jieba 词典词"数据库"单 term 精确命中 2 个文档
+        assert_eq!(e.inverted_posting("ft:content:数据库").unwrap().len(), 2);
+        let hits = e.fulltext_search("content", "数据库").unwrap();
+        assert_eq!(hits.len(), 2);
+        // 无该词 → 0
+        assert_eq!(e.fulltext_search("content", "缓存系统").unwrap().len(), 0);
+    }
+
+    // ---------- 分页查询（M8-P8） ----------
+
+    #[test]
+    fn paged_queries_semantics_and_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["big_text".into()];
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        // 100 docs：status 三态（active 34，docid 等差 3），big_text 每行唯一 token
+        for i in 0..100u64 {
+            let status = ["active", "inactive", "pending"][(i % 3) as usize];
+            let val = serde_json::json!({
+                "docid": i,
+                "status": status,
+                "big_text": format!("rec-{i:08}-msg-{i}"),
+            });
+            let ft = e.fulltext_fields().clone();
+            let terms = crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(i, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+
+        // 全量 total + 行数
+        let all = e.search_term_paged("status=active", None, 0).unwrap();
+        assert_eq!(all.total, 34);
+        assert_eq!(all.rows.len(), 34);
+        // 分页：total 恒为全量命中数，rows 只含当前页，docid 升序接续
+        let p1 = e.search_term_paged("status=active", Some(10), 0).unwrap();
+        let p2 = e.search_term_paged("status=active", Some(10), 10).unwrap();
+        assert_eq!(p1.total, 34);
+        assert_eq!(p1.rows.len(), 10);
+        assert_eq!(p2.rows.len(), 10);
+        assert_eq!(p2.rows[0].0, p1.rows[9].0 + 3, "active docid 等差 3 接续");
+        // 拼接 == 全量（有序稳定）
+        let mut merged = p1.rows.clone();
+        merged.extend(p2.rows);
+        for off in [20u64, 30] {
+            let p = e.search_term_paged("status=active", Some(10), off).unwrap();
+            merged.extend(p.rows);
+        }
+        assert_eq!(merged.len(), 34);
+        for (a, b) in merged.iter().zip(all.rows.iter()) {
+            assert_eq!(a.0, b.0, "分页拼接必须与全量一致");
+        }
+        // 边界：limit=0 → 空页 total 不变；offset > total → 空页；limit > total → 全部
+        let z = e.search_term_paged("status=active", Some(0), 0).unwrap();
+        assert_eq!(z.total, 34);
+        assert!(z.rows.is_empty());
+        let o = e.search_term_paged("status=active", Some(5), 100).unwrap();
+        assert!(o.rows.is_empty());
+        let big = e.search_term_paged("status=active", Some(10_000), 0).unwrap();
+        assert_eq!(big.rows.len(), 34);
+
+        // fulltext 分页同语义
+        let ft = e.fulltext_search_paged("big_text", "rec", Some(10), 90).unwrap();
+        assert_eq!(ft.total, 100);
+        assert_eq!(ft.rows.len(), 10);
+        assert_eq!(ft.rows[0].0, 90);
+        // scan 分页
+        let sc = e.scan_range_paged(Some(10), Some(50), Some(5), 0).unwrap();
+        assert_eq!(sc.total, 41);
+        assert_eq!(sc.rows.len(), 5);
+        assert_eq!(sc.rows[0].0, 10);
+    }
+
+    #[test]
+    fn scan_after_cursor_traversal() {
+        // M8-P11：游标续扫——遍历一致性 / 边界 / 提前终止（无 total 全扫）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=100u64 {
+            let val = serde_json::json!({"docid": i, "v": i});
+            e.put_nosync(i, serde_json::to_vec(&val).unwrap(), &[]).unwrap();
+            if i % 25 == 0 {
+                e.flush_primary().unwrap();
+            }
+        }
+        e.flush_primary().unwrap();
+        // 游标遍历：limit=10 逐页续扫，拼接 == 全量升序
+        let mut merged: Vec<u64> = Vec::new();
+        let mut after: Option<u64> = None;
+        loop {
+            let page: Vec<u64> = e
+                .scan_after(after, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            merged.extend(page.iter().copied());
+            after = Some(*page.last().unwrap());
+        }
+        assert_eq!(merged.len(), 100);
+        assert_eq!(merged, (1..=100).collect::<Vec<u64>>(), "游标遍历覆盖全部且升序");
+        // 边界：after=0 → 从 1 起；after=100 → 空；尾部不足 limit
+        let from0: Vec<u64> = e
+            .scan_after(Some(0), None, 3)
+            .unwrap()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(from0, vec![1, 2, 3]);
+        assert!(e.scan_after(Some(100), None, 10).unwrap().is_empty());
+        assert_eq!(
+            e.scan_after(Some(97), None, 10).unwrap().len(),
+            3,
+            "尾部不足一页取剩余"
+        );
+        // 上界限定：after=0 & end=50 → 1..=50
+        let bounded: Vec<u64> = e
+            .scan_after(Some(0), Some(50), 100)
+            .unwrap()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(bounded, (1..=50).collect::<Vec<u64>>());
+    }
+
     #[test]
     fn group_commit_drop_persists_all() {
         // 开启 2ms 窗口：快速 put 全部攒批，drop 最终落盘 → 重开数据完整
@@ -713,6 +1129,83 @@ mod tests {
         }
         // 60ms 窗口 + 4KB 阈值：快速 50 条 put（远快于窗口）绝大部分应攒批
         assert!(missed >= 40, "窗口内应攒批（攒批 {missed}，同步 {synced}）");
+    }
+
+    // ---------- 倒排字段白名单/黑名单/长文本（M8-P4） ----------
+
+    #[test]
+    fn inverted_whitelist_only_indexes_declared_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.inverted_fields = vec!["status".into(), "city".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "city": "beijing", "name": "alice"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        // 白名单字段可查
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        assert_eq!(e.inverted_doc_count("city=beijing").unwrap(), 1);
+        // 非白名单字段不建倒排
+        assert_eq!(e.inverted_doc_count("name=alice").unwrap(), 0);
+    }
+
+    #[test]
+    fn inverted_exclude_skips_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.exclude_fields = vec!["big_text".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "big_text": "hello world"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        assert_eq!(
+            e.inverted_doc_count("big_text=hello world").unwrap(),
+            0,
+            "黑名单字段不建倒排"
+        );
+    }
+
+    #[test]
+    fn inverted_max_term_len_skips_long_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.max_term_len = 16; // 16 字节以上 term 自动跳过（长文本整串保护）
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let long = "x".repeat(100);
+        let doc = json!({"docid": 1, "status": "active", "payload": long});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(
+            e.inverted_doc_count("status=active").unwrap(),
+            1,
+            "短字段仍建"
+        );
+        assert_eq!(
+            e.inverted_doc_count("payload=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").unwrap(),
+            0,
+            "超长 term 自动跳过（防长文本膨胀）"
+        );
+    }
+
+    #[test]
+    fn inverted_default_all_fields_built() {
+        // 默认配置（白名单空）：短字符串字段全建；仅超长 term（>96）自动跳过
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "city": "beijing"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 1);
+        assert_eq!(e.inverted_doc_count("city=beijing").unwrap(), 1);
     }
 
     #[test]
@@ -896,11 +1389,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
         e.put(1, b"a".to_vec(), &["a"]).unwrap();
-        e.flush_primary().unwrap(); // 刷盘不影响 WAL 记录
+        e.flush_primary().unwrap(); // flush → WAL 截断（M8-P5）：已刷盘记录 1 从 WAL 删除
         e.put(2, b"b".to_vec(), &["b"]).unwrap();
         let bak = dir.path().join("incr-all.json");
         let rep = e.backup_incremental(0, &bak).unwrap();
-        assert_eq!(rep.records, 2, "since=0 应导出全部记录（含已刷盘）");
+        assert_eq!(
+            rep.records, 1,
+            "since=0 导出当前 WAL 全部记录（截断后 = 未刷盘记录 2；记录 1 已入 SST 由全量备份覆盖）"
+        );
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------

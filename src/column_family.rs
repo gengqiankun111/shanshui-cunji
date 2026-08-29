@@ -228,8 +228,11 @@ impl ColumnFamily {
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
         let max_seq = cf.replay_records(&wal_records)?;
-        // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）
-        cf.wal.lock().unwrap().resume_seq(max_seq + 1);
+        // 新写入 seq 必须接续已回放的最大 seq，避免同 key 版本冲突（重启恢复的正确性）。
+        // 截断后重建的 WAL 含头（持久化 next_seq，M8-P5）且无回放记录 → 保持头值不覆盖。
+        if max_seq > 0 {
+            cf.wal.lock().unwrap().resume_seq(max_seq + 1);
+        }
         Ok(cf)
     }
 
@@ -473,6 +476,86 @@ impl ColumnFamily {
         Ok(out)
     }
 
+    /// 流式范围扫描（M8-P10）：k-way merge（memtable 双缓冲 + 各 SST 有序源）按 key 升序
+    /// 回调 `f(key, value)`——同 key 取最大 seq（最新版本），Tombstone 跳过。
+    /// 回调返回 `bool`：true=继续，**false=提前终止**（M8-P11 游标续扫：取满页即停，
+    /// 不再全扫计数 total）。内存 O(块) 不随扫描总量膨胀，语义与 `scan_raw_range` 一致。
+    pub fn scan_stream<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()> {
+        // 源：memtable（immutable + mutable）借用 &self.memtable；SST 借用 &mut self.ssts
+        let mut mem_iters = self.memtable.iter_range(start, end);
+        let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
+        for sst in &mut self.ssts {
+            sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
+        }
+        let mem_count = mem_iters.len();
+        let total = mem_count + sst_iters.len();
+        if total == 0 {
+            return Ok(());
+        }
+        // 各源当前条目 (key, value, seq)
+        let mut cur: Vec<Option<(Vec<u8>, Option<Vec<u8>>, u64)>> = Vec::with_capacity(total);
+        for it in mem_iters.iter_mut() {
+            cur.push(it.next().transpose()?);
+        }
+        for it in sst_iters.iter_mut() {
+            cur.push(it.next().transpose()?);
+        }
+        // k-way merge 用最小堆（O(N log K)，避免每轮线性扫全部源 O(N·K)——K 大时不可接受）
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
+            std::collections::BinaryHeap::new();
+        for (i, c) in cur.iter().enumerate() {
+            if let Some((k, _, _)) = c {
+                heap.push(std::cmp::Reverse((k.clone(), i)));
+            }
+        }
+        loop {
+            let Some(std::cmp::Reverse((min_key, i0))) = heap.pop() else {
+                break; // 全部耗尽
+            };
+            // 收集所有 key == min_key 的源（同 key 候选），取最大 seq（最新版本覆盖旧版本）
+            let mut to_advance: Vec<usize> = vec![i0];
+            while let Some(std::cmp::Reverse((k, i))) = heap.peek() {
+                if *k == min_key {
+                    to_advance.push(*i);
+                    heap.pop();
+                } else {
+                    break;
+                }
+            }
+            let mut best_seq = 0u64;
+            let mut best_val: Option<Vec<u8>> = None;
+            for i in to_advance {
+                let (k, v, seq) = cur[i].take().unwrap();
+                debug_assert!(k == min_key, "同 key 归并");
+                if seq >= best_seq {
+                    best_seq = seq;
+                    best_val = v;
+                }
+                // 推进该源到下一跳，重新入堆
+                cur[i] = if i < mem_count {
+                    mem_iters[i].next().transpose()?
+                } else {
+                    sst_iters[i - mem_count].next().transpose()?
+                };
+                if let Some((nk, _, _)) = &cur[i] {
+                    heap.push(std::cmp::Reverse((nk.clone(), i)));
+                }
+            }
+            // Tombstone（最新版本 value=None）→ 该 key 视为删除，不输出
+            if let Some(v) = best_val {
+                if !f(min_key.as_slice(), &v)? {
+                    break; // 提前终止（游标续扫取满页）
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 范围扫描并保留 seq 与 Tombstone（MVCC 快照 Delta 隔离用，M7-1）：
     /// 返回升序 `(key, seq, value)`，value=None 表示删除标记；每 key 仅保留最大 seq 版本。
     pub fn scan_raw_range_with_seq(
@@ -520,6 +603,9 @@ impl ColumnFamily {
             self.flush_buckets(&imm)?;
         }
         self.wal.lock().unwrap().set_flushed_seq(flushed_max);
+        // WAL 截断（M8-P5）：append 模式 flush 后全部记录已刷盘，清空 WAL 保持小文件
+        // （避免无限增长 + 大文件 fsync 拖慢写入）；ring 模式自带覆盖回收（no-op）
+        self.wal.lock().unwrap().truncate_and_reset()?;
         Ok(())
     }
 
@@ -1042,6 +1128,151 @@ mod tests {
         cfg.blockcache.block_size_kb = 1;
         cfg.sstable.compression = "none".into();
         cfg
+    }
+
+    // ---------- 流式 scan（M8-P10） ----------
+
+    #[test]
+    fn scan_stream_matches_scan_raw_range() {
+        let dir = tmp();
+        let cfg = small_cfg(16); // 小阈值 → 多次 flush → 多 SST 源
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 批量写入并周期性 flush（产生多个 SST：k-way merge 多源）
+        for i in 0..2_000u64 {
+            cf.put_bytes_nosync(
+                format!("k{i:08}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            )
+            .unwrap();
+            if i % 500 == 499 {
+                cf.switch_and_flush().unwrap();
+            }
+        }
+        // memtable 新版本：覆盖 + 删除
+        cf.put_bytes_nosync(b"k00000042".to_vec(), b"updated".to_vec())
+            .unwrap();
+        cf.delete_bytes(b"k00000100".to_vec()).unwrap();
+        cf.sync_wal().unwrap();
+
+        // 全量（旧路径）vs 流式（新路径）：结果完全一致
+        let all = cf.scan_raw_range(None, None).unwrap();
+        let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        cf.scan_stream(None, None, |k, v| {
+            streamed.push((k.to_vec(), v.to_vec()));
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(streamed.len(), all.len(), "流式行数应与全量一致");
+        for (a, b) in streamed.iter().zip(all.iter()) {
+            assert_eq!(a.0, b.0, "key 顺序一致");
+            assert_eq!(a.1, b.1, "value 一致（含覆盖后的新值）");
+        }
+        // 语义校验：覆盖生效、删除隐藏
+        let hit = all.iter().find(|(k, _)| k == b"k00000042").unwrap();
+        assert_eq!(hit.1, b"updated");
+        assert!(
+            !all.iter().any(|(k, _)| k == b"k00000100"),
+            "被删除的 key 不应出现"
+        );
+        // 范围过滤：流式与全量一致
+        let ra = cf
+            .scan_raw_range(Some(&b"k00001000"[..]), Some(&b"k00001010"[..]))
+            .unwrap();
+        let mut rs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        cf.scan_stream(
+            Some(&b"k00001000"[..]),
+            Some(&b"k00001010"[..]),
+            |k, v| {
+                rs.push((k.to_vec(), v.to_vec()));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(rs, ra, "范围过滤流式应与全量一致");
+    }
+
+    // ---------- WAL 截断（M8-P5） ----------
+
+    #[test]
+    fn wal_truncated_after_flush_keeps_data() {
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let wal_path = dir.join(WAL_FILE);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 0..5_000u64 {
+                cf.put_bytes_nosync(i.to_be_bytes().to_vec(), format!("doc-{i}").into_bytes())
+                    .unwrap();
+            }
+            cf.sync_wal().unwrap();
+            let before = std::fs::metadata(&wal_path).unwrap().len();
+            cf.switch_and_flush().unwrap(); // flush → WAL 截断
+            let after = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                after < before && after < 64,
+                "flush 后 WAL 应截断为小文件（before={before} after={after}）"
+            );
+        }
+        // 重开：数据完整（从 SST + WAL 恢复），seq 接续
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.get(0).unwrap().unwrap().0, b"doc-0");
+        assert_eq!(cf2.get(4_999).unwrap().unwrap().0, b"doc-4999");
+        // 新写入 seq 接续（不回到 1）：头持久化 next_seq
+        let next = cf2.wal_next_seq();
+        assert!(
+            next >= 5_001,
+            "重开后 next_seq 应接续（>=5001），实际 {next}"
+        );
+    }
+
+    #[test]
+    fn wal_header_persists_next_seq_across_restart() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let wal_path = dir.join(WAL_FILE);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for i in 0..300u64 {
+            cf.put_bytes_nosync(i.to_be_bytes().to_vec(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        cf.sync_wal().unwrap();
+        cf.switch_and_flush().unwrap(); // 截断，头写入 next_seq=301
+        let first_after_flush = cf.wal_next_seq();
+        drop(cf);
+        // 重开：next_seq 从头恢复（>300），而非 1
+        let cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(
+            cf2.wal_next_seq(),
+            first_after_flush,
+            "重开 next_seq 应接续（头持久化）"
+        );
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() < 64,
+            "WAL 保持小文件"
+        );
+    }
+
+    #[test]
+    fn old_wal_without_header_still_recovers() {
+        // 兼容：旧格式 WAL（无头，M8-P5 之前）照常回放恢复
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 0..100u64 {
+                cf.put_bytes_nosync(i.to_be_bytes().to_vec(), format!("v{i}").into_bytes())
+                    .unwrap();
+            }
+            cf.sync_wal().unwrap();
+            // 不 flush：WAL 保留记录（旧格式无头）
+        }
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(
+            cf2.get(99).unwrap().unwrap().0,
+            b"v99",
+            "旧格式 WAL 应回放恢复"
+        );
+        assert!(cf2.wal_next_seq() >= 101, "旧 WAL 回放后 seq 接续");
     }
 
     #[test]

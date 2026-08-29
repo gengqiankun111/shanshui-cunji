@@ -249,6 +249,56 @@
 - **结果**：2ms 窗口 **91,296 ops/s**（45×），P50 872µs→7.8µs；1ms 窗口 75,330 ops/s（37×）；达无 fsync 上限（113,587）的 80%。
 - **提交**：`648d9bd`（M8-P0）
 
+### P38. 长文本整串进倒排字典：1 亿单 posting term 膨胀（5000 万导入卡顿根因）
+- **现象**：5000 万条导入极慢（数小时级），db-50m 达 19GB；观察进程 CPU 高、磁盘阶段 0 写入。
+- **根因**：`extract_terms` 对**所有字符串字段**生成 `field=value` 完整 term——ds-50m 的 2 个 256 字符
+  big_text 字段每行产生 256B 且全唯一的 term → 5000 万行 = **1 亿个单 posting term ≈ 2.6GB 纯字典浪费**；
+  倒排刷段排序（O(P log P)，P=1000 万/段）与 JSON 解析（每行 2 次序列化 + 遍历）叠加 → CPU 数小时。
+- **复杂度分析**：写入 O(N·F)；倒排排序 ∑O(Pᵢ log Pᵢ)；内存峰值（100 万行 posting + memtable + mmap）
+  实测 **WS 5.3GB / PM 6.5GB，远低于 16G**（非内存问题，是字典膨胀 + 排序 + 全字段建索引）。
+- **修复**（M8-P4）：`[inverted] inverted_fields`（白名单）/ `exclude_fields`（黑名单）/
+  **`max_term_len`（默认 96B，超长 term 自动跳过 = 长文本整串不进字典）**——`Engine::inverted_allowed`
+  写路径统一过滤；demo 实测 100 字段表白名单 20 字段字典压缩 45 万倍（12 vs 550 万唯一 term）。
+- **结果**：重导后 big_text 不再进倒排（8 个枚举字段建索引），导入显著加速、库大幅缩小；
+  长文本存主数据可主键/扫描查询，后续可加 `fulltext` 分词建词 term 索引（与 inverted:false 正交）。
+- **提交**：`cde4f18`（M8-P4）
+
+### P39. WAL 无限增长：6.5GB wal.log 每 100 万行 fsync 拖垮导入
+- **现象**：5000 万导入中 wal.log 达 6.5GB 不回收；导入在 400 万行后长时间卡顿（CPU 满、磁盘 0 写入）；磁盘写入双倍（WAL + SST）。
+- **根因**：append 模式 WAL 在 SST flush 后**不截断**——每次 `flush_wal`（每 100 万行）fsync 6.5GB 大文件的全部脏页 → 单次 fsync 数十秒；WAL 文件持续增长。
+- **修复**（M8-P5）：flush 成功后 `truncate_and_reset` 清空 WAL 并写**文件头（magic + next_seq）**持久化 seq 接续（重开不冲突）；`open_append` 读头 / `recover` 跳头 16B / 旧无头 WAL 兼容；`WalWriter` 打开模式 append → read+write（Windows append 句柄不允许 `set_len(0)`，PermissionDenied）+ sync 前 seek 末尾。
+- **语义变更**：增量备份只导出 WAL 未刷盘记录（已刷盘由全量备份覆盖，与环形 WAL 一致）；缺口检测仍有效。
+- **结果**：WAL 保持小文件，导入卡顿消除、速度稳定 100 万/分钟（SST 构建 + 倒排段排序主导）。
+- **提交**：`a4d829a`（M8-P5）
+
+### P40. 批量导入 HotCache 灌满内存 → 页面颠簸 → 行速指数级崩塌（5000 万导入 4M 行后卡死）
+- **现象**：WAL 截断修复后 5000 万导入仍确定性卡死：0-4M 行 60K 行/s 正常，4M-5M 掉到 2K/s，8M-9M 掉到 0.9K/s，12M 后无限卡（CPU 满核、磁盘 0.9M/s、inverted/primary 停止更新）；5M 复现同样在 ~4.3M 开始指数减速。
+- **根因**：**HotCache 默认 4GB 预算被只写不读的导入文档灌满**。批量导入每行 `put_nosync` → `hotcache.put`，4M 行 × ~600B ≈ 2.4GB 全进缓存（导入从不读取，纯浪费）；LruCache 内部淘汰（容量 4M 条目）不同步 `stats` HashMap（泄漏）与 `used_bytes`（虚增）——叠加 primary memtable 256MB + WAL 缓冲，进程 WS 涨到 4.9GB。本机仅 16GB 且桌面负载（TRAE+浏览器）占 ~11GB → 总需求超物理内存 → **Windows 页面文件颠簸**（峰值 24.8GB）：每个内存访问缺页换入换出 → CPU 满转、磁盘 ~0.9M/s（页面文件）、行速指数恶化、最终假死。修复前验证过单行路径全部 O(1)/O(log n)（WAL 内存缓冲、SkipMap、DashMap、LRU），排除算法 O(N²)。
+- **修复**：`Engine::set_bulk_import(on)`（P40）——批量导入模式跳过 `put_nosync` 的 HotCache 失效/回填（`import_parquet` / CSV / JSON 三个导入器入口统一开启）。导入只写不读，回填缓存无收益，跳过即消除 2.4-4GB 内存压力。
+- **结果**：5M 复现 80s 完成、全程稳定 63K 行/s（越过 4.3M 卡点）；50M 正式导入 WS 从 4.9GB 降到 **621MB**、61.7K 行/s 稳定通过旧卡点 12M。
+- **遗留**：HotCache `stats` 泄漏 / `used_bytes` 虚增（LruCache 内部淘汰未同步）是独立内存缺陷，常规读写负载下也会缓慢泄漏，待后续修复。
+- **提交**：`bde422d`（M8-P6）
+
+### P41. HotCache 内部淘汰不通知 stats/used_bytes：泄漏 + 虚增 + LFU O(N) 风暴（大批量回表卡死 server）
+- **现象**：fulltext 验证时 `GET /fulltext?word=rec`（命中 5M 行）把 server 卡死——日志每秒刷
+  "HotCache 达软水位"（used_bytes 已超硬预算 285MB/268MB 仍上涨）、CPU 满、后续请求全部超时。
+- **根因**：HotCache 容量按**条目数**（`max_memory_mb×1024×1024/1024`，默认 4M 条）设 LruCache
+  容量，**LruCache 满后内部自动淘汰不通知 `stats`/`used_bytes`** → stats 无限泄漏（每写一个
+  新 docid 永久残留）+ used_bytes 只增不减（虚增）。超预算后 `evict_one` 从 stats 选 victim，
+  但该 key 常已被 LruCache 内部淘汰（`cache.pop` 返回 None）→ **淘汰永远失败 + 超预算死循环**；
+  LFU `pick_lfu_victim` 全量扫描 stats（O(N)）→ 大批量回表（每 get 一次 hotcache.put）把
+  写/查询路径卡成 **O(N²)**。这是 P40（50M 导入 4M 行卡死）的叠加因素——内存压力由 hotcache
+  虚增/泄漏放大，页面颠簸由淘汰失败雪上加霜。
+- **修复**：①容量 **unbounded**（`LruCache::unbounded`），淘汰**完全由字节预算**统一管理——
+  stats 与缓存同步（不泄漏）、used_bytes 准确（不虚增）、evict 必有真实 victim；②**软水位渐进
+  淘汰**（每 put 至多 1 个，防单次 put 的 O(N) evict 风暴）；③**LFU 采样近似**（主缓存前 64 条目
+  选最小计数，O(64) 常量，替代全量 O(N) 扫描）。
+- **结果**：hotcache 14 测试全绿（+2 回归：批量 put 无泄漏/无虚增/真淘汰、10K 次 512KB put
+  渐进淘汰 <5s）；5M 库小查询 959ms 正常（修复前 server 假死）。
+- **观察（非本项）**：大结果集查询（数百万行）server 端全量 JSON 构造仍会内存爆炸
+  （命中 5M 行 → 10GB+），API 无 limit/分页 → 后续加 limit/游标分页。
+- **提交**：`5a937ea`（P41）
+
 ---
 
 ## 环境备忘（不入库）

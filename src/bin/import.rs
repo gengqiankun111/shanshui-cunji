@@ -3,6 +3,7 @@
 //! 用法：
 //!   shanshui-cunji-import --csv <in.csv> [--config config.toml]
 //!   shanshui-cunji-import --json <in.jsonl> [--config config.toml]
+//!   shanshui-cunji-import --parquet <in.parquet> [--config config.toml]
 //!   shanshui-cunji-import --csv <in.csv> --schema schema.json  # import-schema（预创建索引字段基座）
 //!
 //! 与迁移工具（shanshui-cunji-migrate）复用内核：import 是通用格式入口（CSV / JSONL），
@@ -15,16 +16,19 @@ use shanshui_cunji::config::Config;
 use shanshui_cunji::import_schema::ImportSchema;
 use shanshui_cunji::migrate::{
     import_csv_filtered, import_csv_incremental, import_json_filtered, import_json_incremental,
-    load_checkpoint,
+    import_parquet, load_checkpoint,
 };
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut csv_path: Option<PathBuf> = None;
     let mut json_path: Option<PathBuf> = None;
+    let mut parquet_path: Option<PathBuf> = None;
     let mut schema_path: Option<PathBuf> = None;
     let mut checkpoint_path: Option<PathBuf> = None;
     let mut incremental = false;
+    let mut data_dir_override: Option<PathBuf> = None;
+    let mut inverted_engine: Option<String> = None;
     let mut config_path = PathBuf::from("config.toml");
     let mut i = 0;
     while i < args.len() {
@@ -41,6 +45,12 @@ fn main() {
                     json_path = Some(PathBuf::from(&args[i]));
                 }
             }
+            "--parquet" => {
+                i += 1;
+                if i < args.len() {
+                    parquet_path = Some(PathBuf::from(&args[i]));
+                }
+            }
             "--schema" => {
                 i += 1;
                 if i < args.len() {
@@ -48,6 +58,18 @@ fn main() {
                 }
             }
             "--incremental" => incremental = true,
+            "--data-dir" => {
+                i += 1;
+                if i < args.len() {
+                    data_dir_override = Some(PathBuf::from(&args[i]));
+                }
+            }
+            "--inverted-engine" => {
+                i += 1;
+                if i < args.len() {
+                    inverted_engine = Some(args[i].clone());
+                }
+            }
             "--checkpoint" => {
                 i += 1;
                 if i < args.len() {
@@ -64,8 +86,8 @@ fn main() {
         }
         i += 1;
     }
-    if csv_path.is_none() && json_path.is_none() {
-        eprintln!("❌ 用法: shanshui-cunji-import --csv <in.csv> | --json <in.jsonl> [--schema schema.json] [--incremental --checkpoint cp] [--config config.toml]");
+    if csv_path.is_none() && json_path.is_none() && parquet_path.is_none() {
+        eprintln!("❌ 用法: shanshui-cunji-import --csv <in.csv> | --json <in.jsonl> | --parquet <in.parquet> [--schema schema.json] [--incremental --checkpoint cp] [--config config.toml]");
         std::process::exit(1);
     }
     if incremental && checkpoint_path.is_none() {
@@ -105,13 +127,19 @@ fn main() {
         None
     };
 
-    let cfg = match Config::load(&config_path) {
+    let mut cfg = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("❌ 配置加载失败: {e}");
             std::process::exit(1);
         }
     };
+    if let Some(d) = &data_dir_override {
+        cfg.storage.data_dir = d.display().to_string();
+    }
+    if let Some(eng) = &inverted_engine {
+        cfg.inverted.engine = eng.clone();
+    }
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
     let mut engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
         Ok(e) => e,
@@ -141,6 +169,9 @@ fn main() {
         } else {
             import_json_filtered(&mut engine, p, whitelist.as_deref())
         }
+    } else if let Some(p) = &parquet_path {
+        println!("Parquet 导入: {}", p.display());
+        import_parquet(&mut engine, p, whitelist.as_deref())
     } else {
         unreachable!()
     };
