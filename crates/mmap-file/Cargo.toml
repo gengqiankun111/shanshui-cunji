@@ -1,0 +1,11 @@
+[package]
+name = "mmap-file"
+version = "0.1.0"
+edition = "2021"
+description = "只读 mmap 文件安全封装（unsafe 白名单隔离，P23 决策）：主库 forbid(unsafe_code) 下按需加载 FST 字典，零堆分配冷启动"
+
+[dependencies]
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

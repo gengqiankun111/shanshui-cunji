@@ -21,6 +21,9 @@ roaring = "0.10"
 crc32fast = "1"
 fst = "0.4"
 memmap2 = "0.9"
+# Ex-5.7（P23 决策）：只读 mmap 安全封装（独立 crate = unsafe 白名单），主库保持零 unsafe；
+# 倒排 FST 字典按需加载（冷启动零堆分配，design 5.2.4.1）
+mmap-file = { path = "crates/mmap-file" }
 csv = "1"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 parquet = "59.2.0"

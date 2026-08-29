@@ -18,8 +18,8 @@
 //!     中途崩溃不丢数据；分层 Tiered Segments 合并（每次只合并最小 2 段）留后续优化。
 //!
 //! > mmap 按需加载（冷启动亚秒）为设计目标；本项目 `#![forbid(unsafe_code)]`，
-//! > memmap2 的 mmap 为 unsafe API，故 FST 字典采用 fs::read 加载（FST 为压缩结构、体积小），
-//! > mmap 化留待独立 crate 封装 unsafe 白名单后落地。
+//! > Ex-5.7 已落地：独立 crate `mmap-file`（crates/mmap-file/，P23 unsafe 白名单）封装
+//! > 只读 mmap 安全 API，FST 字典改用 `fst::Map<MmapFile>`——主库源码保持零 unsafe。
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -33,6 +33,7 @@ use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::keys::{decode_varlen, encode_varlen};
+use mmap_file::MmapFile;
 
 /// 段文件魔数。
 const SEG_MAGIC: &[u8; 8] = b"NVINV001";
@@ -62,7 +63,9 @@ pub struct InvertedIndex {
     /// 段文件列表（新→旧，仅含文件名）。
     segments: Vec<String>,
     /// 段 → FST 术语字典（term → 段内条目字节偏移）；engine=fst 且存在 .fst 时填充。
-    dicts: HashMap<String, fst::Map<Vec<u8>>>,
+    /// Ex-5.7：mmap 只读映射（MmapFile 安全封装，P23 unsafe 白名单）——冷启动零堆分配、
+    /// 物理页按需缺页加载（design 5.2.4.1），替代旧 fs::read 全量读入。
+    dicts: HashMap<String, fst::Map<MmapFile>>,
     next_seg_id: u64,
     /// 刷盘阈值：内存累计 posting 达此值整段落盘。
     flush_threshold: u64,
@@ -126,20 +129,25 @@ impl InvertedIndex {
         );
         // 加载 FST 术语字典（design 5.2.4.1）：每个段对应 inverted-{id}.fst；
         // 缺失的段（旧数据 / hash 引擎写入）在查询时回退线性扫描。
+        // Ex-5.7：mmap 只读映射按需加载（替代 fs::read 全量读入）——冷启动零堆分配。
         let mut dicts = HashMap::new();
         if engine == "fst" {
             for seg in &segments {
                 let fst_name = seg.replace(".seg", ".fst");
                 let fst_path = dir.join(&fst_name);
                 if fst_path.exists() {
-                    if let Ok(bytes) = std::fs::read(&fst_path) {
-                        match fst::Map::new(bytes) {
-                            Ok(map) => {
-                                dicts.insert(seg.clone(), map);
-                            }
-                            Err(e) => {
-                                info!("FST 字典解析失败，该段回退线性扫描: {fst_name}: {e}")
-                            }
+                    match MmapFile::open(&fst_path)
+                        .map_err(Error::from)
+                        .and_then(|mm| {
+                            fst::Map::new(mm)
+                                .map_err(|e| Error::Serialize(format!("FST 字典解析失败: {e}")))
+                        })
+                    {
+                        Ok(map) => {
+                            dicts.insert(seg.clone(), map);
+                        }
+                        Err(e) => {
+                            info!("FST 字典加载失败，该段回退线性扫描: {fst_name}: {e}")
                         }
                     }
                 }
@@ -366,32 +374,37 @@ impl InvertedIndex {
     }
 
     /// 编译并写 FST 字典文件 `inverted-{id}.fst`（term → 段内条目字节偏移，字典序），
-    /// 返回内存字典（供本实例即时使用，无需重启）。
+    /// 返回 mmap 只读字典（Ex-5.7，供本实例即时使用，无需重启；零堆分配按需加载）。
     fn write_fst_dict(
         &self,
         seg_id: u64,
         term_offsets: &[(Vec<u8>, u64)],
-    ) -> Result<fst::Map<Vec<u8>>> {
+    ) -> Result<fst::Map<MmapFile>> {
         let fst_path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.fst"));
         let tmp = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.fst.tmp"));
         {
             let file = std::fs::File::create(&tmp)?;
-            let mut w = std::io::BufWriter::new(file);
-            let mut builder = fst::MapBuilder::new(&mut w)
-                .map_err(|e| Error::Serialize(format!("FST 构建失败: {e}")))?;
-            for (term, offset) in term_offsets {
+            {
+                let mut w = std::io::BufWriter::new(&file);
+                let mut builder = fst::MapBuilder::new(&mut w)
+                    .map_err(|e| Error::Serialize(format!("FST 构建失败: {e}")))?;
+                for (term, offset) in term_offsets {
+                    builder
+                        .insert(term, *offset)
+                        .map_err(|e| Error::Serialize(format!("FST 写入失败: {e}")))?;
+                }
                 builder
-                    .insert(term, *offset)
-                    .map_err(|e| Error::Serialize(format!("FST 写入失败: {e}")))?;
+                    .finish()
+                    .map_err(|e| Error::Serialize(format!("FST 完成失败: {e}")))?;
+                w.flush()?;
             }
-            builder
-                .finish()
-                .map_err(|e| Error::Serialize(format!("FST 完成失败: {e}")))?;
-            w.flush()?;
+            // 写句柄上 fsync（Windows FlushFileBuffers 需写权限；只读句柄会 PermissionDenied）
+            file.sync_all()?;
         }
-        let bytes = std::fs::read(&tmp)?;
+        // 原子改名（先改名再 mmap：Windows 下已映射文件无法 rename）
         std::fs::rename(&tmp, &fst_path)?;
-        fst::Map::new(bytes).map_err(|e| Error::Serialize(format!("FST 内存映射失败: {e}")))
+        let mm = MmapFile::open(&fst_path)?;
+        fst::Map::new(mm).map_err(|e| Error::Serialize(format!("FST 字典解析失败: {e}")))
     }
 
     fn persist_manifest(&self) -> Result<()> {
@@ -635,13 +648,13 @@ impl InvertedIndex {
         self.segments = vec![fname.clone()];
         self.persist_manifest()?;
 
-        // ⑤ 删除旧段与旧 FST（孤儿无害，启动不加载）
+        // ⑤ 重建内存字典 → 释放旧段 mmap 映射后再删旧文件（Ex-5.7：Windows 下已映射
+        //    文件无法删除；旧段孤儿无害，启动不加载）
+        self.dicts.clear();
         for seg in &old_segments {
             let _ = std::fs::remove_file(self.dir.join(seg));
             let _ = std::fs::remove_file(self.dir.join(seg.replace(".seg", ".fst")));
         }
-        // 重建内存字典
-        self.dicts.clear();
         if let Some(m) = new_dict {
             self.dicts.insert(fname, m);
         }

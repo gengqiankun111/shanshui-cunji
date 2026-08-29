@@ -977,6 +977,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmap-file"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
 name = "no_std_io2"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1448,6 +1455,7 @@ dependencies = [
  "lru",
  "memmap2",
  "mimalloc",
+ "mmap-file",
  "parquet",
  "proptest",
  "roaring",
