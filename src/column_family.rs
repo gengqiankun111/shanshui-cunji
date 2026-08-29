@@ -713,7 +713,9 @@ impl ColumnFamily {
     /// 基础 Compaction（无删除位图过滤）。Ex-5.8：无重叠 L0 段合并走**数据块级复用**
     /// （只重建元数据区），否则回退全量合并（等价 `compact_filtered(&|_| false)`）。
     pub fn compact(&mut self) -> Result<CompactReport> {
-        let (sel, out_level) = select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold);
+        let heat: Vec<u64> = self.ssts.iter().map(|s| s.heat()).collect();
+        let (sel, out_level) =
+            select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold, &heat);
         if sel.len() <= 1 {
             return Ok(CompactReport {
                 merged_ssts: 0,
@@ -740,7 +742,9 @@ impl ColumnFamily {
     /// - 崩溃安全：新段写入 → fsync → 原子更新 Manifest → 删除旧段；
     /// - 后台 IO 限速：写完后按实际文件字节 acquire。
     pub fn compact_filtered(&mut self, drop_key: &dyn Fn(&[u8]) -> bool) -> Result<CompactReport> {
-        let (sel, out_level) = select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold);
+        let heat: Vec<u64> = self.ssts.iter().map(|s| s.heat()).collect();
+        let (sel, out_level) =
+            select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold, &heat);
         if sel.len() <= 1 {
             return Ok(CompactReport {
                 merged_ssts: 0,
@@ -1058,6 +1062,11 @@ impl ColumnFamily {
         self.ssts.len()
     }
 
+    /// Ex-5.9：指定 SST 的读热度（冷热感知 Compaction 监控/策略数据源）。
+    pub fn sst_heat(&self, idx: usize) -> u64 {
+        self.ssts.get(idx).map_or(0, |s| s.heat())
+    }
+
     /// 当前 WAL 下一可分配 seq（Engine 快照点来源，design 4.7 MVCC）。
     pub fn wal_next_seq(&self) -> u64 {
         self.wal.lock().unwrap().next_seq()
@@ -1190,6 +1199,8 @@ fn get_from_sst(
             }
         }
     }
+    // Ex-5.9：布隆放行（真正读块）→ 读热度 +1（冷热感知 Compaction 数据源）
+    sst.touch();
     let ck = BlockCacheKey {
         file: sst.path().to_path_buf(),
         offset: entry.offset,
@@ -1221,8 +1232,14 @@ fn imm_scan_max_seq(imm: &MemTable) -> u64 {
 /// - L0 空且 L1 > 1 → 合并全部 L1 → L2（压实下沉）；
 /// - L0/L1 均空且 L2 > 1 → 合并 L2（异常残留收敛）。
 /// 单段 L0（未达 2 段）不压实——等待更多刷盘批次，避免无收益重写。
+/// Ex-5.9 冷热感知：L0 段数超过 `limit`（逼近写 Stall）且存在热度数据时，**优先合并最热的
+/// `limit` 段**（热段先下沉 L1 聚合，热点读路径段数更快减少）；无热度数据维持全量合并。
 /// 返回 `(选中段下标, 输出层)`；无需要压实的输入时返回 `(空, 0)`。
-fn select_compaction_inputs(levels: &[u32], level_limit: usize) -> (Vec<usize>, u32) {
+fn select_compaction_inputs(
+    levels: &[u32],
+    level_limit: usize,
+    heat: &[u64],
+) -> (Vec<usize>, u32) {
     let l0: Vec<usize> = levels
         .iter()
         .enumerate()
@@ -1246,7 +1263,15 @@ fn select_compaction_inputs(levels: &[u32], level_limit: usize) -> (Vec<usize>, 
             return (Vec::new(), 0); // 单个 L0 段：暂不压实（无收益重写）
         }
         if l1.len() < level_limit.max(1) {
-            (l0, 1)
+            // Ex-5.9：L0 超阈值且存在热度 → 优先合并最热的 level_limit 段（热段先下沉 L1）
+            if l0.len() > level_limit && heat.iter().any(|h| *h > 0) {
+                let mut ranked = l0.clone();
+                ranked.sort_by(|a, b| heat[*b].cmp(&heat[*a]).then(a.cmp(b)));
+                ranked.truncate(level_limit.max(1));
+                (ranked, 1)
+            } else {
+                (l0, 1)
+            }
         } else {
             let mut sel = l0.clone();
             sel.extend(l1);
@@ -1758,21 +1783,77 @@ mod tests {
 
     #[test]
     fn select_compaction_inputs_picks_levels() {
+        let no_heat = &[];
         // 2 个 L0 + L1 未满 → 仅 L0
-        assert_eq!(select_compaction_inputs(&[0, 0, 1], 8), (vec![0, 1], 1));
+        assert_eq!(
+            select_compaction_inputs(&[0, 0, 1], 8, no_heat),
+            (vec![0, 1], 1)
+        );
         // 单个 L0 → 暂不压实
-        assert_eq!(select_compaction_inputs(&[0, 1], 8), (Vec::new(), 0));
+        assert_eq!(
+            select_compaction_inputs(&[0, 1], 8, no_heat),
+            (Vec::new(), 0)
+        );
         // L0 ≥ 2 且 L1 已满 → L0 + 全部 L1 收敛
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2),
+            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2, no_heat),
             (vec![0, 1, 2, 3, 4, 5], 1)
         );
         // L0 空、L1 > 1 → L1 → L2
-        assert_eq!(select_compaction_inputs(&[1, 1], 8), (vec![0, 1], 2));
+        assert_eq!(
+            select_compaction_inputs(&[1, 1], 8, no_heat),
+            (vec![0, 1], 2)
+        );
         // L0 空、L1 单段 → 无压实
-        assert_eq!(select_compaction_inputs(&[1], 8), (Vec::new(), 0));
+        assert_eq!(
+            select_compaction_inputs(&[1], 8, no_heat),
+            (Vec::new(), 0)
+        );
         // L0/L1 空、L2 > 1 → 收敛 L2
-        assert_eq!(select_compaction_inputs(&[2, 2], 8), (vec![0, 1], 2));
+        assert_eq!(
+            select_compaction_inputs(&[2, 2], 8, no_heat),
+            (vec![0, 1], 2)
+        );
+    }
+
+    #[test]
+    fn select_compaction_hot_first_when_l0_over_limit() {
+        // Ex-5.9：L0 段数超过 limit 且存在热度 → 优先合并最热的 limit 段（热段先下沉 L1）
+        let levels = [0u32, 0, 0, 0, 0]; // 5 个 L0，limit=3
+        let heat = [0u64, 0, 100, 50, 10]; // 段 2 最热
+        let (sel, out) = select_compaction_inputs(&levels, 3, &heat);
+        assert_eq!(out, 1);
+        assert_eq!(sel, vec![2, 3, 4], "应选最热 3 段（100/50/10）");
+        // 无热度数据 → 维持全量合并
+        let (sel2, _) = select_compaction_inputs(&levels, 3, &[]);
+        assert_eq!(sel2, vec![0, 1, 2, 3, 4], "无热度全量合并");
+        // L0 未超阈值 → 全量（热度不参与）
+        let (sel3, _) = select_compaction_inputs(&[0, 0], 3, &heat);
+        assert_eq!(sel3, vec![0, 1]);
+    }
+
+    #[test]
+    fn sst_heat_tracks_point_reads() {
+        // Ex-5.9：点查命中递增 SST 热度；跨 flush/compact 保持
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for i in 0..50u64 {
+            cf.put(i, format!("v{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_count(), 1);
+        assert_eq!(cf.sst_heat(0), 0, "初始零热度");
+        // 多次点查（含未命中——未命中不计数）
+        for _ in 0..10 {
+            cf.get(5).unwrap();
+        }
+        cf.get(1000).unwrap(); // 未命中（键序在范围外，布隆拦截不计数）
+        let h = cf.sst_heat(0);
+        assert_eq!(h, 10, "10 次命中计数，未命中不计数");
+        // 热度读取不重置（累积）
+        cf.get(6).unwrap();
+        assert_eq!(cf.sst_heat(0), 11);
     }
 
     #[test]

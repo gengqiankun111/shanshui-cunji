@@ -25,6 +25,7 @@
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bloom::BloomFilter;
 use crate::error::{Error, Result};
@@ -658,6 +659,8 @@ pub struct SstReader {
     compression: Compression,
     /// 文件格式版本（v3=纯行式，v4=PAX，v5=分区布隆）。
     format: u16,
+    /// Ex-5.9 冷热感知：读热度计数（点查/范围扫描命中递增，冷热 Compaction 选段依据）。
+    heat: AtomicU64,
 }
 
 /// Level 1 摘要条目：每 `index_granularity` 个块一条（design 4.4.2）。
@@ -814,11 +817,22 @@ impl SstReader {
             bloom,
             compression,
             format: version,
+            heat: AtomicU64::new(0),
         })
     }
 
     pub fn footer(&self) -> &SstFooter {
         &self.footer
+    }
+
+    /// Ex-5.9：读命中递增热度（冷热感知 Compaction 数据源）。
+    pub fn touch(&self) {
+        self.heat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Ex-5.9：当前读热度计数。
+    pub fn heat(&self) -> u64 {
+        self.heat.load(Ordering::Relaxed)
     }
 
     /// v5 分区布隆原始字节（每块一个，与 Index 对齐）。
