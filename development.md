@@ -1204,6 +1204,22 @@ impl RuntimePools {
    313 测试对齐 + 四分支同步 + 发布前 bug 清理：WAL `truncate(false)` 表意/删死代码 rows_payload/
    修未用变量）；测试 313 全绿。
 
+### 7.24 Ex-5.1 SSTable 4KB 块（SSD 原生，design 4.8）
+
+> 背景：SSD-only 定位下，块大小从 16KB（对齐 HDD 扇区/寻道）改为 4KB（对齐 SSD 页）——
+> 点查读放大 16×→4×；两级索引（design 4.4.2 已有）需防"块变小 → 索引条目 ×4 → 内存膨胀"。
+
+1. ~~**demo 研究（src/demo/block4k/，gitignore 不提交）**~~ ✅：6 测试全绿——50 万行 JSON 实测：
+   块数 2726→10823（3.97×）；点查读放大平均命中块 1257B→413B（-67%）；压缩后体积 3.43MB→
+   4.48MB（小块 zstd 窗口小 +30%，SSD 空间便宜可接受）；单条 100KB 长 value 超块不 panic；
+   5000 随机 + 首/末边界 + 不存在点查全对；**窗口化两级定位**（L1 摘要粗定位 + 窗口内精确二分）
+   2000 随机 key 与全量二分结果一致。
+2. ~~**kernel 整合**~~ ✅：`BlockCacheConfig.block_size_kb` 默认 16→4；`SstableConfig.index_granularity`
+   默认 16→64（与 4KB 块联动，L1 摘要 170 vs 171，内存不膨胀）；读路径从 SST header 取块大小
+   （不依赖配置）——旧 16KB 块数据照常可读，无格式变更；测试 313 全绿。
+3. ~~**验证**~~ ✅：`cargo test` 313 全绿；demo 6 测试全绿（见 1）；提交 `056b21d`。
+   ⚠️ 性能收益需在 **SSD 环境**实测（HDD 开发环境不压测，design 1.2 警告）。
+
 ---
 
 ## 8. 编码规范
