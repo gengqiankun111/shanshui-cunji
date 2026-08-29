@@ -113,6 +113,24 @@
 | 读写分离 / 双写加速 | ⏸ | 评估中 |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
+## J. SSD 原生优化（v0.7 起，Ex-5，放弃 HDD 兼容）
+
+> 定位（design 1.2/4.8）：只支持 NVMe/SATA SSD；目标「写入快 + 20 倒排字段」写入 TPS 40 万+。
+> ⚠️ **开发环境用机械硬盘性能大幅下降、勿压测**（design 1.2 警告）。
+
+| 任务 | 优先级 | 状态 |
+|---|---|---|
+| SSTable 4KB 块 + 两级索引（block_size_kb 16→4，回表读放大 -75%） | P0 | ⏳ Ex-5.1 |
+| 倒排分片锁（Term Hash 256 分区，锁竞争 P99 -40%） | P0 | ⏳ Ex-5.2 |
+| 倒排更新批处理（同 Term 攒批批量追加，CPU -60%） | P0 | ⏳ Ex-5.3 |
+| Compaction 参数调优（层级 20× + 并行 2~4，写放大 -60%） | P0 | ⏳ Ex-5.4 |
+| 环形大文件 WAL 规模化（预分配 + 磨损均衡，WAL P99 -60%） | P1 | ⏳ Ex-5.5 |
+| 删除位图（Deletion Bitmap，删除 IO -99%） | P1 | ⏳ Ex-5.6 |
+| 倒排 FST + Mmap 字典（冷启动 8s→50ms） | P1 | ⏳ Ex-5.7 |
+| 元数据-数据解耦（Compaction 只重写元数据，写放大 -50%） | P1 | ⏳ Ex-5.8 |
+| 冷热感知 Compaction + Bloom Merge（写入量 -30%） | P2 | ⏳ Ex-5.9 |
+| 多 SSD 条带化（WAL 独占最快盘，多盘 +3~4×） | P2 | ⏳ Ex-5.10 |
+
 ---
 
 ## 近期里程碑（按完成顺序）
