@@ -144,17 +144,43 @@ impl Engine {
         cfg: &Config,
         query_timeout: std::time::Duration,
     ) -> Result<Self> {
-        let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
+        // Ex-5.10 多 SSD 条带化目录路由：WAL 独占最快盘（wal_dir），SSTable 数据盘（sst_dir），
+        // 倒排独立盘（inverted_dir）；未配置时回退单盘 data_dir 布局（旧行为）。
+        let sst_root = cfg.storage.sst_dir.as_deref().map(Path::new).unwrap_or(data_dir);
+        let wal_root = cfg.storage.wal_dir.as_deref().map(Path::new).unwrap_or(sst_root);
+        let inverted_root = cfg
+            .storage
+            .inverted_dir
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(data_dir);
+        let primary = ColumnFamily::open_with_wal_dir(
+            "primary",
+            &sst_root.join("primary"),
+            Some(wal_root),
+            cfg,
+        )?;
         let mut inverted = InvertedIndex::open_with_gc(
-            &data_dir.join("inverted"),
+            &inverted_root.join("inverted"),
             1_000_000,
             &cfg.inverted.engine,
             cfg.inverted.segment_max_size_mb * 1024 * 1024,
         )?;
         // 位图索引（design 5.2.4，M7-2）：白名单非空时全量重建内存位图
         inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
-        let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
-        let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
+        let cidx = ColumnFamily::open_with_wal_dir(
+            "cidx",
+            &sst_root.join("cidx"),
+            Some(wal_root),
+            cfg,
+        )
+        .ok();
+        let delta = ColumnFamily::open_with_wal_dir(
+            "delta",
+            &sst_root.join("delta"),
+            Some(wal_root),
+            cfg,
+        )?;
         // 删除位图（Ex-5.6）：开启时加载/创建独立位图文件（4KB 页对齐，见 bitmap.rs）
         let deletion_bitmap = if cfg.storage.deletion_bitmap_enabled {
             Some(DeletionBitmap::open(&data_dir.join("deletion.bitmap"))?)
@@ -1769,6 +1795,48 @@ mod tests {
     }
 
     // ---------- Ex-5.6 删除位图 ----------
+
+    #[test]
+    fn multi_ssd_striping_places_files() {
+        // Ex-5.10 多 SSD 条带化：wal_dir/sst_dir/inverted_dir 分盘——WAL/SST/倒排文件
+        // 落位正确 + 数据跨重启恢复（默认单盘布局由既有测试覆盖）
+        let data_dir = tempfile::tempdir().unwrap();
+        let wal_dir = tempfile::tempdir().unwrap();
+        let sst_dir = tempfile::tempdir().unwrap();
+        let inv_dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.storage.wal_dir = Some(wal_dir.path().to_string_lossy().to_string());
+        cfg.storage.sst_dir = Some(sst_dir.path().to_string_lossy().to_string());
+        cfg.storage.inverted_dir = Some(inv_dir.path().to_string_lossy().to_string());
+        {
+            let mut e = Engine::open(data_dir.path(), &cfg).unwrap();
+            e.put(1, b"doc1".to_vec(), &["rust"]).unwrap();
+            e.put(2, b"doc2".to_vec(), &["go"]).unwrap();
+            e.flush_primary().unwrap();
+            e.flush_inverted().unwrap();
+            assert_eq!(e.get(1).unwrap().unwrap(), b"doc1");
+        }
+        // 落位验证：WAL / SST / 倒排各在其盘
+        assert!(
+            wal_dir.path().join("primary").join("wal.log").exists(),
+            "primary WAL 应落在 wal_dir"
+        );
+        let sst_files: Vec<_> = std::fs::read_dir(sst_dir.path().join("primary"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!sst_files.is_empty(), "SST 应落在 sst_dir");
+        assert!(
+            inv_dir.path().join("inverted").join("inverted-manifest.json").exists(),
+            "倒排应在 inverted_dir"
+        );
+        assert!(!data_dir.path().join("primary").exists(), "列族目录已外移 sst_dir");
+        // 跨重启恢复（多盘布局持久）
+        let mut e2 = Engine::open(data_dir.path(), &cfg).unwrap();
+        assert_eq!(e2.get(1).unwrap().unwrap(), b"doc1");
+        assert_eq!(e2.get(2).unwrap().unwrap(), b"doc2");
+        assert!(e2.search_term("rust").unwrap().len() == 1);
+    }
 
     #[test]
     fn deletion_bitmap_persists_across_restart() {

@@ -106,9 +106,23 @@ pub struct CompactReport {
 }
 
 impl ColumnFamily {
-    /// 打开（或创建）一个列族：加载 Manifest/SST、回放 WAL。
+    /// 打开（或创建）一个列族：加载 Manifest/SST、回放 WAL。WAL 与数据同目录（旧布局）。
     pub fn open(name: &str, dir: &Path, cfg: &Config) -> Result<Self> {
+        Self::open_with_wal_dir(name, dir, None, cfg)
+    }
+
+    /// 打开列族并指定独立 WAL 目录（Ex-5.10 多 SSD 条带化：WAL 独占最快盘）。
+    pub fn open_with_wal_dir(
+        name: &str,
+        dir: &Path,
+        wal_dir: Option<&Path>,
+        cfg: &Config,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        if let Some(w) = wal_dir {
+            std::fs::create_dir_all(w)?;
+            std::fs::create_dir_all(w.join(name))?; // 独立 WAL 盘列族子目录
+        }
         if cfg.storage.time_bucket != "day" {
             return Err(Error::Config(format!(
                 "storage.time_bucket 仅支持 day（当前: {}）",
@@ -179,7 +193,11 @@ impl ColumnFamily {
         let compression = Compression::from_str(&cfg.sstable.compression)?;
         let compression_level = cfg.sstable.compression_level as i32;
 
-        let wal_path = dir.join(WAL_FILE);
+        let wal_path = match wal_dir {
+            // 独立 WAL 盘按列族分子目录（多列族同名 wal.log 隔离；Ex-5.10 条带化）
+            Some(w) => w.join(name).join(WAL_FILE),
+            None => dir.join(WAL_FILE),
+        };
         // WAL 模式（design 4.3 阶段 3）：
         // - append：传统追加文件（不截断旧 WAL），回放恢复 MemTable 后继续写入；
         // - ring：预分配环形文件，Flush 后上报刷盘游标腾空空间，满则强制 Flush。
@@ -1232,8 +1250,10 @@ fn imm_scan_max_seq(imm: &MemTable) -> u64 {
 /// - L0 空且 L1 > 1 → 合并全部 L1 → L2（压实下沉）；
 /// - L0/L1 均空且 L2 > 1 → 合并 L2（异常残留收敛）。
 /// 单段 L0（未达 2 段）不压实——等待更多刷盘批次，避免无收益重写。
+///
 /// Ex-5.9 冷热感知：L0 段数超过 `limit`（逼近写 Stall）且存在热度数据时，**优先合并最热的
 /// `limit` 段**（热段先下沉 L1 聚合，热点读路径段数更快减少）；无热度数据维持全量合并。
+///
 /// 返回 `(选中段下标, 输出层)`；无需要压实的输入时返回 `(空, 0)`。
 fn select_compaction_inputs(
     levels: &[u32],

@@ -507,6 +507,14 @@ pub struct StorageConfig {
     pub ttl_days: Option<u32>,
     /// 数据目录。
     pub data_dir: String,
+    /// 多 SSD 条带化（Ex-5.10，design 4.8.3 P2）：WAL 独占最快 SSD 的目录
+    /// （None = 用 `data_dir` 内各列族目录，维持旧布局）。
+    pub wal_dir: Option<String>,
+    /// 多 SSD 条带化：SSTable 数据盘目录（primary/cidx/delta 列族落此盘；
+    /// None = 用 `data_dir` 内各列族目录）。
+    pub sst_dir: Option<String>,
+    /// 多 SSD 条带化：倒排索引独立盘目录（None = 用 `data_dir` 内 inverted）。
+    pub inverted_dir: Option<String>,
     /// 热字段白名单（阶段 1.5 PAX 列式块）：高频查询字段进热列组（块头），其余进冷列组（块尾）。
     pub hot_fields: Vec<String>,
     /// TTL 时间分桶粒度：`day`（MVP）/ `hour`（预留，阶段 1.5 仅 day）。
@@ -543,6 +551,11 @@ impl Default for StorageConfig {
             l0_stall_threshold: 12,
             ttl_days: None,
             data_dir: "./data".into(),
+            // Ex-5.10：多 SSD 条带化默认关闭（None = 单盘 data_dir 布局）；
+            // 配置 wal_dir/sst_dir/inverted_dir 指向不同盘实现 WAL 独占最快盘 + 数据/倒排分盘。
+            wal_dir: None,
+            sst_dir: None,
+            inverted_dir: None,
             hot_fields: Vec::new(),
             time_bucket: "day".into(),
             ttl_field: "timestamp".into(),
