@@ -1058,7 +1058,25 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：5M 库 `word=rec&limit=10`（命中 5M）1.1s 返回 total=5,000,000，
    翻到 offset=4999990 页 316ms 首条 docid=4999990；`search status=active&limit=5`
    total=1,666,667（精确）；**server WS 221MB**（修复前 10GB+ 卡死）；
-   测试 307 全绿（+3：engine 分页语义与边界 / execute_filter_paged / parse_paging）。
+    测试 307 全绿（+3：engine 分页语义与边界 / execute_filter_paged / parse_paging）。
+
+### 7.17 M8-P9 中文 bigram 分词（fulltext 中文可检索）
+
+> 背景（7.14 已知限制）：`tokenize` 把连续中文字符当单 token（`is_alphanumeric` 全 true）→
+> 中文文本整串进倒排，长中文文本无法检索。方案对比（demo 研究）：
+> unigram（逐字，膨胀=字数）/ **bigram**（相邻 2 字，与 ES ngram / Lucene CJKAnalyzer 同款，
+> 中文检索事实标准，零依赖无词典）/ jieba（精确高但重依赖 ~2MB 词典，vendor 无、离线构建不可行）——选 **bigram**。
+
+1. ~~**demo 研究（src/demo/cjk-tokenizer/，gitignore 不提交）**~~ ✅：混合分词规则验证——
+   ASCII 字母数字 → 单词（保留原有）；连续中文/非 ASCII → bigram（单字回退 unigram）；
+   索引膨胀 ≈ 字数（≤ unigram）；2-4 字关键词 bigram AND 交集精确命中；4 测试全绿。
+2. ~~**kernel 整合**~~ ✅（2026-08-29）：`server::tokenize` 升级为字符类分段分词
+   （`cjk_bigram`：长度 1 → unigram，≥2 → 相邻 2 字）；仅影响 fulltext 路径
+   （extract_terms 整串 term 不经 tokenize，整串倒排行为不变）；无需新配置
+   （fulltext_fields 声明即启用）。
+3. ~~**验证**~~ ✅：HTTP 实测中文检索——PUT「山水存迹数据库存储引擎」等 3 条，
+   `fulltext 数据` → total=2（含"数据库"文档 5000001/5000002）、`fulltext 山水` → total=1；
+   测试 308 全绿（+1：engine 中文 bigram 端到端；tokenize 测试更新为 bigram 断言）。
 
 ---
 

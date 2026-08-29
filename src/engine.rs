@@ -826,6 +826,44 @@ mod tests {
         assert_eq!(hits[0].0, 42);
     }
 
+    #[test]
+    fn cjk_fulltext_searchable_via_bigram() {
+        // M8-P9：中文整串不再当单 token（无法检索）——bigram 分词后 2-4 字关键词可检索
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.fulltext_fields = vec!["content".into()];
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        let docs = [
+            (1u64, "山水存迹数据库存储引擎"),
+            (2u64, "基于Rust的LSM树文档数据库"),
+            (3u64, "分布式缓存系统设计"),
+        ];
+        for (id, content) in docs {
+            let val = serde_json::json!({"docid": id, "content": content});
+            let ft = e.fulltext_fields().clone();
+            let terms = crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put_nosync(id, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        }
+        e.flush_inverted().unwrap();
+
+        // 3 字关键词"数据库" → bigram 数据/据库（AND 交集精确命中含该词的文档 1、2）
+        let d1 = e.inverted_posting("ft:content:数据").unwrap();
+        let d2 = e.inverted_posting("ft:content:据库").unwrap();
+        let and = d1 & d2;
+        assert_eq!(and.len(), 2);
+        assert!(and.contains(1) && and.contains(2));
+        // 4 字关键词"山水存迹" → 3 个 bigram AND → 只命中 doc 1
+        let inter = e.inverted_posting("ft:content:山水").unwrap()
+            & e.inverted_posting("ft:content:水存").unwrap()
+            & e.inverted_posting("ft:content:存迹").unwrap();
+        assert_eq!(inter.len(), 1);
+        assert!(inter.contains(1));
+        // fulltext_search 回表
+        let hits = e.fulltext_search("content", "数据").unwrap();
+        assert!(hits.iter().any(|(id, _)| *id == 1 || *id == 2));
+    }
+
     // ---------- 分页查询（M8-P8） ----------
 
     #[test]

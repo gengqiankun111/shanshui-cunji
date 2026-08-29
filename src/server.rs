@@ -224,23 +224,55 @@ pub fn extract_terms_with_fulltext(
     terms
 }
 
-/// 简单分词（M8-P7）：按非字母数字边界切分，字母小写归一，过滤空 token。
-/// ASCII 文本（如 `rec-00000001-msg-73-tag42`）→ `rec/00000001/msg/73/tag42`；
-/// Unicode 字母/数字（含中文）视为 token 字符，连续中文串 = 单 token（完整中文分词留后续）。
+/// 分词（M8-P7 + 中文 bigram M8-P9）：按字符类分段——
+/// **ASCII 字母数字** → 单词 token（按非字母数字边界切分 + 小写归一，原有行为）；
+/// **连续中文/非 ASCII 字母数字** → bigram（相邻 2 字一个 token，单字回退 unigram）——
+/// 中文整串当单 token 无法检索（7.14 已知限制），bigram 与 Elasticsearch ngram /
+/// Lucene CJKAnalyzer 同款（中文检索事实标准），零依赖、无词典、索引膨胀 ≈ 字数。
 pub fn tokenize(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
+    let mut out = Vec::new();
+    let mut ascii_word = String::new();
+    let mut cjk = String::new();
     for c in text.chars() {
-        if c.is_alphanumeric() {
-            cur.push(c.to_ascii_lowercase());
-        } else if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+        if c.is_ascii_alphanumeric() {
+            if !cjk.is_empty() {
+                out.extend(cjk_bigram(&cjk));
+                cjk.clear();
+            }
+            ascii_word.push(c.to_ascii_lowercase());
+        } else if c.is_alphanumeric() {
+            // 非 ASCII 字母数字（CJK 等）：结束 ASCII 单词，进入中文块
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            cjk.push(c);
+        } else {
+            // 分隔符
+            if !ascii_word.is_empty() {
+                out.push(std::mem::take(&mut ascii_word));
+            }
+            if !cjk.is_empty() {
+                out.extend(cjk_bigram(&cjk));
+                cjk.clear();
+            }
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
+    if !ascii_word.is_empty() {
+        out.push(ascii_word);
+    }
+    if !cjk.is_empty() {
+        out.extend(cjk_bigram(&cjk));
     }
     out
+}
+
+/// 中文块 bigram：长度 1 → 单字 unigram（保证单字可查）；≥2 → 相邻 2 字。
+fn cjk_bigram(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() == 1 {
+        return vec![chars[0].to_string()];
+    }
+    chars.windows(2).map(|w| w.iter().collect()).collect()
 }
 
 /// 由分词结果生成 fulltext 词 term：`ft:{field}:{token}`；同一字段值内重复 token 去重
@@ -894,8 +926,17 @@ mod tests {
         assert!(tokenize("").is_empty());
         assert!(tokenize("---").is_empty());
         assert_eq!(tokenize("a--b--"), vec!["a", "b"]);
-        // Unicode：连续中文字符 = 单 token（完整中文分词留后续）
-        assert_eq!(tokenize("山水存迹数据库"), vec!["山水存迹数据库"]);
+        // Unicode：连续中文字符 → bigram（M8-P9；单字回退 unigram）
+        assert_eq!(
+            tokenize("山水存迹数据库"),
+            vec!["山水", "水存", "存迹", "迹数", "数据", "据库"]
+        );
+        assert_eq!(tokenize("山"), vec!["山"], "单字中文回退 unigram");
+        // 混合：ASCII 单词独立 + 中文 bigram
+        assert_eq!(tokenize("Rust数据库"), vec!["rust", "数据", "据库"]);
+        assert_eq!(tokenize("hello山水world"), vec!["hello", "山水", "world"]);
+        // 中文 + 标点分隔
+        assert_eq!(tokenize("山水，存迹"), vec!["山水", "存迹"]);
     }
 
     #[test]
