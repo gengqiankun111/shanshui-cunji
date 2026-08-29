@@ -1310,6 +1310,28 @@ impl RuntimePools {
    （已有）；Ex-7.3 依赖 io_uring 阶段 3；Ex-7.4 依赖 Ex-5.4 compaction 调优。
    性能验证须在 **SSD 环境**（HDD 不压测，design 1.2 警告）。
 
+### 7.30 musl 目标验证锁定（mimalloc 编译时绑定确认）
+
+> 背景（2026-08-29 确认锁定，非重测）：验证「编译时绑定 mimalloc」在 musl 目标下功能正常——
+> 服务器部署目标（x86_64-unknown-linux-musl 静态链接）的构建与测试全链路确认。
+> 本机（Windows）无法交叉编译 musl（无 musl 工具链/Docker/WSL 发行版）→ 在阿里云 Debian
+> 服务器（106.14.68.116，musl-gcc 已装）执行。
+
+1. ~~**环境准备**~~ ✅：服务器装 rustup（rsproxy 镜像）+ musl target；源码 git archive 打包
+   （6.4MB，排除 src/demo/vendor/Windows .cargo 配置）scp 上传；依赖改用**本机 cargo vendor**
+   （本机科学上网下载 202 crate → 29.5MB tar.gz → 上传解压 → 服务器 `--offline` 离线构建，
+   规避 rsproxy 网络超时反复失败）。
+2. ~~**验证执行**~~ ✅：`cargo test --target x86_64-unknown-linux-musl --offline`——
+   **libmimalloc-sys v0.1.49 + mimalloc v0.1.52 交叉编译成功**（musl-gcc 编 C 代码）、
+   zstd-sys 成功、**318 测试全绿**（与 Windows msvc 完全一致，49.44s）；default features
+   = alloc-mimalloc + cjk-jieba 生效确认。
+3. ~~**结论**~~ ✅：**mimalloc 编译时绑定在 musl 下锁定确认**——服务器部署构建与测试
+   全链路正常（编译 0 错误、测试 0 失败）。读写分离 demo 评估（src/demo/rw-separation，
+   gitignore 不提交）：全局锁 vs 读写分离（主写+从读同步复制）——读 P95 3µs→2µs（1.5×）、
+   吞吐持平（写瓶颈在 fsync 非锁）、同步复制读己之写强一致、异步最终一致窗口验证。
+   读写分离收益定位：**读延迟改善，写吞吐不增**（写瓶颈磁盘 fsync）——整合决策待定
+   （feature.md I 模块 ⏸，Ex-6.2/6.3 前置）。
+
 ---
 
 ## 8. 编码规范
