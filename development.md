@@ -1702,6 +1702,25 @@ impl RuntimePools {
 
 ---
 
+### 7.49 读写分离评估收口（I 模块，Ex-6 并发读前置）
+
+> 背景：feature.md I 模块「读写分离 / 双写加速」为 Ex-6 倒排并发读（Seqlock/ArcSwap）的前置。
+> 评估结论：**维持暂缓（in-process 网关 RwLock）**，但读路径 &self 基础已铺底。
+
+1. ~~**评估依据**~~ ✅：M8-P1 `be09a07`（网关 Mutex→RwLock 剩余收益 <20%——组提交已解决
+   「读被写拖垮」，B 负载 18,987→149,539 ops/s）；`src/demo/rw-separation`（主写+从读同步
+   复制：读 P95 3µs→2µs **1.5×**、写吞吐持平——写瓶颈在磁盘 fsync 非锁）。
+2. ~~**读路径 &self 基础**~~ ✅（`c48a7c1`）：`SstReader::read_block` 改**位置读**（read_at：
+   Windows seek_read / Unix read_at，`&File` 可并发不移动游标）+ `ColumnFamily::get/
+   get_bytes/get_bytes_at` **&self 化**（内部 PerCpuCounter/BlockCache/SstReader::touch 由
+   Ex-5.9/7.1 已内部同步，&mut 为历史遗留）——sstable 22 + column_family 34 测试全绿。
+3. ~~**剩余阻塞与路径**~~：① HotCache 内部 LruCache+stats 需 Mutex 化才能 `&self`（热路径锁
+   开销需实测）；② 倒排 pending 攒批缓冲刷盘需 `&mut`——搜索类读（search/fulltext/sql/
+   count）仍需写锁，仅点查/范围扫描可并发读；③ 复制型读写分离（`read_from_replica` 路由）
+   基于已有 ReplicationLog，属**分布式阶段**（与本机+阿里云两节点测试衔接）。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
