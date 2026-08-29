@@ -650,7 +650,19 @@ fn handle_put(engine: &mut Engine, body: &[u8]) -> (u16, String) {
     let terms =
         extract_terms_with_fulltext_seg(&val, None, Some(engine.fulltext_fields()), engine.use_jieba());
     let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-    match engine.put(docid, body.to_vec(), &term_refs) {
+    // 写入 Enrich（design 19 / development 5.21）：`[enrich] enabled && source=local` 时
+    // WAL 写入前展开关联文档（join::put_with_enrich，fail_policy reject/degrade）
+    let result = if let Some((fail_policy, from_field, to_field)) = engine.enrich_config() {
+        let fp = fail_policy.to_string();
+        let from = from_field.to_string();
+        let to = to_field.to_string();
+        crate::join::put_with_enrich(engine, docid, body.to_vec(), &term_refs, &fp, |e, v| {
+            crate::join::enrich_check_local(e, v, &from, &to)
+        })
+    } else {
+        engine.put(docid, body.to_vec(), &term_refs)
+    };
+    match result {
         Ok(()) => (
             200,
             json!({"ok": true, "docid": docid, "terms": terms.len()}).to_string(),
@@ -1162,6 +1174,39 @@ mod tests {
         assert_eq!(parse_paging("limit=10&offset=20"), (Some(10), 20));
         assert_eq!(parse_paging("offset=5"), (None, 5));
         assert_eq!(parse_paging("limit=abc&offset=xyz"), (None, 0), "非法参数忽略");
+    }
+
+    #[test]
+    fn http_put_with_enrich_expands_related_doc() {
+        // 写入 Enrich（design 19）：`[enrich] enabled && source=local` → /put WAL 前展开关联文档
+        let dir = tmp();
+        let mut c = cfg();
+        c.enrich.enabled = true;
+        c.enrich.source = "local".into();
+        c.enrich.fail_policy = "degrade".into(); // 关联缺失/无关联字段 → 降级写原文档
+        c.enrich.from_field = "user_id".into();
+        c.enrich.to_field = "docid".into();
+        let engine = Engine::open(&dir, &c).unwrap();
+        assert!(engine.enrich_config().is_some(), "enrich 配置生效");
+        let addr = spawn_server(engine);
+
+        // 关联文档（user 档案 docid=7，无 user_id → 降级正常写入）
+        let (st, body) = http_req(addr, "POST", "/put", br#"{"docid":7,"name":"alice","city":"beijing"}"#);
+        assert_eq!(st, 200, "关联文档写入失败: {body}");
+
+        // 主文档：order 引用 user_id=7 → 写入时展开 _enrich.related
+        let (st, body) = http_req(addr, "POST", "/put", br#"{"docid":1001,"user_id":7,"amount":99}"#);
+        assert_eq!(st, 200, "主文档写入失败: {body}");
+        let (st, body) = http_req(addr, "GET", "/get?docid=1001", b"");
+        assert_eq!(st, 200);
+        assert!(body.contains("_enrich"), "应展开关联文档: {body}");
+        assert!(body.contains("alice"), "关联字段展开: {body}");
+
+        // 关联缺失（user_id=999）：degrade 策略 → 降级写入原文档（不展开）
+        let (st, _) = http_req(addr, "POST", "/put", br#"{"docid":2002,"user_id":999,"amount":1}"#);
+        assert_eq!(st, 200, "degrade 应降级写入");
+        let (st, body) = http_req(addr, "GET", "/get?docid=2002", b"");
+        assert!(st == 200 && !body.contains("_enrich"), "降级文档不展开: {body}");
     }
 
     #[test]

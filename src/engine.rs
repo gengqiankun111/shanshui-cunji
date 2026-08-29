@@ -62,6 +62,9 @@ pub struct Engine {
     /// 中文分词器（M8-P13）：true = jieba 完整词典分词（需 cjk-jieba feature）；
     /// false = bigram（M8-P9）。来自 `[inverted] cjk_segmenter`。
     use_jieba: bool,
+    /// 写入 Enrich（design 19 / development 5.21）：Some((fail_policy, from_field, to_field)) =
+    /// 启用 local 数据源预连接（server /put 走 join::put_with_enrich）；None = 关闭（零开销）。
+    enrich: Option<(String, String, String)>,
     /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
     /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
     skip_hotcache: bool,
@@ -240,6 +243,16 @@ impl Engine {
             max_term_len: cfg.inverted.max_term_len,
             fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
             use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
+            // 写入 Enrich（design 19 / development 5.21）：`[enrich] enabled && source=local` 启用
+            enrich: if cfg.enrich.enabled && cfg.enrich.source == "local" {
+                Some((
+                    cfg.enrich.fail_policy.clone(),
+                    cfg.enrich.from_field.clone(),
+                    cfg.enrich.to_field.clone(),
+                ))
+            } else {
+                None
+            },
             skip_hotcache: false,
             pending_inverted: Vec::new(),
             compaction_parallel: cfg.storage.compaction_parallel,
@@ -863,6 +876,14 @@ impl Engine {
     /// QueryTooExpensive（复用 engine.execute 的查询超时机制）。
     pub fn query_guard(&self) -> crate::watchdog::QueryGuard {
         self.watchdog.begin_query()
+    }
+
+    /// 写入 Enrich 配置（design 19 / development 5.21）：Some((fail_policy, from_field,
+    /// to_field)) = 启用 local 数据源预连接（server /put 走 join::put_with_enrich）；None = 关闭。
+    pub fn enrich_config(&self) -> Option<(&str, &str, &str)> {
+        self.enrich
+            .as_ref()
+            .map(|(f, a, b)| (f.as_str(), a.as_str(), b.as_str()))
     }
 
     /// 倒排某词条命中的 docid 集合（不回表，供测试/监控）。

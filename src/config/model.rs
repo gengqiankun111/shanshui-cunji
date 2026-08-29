@@ -679,7 +679,8 @@ impl Default for JoinConfig {
     }
 }
 
-/// 写入 Enrich（预连接，development 5.21 / design 19）。
+/// 写入 Enrich（预连接，development 5.21 / design 19.2 ② / 19.3）。
+/// 钩子由业务方注入（Engine::set_enrich 查 Redis/MySQL/HTTP/本地表）；config 控制开关与失败策略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnrichConfig {
@@ -689,6 +690,10 @@ pub struct EnrichConfig {
     pub source: String,
     /// 失败策略："reject"（拒绝写入）/ "degrade"（降级写入原文档）。
     pub fail_policy: String,
+    /// local 数据源关联源字段（主文档中指向关联键的字段，默认 user_id）。
+    pub from_field: String,
+    /// local 数据源关联目标字段（关联文档中被查找的字段，默认 docid）。
+    pub to_field: String,
 }
 
 impl Default for EnrichConfig {
@@ -697,6 +702,8 @@ impl Default for EnrichConfig {
             enabled: false,
             source: "local".into(),
             fail_policy: "degrade".into(),
+            from_field: "user_id".into(),
+            to_field: "docid".into(),
         }
     }
 }
