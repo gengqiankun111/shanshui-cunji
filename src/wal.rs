@@ -82,6 +82,7 @@ impl WalWriter {
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -350,6 +351,7 @@ impl RingWal {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         if is_new {
             file.set_len(size as u64)?;

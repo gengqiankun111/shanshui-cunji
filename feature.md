@@ -111,7 +111,7 @@
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
 | 读写分离 / 双写加速 | ⏸ | 评估中 |
-| 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ⏳ | 评估中 |
+| 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
 ---
 
@@ -126,7 +126,11 @@
   ring+gc 2ms 68,756 ops/s（M8-P1 基线 30,270 → 2.3×）
 - **M8-P13 jieba 完整中文词典分词**：`[inverted] cjk_segmenter="jieba"`（`cjk-jieba` feature，
   词典嵌入默认开）——中文语义词精确命中（"数据库"单 term），索引词数 ≤ bigram 碎片
+- **倒排 posting 压缩探索**（demo 验证，不集成）：Roaring 密集容器 1bit/docid 已达理论下限
+  （16.6M 连续 0.13B/docid），delta-varint 1B/Gorilla 2B 均更差；稀疏 1% 场景 Roaring 2B/docid 为
+  delta 2×（绝对差 ~0.5MB/500K docid），但 Roaring AND 查询快 20.1×（337us vs 6.7ms）且库成熟
+  → **维持 Roaring，不引入新编码**
 
 ## 下一候选
 
-- 倒排 posting 压缩探索（Roaring 已用，Gorilla/变长评估）
+- 倒排 posting 流式输出（大结果集已由分页解决，仍可评估）；类 SQL 解析 / 写入 Enrich / 读写分离（⏸）

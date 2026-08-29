@@ -1257,7 +1257,6 @@ mod tests {
         // 兼容：旧格式 WAL（无头，M8-P5 之前）照常回放恢复
         let dir = tmp();
         let cfg = small_cfg(64);
-        let wal_path = dir.join(WAL_FILE);
         {
             let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
             for i in 0..100u64 {

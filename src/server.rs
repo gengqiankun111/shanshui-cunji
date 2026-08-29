@@ -777,11 +777,6 @@ fn value_row(docid: u64, raw: &[u8]) -> Value {
     }
 }
 
-/// 将查询结果组装为 `{"total":N,"rows":[...]}`。
-fn rows_payload(rows: &[(u64, Vec<u8>)]) -> Value {
-    rows_payload_total(rows.len() as u64, rows)
-}
-
 /// 分页响应（M8-P8）：`total` = 全量命中数（≠ 当前页行数，供客户端计算总页数）。
 fn rows_payload_total(total: u64, rows: &[(u64, Vec<u8>)]) -> Value {
     let items: Vec<Value> = rows.iter().map(|(d, v)| value_row(*d, v)).collect();

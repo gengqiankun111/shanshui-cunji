@@ -1158,6 +1158,31 @@ impl RuntimePools {
    精确命中 2 条；测试 313 全绿（+2：tokenize_seg 语义词/混合/标点、engine jieba 端到端单 term
    命中）；feature 关闭编译回退验证通过。
 
+### 7.22 倒排 posting 压缩探索（结论：维持 Roaring，不引入新编码）
+
+> 背景：倒排段内每 term posting 用 RoaringBitmap 序列化（SEG_VERSION=2）。评估
+> delta-varint / Gorilla 变长编码能否替代——尤其是稀疏 posting（array container 2B/docid
+> 理论 1B）。demo 研究（src/demo/posting-compression/，gitignore 不提交）。
+
+1. ~~**demo 编码实现**~~ ✅：delta-varint（delta + LEB128）、简化 Gorilla（XOR + 前导零控制位）、
+   Roaring 三编码；真实分布生成：密集连续（16.6M）/ 簇状（10 簇×1M）/ 稀疏（500K/50M、5K/50M）；
+   4 测试全绿（压缩率对比 / AND 查询性能 / 稀疏紧凑性 / 密集下限）。
+2. ~~**实测数据**~~ ✅（release）：
+
+   | 场景 | Roaring | delta-varint | Gorilla | 结论 |
+   |---|---|---|---|---|
+   | 密集 16.6M 连续 | **0.13B/docid**（1bit 理论下限） | 1.00B | 2.00B | Roaring 最优 |
+   | 簇状 10 簇×1M | **0.13B/docid** | 1.00B | 2.00B | Roaring 最优 |
+   | 稀疏 1%（500K/50M） | 2.01B | **1.00B** | 2.39B | delta 省 ~0.5MB，绝对差小 |
+   | 稀疏 0.01%（5K/50M） | 3.22B | **2.00B** | 3.15B | 量级极小，无所谓 |
+   | AND 8M∩4M 查询 | **337us** | 需解码后双指针 | — | Roaring 快 20.1×（vs 线性 6.7ms） |
+
+3. ~~**决策**~~ ✅：**维持 Roaring，不引入新编码**。依据：① 密集/簇状（高频词主流场景）
+   Roaring 已达 1bit/docid 理论下限，任何变长编码（≥1B）不可能更优；② 稀疏场景 delta 省空间
+   但绝对量级小（500K docid 差 ~0.5MB），且需牺牲 Roaring 的向量化 AND/交集 20× 查询性能与
+   FST 集成；③ Roaring 库成熟（迭代/交集/并集/差集完备）。后续若出现超高频 posting 段内存
+   瓶颈，可再评估 Roaring 64 位 + 密度感知（rle 容器）。
+
 ---
 
 ## 8. 编码规范
