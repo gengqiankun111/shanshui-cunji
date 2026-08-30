@@ -1,9 +1,9 @@
 //! 功能演示 / 冒烟测试 CLI（`shanshui-cunji demo`）。
 //!
 //! 按 development 步骤 15 之前的内核能力，端到端验证：
-//! 构造测试数据 → 插入 → 批量插入（1000 条/批）→ 主键查询（100 万次）→ 缓存查询（100 万次）→ 组合索引
-//! → 倒排检索（1 千次）+ COUNT（内存位图 1 万次）→ fulltext 分词（1 千次）→ 类 SQL（等值 1 千次 +
-//! amount/ts BETWEEN 各 100 次）→ 分片路由（抽样）→ 删除（100 万次）→ 备份还原。
+//! 构造测试数据 → 插入 → 批量插入（put_batch，批大小可配 SHANSHUI_BATCH_SIZE）→ 主键查询（100 万次）
+//! → 缓存查询（100 万次）→ 组合索引 → 倒排检索（1 千次）+ COUNT（内存位图 1 万次）→ fulltext 分词
+//! （1 千次）→ 类 SQL（等值 1 千次 + amount/ts BETWEEN 各 100 次）→ 分片路由（抽样）→ 删除（100 万次）→ 备份还原。
 //! 输出结构化结果，供 HTML 报告与截图使用（dev 阶段交付物）。
 
 use std::collections::HashSet;
@@ -277,15 +277,20 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         insert_ms,
     ));
 
-    // ---------- 2.5 批量插入（用户端批量：1000 条/批原子提交；独立引擎不干扰主库） ----------
-    // 用户端「累计 1000 条一起插入」是常见批量场景——用 put_batch API（攒批 + 一次 flush_wal
-    // 原子提交，WAL 批次整体重放；为 D 项 WriteBatch 前置）
+    // ---------- 2.5 批量插入（用户端批量：批大小原子提交；独立引擎不干扰主库） ----------
+    // 用户端「累计 N 条一起插入」是常见批量场景——用 put_batch API（攒批 + 一次 flush_wal
+    // 原子提交，WAL 批次整体重放；为 D 项 WriteBatch 前置）。批大小可配
+    // `SHANSHUI_BATCH_SIZE`（默认 1000）——批越大 fsync 次数越少、吞吐越高。
     let t = Instant::now();
     let batch_dir = data_dir.join("batch");
     let mut bengine =
         Engine::open_with_timeout(&batch_dir, cfg, std::time::Duration::from_secs(3600))?;
     let batch_n = scale.min(1_000_000); // 批量插入抽样上限（新 docid 域，不与主库重叠）
-    let batch_size = 1_000u64;
+    let batch_size: u64 = std::env::var("SHANSHUI_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000);
     let mut batches = 0u64;
     let mut b_ok = 0u64;
     for start in (1..=batch_n).step_by(batch_size as usize) {
@@ -303,7 +308,7 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     bengine.flush_inverted()?;
     let b_ms = t.elapsed().as_secs_f64() * 1000.0;
     results.push(TestResult::new(
-        "批量插入(1000/批)",
+        "批量插入",
         b_ok == batch_n,
         format!(
             "独立引擎 put_batch 批量插入 {batch_n} 条（{batch_size} 条/批 × {batches} 批，每批原子提交），{:.0} ms（{:.0} 条/s）",

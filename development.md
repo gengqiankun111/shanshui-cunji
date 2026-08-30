@@ -1769,6 +1769,46 @@ impl RuntimePools {
 
 ---
 
+### 7.52 本机 2000 万 / 5000 万大数据量基准（demo 13 项放大）+ 查询引擎优化
+
+> 2026-08-30。`shanshui-cunji demo --scale N --config config.bench.toml`（images/perf-0.6.0/ 汇总报告）。
+> 13 项测试全绿（冒烟 / 2000 万 / 5000 万）：构造数据 → 批量插入 → put_batch 批量（1000/5000 条/批）→
+> 主键 100 万次 → HotCache 100 万次 → 组合索引 1 万次 → 倒排检索 1 千次 + COUNT 1 万次 → fulltext 1 千次
+> → 类 SQL（等值 1 千次 + amount/ts BETWEEN 各 100 次）→ 分片抽样 → 删除 100 万次 → 备份还原。
+
+| 测试项 | 2000 万 | 5000 万 |
+|---|---|---|
+| 单条流式插入 | 46,492 条/s（430s） | 30,657 条/s（1631s，写放大+compaction） |
+| put_batch 批量（1000/批） | 32,746 条/s | 32,602 条/s |
+| put_batch 批量（5000/批） | 35,047 条/s（fsync 次数 -80%） | — |
+| 主键 ×100 万 | 15.6s（15.6µs/次） | 26.5s（26.5µs/次） |
+| HotCache ×100 万 | 0.66s | 0.71s |
+| 倒排（1000 检索+1 万 COUNT+抽样 20 万回表） | 0.51s | 1.44s |
+| fulltext ×1000（5.4 / 64.8 ms/次） | 5.4s | 64.8s |
+| 类 SQL（1000 等值 + BETWEEN 各 100） | 13.1s | 18.8s |
+| 删除 ×100 万 | 2.2s | 17.3s |
+| 备份 · 还原 | 48.0s | 287.0s |
+| 总耗时 | ~9.4 分钟 | ~28 分钟 |
+
+- **G 项倒排 posting 检索优化（c380792）**：`InvertedIndex` 新增 term→bitmap LRU 缓存（256 项）——
+  search 对 bitmap_fields 白名单 term 直接返回全量内存位图（O(1)），非白名单 term 首次反序列化后缓存；
+  写路径 add/add_batch/flush_segment/gc/with_bitmap_fields 清缓存保一致；+2 单测。
+  效果：倒排 1000 检索 + 1 万 COUNT + 抽样 20 万回表 165s（10 万条旧版）→ 2000 万库 0.5s；
+  fulltext 1000 次 175s → 5.4s（2000 万）。
+- **倒排段 GC 合并入口**：`Engine::inverted_gc()`（496 段 → 1 段，释放 137-344MB）——批量导入后段数
+  爆炸（每 100 万 term 对一段）导致查询遍历全部段过慢，合并后查询只遍历 1 段；后台化排期 J 项。
+- **put_batch 批量插入 API（6197c21）**：`Engine::put_batch(&[(u64, Vec<u8>, Vec<String>)])`——
+  攒批 + 一次 flush_wal 原子提交（WAL 批次整体重放），为 D 项 WriteBatch 前置；demo 批大小可配
+  `SHANSHUI_BATCH_SIZE`。批量吞吐受「批次数 × fsync」限制（1000→5000 条/批 +7%）。
+- **probe 定位模式**：`SHANSHUI_QUERY_MODE=probe`（查询次数=10）走完全流程定位瓶颈——
+  分片全量重写 + 全量 scan（10.6 分钟）为最大瓶颈，改抽样 100 万验证分布。
+- 相关修复：fulltext 词 term 与倒排白名单正交（inverted_allowed 放行 ft:）；sqlish post_filter
+  LIMIT 下推（BETWEEN 后过滤免遍历全量命中集）；make_doc 增 ts 秒级时间戳（日期 BETWEEN 基准）。
+- 结论：G 项 + 白名单位图 + LIMIT 下推后查询路径不再是大数据量瓶颈；插入受写放大（磁盘 200MB/s
+  vs 逻辑 9MB/s）与 compaction 限制；1 亿数据基准（B 项）排期见 development_process_order.md。
+
+---
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
