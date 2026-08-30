@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use roaring::RoaringBitmap;
 use serde_json::json;
+use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::inverted::InvertedIndex;
@@ -29,6 +30,14 @@ use crate::term_cache::TermCache;
 pub trait ShardEndpoint {
     /// 写入一条文档（`data` 为文档 JSON 字符串，`terms` 为倒排词条）。
     fn put(&mut self, node: &str, docid: u64, data: &str, terms: &[String]) -> Result<()>;
+    /// 批量写入（C 项②，分布式吞吐优化）：一次调用提交 N 条，RTT 分摊到批。
+    /// 默认逐条（LocalShardEndpoint 语义不变）；RpcShardEndpoint 覆盖为一次 RPC。
+    fn put_batch(&mut self, node: &str, items: &[(u64, String, Vec<String>)]) -> Result<()> {
+        for (docid, data, terms) in items {
+            self.put(node, *docid, data, terms)?;
+        }
+        Ok(())
+    }
     /// 主键读取（缺失返回 None）。
     fn get(&mut self, node: &str, docid: u64) -> Result<Option<String>>;
     /// 本节点命中 term 的 docid 列表（即该节点的分片 Chunk）。
@@ -105,6 +114,30 @@ impl<E: ShardEndpoint> Gateway<E> {
             }
         }
         Ok(nid)
+    }
+
+    /// 批量写入（C 项②，分布式吞吐优化）：按 docid 一致性哈希**分组路由** → 每节点一次
+    /// `endpoint.put_batch`（RPC 场景一次连接一次调用，RTT 分摊到批而非单条）。
+    /// 返回 节点 → 写入条数（合计 = 输入条数，供强一致校验）。
+    pub fn put_batch(
+        &mut self,
+        items: &[(u64, String, Vec<String>)],
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        let mut groups: std::collections::HashMap<String, Vec<(u64, String, Vec<String>)>> =
+            std::collections::HashMap::new();
+        for (docid, data, terms) in items {
+            let node = self.route_node(*docid)?;
+            groups
+                .entry(node.node_id.clone())
+                .or_default()
+                .push((*docid, data.clone(), terms.clone()));
+        }
+        let mut out = std::collections::HashMap::new();
+        for (node, batch) in groups {
+            self.endpoint.put_batch(&node, &batch)?;
+            out.insert(node, batch.len());
+        }
+        Ok(out)
     }
 
     /// docid → 虚拟分片（与 `sharding::route` 同哈希）。
@@ -388,6 +421,19 @@ impl ShardEndpoint for RpcShardEndpoint {
         Ok(())
     }
 
+    // C 项②：批量写入一次 RPC（RTT 分摊到批；节点 Engine::put_batch 原子批量 + 组提交）
+    fn put_batch(&mut self, node: &str, items: &[(u64, String, Vec<String>)]) -> Result<()> {
+        let json_items: Vec<Value> = items
+            .iter()
+            .map(|(docid, data, terms)| {
+                json!({"docid": docid, "data": data, "terms": terms})
+            })
+            .collect();
+        self.client(node)?
+            .call("shard.put_batch", json!({"items": json_items}))?;
+        Ok(())
+    }
+
     fn get(&mut self, node: &str, docid: u64) -> Result<Option<String>> {
         let r = self
             .client(node)?
@@ -641,6 +687,34 @@ mod tests {
         }
         assert!(gw.ping_all().is_empty(), "两节点在线");
         eprintln!("[高并发强一致] 2 节点真实 TCP × 8 线程 × 2500 并发写：20000 条全部可见、广播精确命中");
+    }
+
+    #[test]
+    fn gateway_put_batch_routes_and_counts() {
+        // C 项②：Gateway::put_batch 按 docid 一致性哈希分组 → 各节点批量写入，
+        // 计数 = 输入条数（无丢失/无重复），广播检索精确命中、逐条可见
+        let mut meta = MetaCenter::new(128);
+        meta.register("n1", "127.0.0.1:19001", "master").unwrap();
+        meta.register("n2", "127.0.0.1:19002", "slave").unwrap();
+        let mut gw = Gateway::new(meta.clone(), LocalShardEndpoint::with_nodes(&["n1", "n2"]));
+        let items: Vec<(u64, String, Vec<String>)> = (1..=1000u64)
+            .map(|d| (d, format!("{{\"d\":{d}}}"), terms(&["status=active"])))
+            .collect();
+        let counts = gw.put_batch(&items).unwrap();
+        let total: usize = counts.values().sum();
+        assert_eq!(total, 1000, "批量写入合计 = 输入条数");
+        assert_eq!(counts.len(), 2, "docid 应路由到两节点");
+        for (n, c) in &counts {
+            assert!(*c > 0, "节点 {n} 应有写入");
+        }
+        // 广播检索精确命中 1000（无丢失/无重复）
+        let all = gw.broadcast_search("status=active").unwrap();
+        assert_eq!(all.len(), 1000);
+        // 逐条点查：跨节点确定性路由强一致可见
+        for d in 1..=1000u64 {
+            assert!(gw.get(d).unwrap().is_some(), "docid={d} 批量后可见");
+        }
+        eprintln!("[put_batch 分组路由] 1000 条批量 → 节点分布 {counts:?}，广播精确命中、逐条可见");
     }
 
     // ---- 网关全局 Term 缓存（design 9.9）----

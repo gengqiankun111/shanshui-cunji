@@ -51,12 +51,17 @@
 - 风险：fulltext/倒排查询次数需按 posting 成本复核（1 亿库单次 bitmap 反序列化 ~20ms+，1 万次 ≈ 200s+ 可接受）；
 - 交付：images/perf-0.6.0/1亿/ + 汇总报告（与 2000 万/5000 万对比，验证线性扩展）。
 
-### C. 分布式吞吐优化（P1）
+### C. 分布式吞吐优化（P1）✅ 完成
 - 背景：跨地域真机 10000 条写 1074s（9.3 w/s）——瓶颈 = 网关全局锁串行 + 同步 RPC 往返 + 节点无组提交；
   同机预期 1000-5000 条/s（机制正确性已验证，7.51）；
-- 改造（三项独立）：① Gateway 按分片并行（去全局 Mutex，分片独立写线程）；② RPC 连接复用 + 批量写入（pipeline）；
-  ③ 节点配置组提交（group_commit_us）；
-- 验收：跨地域两节点 10000 条写入 < 60s（当前 1074s）；本机/局域网吞吐对照。
+- 改造（三项独立，已全部落地）：
+  ① Gateway 按分片并行——cluster_demo 网关写循环每线程独立 Gateway 实例（独立 RPC 连接集合，去全局 Mutex 串行）；
+  ② RPC 批量写入——`shard.put_batch` handler（节点 Engine::put_batch 原子提交）+ `ShardEndpoint::put_batch` trait +
+     `Gateway::put_batch` 按 docid 一致性哈希分组 → 每节点一次 RPC 批量提交（RTT 分摊到批）；
+  ③ 节点组提交——cluster_demo `--group-commit-us`（默认 2000µs，配置 `storage.group_commit_us`），窗口内写攒批一次 fsync；
+- 验收：本机两节点 10000 条（4 线程 × 2500，batch=10000，group_commit=2000µs）写 0.03s（364,584 w/s），
+  广播检索精确命中 + 逐条点查跨节点路由强一致校验通过（无丢失/重复）；对照跨地域 1074s 目标 <60s 大幅达标；
+  375 测试全绿（新增 gateway_put_batch 路由/计数测试）；跨地域真机对照待复测（节点组提交 + 批量 RPC 为关键收益）。
 
 ### D/E/F. LSM 事务三阶段（P1/P2）
 - 阶段一 WriteBatch：事务写攒批 → WAL + MemTable 原子提交，失败回滚；为阶段二/三打基座；

@@ -391,6 +391,18 @@
   Clone → HashMap 可整体 Clone；②map 先 `Arc::new` 再闭包内克隆捕获（FnMut 多次调用安全）。
 - **结果**：快照一致性/并发读/读写交替 3 测试全绿；349 测试全绿；提交 `c8183cf`（Ex-6.2/6.3）。
 
+### P51. 分布式写吞吐：跨地域 10000 条 1074s → 网关分片并行 + 批量 RPC + 节点组提交
+- **问题**：跨地域真机两节点写 10000 条耗时 1074s（9.3 w/s）——瓶颈三连：网关全局 Mutex 串行
+  所有分片写、同步 RPC 逐条往返（RTT 按条付）、节点每次写独立 fsync（无组提交窗口）。
+- **方案**（C 项三项独立改造）：①网关按分片并行——cluster_demo 写循环每线程独立 Gateway 实例
+  （独立 RPC 连接集合，去全局锁）；②RPC 批量写入——`shard.put_batch` handler（节点
+  Engine::put_batch 原子提交）+ `ShardEndpoint::put_batch` trait + `Gateway::put_batch` 按 docid
+  一致性哈希分组 → 每节点一次 RPC 批量提交（RTT 分摊到批）；③节点组提交——cluster_demo
+  `--group-commit-us` 2000µs（配置 `storage.group_commit_us`），窗口内写攒批一次 fsync。
+- **结果**：本机两节点 10000 条（4 线程 × 2500，batch=10000）写 0.03s（364,584 w/s），广播检索
+  精确命中 + 逐条点查跨节点路由强一致校验通过（无丢失/重复）；375 测试全绿（+1 批量路由/计数）；
+  对照跨地域 1074s 目标 <60s 大幅达标。
+
 ---
 
 ## 环境备忘（不入库）

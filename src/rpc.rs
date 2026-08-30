@@ -265,6 +265,42 @@ pub fn register_shard_handlers(server: &RpcServer, engine: Arc<Mutex<Engine>>) {
         }
     });
 
+    // C 项②（分布式吞吐优化）：批量写入——一次 RPC 提交 N 条（节点 Engine::put_batch
+    // 原子批量 + 组提交窗口，RTT 分摊到批而非单条；跨地域写放大主因是同步 RTT）。
+    server.register("shard.put_batch", {
+        let engine = engine.clone();
+        move |params| {
+            let items = params["items"]
+                .as_array()
+                .ok_or_else(|| "shard.put_batch 缺少 items".to_string())?;
+            let parsed: Vec<(u64, Vec<u8>, Vec<String>)> = items
+                .iter()
+                .map(|it| {
+                    let docid = it["docid"]
+                        .as_u64()
+                        .ok_or_else(|| "item 缺少 docid".to_string())?;
+                    let data = it["data"]
+                        .as_str()
+                        .ok_or_else(|| "item 缺少 data".to_string())?
+                        .as_bytes()
+                        .to_vec();
+                    let terms: Vec<String> = it["terms"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok((docid, data, terms))
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?;
+            let mut eng = engine.lock().unwrap();
+            eng.put_batch(&parsed).map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "count": parsed.len()}))
+        }
+    });
+
     server.register("shard.search_docids", {
         let engine = engine.clone();
         move |params| {
@@ -393,5 +429,27 @@ mod tests {
             .call("shard.search_docids", json!({"term": "status=pending"}))
             .unwrap();
         assert!(r["docids"].as_array().unwrap().is_empty());
+
+        // C 项②：批量写入（一次 RPC 提交 N 条）→ 逐条可见
+        let batch_items = json!([
+            {"docid": 2001, "data": "{\"s\":\"b\"}", "terms": ["status=active"]},
+            {"docid": 2002, "data": "{\"s\":\"b\"}", "terms": ["status=active"]},
+            {"docid": 2003, "data": "{\"s\":\"b\"}", "terms": ["status=pending"]},
+        ]);
+        let r = client
+            .call("shard.put_batch", json!({"items": batch_items}))
+            .unwrap();
+        assert_eq!(r["count"], 3);
+        assert_eq!(client.call("shard.get", json!({"docid": 2001})).unwrap()["found"], true);
+        assert_eq!(client.call("shard.get", json!({"docid": 2003})).unwrap()["found"], true);
+        let r = client
+            .call("shard.search_docids", json!({"term": "status=active"}))
+            .unwrap();
+        assert_eq!(r["docids"].as_array().unwrap().len(), 3); // 1001 + 2001 + 2002
+        // 空批合法
+        let r = client
+            .call("shard.put_batch", json!({"items": []}))
+            .unwrap();
+        assert_eq!(r["count"], 0);
     }
 }
