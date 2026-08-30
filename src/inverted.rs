@@ -23,11 +23,13 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use lru::LruCache;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -85,10 +87,18 @@ pub struct InvertedIndex {
     bitmaps: Vec<std::sync::Mutex<
         std::collections::HashMap<String, std::collections::HashMap<String, RoaringBitmap>>,
     >>,
+    /// G 项（design_extension 9.6）：term → posting 位图缓存（LRU 有界）。
+    /// 非白名单 term（fulltext 词等）查询首次反序列化后缓存，重复查询直接返回——
+    /// posting 随规模线性（5000 万库单次反序列化 ~10-200ms），缓存后 O(1)。
+    /// 写路径（add/add_batch/flush_segment/gc/with_bitmap_fields）清空保证一致性。
+    posting_cache: std::sync::Mutex<LruCache<String, Arc<RoaringBitmap>>>,
 }
 
 /// 位图索引分片锁数（Ex-5.2，design 4.8.3 P0-4）。
 const BITMAP_SHARDS: usize = 256;
+
+/// G 项：posting 位图缓存容量（LRU 项数；按 term 池规模取 256——覆盖倒排枚举 + fulltext 词条）。
+const POSTING_CACHE_CAP: usize = 256;
 
 /// FNV-1a 字段分片：field → 分片下标（确定性，同 field 恒同片）。
 fn bitmap_shard(field: &str) -> usize {
@@ -178,6 +188,9 @@ impl InvertedIndex {
             bitmaps: (0..BITMAP_SHARDS)
                 .map(|_| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .collect(),
+            posting_cache: std::sync::Mutex::new(LruCache::new(
+                NonZeroUsize::new(POSTING_CACHE_CAP).expect("非零缓存容量"),
+            )),
         })
     }
 
@@ -188,6 +201,8 @@ impl InvertedIndex {
         if self.bitmap_fields.is_empty() {
             return Ok(());
         }
+        // G 项：位图重建 → posting 缓存失效（位图查询路径变化）
+        self.clear_posting_cache();
         // 全量重建：清空全部分片，遍历内存 + 各段 posting，命中白名单字段的 term 建内存位图
         for m in &self.bitmaps {
             m.lock().unwrap().clear();
@@ -239,9 +254,16 @@ impl InvertedIndex {
         Some(out)
     }
 
+    /// G 项：清空 posting 位图缓存（写路径 / 段刷盘 / GC / 位图重建时调用，保证缓存一致性）。
+    fn clear_posting_cache(&self) {
+        self.posting_cache.lock().unwrap().clear();
+    }
+
     /// 追加一个 (term, docid) 到内存字典。docid 必须 < 2^32（RoaringBitmap 上限）。
     pub fn add(&self, term: &str, docid: u64) {
         assert!(docid < u32::MAX as u64, "docid 超出 RoaringBitmap 支持范围");
+        // G 项：posting 变更 → 缓存失效（写路径清空 LRU）
+        self.clear_posting_cache();
         // 位图索引同步维护（design 5.2.4，M7-2）：仅当白名单非空且 term 命中字段时更新
         if !self.bitmap_fields.is_empty() {
             if let Some((field, value)) = term.split_once('=') {
@@ -270,6 +292,8 @@ impl InvertedIndex {
         if items.is_empty() {
             return;
         }
+        // G 项：posting 变更 → 缓存失效
+        self.clear_posting_cache();
         // 局部分组：同 term 合并 docid（借用 items，不拷贝 term 字符串）
         let mut groups: std::collections::HashMap<&str, Vec<u64>> =
             std::collections::HashMap::with_capacity(items.len());
@@ -325,6 +349,8 @@ impl InvertedIndex {
         if self.mem.is_empty() {
             return Ok(());
         }
+        // G 项：段落盘 → posting 缓存失效
+        self.clear_posting_cache();
         let seg_id = self.next_seg_id;
         self.next_seg_id += 1;
         let path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg"));
@@ -440,7 +466,26 @@ impl InvertedIndex {
     }
 
     /// 查询 term：合并内存 posting 与各段 posting，返回 RoaringBitmap（docid 按 u32 语义）。
+    /// G 项优化（design_extension 9.6）：① 白名单字段 term 直接返回全量内存位图（O(1)）；
+    /// ② 非白名单 term 查 LRU 缓存（重复查询免段遍历 + posting 反序列化）。
     pub fn search(&self, term: &str) -> Result<RoaringBitmap> {
+        // ① 白名单字段 term → 内存位图（写路径同步维护，含已落盘段全量）
+        if let Some((field, value)) = term.split_once('=') {
+            if self.bitmap_fields.contains(field) {
+                if let Some(b) = self.bitmaps[bitmap_shard(field)]
+                    .lock()
+                    .unwrap()
+                    .get(field)
+                    .and_then(|m| m.get(value))
+                {
+                    return Ok(b.clone());
+                }
+            }
+        }
+        // ② LRU 缓存命中（RoaringBitmap 容器 Arc 共享，clone 为浅拷贝 O(1)）
+        if let Some(cached) = self.posting_cache.lock().unwrap().get(term) {
+            return Ok((**cached).clone());
+        }
         let mut result = RoaringBitmap::new();
         // 内存（最新）
         if let Some(docids) = self.mem.get(term) {
@@ -452,6 +497,11 @@ impl InvertedIndex {
             let posting = self.read_segment_posting(seg, term)?;
             result |= posting;
         }
+        // ③ 未命中 → 段遍历反序列化后入缓存（下次同 term O(1)）
+        self.posting_cache
+            .lock()
+            .unwrap()
+            .put(term.to_string(), Arc::new(result.clone()));
         Ok(result)
     }
 
@@ -618,6 +668,8 @@ impl InvertedIndex {
                 segment_count: self.segments.load().len(),
             });
         }
+        // G 项：段合并 → posting 缓存失效（旧段 bitmap 过期）
+        self.clear_posting_cache();
         // ① 读取全部段的所有 term 最新 posting（bitmap 合并天然去重）
         let mut map: std::collections::BTreeMap<String, RoaringBitmap> =
             std::collections::BTreeMap::new();
@@ -753,6 +805,60 @@ mod tests {
         assert!(!r.contains(2));
         assert!(idx.search("go").unwrap().contains(2));
         assert!(idx.search("absent").unwrap().is_empty());
+    }
+
+    // ---------- 位图索引（design 5.2.4，M7-2） ----------
+
+    // ---------- G 项：posting 检索优化（term→bitmap 缓存） ----------
+
+    #[test]
+    fn search_hits_bitmap_whitelist_fast_path() {
+        // 白名单字段 term：search 直接返回全量内存位图（与段遍历结果一致）
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        idx.with_bitmap_fields(&["status".to_string(), "city".to_string()])
+            .unwrap();
+        for (term, d) in [
+            ("status=active", 1u64),
+            ("status=active", 3),
+            ("status=inactive", 2),
+            ("status=active", 5),
+            ("city=beijing", 1),
+            ("city=beijing", 2),
+        ] {
+            idx.add(term, d);
+        }
+        idx.flush_segment().unwrap(); // 落盘后白名单路径仍应全量
+        let r = idx.search("status=active").unwrap();
+        assert!(r.contains(1) && r.contains(3) && r.contains(5));
+        assert!(!r.contains(2), "白名单路径不应含 inactive docid");
+        let bj = idx.search("city=beijing").unwrap();
+        assert_eq!(bj.len(), 2);
+    }
+
+    #[test]
+    fn posting_cache_serves_repeat_terms_and_invalidates_on_write() {
+        // 非白名单 term：首次反序列化入缓存，重复查询命中；写路径失效后查询更新
+        let mut idx = InvertedIndex::open(&tmp(), 10_000).unwrap();
+        idx.add("ft:content:山水", 1);
+        idx.add("ft:content:山水", 3);
+        idx.flush_segment().unwrap();
+        let r1 = idx.search("ft:content:山水").unwrap();
+        assert_eq!(r1.len(), 2);
+        // 缓存已填充
+        assert!(idx.posting_cache.lock().unwrap().contains("ft:content:山水"));
+        // 重复查询命中缓存，结果一致
+        let r2 = idx.search("ft:content:山水").unwrap();
+        assert_eq!(r2, r1);
+        // 写路径 → 缓存失效 → 新 docid 可查
+        idx.add("ft:content:山水", 7);
+        assert!(
+            !idx.posting_cache.lock().unwrap().contains("ft:content:山水"),
+            "写入后缓存应失效"
+        );
+        let r3 = idx.search("ft:content:山水").unwrap();
+        assert_eq!(r3.len(), 3);
+        assert!(r3.contains(7));
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------

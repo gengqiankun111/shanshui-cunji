@@ -878,6 +878,15 @@ impl Engine {
         self.inverted.flush_segment()
     }
 
+    /// 倒排段 GC 合并（design 5.2.2/5.2.4⑤）：段文件总量超阈值时合并为少量大段。
+    /// 大数据量导入后段数可能爆炸（demo 每 100 万 term 对刷一段 → 5000 万库数百段），
+    /// 查询每次遍历全部段（高频 term 每段反序列化 posting）→ 段数直接放大查询延迟，
+    /// 故批量导入后应显式调用一次合并（真实部署由后台 GC 周期触发，当前无自动线程）。
+    pub fn inverted_gc(&mut self) -> Result<crate::inverted::GcReport> {
+        self.flush_inverted_pending();
+        self.inverted.gc()
+    }
+
     /// 查询看门狗守卫（类 SQL 扫描过滤/回表熔断用）：`is_expired()` 超时后返回
     /// QueryTooExpensive（复用 engine.execute 的查询超时机制）。
     pub fn query_guard(&self) -> crate::watchdog::QueryGuard {
