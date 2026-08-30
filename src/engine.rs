@@ -399,6 +399,18 @@ impl Engine {
         Ok(())
     }
 
+    /// 批量写入（原子批次，用户端批量语义）：一次性提交一组 `(docid, value, terms)`——
+    /// put_nosync 攒批 + 一次 `flush_wal` 统一提交（整批落盘或崩溃后按 WAL 批次整体重放，
+    /// 无中间态；与组提交正交——显式批次边界，延迟可预期）。
+    /// 为 D 项（LSM 事务阶段一 WriteBatch 原子写）的前置基础；单条语义同 `put`。
+    pub fn put_batch(&mut self, items: &[(u64, Vec<u8>, Vec<String>)]) -> Result<()> {
+        for (docid, value, terms) in items {
+            let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            self.put_nosync(*docid, value.clone(), &refs)?;
+        }
+        self.flush_wal()
+    }
+
     /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
     /// term 编码 `field=value`，field 为 JSON 字段路径（嵌套用 `.` 连接）。
     /// fulltext 词 term（`ft:{field}:{token}`）与 inverted_fields 白名单正交：是否建索引
@@ -1600,6 +1612,34 @@ mod tests {
         assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1");
         assert_eq!(e.get(2).unwrap().unwrap(), b"doc-2");
         assert!(e.get(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn put_batch_atomic_batch_visible_and_indexed() {
+        // put_batch：批量原子提交——全部可见、倒排可查、覆盖语义正确（D 项 WriteBatch 前置）
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        let items: Vec<(u64, Vec<u8>, Vec<String>)> = (1..=100u64)
+            .map(|i| {
+                (
+                    i,
+                    format!("doc-{i}").into_bytes(),
+                    vec![format!("status={}", if i % 2 == 0 { "active" } else { "inactive" })],
+                )
+            })
+            .collect();
+        e.put_batch(&items).unwrap();
+        // 全部可见
+        assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1");
+        assert_eq!(e.get(100).unwrap().unwrap(), b"doc-100");
+        assert!(e.get(101).unwrap().is_none());
+        // 倒排可查（查询自动刷 pending）
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 50);
+        assert_eq!(e.inverted_doc_count("status=inactive").unwrap(), 50);
+        // 覆盖：同批内后写覆盖前写
+        let overwrite: Vec<(u64, Vec<u8>, Vec<String>)> =
+            vec![(1, b"doc-1-v2".to_vec(), vec![])];
+        e.put_batch(&overwrite).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1-v2");
     }
 
     #[test]

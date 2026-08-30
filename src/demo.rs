@@ -1,9 +1,9 @@
 //! 功能演示 / 冒烟测试 CLI（`shanshui-cunji demo`）。
 //!
 //! 按 development 步骤 15 之前的内核能力，端到端验证：
-//! 构造测试数据 → 插入 → 主键查询（100 万次）→ 缓存查询（100 万次）→ 组合索引 → 倒排检索（1 千次）→
-//! 倒排 COUNT（内存位图 1 万次）→ fulltext 分词（1 千次）→ 类 SQL（1 千次 + BETWEEN 100 次）→
-//! 分片路由（100 万次）→ 删除（100 万次）→ 备份还原。
+//! 构造测试数据 → 插入 → 批量插入（1000 条/批）→ 主键查询（100 万次）→ 缓存查询（100 万次）→ 组合索引
+//! → 倒排检索（1 千次）+ COUNT（内存位图 1 万次）→ fulltext 分词（1 千次）→ 类 SQL（等值 1 千次 +
+//! amount/ts BETWEEN 各 100 次）→ 分片路由（抽样）→ 删除（100 万次）→ 备份还原。
 //! 输出结构化结果，供 HTML 报告与截图使用（dev 阶段交付物）。
 
 use std::collections::HashSet;
@@ -101,6 +101,7 @@ fn make_doc(docid: u64, ft: &HashSet<String>) -> (Vec<u8>, Vec<String>) {
         "status": status,
         "city": city,
         "amount": (i * 7) % 1000,
+        "ts": 1_700_000_000 + (i % 31_536_000), // 秒级时间戳（日期 BETWEEN 基准字段）
         "title": title_text(i),
         "content": content_text(i),
         "remark": remark_text(i),
@@ -276,6 +277,42 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         insert_ms,
     ));
 
+    // ---------- 2.5 批量插入（用户端批量：1000 条/批原子提交；独立引擎不干扰主库） ----------
+    // 用户端「累计 1000 条一起插入」是常见批量场景——用 put_batch API（攒批 + 一次 flush_wal
+    // 原子提交，WAL 批次整体重放；为 D 项 WriteBatch 前置）
+    let t = Instant::now();
+    let batch_dir = data_dir.join("batch");
+    let mut bengine =
+        Engine::open_with_timeout(&batch_dir, cfg, std::time::Duration::from_secs(3600))?;
+    let batch_n = scale.min(1_000_000); // 批量插入抽样上限（新 docid 域，不与主库重叠）
+    let batch_size = 1_000u64;
+    let mut batches = 0u64;
+    let mut b_ok = 0u64;
+    for start in (1..=batch_n).step_by(batch_size as usize) {
+        let end = (start + batch_size).min(batch_n + 1);
+        let items: Vec<(u64, Vec<u8>, Vec<String>)> = (start..end)
+            .map(|docid| {
+                let (doc, terms) = make_doc(scale + docid, &ft);
+                (scale + docid, doc, terms)
+            })
+            .collect();
+        bengine.put_batch(&items)?;
+        b_ok += items.len() as u64;
+        batches += 1;
+    }
+    bengine.flush_inverted()?;
+    let b_ms = t.elapsed().as_secs_f64() * 1000.0;
+    results.push(TestResult::new(
+        "批量插入(1000/批)",
+        b_ok == batch_n,
+        format!(
+            "独立引擎 put_batch 批量插入 {batch_n} 条（{batch_size} 条/批 × {batches} 批，每批原子提交），{:.0} ms（{:.0} 条/s）",
+            b_ms,
+            b_ok as f64 / b_ms * 1000.0
+        ),
+        b_ms,
+    ));
+
     // ---------- 3. 主键查询（100 万次，首次 → LSM） ----------
     let t = Instant::now();
     let mut pk_hits = 0u64;
@@ -441,11 +478,24 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         let rows = crate::sqlish::execute(&mut engine, &sql, 50)?;
         between_hits += rows.len() as u64;
     }
+    // 日期 BETWEEN：ts 为秒级时间戳（数字），模拟「近 1 小时」时间范围过滤
+    //（日期转数字比较是标准做法；带时分秒 = 秒级整数；ISO 字符串亦可字典序比较）
+    let mut ts_hits = 0u64;
+    let base_ts = 1_700_000_000u64;
+    for i in 0..between_n {
+        let lo = base_ts + (i.wrapping_mul(3600) % 31_536_000);
+        let hi = lo + 3600;
+        let sql = format!(
+            "SELECT * FROM docs WHERE status='active' AND ts BETWEEN {lo} AND {hi} LIMIT 50"
+        );
+        let rows = crate::sqlish::execute(&mut engine, &sql, 50)?;
+        ts_hits += rows.len() as u64;
+    }
     results.push(TestResult::new(
         "查询 · 类 SQL",
         sql_hits > 0,
         format!(
-            "{sql_n} 次等值 `status='active' AND city='beijing'`（倒排 AND 交集）+ {between_n} 次 `AND amount BETWEEN lo AND hi`（后过滤快路径），累计命中 {sql_hits}+{between_hits}"
+            "{sql_n} 次等值 `status='active' AND city='beijing'`（倒排 AND 交集）+ {between_n} 次 `AND amount BETWEEN lo AND hi`（后过滤快路径）+ {between_n} 次 `AND ts BETWEEN`（日期时间戳），累计命中 {sql_hits}+{between_hits}+{ts_hits}"
         ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));

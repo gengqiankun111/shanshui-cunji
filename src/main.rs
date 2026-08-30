@@ -317,19 +317,20 @@ fn run_demo(config_path: &Path, scale: u64, out_dir: &Path, gen_only: bool) {
 fn build_html_report(results: &[shanshui_cunji::demo::TestResult], scale: u64) -> String {
     let mut sections = String::new();
     // 固定 slug（按功能顺序），与截图脚本一一对应
-    const SLUGS: [&str; 12] = [
+    const SLUGS: [&str; 13] = [
         "01-data",
         "02-insert",
-        "03-query-primary",
-        "04-query-cache",
-        "05-query-composite",
-        "06-query-inverted",
-        "07-query-fulltext",
-        "08-query-sql",
-        "09-sharding",
-        "10-delete",
-        "11-optimizer",
-        "12-backup",
+        "03-batch-insert",
+        "04-query-primary",
+        "05-query-cache",
+        "06-query-composite",
+        "07-query-inverted",
+        "08-query-fulltext",
+        "09-query-sql",
+        "10-sharding",
+        "11-delete",
+        "12-optimizer",
+        "13-backup",
     ];
     for (i, r) in results.iter().enumerate() {
         let cls = if r.passed { "pass" } else { "fail" };
