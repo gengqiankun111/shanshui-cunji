@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>山水存迹数据库（shanshui-cunji）v0.6.0 功能测试报告</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Segoe UI','Microsoft YaHei',sans-serif; background:#0f172a; color:#e2e8f0; padding:32px; }
+  .wrap { max-width:860px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:4px; color:#f8fafc; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:24px; }
+  .summary { background:#1e293b; border-radius:12px; padding:20px 24px; margin-bottom:28px; }
+  .summary .big { font-size:28px; font-weight:700; color:#4ade80; }
+  .bar { height:8px; background:#334155; border-radius:4px; margin-top:12px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,#34d399,#22d3ee); width:100%; }
+  .card { background:#1e293b; border-radius:12px; padding:18px 22px; margin-bottom:16px;
+           border-left:4px solid #475569; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+  .card.pass { border-left-color:#34d399; }
+  .card.fail { border-left-color:#f87171; }
+  .head { display:flex; align-items:center; gap:12px; }
+  .idx { font-size:12px; color:#64748b; }
+  .head h2 { font-size:16px; flex:1; }
+  .badge { font-size:12px; padding:2px 10px; border-radius:999px; }
+  .badge.pass { background:rgba(52,211,153,.15); color:#4ade80; }
+  .badge.fail { background:rgba(248,113,113,.15); color:#f87171; }
+  .detail { color:#94a3b8; font-size:13px; margin-top:10px; line-height:1.6; }
+  .meta { margin-top:10px; font-size:12px; color:#64748b; }
+  .meta b { color:#e2e8f0; }
+</style></head><body><div class="wrap">
+  <h1>山水存迹数据库（shanshui-cunji）v0.6.0 功能冒烟测试报告</h1>
+   <div class="sub">LSM-Tree 单机内核 · 2026-08-27 · 数据量 20000000 条 · 按功能归类</div>
+   <div class="summary">
+     <span class="big">13/13</span> 项通过
+     <div class="bar"><i></i></div>
+   </div>
+   <section class="card pass" id="01-data">
+                <div class="head">
+                    <span class="idx">01</span>
+                    <h2>构造测试数据</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">生成 20000000 条文档（status/city 倒排 + title/content/remark fulltext 分词；流式生成 100000 条耗时 851 ms）</p>
+                <div class="meta">耗时 <b>170163.22</b> ms</div>
+            </section><section class="card pass" id="02-insert">
+                <div class="head">
+                    <span class="idx">02</span>
+                    <h2>批量插入</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">写入 20000000 / 20000000 条，456995 ms（43764 条/s；WAL 攒批 + 定期倒排刷盘 + 段 GC 合并 100 旧段 → 1 段，释放 27 MB）（单条 avg 10.1 µs / max 3598696.3 µs）</p>
+                <div class="meta">耗时 <b>456994.86</b> ms</div>
+            </section><section class="card pass" id="03-batch-insert">
+                <div class="head">
+                    <span class="idx">03</span>
+                    <h2>批量插入</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">独立引擎 put_batch 批量插入 1000000 条（5000 条/批 × 200 批，每批原子提交），26679 ms（37483 条/s；每批 avg 75.7 ms / max 2851.5 ms）</p>
+                <div class="meta">耗时 <b>26678.70</b> ms</div>
+            </section><section class="card pass" id="04-query-primary">
+                <div class="head">
+                    <span class="idx">04</span>
+                    <h2>查询 · 主键</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">1000000 次主键点查，命中 1000000，未命中 0（稀疏索引→布隆→Zone Map→块缓存）（单条 avg 15.9 µs / max 20059.2 µs）</p>
+                <div class="meta">耗时 <b>15916.78</b> ms</div>
+            </section><section class="card pass" id="05-query-cache">
+                <div class="head">
+                    <span class="idx">05</span>
+                    <h2>查询 · HotCache</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">1000000 次重复查询，HotCache 命中 1000000 / 1000000（写后回填 + 读后回填）（单条 avg 0.9 µs / max 4704.7 µs）</p>
+                <div class="meta">耗时 <b>902.09</b> ms</div>
+            </section><section class="card pass" id="06-query-composite">
+                <div class="head">
+                    <span class="idx">06</span>
+                    <h2>查询 · 组合索引</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">status=active 前缀扫描命中 100000 条（写入索引 100000 条）；10000 次前缀点查命中 3333 （单条 avg 0.3 µs / max 28.1 µs）</p>
+                <div class="meta">耗时 <b>159.03</b> ms</div>
+            </section><section class="card pass" id="07-query-inverted">
+                <div class="head">
+                    <span class="idx">07</span>
+                    <h2>查询 · 倒排词条</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">city=beijing 命中 5000000 条（预期 5000000）；抽样回表 200000/200000 条验证；1000 次检索累计命中 6670000000 （单条 avg 307.1 µs / max 10952.1 µs）；10000 次 COUNT（内存位图）累计 66670000000 （单条 avg 0.2 µs / max 27.8 µs）</p>
+                <div class="meta">耗时 <b>571.74</b> ms</div>
+            </section><section class="card pass" id="08-query-fulltext">
+                <div class="head">
+                    <span class="idx">08</span>
+                    <h2>查询 · fulltext 分词</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">1000 次分词检索（content 字段：中文 bigram / 英文整词，每次回表 ≤10），累计命中 6508619364 （单条 avg 5866.8 µs / max 1414684.7 µs）</p>
+                <div class="meta">耗时 <b>5866.96</b> ms</div>
+            </section><section class="card pass" id="09-query-sql">
+                <div class="head">
+                    <span class="idx">09</span>
+                    <h2>查询 · 类 SQL</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">1000 次等值 `status='active' AND city='beijing'`（倒排 AND 交集）（单条 avg 1015.0 µs / max 101996.1 µs） + 100 次 `AND amount BETWEEN lo AND hi`（后过滤快路径）（单条 avg 1114.2 µs / max 3190.9 µs） + 100 次 `AND ts BETWEEN`（日期时间戳）（单条 avg 118772.9 µs / max 288339.2 µs），累计命中 50000+5000+5000</p>
+                <div class="meta">耗时 <b>13004.50</b> ms</div>
+            </section><section class="card pass" id="10-sharding">
+                <div class="head">
+                    <span class="idx">10</span>
+                    <h2>分片路由</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">4 分片抽样 1000000 条分布：shard0=250000, shard1=250000, shard2=250000, shard3=250000（合计 1000000）；分片点查命中 1000000/1000000 （单条 avg 0.5 µs / max 442.3 µs）</p>
+                <div class="meta">耗时 <b>17764.06</b> ms</div>
+            </section><section class="card pass" id="11-delete">
+                <div class="head">
+                    <span class="idx">11</span>
+                    <h2>删除</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">删除 1000000 条并验证不可见（Tombstone 落盘 + HotCache 失效）：1000000/1000000 （单条 avg 2.1 µs / max 15145.2 µs）</p>
+                <div class="meta">耗时 <b>2194.24</b> ms</div>
+            </section><section class="card pass" id="12-optimizer">
+                <div class="head">
+                    <span class="idx">12</span>
+                    <h2>优化器路由</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">静态路由 5 类访问路径自检通过（主键点查/范围/组合索引/倒排/全扫）</p>
+                <div class="meta">耗时 <b>0.00</b> ms</div>
+            </section><section class="card pass" id="13-backup">
+                <div class="head">
+                    <span class="idx">13</span>
+                    <h2>备份 · 还原</h2>
+                    <span class="badge pass">通过</span>
+                </div>
+                <p class="detail">备份 20000000 条库 → 还原重开：未删可读 45/45（缺失 0），已删仍不可见 5/5，city=beijing 计数 5000000（预期 5000000，含 tombstone）</p>
+                <div class="meta">耗时 <b>44162.14</b> ms</div>
+            </section>
+ </div></body></html>
