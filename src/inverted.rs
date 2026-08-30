@@ -92,6 +92,11 @@ pub struct InvertedIndex {
     /// posting 随规模线性（5000 万库单次反序列化 ~10-200ms），缓存后 O(1)。
     /// 写路径（add/add_batch/flush_segment/gc/with_bitmap_fields）清空保证一致性。
     posting_cache: std::sync::Mutex<LruCache<String, Arc<RoaringBitmap>>>,
+    /// G 补充（design_extension 9.6 候选② / K 项落地）：段数据文件 mmap 化——查询按 FST
+    /// offset 直接切片反序列化，免 `fs::read` 全文件读取 + 堆复制（大段文件未命中查询的
+    /// 主要 IO 成本），物理页按需缺页加载（P23 只读映射白名单，与 dicts 同模式）。
+    /// 运行期懒加载（首次查询注册）；gc 先换新映射再删旧文件（Windows 已映射不可删）。
+    data_files: ArcSwap<HashMap<String, Arc<MmapFile>>>,
 }
 
 /// 位图索引分片锁数（Ex-5.2，design 4.8.3 P0-4）。
@@ -191,6 +196,7 @@ impl InvertedIndex {
             posting_cache: std::sync::Mutex::new(LruCache::new(
                 NonZeroUsize::new(POSTING_CACHE_CAP).expect("非零缓存容量"),
             )),
+            data_files: ArcSwap::from(Arc::new(HashMap::new())),
         })
     }
 
@@ -400,6 +406,15 @@ impl InvertedIndex {
                 n
             });
         }
+        // G 补充：段数据映射预注册（新段已落盘可映射；后续查询零懒加载开销）
+        if let Ok(mm) = MmapFile::open(&path) {
+            let mm_arc = Arc::new(mm);
+            self.data_files.rcu(|m| {
+                let mut n = (**m).clone();
+                n.insert(fname.clone(), mm_arc.clone());
+                n
+            });
+        }
 
         // 更新 Manifest（原子）
         // Ex-6.2：rcu 原子发布段清单快照
@@ -507,9 +522,27 @@ impl InvertedIndex {
 
     /// 读取某段内 term 的 posting（未命中返回空 bitmap）。
     /// FST 字典存在时 O(len(term)) 精确定位（design 5.2.4.1）；旧段回退线性扫描。
+    /// G 补充：段数据 mmap 化——首次访问懒加载注册，后续按 FST offset 直接切片，
+    /// 免 `fs::read` 全文件读取 + 堆复制（大段文件未命中查询的主要 IO 成本）。
     fn read_segment_posting(&self, seg: &str, term: &str) -> Result<RoaringBitmap> {
-        let path = self.dir.join(seg);
-        let data = std::fs::read(&path)?;
+        let data = {
+            let files = self.data_files.load();
+            match files.get(seg) {
+                Some(m) => m.clone(),
+                None => {
+                    drop(files);
+                    let mm =
+                        Arc::new(MmapFile::open(&self.dir.join(seg)).map_err(Error::from)?);
+                    // rcu 发布（&self 可原子更新）：并发查询下重复注册无害（幂等覆盖）
+                    self.data_files.rcu(|m| {
+                        let mut n = (**m).clone();
+                        n.insert(seg.to_string(), mm.clone());
+                        n
+                    });
+                    mm
+                }
+            }
+        };
         if data.len() < 10 || &data[0..8] != SEG_MAGIC {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
@@ -727,6 +760,12 @@ impl InvertedIndex {
             new_dicts.insert(fname.clone(), Arc::new(m));
         }
         self.dicts.store(Arc::new(new_dicts));
+        // G 补充：段数据映射同步替换（先发布新映射再删旧文件——Windows 已映射不可删）
+        let mut new_files: HashMap<String, Arc<MmapFile>> = HashMap::new();
+        if let Ok(mm) = MmapFile::open(&self.dir.join(&fname)) {
+            new_files.insert(fname.clone(), Arc::new(mm));
+        }
+        self.data_files.store(Arc::new(new_files));
         self.persist_manifest()?;
 
         // ⑤ 删旧段与旧 FST（Ex-5.7：已发布新快照后旧映射被释放）
@@ -805,6 +844,75 @@ mod tests {
         assert!(!r.contains(2));
         assert!(idx.search("go").unwrap().contains(2));
         assert!(idx.search("absent").unwrap().is_empty());
+    }
+
+    // ---------- G 补充：段数据 mmap 化（只读新段免全文件读取） ----------
+
+    #[test]
+    fn segment_data_mmap_registered_on_flush_and_queryable() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        for d in 1..=50u64 {
+            idx.add("term-a", d);
+        }
+        idx.flush_segment().unwrap();
+        // flush 预注册 mmap：data_files 含新段
+        let seg = idx.segments.load()[0].clone();
+        assert!(
+            idx.data_files.load().contains_key(&seg),
+            "flush 后应预注册段数据 mmap"
+        );
+        // 查询命中（mmap 切片反序列化路径）
+        let r = idx.search("term-a").unwrap();
+        assert_eq!(r.len(), 50);
+        // 未命中 term 走 FST None 分支
+        assert!(idx.search("absent-term").unwrap().is_empty());
+    }
+
+    #[test]
+    fn segment_data_mmap_lazy_load_after_reopen() {
+        let dir = tmp();
+        {
+            let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+            for d in 1..=30u64 {
+                idx.add("lazy", d);
+            }
+            idx.flush_segment().unwrap();
+        }
+        // 重开：data_files 空（运行期缓存不持久化），首次查询懒加载注册
+        let idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        assert!(idx.data_files.load().is_empty(), "重开应懒加载");
+        let r = idx.search("lazy").unwrap();
+        assert_eq!(r.len(), 30);
+        assert!(!idx.data_files.load().is_empty(), "首次查询后应注册 mmap");
+    }
+
+    #[test]
+    fn segment_data_mmap_survives_gc() {
+        let dir = tmp();
+        let mut idx = InvertedIndex::open_with_gc(&dir, 10_000, "fst", 1).unwrap();
+        for d in 1..=100u64 {
+            idx.add("gc-a", d);
+        }
+        idx.flush_segment().unwrap();
+        for d in 1..=100u64 {
+            idx.add("gc-b", d);
+        }
+        idx.flush_segment().unwrap();
+        assert_eq!(idx.segment_count(), 2);
+        let g = idx.gc().unwrap();
+        assert_eq!(g.merged, 2);
+        assert_eq!(idx.segment_count(), 1);
+        // GC 后：新段已映射，旧段映射已释放，查询仍正确
+        let seg = idx.segments.load()[0].clone();
+        assert!(
+            idx.data_files.load().contains_key(&seg),
+            "GC 后应映射合并新段"
+        );
+        let ra = idx.search("gc-a").unwrap();
+        let rb = idx.search("gc-b").unwrap();
+        assert_eq!(ra.len(), 100);
+        assert_eq!(rb.len(), 100);
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------

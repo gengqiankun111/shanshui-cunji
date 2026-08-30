@@ -18,11 +18,11 @@
 |---|---|---|---|---|
 | A | 本机 2000 万 / 5000 万性能吞吐基准（demo 13 项放大） | P0 | ✅ 完成 | 2026-08-30，13/13 全绿（images/perf-0.6.0/ 汇总报告）；查询次数：主键/HotCache/分片/删除 100 万、倒排检索 1 千+COUNT 1 万、fulltext 1 千、SQL 1 千+amount/ts BETWEEN 各 100 |
 | B | 本机 1 亿数据性能与吞吐测试 | P0 | ⏳ 待排期 | 前置 A ✅；预估插入 30-40 分钟 + 查询（fulltext 大 posting 首次反序列化 ~100ms+/次需复核）；交付 images/perf-0.6.0/1亿/ |
-| C | 分布式吞吐优化（机制已验证 → 性能） | P1 | ⏳ | Gateway 按分片并行（去全局 Mutex）→ RPC 连接复用 + 批量写入 → 节点开组提交；三项独立可随时做 |
-| D | LSM 事务阶段一：WriteBatch 原子写 | P1 | ⏳ | **前置已就位**：put_batch 原子批量 API（6197c21，攒批 + 一次 flush_wal）；在此基础上扩展失败回滚/事务上下文 |
-| E | 事务阶段二：快照隔离（Snapshot/MVCC） | P2 | ⏳ | 全局单调 seq + 一致性快照读 + 历史版本 GC；需 D 先行 |
-| F | 事务阶段三：完整 ACID 与隔离级别 | P2 | ⏳ | 事务管理器 + 悲观/乐观锁 + 死锁检测 + RC/RR/SERIALIZABLE；需 E 先行 |
-| G | 倒排 posting 检索优化 | P2 | ✅ 完成 | c380792：term→bitmap LRU 缓存 + bitmap_fields 白名单内存位图命中；2000 万库倒排 1000 检索+1 万 COUNT+抽样 20 万回表 0.5s |
+| C | 分布式吞吐优化（机制已验证 → 性能） | P1 | ✅ 完成 | ① 网关分片并行（每线程独立 Gateway）② RPC 批量写入（shard.put_batch + Gateway::put_batch 哈希分组）③ 节点组提交（--group-commit-us）；本机两节点 364k w/s + 跨地域 0.5s/21.6k w/s（vs 1074s，~2100×） |
+| D | LSM 事务阶段一：WriteBatch 原子写 | P1 | ✅ 完成 | WriteBatch（攒批 put/delete）+ Engine::write 原子提交（预校验失败零副作用 = 回滚语义）+ 单次 flush_wal 崩溃原子 |
+| E | 事务阶段二：快照隔离（Snapshot/MVCC） | P2 | ✅ 完成 | Transaction（快照 seq 一致读 get_at + 提交时写写冲突检测，last_write_seq > snapshot → TxnConflict abort）；MVCC 已知局限：MemTable 不保留多版本，快照读需旧版本已落 SST |
+| F | 事务阶段三：完整 ACID 与隔离级别 | P2 | ✅ 完成 | Isolation（RC/RR/SERIALIZABLE）+ docid 级锁表（共享读/排他写 + 2PL 升级）+ wait-for 图死锁检测（victim abort）+ 失败路径锁释放 |
+| G | 倒排 posting 检索优化 | P2 | ✅ 完成 | c380792 LRU 缓存 + 白名单内存位图；补充：段数据 mmap 化（K 项落地）——免 fs::read 全文件读取，FST offset 直接切片反序列化，物理页按需加载（P23 白名单） |
 | H | 读写分离落地（M8-P1 评估暂缓） | P3 | ⏸ | 组提交已解决读被写拖垮；读路径 &self 基础（c48a7c1）就绪，待复制型分布式阶段 |
 | I | 高并发查询优化（design 9.5 目标） | P3 | ⏳ | M6 后留待 |
 | J | 倒排段 GC 后台化 | P2 | ⏳ | 当前 gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，工程化） |
@@ -67,21 +67,35 @@
   （广播精确命中 + 逐条可见）——对照基线 1074s 提升 ~2100×，目标 <60s 达标；写路径 RTT 分摊到批 + 组提交
   消除逐条 fsync；剩余耗时在逐条点查读路径（跨地域 RTT ~52ms/次，非 C 项范围）。
 
-### D/E/F. LSM 事务三阶段（P1/P2）
-- 阶段一 WriteBatch：事务写攒批 → WAL + MemTable 原子提交，失败回滚；为阶段二/三打基座；
-- 阶段二 Snapshot/MVCC：全局单调 seq（可复用 ReplicationLog seq 体系）→ 一致性快照读 → 历史版本 GC；
-- 阶段三 完整 ACID：事务管理器 + 锁（悲观/乐观）+ 死锁检测 + RC/RR/SERIALIZABLE；
+### D/E/F. LSM 事务三阶段（P1/P2）✅ 完成
+- 阶段一 WriteBatch（src/txn.rs `WriteBatch` + `Engine::write`）：攒批 put/delete → 预校验（失败零副作用 =
+  "失败回滚"）→ 单次 flush_wal 原子提交（崩溃按 WAL 批次整体重放，无中间态）；回滚 = 丢弃未应用批次；
+- 阶段二 Snapshot/MVCC（`Transaction` + `Engine::txn_begin/txn_get/txn_commit`）：快照 seq = 事务开始时的
+  全局 seq，RR/SERIALIZABLE 走 `get_at(snapshot)` 一致快照读（复用 design 4.7 MVCC）；提交时写写冲突检测
+  （目标在快照后被并发事务修改 → `TxnConflict` abort，冲突后锁全部释放）；
+  已知局限：MemTable 不保留多版本（design 4.7 注明），快照读需旧版本已落 SST（flush 后准确）；
+- 阶段三 完整 ACID（`Isolation` + `LockTable`）：RC（读最新已提交）/ RR（快照 + 写冲突检测）/
+  SERIALIZABLE（RR + 读共享锁/写排他锁 2PL 至提交，共享→排他合法升级）；wait-for 图死锁检测
+  （环中请求者为 victim abort，调用方可重试）；提交/回滚/失败路径均释放锁（防泄漏）；
+- 测试：+15 事务测试（WriteBatch 原子/回滚/预校验、RR 快照读/写冲突、RC 最新读、SERIALIZABLE 读写锁、
+  升级、死锁环、delete 混合提交、快照 seq 推进）+ 393 全绿；错误类型新增 TxnConflict/TxnDeadlock/TxnAborted；
 - 对齐既有评估：单 docid 路由天然不分片（Ex-3 Calvin 结论），分布式事务 L1 Outbox/L2 SAGA 已覆盖写路径本地性。
 
-### G. 倒排 posting 检索优化（P2）
-- 现象：倒排/fulltext/SQL 查询主成本 = RoaringBitmap 反序列化（posting 与规模线性）；
-- 候选：term→bitmap 常驻内存缓存（对齐 bitmap_fields 白名单思想）/ 段内增量位图（只读新段合并）；
-- 收益预估：重复 term 查询降 10-50×。
+### G. 倒排 posting 检索优化（P2）✅ 完成
+- 主体（c380792）：term→bitmap LRU 缓存（256 项，Arc 浅拷贝 O(1)）+ bitmap_fields 白名单内存位图
+  （写路径同步维护，查询 O(1) 直接返回）+ 写路径（add/flush/gc）缓存失效；2000 万库倒排 0.5s；
+- 补充（K 项方向落地）：**段数据 mmap 化**——`data_files: ArcSwap<HashMap<seg, Arc<MmapFile>>>`，
+  查询按 FST offset 直接 mmap 切片反序列化（免 `fs::read` 全文件读取 + 堆复制），物理页按需缺页加载
+  （P23 只读映射白名单，与 dicts 同模式）；flush 预注册 + 重开懒加载 + gc 先换映射再删旧文件
+  （Windows 已映射不可删）；大段文件未命中查询（首次反序列化）IO 成本显著下降；
+- 测试：+3 mmap 测试（flush 注册/重开懒加载/GC 后正确）；收益预估：重复 term 10-50×（LRU）+ 首次查询段读取优化（mmap）。
 
 ## 4. 已完成大项（最近）
 
+- D/E/F LSM 事务三阶段 ✅（WriteBatch 原子写 + 快照隔离 + ACID 锁/死锁检测/隔离级别，+15 测试）
+- G 项倒排 posting 检索优化 ✅（c380792 LRU + 白名单位图；补充段数据 mmap 化，+3 测试）
 - 本机 2000 万 / 5000 万大数据量基准 ✅（A：13 项全绿，perf-0.6.0/汇总报告）
-- G 项倒排 posting 检索优化 ✅（c380792：LRU 缓存 + 白名单内存位图）
+- C 项分布式吞吐优化 ✅（本机 364k w/s + 跨地域 0.5s/~2100×，强一致通过）
 - put_batch 批量插入 API ✅（6197c21：原子批次，D 项 WriteBatch 前置）
 - 阿里云两节点分布式强一致测试 ✅（7.51，cluster_demo：2000 条隧道 + 10000 条直连均强一致通过）
 - 服务器 YCSB 基准 ✅（7.51：rotational=1 高效云盘 load 约本机一半、读 p50 持平、长尾放大）

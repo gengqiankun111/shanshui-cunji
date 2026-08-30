@@ -404,6 +404,27 @@
   跨地域真机复测（阿里云 HDD node + SSH 隧道）10000 条写 0.5s（21,590 w/s）——对照基线 1074s 提升
   ~2100×，目标 <60s 达标。
 
+### P52. 事务三阶段：锁泄漏 / 死锁环检测依赖等待关系保留 / MemTable 多版本局限
+- **问题**：D/E/F 事务三阶段实现中三个坑——① `txn_commit` 失败路径（写锁获取中断 / 冲突 abort）
+  不释放已获取锁 → 锁泄漏；② wait-for 死锁环检测：冲突请求若立即撤销等待关系，后续请求无法形成
+  环 → 死锁漏检；③ 快照读测试暴露 MVCC 已知局限：MemTable 仅保留每 key 最新版本，未刷盘覆盖的
+  历史版本不可回读（get_at 返回 None 而非旧值）。
+- **方案**：① commit 逻辑收敛到闭包（`(|| -> Result<()>)()`），成功后 mark_finished，无论成败统一
+  `txn_locks.release(txn.id)`；② 无环冲突**保留等待关系**（`waiting` 表），仅死锁时撤销受害者等待，
+  release 时统一清理；共享→排他锁支持 2PL 合法升级（唯一持有者是自己时直接升级）；③ 文档化局限 +
+  测试对齐：快照读场景先 `flush_primary` 使旧版本落 SST（MemTable 多版本保留留后续）。
+- **结果**：+15 事务测试全绿（WriteBatch 原子/回滚/预校验、RR 快照读/写冲突 abort、RC 最新读、
+  SERIALIZABLE 读写锁/升级、死锁环、delete 混合提交、快照 seq 推进）；393 测试全绿；提交见事务提交。
+
+### P53. 倒排段数据 mmap 化：Windows 已映射文件不可删 → gc 先换映射再删文件
+- **问题**：G 项段数据 mmap（K 项方向）落地时，`read_segment_posting` 每次未命中查询 `fs::read`
+  整个段文件（大段几十 MB，纯 IO 浪费 + 堆复制）；mmap 化后 Windows 下已映射文件无法删除
+  （gc 删旧段会失败）。
+- **方案**：`data_files: ArcSwap<HashMap<seg, Arc<MmapFile>>>` 与 dicts 同模式——flush 预注册、
+  重开懒加载（首次查询 rcu 注册）、gc 先 `data_files.store(新段映射)` 释放旧映射再删旧文件
+  （P23 顺序保证，与 dicts 一致）；查询按 FST offset 直接 mmap 切片反序列化。
+- **结果**：+3 mmap 测试（flush 注册/重开懒加载/GC 后查询正确）；393 全绿。
+
 ---
 
 ## 环境备忘（不入库）

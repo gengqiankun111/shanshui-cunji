@@ -1809,6 +1809,31 @@ impl RuntimePools {
 
 ---
 
+### 7.53 LSM 事务三阶段（D/E/F）+ 倒排段数据 mmap 化（G 补充）
+
+> 2026-08-30。development_process_order.md D/E/F/G 全部完成；393 测试全绿（+18）。
+
+- **阶段一 WriteBatch 原子写（D）**：`src/txn.rs` 新增 `WriteBatch`（攒批 put/delete，`rollback` = 丢弃
+  未应用批次）+ `Engine::write(&WriteBatch)` 原子提交——预校验（`validate`，失败零副作用 = "失败回滚"）
+  → 逐条应用 → 单次 `flush_wal`（崩溃按 WAL 批次整体重放，无中间态）；错误类型新增
+  `TxnConflict / TxnDeadlock / TxnAborted`。
+- **阶段二 快照隔离（E）**：`Transaction` 持有事务开始时全局快照 seq（`begin_snapshot`），
+  `Engine::txn_begin/txn_get/txn_commit/txn_rollback`；RR/SERIALIZABLE 走 `get_at(snapshot_seq)`
+  一致快照读（复用 design 4.7 MVCC：主数据按 seq 过滤 + Delta 增量按全局 seq 隔离 + 删除位图
+  立即语义）；提交时写写冲突检测——`last_write_seq(docid) > snapshot` → `TxnConflict` abort
+  （事务内写不落引擎，提交时见到的快照后写必来自并发已提交事务，检测干净）。
+  已知局限：MemTable 不保留多版本（design 4.7 注明），快照读需旧版本已落 SST（flush 后准确）。
+- **阶段三 完整 ACID（F）**：`Isolation`（RC 读最新 / RR 快照 + 写冲突 / SERIALIZABLE 快照 +
+  读共享锁 + 写排他锁 2PL 至提交，共享→排他合法升级）+ `LockTable`（docid 级锁 + wait-for 图
+  死锁检测，环中请求者 victim abort）+ 提交/回滚/失败路径统一释放锁（防泄漏）。
+- **G 补充：倒排段数据 mmap 化**：`data_files: ArcSwap<HashMap<seg, Arc<MmapFile>>>`——查询按 FST
+  offset 直接 mmap 切片反序列化，免 `fs::read` 全文件读取 + 堆复制（大段文件未命中查询主要 IO 成本）；
+  物理页按需缺页加载（P23 只读映射白名单，与 FST dicts 同模式）；flush 预注册 / 重开懒加载 /
+  gc 先换新映射再删旧文件（Windows 已映射不可删）。
+- 测试：+15 事务（WriteBatch 原子/回滚/预校验、RR 快照读/写冲突、RC 最新读、SERIALIZABLE 读写锁/
+  升级、死锁环、delete 混合提交、快照 seq 推进）+ 3 mmap（flush 注册/重开懒加载/GC 后正确）= 393 全绿；
+  问题闭环见 problem_solving P52/P53。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

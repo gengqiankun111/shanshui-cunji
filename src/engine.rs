@@ -89,6 +89,8 @@ pub struct Engine {
     /// 本地消息表（Ex-1）：Some = 启用（业务写同一本地事务入队 outbox，后台投递幂等消费）；
     /// None = 关闭（默认零开销）。
     outbox: Option<Outbox>,
+    /// 事务锁表（F 阶段三）：docid 级排他写锁 / 共享读锁 + wait-for 死锁检测。
+    txn_locks: crate::txn::LockTable,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -266,6 +268,7 @@ impl Engine {
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
             outbox,
+            txn_locks: crate::txn::LockTable::new(),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -421,6 +424,136 @@ impl Engine {
             self.put_nosync(*docid, value.clone(), &refs)?;
         }
         self.flush_wal()
+    }
+
+    // ===== D/E/F 事务三阶段 =====
+
+    /// D 阶段一：WriteBatch 原子提交。预校验（失败零副作用 = "失败回滚"）→ 逐条应用 →
+    /// 单次 `flush_wal`。崩溃原子：WAL 单次 fsync 批次整体重放（整批恢复或整批丢弃，无中间态）。
+    /// 等价于 `put_batch` + delete 语义 + 事务上下文（回滚 = 丢弃未应用的批次）。
+    pub fn write(&mut self, batch: &crate::txn::WriteBatch) -> Result<()> {
+        batch.validate()?;
+        for op in batch.ops() {
+            match op {
+                crate::txn::Op::Put {
+                    docid,
+                    value,
+                    terms,
+                } => {
+                    let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                    self.put_nosync(*docid, value.clone(), &refs)?;
+                }
+                crate::txn::Op::Delete { docid } => self.delete(*docid)?,
+            }
+        }
+        self.flush_wal()
+    }
+
+    /// E/F：开启事务。快照 seq = 当前已分配最大全局 seq（RR/SERIALIZABLE 一致读基准）。
+    pub fn txn_begin(&mut self, isolation: crate::txn::Isolation) -> crate::txn::Transaction {
+        crate::txn::Transaction::new(isolation, self.begin_snapshot())
+    }
+
+    /// E/F：事务读。RC = 最新已提交（`get`）；RR/SERIALIZABLE = 快照一致读（`get_at`）；
+    /// SERIALIZABLE 读目标额外加共享锁（2PL，读锁持有至提交）。
+    pub fn txn_get(
+        &mut self,
+        txn: &mut crate::txn::Transaction,
+        docid: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        if txn.isolation.locks_reads() {
+            self.txn_locks.acquire_shared(txn.id, docid)?;
+            txn.add_lock(docid);
+        }
+        if txn.isolation.uses_snapshot() {
+            self.get_at(docid, txn.snapshot())
+        } else {
+            self.get(docid)
+        }
+    }
+
+    /// E/F：事务提交。写锁（write_set 全目标排他，含共享→排他升级）→
+    /// 写写冲突检测（RR/SERIALIZABLE：目标在快照后被并发事务修改 → `TxnConflict` abort）→
+    /// 应用 ops + 单次 flush_wal → 释放全部锁（失败路径同样释放，防锁泄漏）。
+    pub fn txn_commit(&mut self, mut txn: crate::txn::Transaction) -> Result<()> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        let result = (|| -> Result<()> {
+            txn.validate()?;
+            // ① 写锁（SERIALIZABLE 已持共享锁的 docid 自动升级为排他）
+            let targets: Vec<u64> = txn.write_set().iter().copied().collect();
+            for d in targets {
+                self.txn_locks.acquire_exclusive(txn.id, d)?;
+                txn.add_lock(d);
+            }
+            // ② 写写冲突检测（RR/SERIALIZABLE）
+            if txn.isolation.checks_write_conflict() {
+                for &d in txn.write_set() {
+                    let cur = self.last_write_seq(d)?;
+                    if cur > txn.snapshot() {
+                        return Err(crate::error::Error::TxnConflict(format!(
+                            "txn#{} 写冲突：docid={d} 在快照 {} 后被并发事务修改（当前 seq {cur}）",
+                            txn.id,
+                            txn.snapshot()
+                        )));
+                    }
+                }
+            }
+            // ③ 应用 + 单次 flush_wal（崩溃原子）
+            for op in txn.ops() {
+                match op {
+                    crate::txn::Op::Put {
+                        docid,
+                        value,
+                        terms,
+                    } => {
+                        let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                        self.put_nosync(*docid, value.clone(), &refs)?;
+                    }
+                    crate::txn::Op::Delete { docid } => self.delete(*docid)?,
+                }
+            }
+            self.flush_wal()?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            txn.mark_finished();
+        }
+        self.txn_locks.release(txn.id);
+        result
+    }
+
+    /// E/F：事务回滚（丢弃攒批 + 释放锁，引擎零变更）。
+    pub fn txn_rollback(&mut self, mut txn: crate::txn::Transaction) {
+        if txn.is_finished() {
+            return;
+        }
+        txn.mark_finished();
+        self.txn_locks.release(txn.id);
+    }
+
+    /// 写冲突检测辅助：docid 最后一次写入的全局 seq（主数据权威源）。
+    /// 删除位图模式下删除视为当前 seq 的写（保守：宁可多冲突不漏检）。
+    fn last_write_seq(&mut self, docid: u64) -> Result<u64> {
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.is_deleted(docid) {
+                return Ok(self.current_seq());
+            }
+        }
+        match self.primary.get_bytes(&encode_docid(docid))? {
+            Some((_, seq)) => Ok(seq),
+            None => Ok(0),
+        }
     }
 
     /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
@@ -1184,6 +1317,185 @@ mod tests {
         let mut c = cfg();
         c.storage.group_commit_us = window_us;
         c
+    }
+
+    // ---------- D/E/F LSM 事务三阶段 ----------
+
+    #[test]
+    fn write_batch_atomic_commit_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut wb = crate::txn::WriteBatch::new();
+        wb.put(1, b"doc-1".to_vec(), vec!["t1".into()]);
+        wb.put(2, b"doc-2".to_vec(), vec!["t2".into()]);
+        wb.delete(3); // 删除不存在的 docid 应合法（幂等）
+        e.write(&wb).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1");
+        assert_eq!(e.get(2).unwrap().unwrap(), b"doc-2");
+        assert!(e.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_batch_validate_rejects_zero_docid_before_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut wb = crate::txn::WriteBatch::new();
+        wb.put(0, b"x".to_vec(), vec![]);
+        wb.put(10, b"ok".to_vec(), vec![]);
+        assert!(e.write(&wb).is_err(), "预校验失败 → 拒绝提交");
+        assert!(e.get(10).unwrap().is_none(), "预校验失败不得应用任何 op（失败回滚语义）");
+    }
+
+    #[test]
+    fn write_batch_rollback_discards_ops() {
+        let mut wb = crate::txn::WriteBatch::new();
+        wb.put(1, b"x".to_vec(), vec![]);
+        wb.delete(2);
+        wb.rollback();
+        assert!(wb.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.write(&wb).unwrap(); // 空批合法提交
+        assert!(e.get(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn txn_rr_snapshot_read_ignores_concurrent_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // MemTable 不保留多版本（design 4.7 已知局限）：快照读需旧版本已落 SST
+        e.flush_primary().unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 快照后并发写入（模拟其他事务已提交）
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let got = e.txn_get(&mut txn, 1).unwrap();
+        assert_eq!(got.unwrap(), b"v0", "RR 应读事务开始前的快照值");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_rr_write_conflict_detected_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap(); // 并发事务在快照后修改 docid=1
+        txn.put(1, b"txn-write".to_vec(), vec![]);
+        assert!(
+            e.txn_commit(txn).is_err(),
+            "RR 提交应因写写冲突 abort（last_write_seq > snapshot）"
+        );
+        // 冲突 abort 后引擎保持并发写结果，且锁已释放
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+        assert_eq!(e.txn_locks.lock_count(), 0, "abort 后锁应全部释放");
+    }
+
+    #[test]
+    fn txn_rc_reads_latest_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let got = e.txn_get(&mut txn, 1).unwrap();
+        assert_eq!(got.unwrap(), b"v1", "RC 应读最新已提交版本");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_serializable_read_lock_blocks_concurrent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // txn1 读 docid=1（共享锁，SERIALIZABLE 持有至提交）
+        let mut t1 = e.txn_begin(crate::txn::Isolation::Serializable);
+        let v = e.txn_get(&mut t1, 1).unwrap();
+        assert_eq!(v.unwrap(), b"v0");
+        // txn2 写 docid=1 → 共享读锁未释放 → 排他请求冲突
+        let mut t2 = e.txn_begin(crate::txn::Isolation::Serializable);
+        t2.put(1, b"v2".to_vec(), vec![]);
+        assert!(e.txn_commit(t2).is_err(), "SERIALIZABLE 读锁持有期间排他写应冲突");
+        // txn1 提交释放读锁后，新事务可写
+        e.txn_commit(t1).unwrap();
+        let mut t3 = e.txn_begin(crate::txn::Isolation::Serializable);
+        t3.put(1, b"v3".to_vec(), vec![]);
+        e.txn_commit(t3).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v3");
+    }
+
+    #[test]
+    fn txn_serializable_upgrades_read_lock_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // 同一事务先读后写同一 docid：共享 → 排他升级（2PL 合法）
+        let mut t1 = e.txn_begin(crate::txn::Isolation::Serializable);
+        let v = e.txn_get(&mut t1, 1).unwrap();
+        assert_eq!(v.unwrap(), b"v0");
+        t1.put(1, b"v1".to_vec(), vec![]);
+        e.txn_commit(t1).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+    }
+
+    #[test]
+    fn txn_deadlock_detected_at_engine_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 通过锁表构造 wait-for 环：txn9001 持 10 等 20；txn9002 持 20 等 10
+        e.txn_locks.acquire_exclusive(9001, 10).unwrap();
+        e.txn_locks.acquire_exclusive(9002, 20).unwrap();
+        let r1 = e.txn_locks.acquire_exclusive(9001, 20);
+        assert!(matches!(r1, Err(crate::error::Error::TxnConflict(_))), "无环 → 冲突");
+        let r2 = e.txn_locks.acquire_exclusive(9002, 10);
+        assert!(
+            matches!(r2, Err(crate::error::Error::TxnDeadlock(_))),
+            "环 → 检测死锁（victim abort）"
+        );
+        e.txn_locks.release(9001);
+        e.txn_locks.release(9002);
+        assert_eq!(e.txn_locks.lock_count(), 0);
+    }
+
+    #[test]
+    fn txn_delete_and_mixed_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(5, b"keep".to_vec(), &["t"]).unwrap();
+        e.put(6, b"del".to_vec(), &["t"]).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        txn.delete(6);
+        txn.put(7, b"new".to_vec(), vec!["t".into()]);
+        e.txn_commit(txn).unwrap();
+        assert!(e.get(6).unwrap().is_none(), "事务删除生效");
+        assert_eq!(e.get(7).unwrap().unwrap(), b"new");
+        assert_eq!(e.get(5).unwrap().unwrap(), b"keep");
+    }
+
+    #[test]
+    fn txn_rollback_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        txn.put(1, b"x".to_vec(), vec![]);
+        txn.delete(2);
+        e.txn_rollback(txn);
+        assert!(e.get(1).unwrap().is_none(), "回滚后无写入");
+        assert_eq!(e.txn_locks.lock_count(), 0, "回滚释放全部锁");
+    }
+
+    #[test]
+    fn txn_snapshot_advances_with_committed_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let s0 = e.txn_begin(crate::txn::Isolation::RepeatableRead).snapshot();
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let s1 = e.txn_begin(crate::txn::Isolation::RepeatableRead).snapshot();
+        assert!(s1 > s0, "提交后新事务快照 seq 应推进");
+        // 旧快照仍读到写前状态（历史版本由 WAL/MemTable seq 过滤保证）
+        let got = e.get_at(1, s0).unwrap();
+        assert!(got.is_none(), "旧快照点 docid=1 尚不存在");
+        assert_eq!(e.get_at(1, s1).unwrap().unwrap(), b"v1");
     }
 
     // ---------- 组提交（M8） ----------

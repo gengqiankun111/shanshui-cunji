@@ -45,6 +45,15 @@ pub enum Error {
 
     #[error("cluster error: {0}")]
     Cluster(String),
+
+    #[error("transaction conflict: {0}")]
+    TxnConflict(String),
+
+    #[error("transaction deadlock: {0}")]
+    TxnDeadlock(String),
+
+    #[error("transaction aborted: {0}")]
+    TxnAborted(String),
 }
 
 /// shanshui-cunji 全局结果类型。
