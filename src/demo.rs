@@ -331,7 +331,9 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(1_000);
+        // 默认 10000/批：fsync 次数较 5000/批减半（原子提交语义下每批 1 次 fsync），
+        // 双缓冲流水线场景吞吐更高（perf 报告 2.6 节：5000/批纯提交 51.3k/s → 10000/批预计 +5-10%）
+        .unwrap_or(10_000);
     let mut batches = 0u64;
     let mut b_ok = 0u64;
     let mut lat_batch = LatencyStat::new();
