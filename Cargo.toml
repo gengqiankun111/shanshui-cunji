@@ -27,6 +27,8 @@ mmap-file = { path = "crates/mmap-file" }
 # 看门狗硬盘超限保护（P52 落地）：跨平台磁盘可用空间查询（独立 crate = unsafe 白名单，
 # 与 mmap-file 同模式，主库保持零 unsafe；Windows GetDiskFreeSpaceExW / Unix statvfs）
 disk-space = { path = "crates/disk-space" }
+# H 项 MySQL 协议适配：mysql_native_password 认证（sha1 scramble，MySQL wire protocol）
+sha1 = "0.10"
 csv = "1"
 # Ex-7.2（design_extension v0.5 第 12.2）：CPU 绑核（网络/计算/IO 三池物理核分区，
 # 跳过超线程虚拟核由显式核列表配置；core_affinity 跨 Windows/Linux/macOS）
@@ -58,6 +60,10 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "shanshui-cunji-ycsb"
 path = "src/bin/ycsb.rs"
+
+[[bin]]
+name = "shanshui-cunji-mysql-server"
+path = "src/bin/mysql_server.rs"
 
 [[bin]]
 name = "shanshui-cunji-gen-dataset"

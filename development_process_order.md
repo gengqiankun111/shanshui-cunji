@@ -23,7 +23,7 @@
 | E | 事务阶段二：快照隔离（Snapshot/MVCC） | P2 | ✅ 完成 | Transaction（快照 seq 一致读 get_at + 提交时写写冲突检测，last_write_seq > snapshot → TxnConflict abort）；MVCC 已知局限：MemTable 不保留多版本，快照读需旧版本已落 SST |
 | F | 事务阶段三：完整 ACID 与隔离级别 | P2 | ✅ 完成 | Isolation（RC/RR/SERIALIZABLE）+ docid 级锁表（共享读/排他写 + 2PL 升级）+ wait-for 图死锁检测（victim abort）+ 失败路径锁释放 |
 | G | 倒排 posting 检索优化 | P2 | ✅ 完成 | c380792 LRU 缓存 + 白名单内存位图；补充：段数据 mmap 化（K 项落地）——免 fs::read 全文件读取，FST offset 直接切片反序列化，物理页按需加载（P23 白名单） |
-| H | 读写分离落地（M8-P1 评估暂缓） | P3 | ⏸ | 组提交已解决读被写拖垮；读路径 &self 基础（c48a7c1）就绪，待复制型分布式阶段 |
+| H | MySQL 协议适配（MySQL 生态接入） | P1 | 🔄 进行中 | H-1 协议核心 ✅（握手+认证+报文）→ H-2 系统查询 ✅（SHOW/VERSION）→ H-3 SQL 映射 ✅（INSERT/UPDATE/DELETE/SELECT）→ H-4 事务语句 → H-5 预处理语句 → H-6 sysbench 接入验证；mysql cli 8.0 / pymysql 真实连接全链路通过 |
 | I | 高并发查询优化（design 9.5 目标） | P3 | ⏳ | M6 后留待 |
 | J | 倒排段 GC 后台化 | P2 | ⏳ | 当前 gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，工程化） |
 | K | fulltext 大 posting 反序列化优化 | P2 | ⏳ | 5000 万库 content 词 posting ~1600 万，首次反序列化 ~100ms+；候选：段内 posting 分块延迟加载 |
@@ -66,6 +66,32 @@
   10000 条（4 线程 × 2500，batch=10000，group_commit=2000µs）写 **0.5s（21,590 w/s）**，强一致校验通过
   （广播精确命中 + 逐条可见）——对照基线 1074s 提升 ~2100×，目标 <60s 达标；写路径 RTT 分摊到批 + 组提交
   消除逐条 fsync；剩余耗时在逐条点查读路径（跨地域 RTT ~52ms/次，非 C 项范围）。
+
+### H. MySQL 协议适配（MySQL 生态接入，P1）🔄 进行中
+- **背景**：sqlish 为类 SQL 子集（仅 SELECT 点查/范围 + LIMIT），MySQL 客户端/生态工具
+  （mysql cli、JDBC/MyBatis、Navicat、sysbench）无法接入；网关层实现 MySQL wire protocol →
+  生态工具直接可用（协议兼容场景的 sysbench 压测前提，见上一轮压测选型分析）；
+- **已完成（H-1~H-3）**：`src/mysql.rs`（握手 HandshakeV10 + mysql_native_password 认证 +
+  报文编解码 + COM_QUERY 分发）+ `src/bin/mysql_server.rs`（独立 bin，默认 0.0.0.0:3307）；
+  SHOW DATABASES/TABLES/VARIABLES + SELECT（`WHERE id=N` 主键点查 / sqlish 引擎）+
+  INSERT/UPDATE/DELETE（映射到文档引擎 put/delete）+ SET/BEGIN/COMMIT/ROLLBACK（放行）；
+  数据模型：库 `scc`，表 `documents`，列 `id`（BIGINT 主键）+ `doc`（JSON 文档）；
+  **验证**：mysql cli 8.0 真实连接 + SELECT VERSION()/SHOW DATABASES/INSERT/UPDATE/DELETE 全链路 ✓；
+  pymysql 全链路 ✓；协议级测试 +6（认证/解析/往返）；
+- **待办（H-4~H-6）**：事务语句（BEGIN/COMMIT → txn.rs）、预处理语句（JDBC）、sysbench 接入验证；
+- 子任务（按阶段顺序）：
+  - H-1 协议核心 ✅：HandshakeV10 握手 + mysql_native_password 认证（sha1 scramble）+ 报文编解码
+    （packet/OK/ERR/ResultSet/EOF）+ 独立端口监听（默认 3307 避免冲突）；
+  - H-2 系统查询 ✅：SHOW DATABASES / SHOW TABLES / SHOW VARIABLES、SELECT VERSION()/@@version——
+    客户端连接与元数据兼容（mysql cli 可交互）；
+  - H-3 SQL 映射 ✅：INSERT（→ put + docid 分配）、UPDATE（→ put 全量覆盖）、DELETE（→ engine.delete）、
+    SELECT（→ 主键点查 / sqlish 引擎）、LIMIT/OFFSET；
+  - H-4 事务语句 ⏳：BEGIN/COMMIT/ROLLBACK → txn.rs 事务 API（RR/SERIALIZABLE）；
+  - H-5 预处理语句 ⏳：COM_STMT_PREPARE/EXECUTE（JDBC 依赖，参数化查询）；
+  - H-6 sysbench 接入验证 ⏳：oltp_point_select/read_write 子集跑通 + 与 HTTP 吞吐对照；
+- **验收**：mysql cli 连接 + INSERT/SELECT/UPDATE/DELETE 往返 + 事务语句 + sysbench 子集可跑；
+- **优先级说明**：P1（生态接入价值高：MySQL 工具链/客户端立即可用），排 B（P0）之后、P2 项之前；
+- 备注：读写分离（原 H）暂缓保留——组提交已解决读被写拖垮，待复制型分布式阶段再启。
 
 ### D/E/F. LSM 事务三阶段（P1/P2）✅ 完成
 - 阶段一 WriteBatch（src/txn.rs `WriteBatch` + `Engine::write`）：攒批 put/delete → 预校验（失败零副作用 =

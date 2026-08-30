@@ -446,6 +446,20 @@
 - **结果**：+6 测试全绿；401 全绿；`crates/disk-space` 独立 crate（零新增外部依赖）；
   配置 `[watchdog] disk_warn/throttle/stall_ratio + stall_min_mb + cpu_query_limit`。
 
+### P56. MySQL 协议适配三坑：授权包 seq 全局连续 / 握手响应字段顺序 / plugin name
+- **问题**：H 项 MySQL wire protocol 实现，mysql cli 8.0 连接报 `Lost connection at
+  reading authorization packet`（服务器日志显示认证通过且 OK 已发送，客户端却读到 EOF）——
+  三个协议细节坑：①**授权包 seq 应为 2**（握手 seq0 → 客户端握手响应 seq1 → 授权包 seq2，
+  **全局连续而非每方向独立**；pymysql 报 `Packet sequence number wrong - got 1 expected 2` 定位）；
+  ②**握手响应字段顺序**：username → auth_response → [CONNECT_WITH_DB] db → [PLUGIN_AUTH]
+  auth_plugin_name → attrs（db 在 auth_response **之后**，且各字段由「服务器声明」决定客户端
+  是否发送——服务器未声明 CONNECT_WITH_DB 时客户端不发 db，直接是 plugin name）；
+  ③auth plugin name（"mysql_native_password"）是握手响应的独立 NUL 串字段，需读取。
+- **方案**：授权 OK/ERR 包 seq 改 2；按服务器声明跳过 db/attrs、按顺序读取 auth_response 与
+  plugin name；`mysql_native_password` 认证（sha1 scramble）校验。
+- **结果**：mysql cli 8.0 真实连接 + SELECT VERSION()/SHOW DATABASES/INSERT/UPDATE/DELETE
+  全链路通过；pymysql 全链路通过；协议级测试 +6；407 全绿；提交见 H 项提交。
+
 ---
 
 ## 环境备忘（不入库）

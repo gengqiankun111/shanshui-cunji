@@ -1854,6 +1854,25 @@ impl RuntimePools {
 - 配置：`[watchdog] disk_warn_ratio / disk_throttle_ratio / disk_stall_ratio / disk_stall_min_mb /
   disk_sample_secs / cpu_query_limit`（validate 校验水位次序 0 < warn 且 warn > throttle >= stall）。
 
+---
+
+### 7.55 MySQL 协议适配（H-1~H-3：握手 + 认证 + SQL 映射）
+
+> 2026-08-30。mysql cli 8.0 / pymysql 真实连接全链路通过；407 测试全绿（+6 协议级）。
+
+- **src/mysql.rs**：MySQL wire protocol 服务器（握手 HandshakeV10 + mysql_native_password 认证
+  sha1 scramble + packet/OK/ERR/ResultSet/EOF 编解码 + COM_QUERY 分发）；
+  数据模型：库 `scc` / 表 `documents` / 列 `id`（BIGINT 主键）+ `doc`（JSON 文档）；
+- **COM_QUERY 分发**：SHOW DATABASES/TABLES/VARIABLES、SELECT VERSION()/@@version、
+  SELECT（`WHERE id=N` 主键点查 / sqlish 引擎返回 id+doc 两列）、INSERT/UPDATE/DELETE
+  （简易 SQL 解析 → 文档引擎 put/delete + 倒排词条派生）、SET/BEGIN/COMMIT/ROLLBACK（放行）；
+- **src/bin/mysql_server.rs**：独立 bin（`--data-dir` + `--bind 0.0.0.0:3307` + `--user` + `--password`），
+  Arc<Mutex<Engine>> 每连接线程（与 rpc.rs 同模式）；
+- **验证**：mysql cli 8.0 真实连接（SELECT VERSION → `8.0.0-shanshui-cunji`、SHOW DATABASES → scc、
+  INSERT/SELECT/UPDATE/DELETE 全链路）+ pymysql 全链路 + 协议级测试 6 个；
+- 关键坑（problem_solving P56）：授权包 seq=2（全局连续非每方向独立）、握手响应字段顺序
+  （auth_response 在 db 前、plugin name 独立字段、按服务器声明跳过 db/attrs）；
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
