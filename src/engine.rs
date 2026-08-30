@@ -401,10 +401,16 @@ impl Engine {
 
     /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
     /// term 编码 `field=value`，field 为 JSON 字段路径（嵌套用 `.` 连接）。
+    /// fulltext 词 term（`ft:{field}:{token}`）与 inverted_fields 白名单正交：是否建索引
+    /// 由 fulltext_fields 声明决定（白名单非空时 ft: term 不被滤掉，否则无法分词检索）。
     fn inverted_allowed(&self, term: &str) -> bool {
         // 超长 term（长文本整串）自动跳过：防止误配下字典膨胀
         if self.max_term_len > 0 && term.len() > self.max_term_len {
             return false;
+        }
+        if let Some(rest) = term.strip_prefix("ft:") {
+            let field = rest.split(':').next().unwrap_or("");
+            return self.fulltext_fields.contains(field);
         }
         let field = term.split('=').next().unwrap_or("");
         if let Some(include) = &self.inverted_include {
@@ -1255,6 +1261,27 @@ mod tests {
         // fulltext_search 回表
         let hits = e.fulltext_search("content", "数据").unwrap();
         assert!(hits.iter().any(|(id, _)| *id == 1 || *id == 2));
+    }
+
+    #[test]
+    fn fulltext_survives_inverted_whitelist() {
+        // M8-P4/P7 正交：inverted_fields 白名单非空时，ft: 词 term 不受白名单过滤
+        // （否则长文本分词索引被白名单误滤，fulltext 检索恒空）
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.inverted_fields = vec!["status".into()]; // 白名单只建 status
+        c.inverted.fulltext_fields = vec!["content".into()];
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        let val = serde_json::json!({"docid": 1, "status": "active", "content": "山水存迹"});
+        let ft = e.fulltext_fields().clone();
+        let terms = crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put_nosync(1, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        // 白名单字段 term 建了；ft: 词 term 也建了（不被滤掉）
+        assert!(e.inverted_posting("status=active").unwrap().contains(1));
+        assert!(e.inverted_posting("ft:content:山水").unwrap().contains(1));
+        assert_eq!(e.fulltext_search("content", "山水").unwrap().len(), 1);
     }
 
     #[test]

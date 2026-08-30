@@ -1,7 +1,8 @@
 //! shanshui-cunji-gen-dataset：异步（分块流式 + 进度输出，可后台运行）构建 Parquet 数据集。
 //!
-//! 规格：N 条记录 × 20 字段——9 个数值型（Int64×7 / Int32×2 / Float64×1）+ 2 个 256 字符文本
-//! （`big_text_a/b`）+ 8 个短字符串/枚举 + 1 个布尔，满足「几个整型 + 1-2 个 256 字符字段」。
+//! 规格：N 条记录 × 23 字段——9 个数值型（Int64×7 / Int32×2 / Float64×1）+ 2 个 256 字符文本
+//! （`big_text_a/b`）+ 8 个短字符串/枚举 + 1 个布尔 + 3 个 fulltext 分词长文本（`title/content/remark`，
+//! 中文 bigram / 英文整词可查），满足「几个整型 + 1-2 个 256 字符字段」+ 倒排/fulltext 基准需求。
 //!
 //! 用法：
 //!   shanshui-cunji-gen-dataset --rows 50000000 --out D:\shanshui-data\ds-50m.parquet
@@ -68,6 +69,9 @@ fn main() {
         Field::new("active_days", DataType::Int32, false),
         Field::new("visit_count", DataType::Int64, false),
         Field::new("balance", DataType::Int64, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("content", DataType::Utf8, false),
+        Field::new("remark", DataType::Utf8, false),
     ]));
 
     let props = WriterProperties::builder()

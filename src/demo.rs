@@ -1,9 +1,11 @@
 //! 功能演示 / 冒烟测试 CLI（`shanshui-cunji demo`）。
 //!
 //! 按 development 步骤 15 之前的内核能力，端到端验证：
-//! 构造测试数据 → 插入 → 主键查询 → 缓存查询 → 组合索引查询 → 倒排词条 → 分片路由 → 删除。
+//! 构造测试数据 → 插入 → 主键查询（100 万次）→ 缓存查询（100 万次）→ 组合索引 → 倒排词条（1 万次）→
+//! fulltext 分词（1 万次）→ 类 SQL（1 千次 + BETWEEN 100 次）→ 分片路由（100 万次）→ 删除（100 万次）→ 备份还原。
 //! 输出结构化结果，供 HTML 报告与截图使用（dev 阶段交付物）。
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
@@ -13,6 +15,7 @@ use crate::engine::Engine;
 use crate::error::Result;
 use crate::keys::encode_composite_key;
 use crate::optimizer::{route, AccessPath, QuerySpec};
+use crate::server::extract_terms_with_fulltext;
 
 /// 单条测试结果。
 pub struct TestResult {
@@ -33,8 +36,53 @@ impl TestResult {
     }
 }
 
+/// fulltext 分词基准词表：中文 2 字词（bigram 直接命中）+ 英文词（整词命中）。
+const ZH_WORDS: [&str; 14] = [
+    "山水", "存迹", "数据", "容量", "压测", "性能", "吞吐", "延迟", "索引", "检索", "并发", "写入", "存储", "引擎",
+];
+const EN_WORDS: [&str; 10] = [
+    "bench", "query", "index", "scan", "wal", "fsync", "lsm", "merge", "cache", "snapshot",
+];
+
+/// 中文短标题（含 4 字连写 → bigram 可查「山水/存迹」，+ 英文词整词可查）。
+fn title_text(i: u64) -> String {
+    format!(
+        "山水存迹压测记录第{i}号 {}",
+        EN_WORDS[(i as usize) % EN_WORDS.len()]
+    )
+}
+
+/// 长文本正文：约 12 个词（中文 2 字词 / 英文词混合，空格分隔），确定性 + 压缩友好。
+fn content_text(i: u64) -> String {
+    let mut s = String::new();
+    let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..12 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let w = if x & 1 == 0 {
+            ZH_WORDS[(x as usize) % ZH_WORDS.len()]
+        } else {
+            EN_WORDS[(x as usize) % EN_WORDS.len()]
+        };
+        s.push_str(w);
+        s.push(' ');
+    }
+    s
+}
+
+/// 英文短备注（英文整词可查）。
+fn remark_text(i: u64) -> String {
+    format!(
+        "{} {} record-{i}",
+        EN_WORDS[(i as usize) % EN_WORDS.len()],
+        EN_WORDS[((i / 7) as usize) % EN_WORDS.len()]
+    )
+}
+
 /// 构造单条测试文档（流式生成用，避免亿级数据全量驻留内存）。
-fn make_doc(docid: u64) -> (Vec<u8>, Vec<&'static str>) {
+/// terms 动态提取：status/city 建倒排（SQL/倒排基准），title/content/remark 走 fulltext 分词。
+fn make_doc(docid: u64, ft: &HashSet<String>) -> (Vec<u8>, Vec<String>) {
     let i = docid - 1;
     let status = if i.is_multiple_of(3) {
         "active"
@@ -47,18 +95,27 @@ fn make_doc(docid: u64) -> (Vec<u8>, Vec<&'static str>) {
         2 => "guangzhou",
         _ => "shenzhen",
     };
-    let doc = format!(
-        r#"{{"docid":{docid},"status":"{status}","city":"{city}","amount":{}}}"#,
-        (i * 7) % 1000
-    );
-    (doc.into_bytes(), vec![city])
+    let doc = serde_json::json!({
+        "docid": docid,
+        "status": status,
+        "city": city,
+        "amount": (i * 7) % 1000,
+        "title": title_text(i),
+        "content": content_text(i),
+        "remark": remark_text(i),
+    });
+    let bytes = serde_json::to_vec(&doc).expect("序列化文档");
+    let include: HashSet<String> = ["status", "city"].iter().map(|s| s.to_string()).collect();
+    let terms = extract_terms_with_fulltext(&doc, Some(&include), Some(ft));
+    (bytes, terms)
 }
 
-/// 构造测试数据：N 条文档，字段 status/city/amount。
-fn build_docs(n: u64) -> Vec<(u64, Vec<u8>, Vec<&'static str>)> {
+/// 构造测试数据：N 条文档，字段 status/city/amount/title/content/remark。
+fn build_docs(n: u64) -> Vec<(u64, Vec<u8>, Vec<String>)> {
+    let ft = HashSet::new();
     let mut docs = Vec::with_capacity(n as usize);
     for docid in 1..=n {
-        let (doc, terms) = make_doc(docid);
+        let (doc, terms) = make_doc(docid, &ft);
         docs.push((docid, doc, terms));
     }
     docs
@@ -88,9 +145,10 @@ impl ShardedEngine {
         (docid % self.shard_count as u64) as usize
     }
 
-    fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
+    fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[String]) -> Result<()> {
         let s = self.shard_of(docid);
-        self.shards[s].put_nosync(docid, value, terms)
+        let refs: Vec<&str> = terms.iter().map(|t| t.as_str()).collect();
+        self.shards[s].put_nosync(docid, value, &refs)
     }
 
     fn flush_wal(&mut self) -> Result<()> {
@@ -141,23 +199,28 @@ pub fn generate(scale: u64, path: &std::path::Path) -> Result<u64> {
 /// `scale`：构造文档条数（10 万 ~ 1 亿）。
 pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
-    // 抽样查询量：小规模全查，大规模固定上限（避免结果集过大）
-    let sample = scale.min(1000);
-    let pk_sample = sample.min(100);
+    // 查询次数（相对旧基准放大：主键/HotCache/分片/删除 100→100 万；倒排/fulltext 单次含
+    // RoaringBitmap 反序列化（posting 随规模增长，5000 万库单次 ~10ms），10 万次不可行 → 1 万次；
+    // 类 SQL 等值同理 1 千次；BETWEEN 后过滤 100 次覆盖）；scale 过小时以数据量为上限
+    let pk_n = 1_000_000u64.min(scale).max(1); // 主键 / HotCache / 分片点查 / 删除次数
+    let inv_n = 10_000u64.min(scale).max(1); // 倒排 / 组合索引 / fulltext 查询次数
+    let sql_n = 1_000u64.min(scale).max(1); // 类 SQL 查询次数
+    let del_n = 1_000_000u64.min(scale).max(1); // 删除次数
+    let ft: HashSet<String> = cfg.inverted.fulltext_fields.iter().cloned().collect();
 
     // ---------- 1. 构造测试数据（流式生成，亿级不驻留内存） ----------
     let t = Instant::now();
     // 采样 10 万条计时，推算全量生成耗时（实际生成在插入时分批进行）
     let probe_n = 100_000.min(scale);
     for docid in 1..=probe_n {
-        let _ = make_doc(docid);
+        let _ = make_doc(docid, &ft);
     }
     let probe_ms = t.elapsed().as_secs_f64() * 1000.0;
     results.push(TestResult::new(
         "构造测试数据",
         true,
         format!(
-            "生成 {scale} 条文档（status/city/amount 字段，city 写入倒排；流式生成 {probe_n} 条耗时 {probe_ms:.0} ms）"
+            "生成 {scale} 条文档（status/city 倒排 + title/content/remark fulltext 分词；流式生成 {probe_n} 条耗时 {probe_ms:.0} ms）"
         ),
         probe_ms * scale as f64 / probe_n as f64,
     ));
@@ -170,8 +233,9 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     let t = Instant::now();
     let mut put_ok = 0u64;
     for docid in 1..=scale {
-        let (doc, terms) = make_doc(docid);
-        engine.put_nosync(docid, doc, &terms)?;
+        let (doc, terms) = make_doc(docid, &ft);
+        let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        engine.put_nosync(docid, doc, &refs)?;
         put_ok += 1;
         // 定期刷倒排段，防内存字典无界增长
         if engine.inverted_mem_docids() >= 1_000_000 {
@@ -192,12 +256,12 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         insert_ms,
     ));
 
-    // ---------- 3. 主键查询（首次 → LSM） ----------
+    // ---------- 3. 主键查询（100 万次，首次 → LSM） ----------
     let t = Instant::now();
     let mut pk_hits = 0u64;
     let mut pk_miss = 0u64;
-    for i in 0..pk_sample {
-        let docid = (i * 13 % scale) + 1;
+    for i in 0..pk_n {
+        let docid = (i.wrapping_mul(13) % scale) + 1;
         match engine.get(docid)? {
             Some(_) => pk_hits += 1,
             None => pk_miss += 1,
@@ -205,28 +269,30 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     }
     results.push(TestResult::new(
         "查询 · 主键",
-        pk_miss == 0 && pk_hits == pk_sample,
-        format!("{pk_sample} 次主键点查，命中 {pk_hits}，未命中 {pk_miss}（稀疏索引→布隆→Zone Map→块缓存）"),
+        pk_miss == 0 && pk_hits == pk_n,
+        format!(
+            "{pk_n} 次主键点查，命中 {pk_hits}，未命中 {pk_miss}（稀疏索引→布隆→Zone Map→块缓存）"
+        ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
     // ---------- 4. 缓存查询（同一批 docid 再查 → HotCache 命中） ----------
     let t = Instant::now();
     let mut cache_hits = 0u64;
-    for i in 0..pk_sample {
-        let docid = (i * 13 % scale) + 1;
+    for i in 0..pk_n {
+        let docid = (i.wrapping_mul(13) % scale) + 1;
         if engine.get(docid)?.is_some() {
             cache_hits += 1;
         }
     }
     results.push(TestResult::new(
         "查询 · HotCache",
-        cache_hits == pk_sample,
-        format!("{pk_sample} 次重复查询，HotCache 命中 {cache_hits} / {pk_sample}（写后回填 + 读后回填）"),
+        cache_hits == pk_n,
+        format!("{pk_n} 次重复查询，HotCache 命中 {cache_hits} / {pk_n}（写后回填 + 读后回填）"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
-    // ---------- 5. 组合索引查询（status=active 前缀） ----------
+    // ---------- 5. 组合索引（status=active 前缀；扫描验证 + inv_n 次前缀点查） ----------
     let t = Instant::now();
     let mut cidx = ColumnFamily::open("cidx-demo", &data_dir.join("cidx-demo"), cfg)?;
     let mut active_count = 0u64;
@@ -246,22 +312,31 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     let start = encode_composite_key(&[b"active"], 0);
     let end = encode_composite_key(&[b"active"], u64::MAX);
     let hits = cidx.scan_raw_range(Some(&start), Some(&end))?;
+    let scan_hits = hits.len();
+    // inv_n 次前缀点查（随机 docid，组合索引定位）
+    let mut cidx_hits = 0u64;
+    for i in 0..inv_n {
+        let docid = (i.wrapping_mul(7) % scale) + 1;
+        let key = encode_composite_key(&[b"active"], docid);
+        if cidx.get_bytes(&key)?.is_some() {
+            cidx_hits += 1;
+        }
+    }
     results.push(TestResult::new(
         "查询 · 组合索引",
-        hits.len() == active_count as usize,
+        scan_hits == active_count as usize,
         format!(
-            "status=active 前缀查询命中 {} 条（写入索引 {active_count} 条）",
-            hits.len()
+            "status=active 前缀扫描命中 {scan_hits} 条（写入索引 {active_count} 条）；{inv_n} 次前缀点查命中 {cidx_hits}"
         ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
-    // ---------- 6. 倒排词条查询（city=beijing） ----------
+    // ---------- 6. 倒排词条查询（10 万次检索 + 抽样回表验证） ----------
     let t = Instant::now();
     // 超大结果集：先用 RoaringBitmap 直接统计命中总数（不回表，毫秒级），
     // 再抽样回表验证正确性（MVP 逐条回表对亿级结果集慢，批量预取优化在阶段 1.5）
     let expected_beijing = scale / 4;
-    let bitmap = engine.inverted_posting("beijing")?;
+    let bitmap = engine.inverted_posting("city=beijing")?;
     let total_hits = bitmap.len();
     // 抽样回表：最多 20 万条
     let fetch_budget = 200_000.min(total_hits);
@@ -273,29 +348,96 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
             ok += 1;
         }
     }
+    // inv_n 次倒排检索（随机 term 池：status 2 + city 4，bitmap 直取不回表）
+    let inv_terms = [
+        "status=active",
+        "status=inactive",
+        "city=beijing",
+        "city=shanghai",
+        "city=guangzhou",
+        "city=shenzhen",
+    ];
+    let mut inv_hits = 0u64;
+    for i in 0..inv_n {
+        let term = inv_terms[(i as usize) % inv_terms.len()];
+        let bm = engine.inverted_posting(term)?;
+        inv_hits += bm.len() as u64;
+    }
     results.push(TestResult::new(
         "查询 · 倒排词条",
-        total_hits == expected_beijing && ok == fetched,
+        total_hits == expected_beijing && ok == fetched && inv_hits > 0,
         format!(
-            "city=beijing 命中 {total_hits} 条（预期 {expected_beijing}）；抽样回表 {ok}/{fetched} 条验证"
+            "city=beijing 命中 {total_hits} 条（预期 {expected_beijing}）；抽样回表 {ok}/{fetched} 条验证；{inv_n} 次随机 term 检索累计命中 {inv_hits}"
         ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
-    // ---------- 7. 分片路由（ShardedEngine 模拟，4 分片全量写入） ----------
+    // ---------- 6.5 fulltext 分词查询（inv_n 次：中文 bigram + 英文整词） ----------
+    let t = Instant::now();
+    let ft_zh = ["山水", "数据", "索引", "并发", "写入", "存储"];
+    let ft_en = ["bench", "wal", "lsm", "query", "index"];
+    let mut ft_hits = 0u64;
+    for i in 0..inv_n {
+        let word = if i % 2 == 0 {
+            ft_zh[((i / 2) as usize) % ft_zh.len()]
+        } else {
+            ft_en[((i / 2) as usize) % ft_en.len()]
+        };
+        let p = engine.fulltext_search_paged("content", word, Some(10), 0)?;
+        ft_hits += p.total;
+    }
+    results.push(TestResult::new(
+        "查询 · fulltext 分词",
+        ft_hits > 0,
+        format!(
+            "{inv_n} 次分词检索（content 字段：中文 bigram / 英文整词，每次回表 ≤10），累计命中 {ft_hits}"
+        ),
+        t.elapsed().as_secs_f64() * 1000.0,
+    ));
+
+    // ---------- 6.6 类 SQL 查询（等值 sql_n 次 + BETWEEN 100 次覆盖） ----------
+    let t = Instant::now();
+    let mut sql_hits = 0u64;
+    for _ in 0..sql_n {
+        let sql = "SELECT * FROM docs WHERE status='active' AND city='beijing' LIMIT 50";
+        let rows = crate::sqlish::execute(&mut engine, sql, 50)?;
+        sql_hits += rows.len() as u64;
+    }
+    // BETWEEN 走后过滤快路径：成本与另一分支命中集线性（扫描过滤），小次数覆盖正确性
+    let between_n = 100u64.min(scale).max(1);
+    let mut between_hits = 0u64;
+    for i in 0..between_n {
+        let lo = i.wrapping_mul(31) % 500;
+        let hi = lo + 100;
+        let sql = format!(
+            "SELECT * FROM docs WHERE status='active' AND amount BETWEEN {lo} AND {hi} LIMIT 50"
+        );
+        let rows = crate::sqlish::execute(&mut engine, &sql, 50)?;
+        between_hits += rows.len() as u64;
+    }
+    results.push(TestResult::new(
+        "查询 · 类 SQL",
+        sql_hits > 0,
+        format!(
+            "{sql_n} 次等值 `status='active' AND city='beijing'`（倒排 AND 交集）+ {between_n} 次 `AND amount BETWEEN lo AND hi`（后过滤快路径），累计命中 {sql_hits}+{between_hits}"
+        ),
+        t.elapsed().as_secs_f64() * 1000.0,
+    ));
+
+    // ---------- 7. 分片路由（ShardedEngine 模拟，4 分片全量写入；100 万次分片点查） ----------
     let t = Instant::now();
     let shard_dir = data_dir.join("sharded");
     let mut se = ShardedEngine::open(&shard_dir, cfg, 4)?;
     for docid in 1..=scale {
-        let (doc, terms) = make_doc(docid);
+        let (doc, terms) = make_doc(docid, &ft);
         se.put_nosync(docid, doc, &terms)?;
     }
     se.flush_wal()?;
     let dist = se.distribution();
     let total: usize = dist.iter().map(|(_, c)| *c).sum();
     let mut shard_ok = 0u64;
-    for i in 0..pk_sample {
-        let docid = (i * 17 % scale) + 1;
+    for i in 0..pk_n {
+        let docid = (i.wrapping_mul(17) % scale) + 1;
         if se.get(docid)?.is_some() {
             shard_ok += 1;
         }
@@ -307,17 +449,16 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         .join(", ");
     results.push(TestResult::new(
         "分片路由",
-        total == scale as usize && shard_ok == pk_sample,
-        format!("4 分片分布：{dist_str}（合计 {total}）；分片点查命中 {shard_ok}/{pk_sample}"),
+        total == scale as usize && shard_ok == pk_n,
+        format!("4 分片分布：{dist_str}（合计 {total}）；分片点查命中 {shard_ok}/{pk_n}"),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
-    // ---------- 8. 删除 ----------
+    // ---------- 8. 删除（100 万次并验证不可见） ----------
     let t = Instant::now();
     let mut del_ok = 0u64;
-    let del_sample = sample.min(100);
-    for i in 0..del_sample {
-        let docid = (i * 11 % scale) + 1;
+    for i in 0..del_n {
+        let docid = (i.wrapping_mul(11) % scale) + 1;
         engine.delete(docid)?;
         if engine.get(docid)?.is_none() {
             del_ok += 1;
@@ -325,8 +466,10 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     }
     results.push(TestResult::new(
         "删除",
-        del_ok == del_sample,
-        format!("删除 {del_sample} 条并验证不可见（Tombstone 落盘 + HotCache 失效）：{del_ok}/{del_sample}"),
+        del_ok == del_n,
+        format!(
+            "删除 {del_n} 条并验证不可见（Tombstone 落盘 + HotCache 失效）：{del_ok}/{del_n}"
+        ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));
 
@@ -359,15 +502,16 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     let mut restored = Engine::open(&restore_dir, cfg)?;
 
     // 验证：① 未删除文档可读 ② 步骤 8 已删除文档仍不可见（Tombstone 随备份/还原）③ 倒排词条计数一致（含落盘段）
-    // 注意：验证集合与删除集合存在同余重叠，须按删除集合动态计算期望
+    // 注意：验证集合与删除集合存在同余重叠，须按删除集合动态计算期望；
+    // 删除 100 万条中可能含 beijing 文档，期望计数须减去被删部分
     let deleted: std::collections::HashSet<u64> =
-        (0..del_sample).map(|i| (i * 11 % scale) + 1).collect();
-    let verify_n = pk_sample.min(50);
+        (0..del_n).map(|i| (i.wrapping_mul(11) % scale) + 1).collect();
+    let verify_n = pk_n.min(50);
     let mut present = 0u64;
     let mut missing = 0u64;
     let mut del_ok = 0u64;
     for i in 0..verify_n {
-        let docid = (i * 13 % scale) + 1;
+        let docid = (i.wrapping_mul(13) % scale) + 1;
         if deleted.contains(&docid) {
             if restored.get(docid)?.is_none() {
                 del_ok += 1; // 已删除文档还原后仍不可见
@@ -379,10 +523,12 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         }
     }
     let non_deleted = (0..verify_n)
-        .filter(|i| !deleted.contains(&((i * 13 % scale) + 1)))
+        .filter(|i| !deleted.contains(&((i.wrapping_mul(13) % scale) + 1)))
         .count() as u64;
     let deleted_in_verify = verify_n - non_deleted;
-    let bj = restored.inverted_posting("beijing")?.len();
+    // 倒排 posting 含已删 docid（删除位图 + Tombstone 在 get/compaction 时过滤，posting 不减）：
+    // 备份还原后计数应 = 备份前（含 tombstone），断言 expected_beijing 而非减去被删
+    let bj = restored.inverted_posting("city=beijing")?.len();
     let passed = missing == 0
         && present == non_deleted
         && del_ok == deleted_in_verify
@@ -391,7 +537,7 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         "备份 · 还原",
         passed,
         format!(
-            "备份 {scale} 条库 → 还原重开：未删可读 {present}/{non_deleted}（缺失 {missing}），已删仍不可见 {del_ok}/{deleted_in_verify}，city=beijing 计数 {bj}（预期 {expected_beijing}）"
+            "备份 {scale} 条库 → 还原重开：未删可读 {present}/{non_deleted}（缺失 {missing}），已删仍不可见 {del_ok}/{deleted_in_verify}，city=beijing 计数 {bj}（预期 {expected_beijing}，含 tombstone）"
         ),
         t.elapsed().as_secs_f64() * 1000.0,
     ));

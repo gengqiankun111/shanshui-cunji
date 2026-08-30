@@ -476,10 +476,13 @@ fn leaf_passes(engine: &mut Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
 }
 
 /// 后过滤：只检查 `bitmap` 内已命中的文档（AND 快路径——扫描域 = 另一分支位图；逐批熔断）。
+/// `limit` 下推：找到 limit 个命中即停——比较/BETWEEN 作后过滤时避免遍历全量命中集
+/// （千万级库 status=active 上 LIMIT 50 的 BETWEEN 若全量遍历 = 数百秒，提前停 = 毫秒级）。
 fn post_filter(
     engine: &mut Engine,
     bitmap: RoaringBitmap,
     leaf: &Leaf,
+    limit: u64,
     guard: &crate::watchdog::QueryGuard,
 ) -> Result<RoaringBitmap> {
     let mut out = RoaringBitmap::new();
@@ -493,6 +496,9 @@ fn post_filter(
         }
         if leaf_passes(engine, docid as u64, leaf)? {
             out.insert(docid);
+            if out.len() as u64 >= limit {
+                break;
+            }
         }
     }
     Ok(out)
@@ -502,14 +508,20 @@ fn post_filter(
 fn scan_all(
     engine: &mut Engine,
     leaf: &Leaf,
+    limit: u64,
     guard: &crate::watchdog::QueryGuard,
 ) -> Result<RoaringBitmap> {
     let full = full_docids(engine, guard)?;
-    post_filter(engine, full, leaf, guard)
+    post_filter(engine, full, leaf, limit, guard)
 }
 
 /// 单条件求值：`=` 走倒排 posting（docid 特例点查）；`!=` 全量 − posting；比较/BETWEEN 扫描。
-fn eval_cond(engine: &mut Engine, c: &Cond, guard: &crate::watchdog::QueryGuard) -> Result<RoaringBitmap> {
+fn eval_cond(
+    engine: &mut Engine,
+    c: &Cond,
+    limit: u64,
+    guard: &crate::watchdog::QueryGuard,
+) -> Result<RoaringBitmap> {
     match c.op {
         CmpOp::Eq => {
             if c.field == "docid" {
@@ -539,39 +551,44 @@ fn eval_cond(engine: &mut Engine, c: &Cond, guard: &crate::watchdog::QueryGuard)
             };
             Ok(full - hit)
         }
-        _ => scan_all(engine, &Leaf::Cmp(c), guard),
+        _ => scan_all(engine, &Leaf::Cmp(c), limit, guard),
     }
 }
 
 /// WHERE 求值 → 命中位图。
 /// AND 快路径：比较/BETWEEN 分支作后过滤（只检查另一分支已命中文档，避免全量扫描）。
-fn eval(engine: &mut Engine, e: &WhereExpr, guard: &crate::watchdog::QueryGuard) -> Result<RoaringBitmap> {
+fn eval(
+    engine: &mut Engine,
+    e: &WhereExpr,
+    limit: u64,
+    guard: &crate::watchdog::QueryGuard,
+) -> Result<RoaringBitmap> {
     match e {
-        WhereExpr::Cond(c) => eval_cond(engine, c, guard),
+        WhereExpr::Cond(c) => eval_cond(engine, c, limit, guard),
         WhereExpr::Between { field, low, high } => {
-            scan_all(engine, &Leaf::Between { field, low, high }, guard)
+            scan_all(engine, &Leaf::Between { field, low, high }, limit, guard)
         }
         WhereExpr::Not(x) => {
             let full = full_docids(engine, guard)?;
-            let hit = eval(engine, x, guard)?;
+            let hit = eval(engine, x, limit, guard)?;
             Ok(full - hit)
         }
         WhereExpr::And(a, b) => {
             if let Some(leaf) = scan_leaf(a) {
-                let base = eval(engine, b, guard)?;
-                return post_filter(engine, base, &leaf, guard);
+                let base = eval(engine, b, limit, guard)?;
+                return post_filter(engine, base, &leaf, limit, guard);
             }
             if let Some(leaf) = scan_leaf(b) {
-                let base = eval(engine, a, guard)?;
-                return post_filter(engine, base, &leaf, guard);
+                let base = eval(engine, a, limit, guard)?;
+                return post_filter(engine, base, &leaf, limit, guard);
             }
-            let la = eval(engine, a, guard)?;
-            let lb = eval(engine, b, guard)?;
+            let la = eval(engine, a, limit, guard)?;
+            let lb = eval(engine, b, limit, guard)?;
             Ok(la & lb)
         }
         WhereExpr::Or(a, b) => {
-            let la = eval(engine, a, guard)?;
-            let lb = eval(engine, b, guard)?;
+            let la = eval(engine, a, limit, guard)?;
+            let lb = eval(engine, b, limit, guard)?;
             Ok(la | lb)
         }
     }
@@ -584,7 +601,7 @@ pub fn execute(engine: &mut Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
     let bitmap = match &sel.where_expr {
-        Some(e) => eval(engine, e, &guard)?,
+        Some(e) => eval(engine, e, limit, &guard)?,
         None => full_docids(engine, &guard)?,
     };
     let mut rows = Vec::new();

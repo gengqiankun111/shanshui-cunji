@@ -18,5 +18,8 @@ vendor/
 # 开发点独立研究 demo（demo-first 流程：src/demo/<点>/* 研究跑通后再整合进 kernel，不提交）
 src/demo/
 
+# 测试辅助脚本（function_test：demo/压测运行脚本 + 截图脚本；不提交，仓库内保留 demo 主代码 src/demo.rs）
+function_test/
+
 # Cargo.lock 是二进制项目的一部分，必须入库以锁定依赖版本
 # Cargo.lock
