@@ -1,0 +1,9 @@
+[package]
+name = "disk-space"
+version = "0.1.0"
+edition = "2021"
+description = "只读磁盘可用空间查询（P52 看门狗扩展：跨平台，Windows GetDiskFreeSpaceExW / Unix statvfs）"
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"

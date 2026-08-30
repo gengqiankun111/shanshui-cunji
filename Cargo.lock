@@ -536,6 +536,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-space"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1488,6 +1495,7 @@ dependencies = [
  "crossbeam-skiplist",
  "csv",
  "dashmap",
+ "disk-space",
  "fst",
  "jieba-rs",
  "lru",

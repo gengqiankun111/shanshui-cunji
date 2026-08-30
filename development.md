@@ -1831,8 +1831,28 @@ impl RuntimePools {
   物理页按需缺页加载（P23 只读映射白名单，与 FST dicts 同模式）；flush 预注册 / 重开懒加载 /
   gc 先换新映射再删旧文件（Windows 已映射不可删）。
 - 测试：+15 事务（WriteBatch 原子/回滚/预校验、RR 快照读/写冲突、RC 最新读、SERIALIZABLE 读写锁/
-  升级、死锁环、delete 混合提交、快照 seq 推进）+ 3 mmap（flush 注册/重开懒加载/GC 后正确）= 393 全绿；
-  问题闭环见 problem_solving P52/P53。
+   升级、死锁环、delete 混合提交、快照 seq 推进）+ 3 mmap（flush 注册/重开懒加载/GC 后正确）= 393 全绿；
+   问题闭环见 problem_solving P52/P53。
+
+---
+
+### 7.54 看门狗 CPU/磁盘三级响应（P52 设计落地）
+
+> 2026-08-30。401 测试全绿（+8）；`crates/disk-space` 独立 crate（P23 unsafe 白名单）。
+
+- **磁盘看门狗 `DiskGuardian`**：剩余空间三级响应——预警（warn=0.20，记录计数）/ 限流
+  （throttle=0.10，软信号放行）/ 熔断（stall=0.05 **且** 绝对剩余 < 1GB → 拒绝写，只读保持）；
+  熔断双条件防"小比例但空间仍充裕"误熔断（P54，C 盘 3% 实测触发）；1s 采样缓存免写路径频繁
+  syscall；`crates/disk-space`（Windows GetDiskFreeSpaceExW / Unix statvfs，零新增外部依赖）。
+- **CPU 看门狗 `CpuGuardian`**：并发查询数代理 CPU 压力——`Watchdog::try_begin_query` 达
+  `cpu_query_limit`（默认 64）返回 Stalled 拒绝新查询（防 CPU 风暴），`QueryGuard` drop 自动释放
+  槽位（Arc 计数，无泄漏）。
+- **写路径统一入口**：`Watchdog::check_all(mem_ratio, data_dir)` = 内存水位 + 磁盘水位；
+  挂接 put / put_batch / write / delete / txn_commit（事务提交前检查）。
+- **查询执行器**：`Engine::execute` 改用 `try_begin_query`（CPU 并发限制 + 查询超时熔断双保险）。
+- **admin status**：`EngineStats` 新增 disk_ratio / disk_status / cpu_active_queries / cpu_query_limit。
+- 配置：`[watchdog] disk_warn_ratio / disk_throttle_ratio / disk_stall_ratio / disk_stall_min_mb /
+  disk_sample_secs / cpu_query_limit`（validate 校验水位次序 0 < warn 且 warn > throttle >= stall）。
 
 ## 8. 编码规范
 

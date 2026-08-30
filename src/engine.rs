@@ -91,6 +91,8 @@ pub struct Engine {
     outbox: Option<Outbox>,
     /// 事务锁表（F 阶段三）：docid 级排他写锁 / 共享读锁 + wait-for 死锁检测。
     txn_locks: crate::txn::LockTable,
+    /// 数据目录（P52 看门狗磁盘水位检测目标）。
+    data_dir: std::path::PathBuf,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -146,6 +148,14 @@ pub struct EngineStats {
     pub mem_ratio: f64,
     /// 内存硬上限（MB）。
     pub max_memory_mb: usize,
+    /// 磁盘剩余空间占比（0~1；检测失败 = 1.0）。
+    pub disk_ratio: f64,
+    /// 磁盘空间状态（Normal/Throttled/Stalled，P52）。
+    pub disk_status: String,
+    /// CPU 并发查询数（P52 代理信号）。
+    pub cpu_active_queries: usize,
+    /// CPU 并发查询上限。
+    pub cpu_query_limit: usize,
 }
 
 impl Engine {
@@ -269,6 +279,7 @@ impl Engine {
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
             outbox,
             txn_locks: crate::txn::LockTable::new(),
+            data_dir: data_dir.to_path_buf(),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -347,8 +358,8 @@ impl Engine {
     /// 写失效链：先失效 HotCache 与组合索引旧条目，最后写 LSM（design 6.6）。
     /// OOM Guardian：写入前按水位限流/熔断（design 14.1.1）。
     pub fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
-        // 内存限流：软水位返回限流信号（MVP 仍放行，记录计数）；硬水位直接拒绝
-        let _status = self.watchdog.memory_check(self.mem_ratio)?;
+        // 看门狗统一检查（P52）：内存硬水位熔断 + 磁盘剩余空间熔断；软水位放行记录
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.put_nosync(docid, value, terms)?;
         // 组提交（M8）：开启时窗口内攒批一次 fsync，否则逐条 fsync（强安全）
         self.maybe_group_commit()?;
@@ -419,6 +430,7 @@ impl Engine {
     /// 无中间态；与组提交正交——显式批次边界，延迟可预期）。
     /// 为 D 项（LSM 事务阶段一 WriteBatch 原子写）的前置基础；单条语义同 `put`。
     pub fn put_batch(&mut self, items: &[(u64, Vec<u8>, Vec<String>)]) -> Result<()> {
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         for (docid, value, terms) in items {
             let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             self.put_nosync(*docid, value.clone(), &refs)?;
@@ -433,6 +445,7 @@ impl Engine {
     /// 等价于 `put_batch` + delete 语义 + 事务上下文（回滚 = 丢弃未应用的批次）。
     pub fn write(&mut self, batch: &crate::txn::WriteBatch) -> Result<()> {
         batch.validate()?;
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         for op in batch.ops() {
             match op {
                 crate::txn::Op::Put {
@@ -490,6 +503,8 @@ impl Engine {
         }
         let result = (|| -> Result<()> {
             txn.validate()?;
+            // P52：提交前统一看门狗检查（内存/磁盘熔断）
+            self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
             // ① 写锁（SERIALIZABLE 已持共享锁的 docid 自动升级为排他）
             let targets: Vec<u64> = txn.write_set().iter().copied().collect();
             for d in targets {
@@ -671,6 +686,7 @@ impl Engine {
     /// 不逐条 fsync——墓碑不进入 LSM 层级，-99% IO）；WAL 记录供增量备份导出/崩溃回放
     /// （回放转本函数重新置位，幂等）。关闭时回退传统 Tombstone 路径。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.hotcache.invalidate(docid);
         match &mut self.deletion_bitmap {
             Some(bm) => {
@@ -967,7 +983,8 @@ impl Engine {
     /// 查询执行器：按 QuerySpec 静态路由到访问路径并执行（design 7.1 最小集枚举）。
     /// 看门狗：查询超时熔断（逐行检查 QueryGuard，超时返回 QueryTooExpensive）。
     pub fn execute(&mut self, spec: &QuerySpec) -> Result<Vec<QueryRow>> {
-        let guard = self.watchdog.begin_query();
+        // P52：CPU 并发限制（超限返回 Stalled）+ 查询超时熔断
+        let guard = self.watchdog.try_begin_query()?;
         // Ex-5.3：倒排查询前刷入攒批缓冲（Inverted 分支可能命中 pending 中的 term）
         self.flush_inverted_pending();
         let rows = match route(spec) {
@@ -1242,6 +1259,19 @@ impl Engine {
 
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
+        // P52：磁盘剩余空间占比（syscall 带缓存，1s 间隔）
+        let (disk_ratio, disk_status) = match disk_space::space_info(&self.data_dir) {
+            Ok((avail, total)) if total > 0 => {
+                let r = avail as f64 / total as f64;
+                let s = match self.watchdog.disk().classify(avail, total) {
+                    crate::watchdog::DiskStatus::Normal => "normal",
+                    crate::watchdog::DiskStatus::Throttled => "throttled",
+                    crate::watchdog::DiskStatus::Stalled => "stalled",
+                };
+                (r, s.to_string())
+            }
+            _ => (1.0, "unknown".into()),
+        };
         EngineStats {
             sst_file_count: self.primary.sst_count()
                 + self.delta.sst_count()
@@ -1251,6 +1281,10 @@ impl Engine {
             seq: 0, // 阶段 2 接入执行器统计
             mem_ratio: self.mem_ratio,
             max_memory_mb: self.max_memory_mb,
+            disk_ratio,
+            disk_status,
+            cpu_active_queries: self.watchdog.cpu_active(),
+            cpu_query_limit: self.watchdog.cpu().limit(),
         }
     }
 

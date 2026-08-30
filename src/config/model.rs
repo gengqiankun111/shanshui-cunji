@@ -41,6 +41,7 @@ pub struct Config {
     pub compaction: CompactionConfig,
     pub sidecar: SidecarConfig,
     pub cache_external: CacheExternalConfig,
+    pub watchdog: WatchdogConfig,
 }
 
 impl Config {
@@ -163,6 +164,19 @@ impl Config {
         {
             return Err(Error::Config(
                 "memory.watermark_high 须 > 0，且 watermark_stall 须 >= watermark_high".into(),
+            ));
+        }
+        if self.watchdog.disk_throttle_ratio >= self.watchdog.disk_warn_ratio
+            || self.watchdog.disk_stall_ratio > self.watchdog.disk_throttle_ratio
+            || self.watchdog.disk_warn_ratio <= 0.0
+        {
+            return Err(Error::Config(
+                "watchdog 磁盘水位须 0 < warn，且 warn > throttle >= stall".into(),
+            ));
+        }
+        if self.watchdog.cpu_query_limit == 0 || self.watchdog.disk_sample_secs == 0 {
+            return Err(Error::Config(
+                "watchdog.cpu_query_limit / disk_sample_secs 必须 > 0".into(),
             ));
         }
         if self.memtable.max_size_mb == 0 {
@@ -374,6 +388,38 @@ impl Default for MemoryConfig {
         Self {
             watermark_high: 0.85,
             watermark_stall: 1.0,
+        }
+    }
+}
+
+/// 看门狗扩展配置（P52 落地：CPU / 硬盘超限三级响应）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatchdogConfig {
+    /// 磁盘剩余空间预警水位（剩余/总量 低于此值 → 预警 + 触发回收）。
+    pub disk_warn_ratio: f64,
+    /// 磁盘剩余空间限流水位（低于 → 拒绝新写入，只读保持）。
+    pub disk_throttle_ratio: f64,
+    /// 磁盘剩余空间熔断水位（低于 → 强制只读，返回 Stalled）。
+    pub disk_stall_ratio: f64,
+    /// 磁盘熔断绝对下限（MB）：剩余空间同时低于 stall_ratio 且低于此绝对量才熔断
+    /// （避免小比例但剩余空间仍充裕的盘误熔断；对齐 MySQL 预留空间思想）。
+    pub disk_stall_min_mb: usize,
+    /// 磁盘可用空间采样间隔（秒）：避免写路径每次 syscall 查询。
+    pub disk_sample_secs: u64,
+    /// CPU 并发查询上限（代理信号：active 查询数超限 → Stalled 拒绝新查询）。
+    pub cpu_query_limit: usize,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            disk_warn_ratio: 0.20,
+            disk_throttle_ratio: 0.10,
+            disk_stall_ratio: 0.05,
+            disk_stall_min_mb: 1024,
+            disk_sample_secs: 1,
+            cpu_query_limit: 64,
         }
     }
 }

@@ -425,6 +425,27 @@
   （P23 顺序保证，与 dicts 一致）；查询按 FST offset 直接 mmap 切片反序列化。
 - **结果**：+3 mmap 测试（flush 注册/重开懒加载/GC 后查询正确）；393 全绿。
 
+### P54. 看门狗磁盘熔断：C 盘 3% 剩余真实触发熔断 → 比例 + 绝对下限双条件
+- **问题**：P52 看门狗落地时，`DiskGuardian::classify` 按剩余比例分级（stall=5%）——本机 C 盘
+  100GB 仅剩 3GB（3%）→ **所有写路径测试真实熔断拒绝**（check_all 挂进 put/put_batch/write/delete）。
+  暴露设计缺陷：小比例但绝对空间仍充裕的盘会被误熔断（数据库写爆盘的真正危险是"剩余不足一个
+  MemTable/WAL 段"，与绝对量相关）。
+- **方案**：熔断改为**双条件**——剩余比例 ≤ `disk_stall_ratio` **且** 剩余绝对字节 <
+  `disk_stall_min_mb`（默认 1024MB，对齐 MySQL 预留空间思想）；限流/预警仍按比例。
+- **结果**：C 盘 3GB 剩余 → 比例 3% 触发限流（软信号放行）而非熔断，写路径恢复；401 测试全绿
+  （+8：disk classify 分级/采样缓存/check_all 熔断/CPU 并发限制与释放/query guard drop 释放）。
+
+### P55. 看门狗 CPU/磁盘三级响应（P52 设计落地）
+- **问题**：看门狗仅有内存水位（memory_check）+ 查询超时；CPU 风暴与磁盘写爆无保护。
+- **方案**：①`DiskGuardian`：磁盘剩余空间三级（预警 warn=0.20 → 限流 throttle=0.10 →
+  熔断 stall=0.05+1GB 绝对下限），`disk_space` 独立 crate（P23 白名单，Windows
+  GetDiskFreeSpaceExW / Unix statvfs）跨平台查询，1s 采样缓存免写路径频繁 syscall；
+  ②`CpuGuardian`：并发查询数代理 CPU 压力（`try_begin_query` 超限返回 Stalled，QueryGuard
+  drop 自动释放槽位）；③写路径统一入口 `Watchdog::check_all(mem, disk)`（put/put_batch/
+  write/delete/txn_commit 调用）；④EngineStats 暴露 disk_ratio/disk_status/cpu_active。
+- **结果**：+6 测试全绿；401 全绿；`crates/disk-space` 独立 crate（零新增外部依赖）；
+  配置 `[watchdog] disk_warn/throttle/stall_ratio + stall_min_mb + cpu_query_limit`。
+
 ---
 
 ## 环境备忘（不入库）
