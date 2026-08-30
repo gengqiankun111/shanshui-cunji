@@ -568,6 +568,14 @@ pub struct StorageConfig {
     /// 墓碑不再污染 LSM 层级；compaction 按位图物理删除，put 清位复活。
     /// true = 开启（默认）；false = 回退传统 Tombstone 路径。
     pub deletion_bitmap_enabled: bool,
+    /// L 项（Compaction 智能调度）：动态窗口下限——低峰（写压力低）时 L0 更晚收敛，
+    /// 合并次数更少、写放大更低（空间换写放大，SSD 时代）。
+    pub l0_stall_min: usize,
+    /// L 项：动态窗口上限——高峰（写压力高）时 L0 更早收敛，提前防段堆积 + 写 Stall。
+    pub l0_stall_max: usize,
+    /// L 项：合并冷却轮次（compact 输出段 N 轮内不参与下一轮合并，防"刚合并又合并"的
+    /// 无谓重写，写放大 -10~20%）；0 = 关闭。纯调度策略，不改数据格式（崩溃安全）。
+    pub compaction_cooldown: u32,
 }
 
 impl Default for StorageConfig {
@@ -597,6 +605,11 @@ impl Default for StorageConfig {
             // Ex-5.6（design 4.6）：SSD 原生删除位图默认开启——删除 1bit+1 页 fsync（-99% IO），
             // 查询 O(1) 跳过，墓碑不污染 LSM；关闭回退传统 Tombstone 路径。
             deletion_bitmap_enabled: true,
+            // L 项（Compaction 智能调度）：动态窗口 8~16（基础 12 ± 4，随写压力浮动，
+            // 高峰收窄提前收敛、低峰放宽降写放大）；合并冷却 2 轮防刚合并又合并。
+            l0_stall_min: 8,
+            l0_stall_max: 16,
+            compaction_cooldown: 2,
         }
     }
 }
@@ -608,6 +621,10 @@ pub struct InvertedConfig {
     pub engine: String,
     /// 倒排字典内存硬上限（MB）。
     pub max_memory_bytes: usize,
+    /// 倒排刷盘阈值（term-docid 对数，L 项）：内存累计达此值刷一段。100 万 → 500 万：
+    /// 段数 -83%（5000 万库 1240→210 段）、查询段遍历 -83%、刷盘频率 -80%；代价 = 内存
+    /// +阈值大小、单次刷盘停顿 ×5。0 = 用默认 100 万。
+    pub flush_threshold: u64,
     /// 魔鬼倒排列表门控：超过则不展开，降级全表扫描 + Zone Map。
     pub max_posting_scan: u64,
     /// 倒排段 GC 阈值（MB，design 5.2.2 / 5.2.4⑤）：段文件总量超此值触发后台合并。
@@ -644,6 +661,7 @@ impl Default for InvertedConfig {
             // 阶段 1.5 起默认 FST + mmap 字典（design 5.2.4.1：亚秒冷启动、按需加载）
             engine: "fst".into(),
             max_memory_bytes: 12 * 1024 * 1024 * 1024,
+            flush_threshold: 1_000_000,
             max_posting_scan: 1_000_000,
             segment_max_size_mb: 1024,
             bitmap_fields: Vec::new(),

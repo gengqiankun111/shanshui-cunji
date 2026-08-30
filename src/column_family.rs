@@ -72,6 +72,17 @@ pub struct ColumnFamily {
     io_limiter: Option<crate::io_scheduler::IoRateLimiter>,
     /// L0 段数阈值（`storage.l0_stall_threshold`，超过判需要 Compaction）。
     l0_stall_threshold: usize,
+    /// L 项：动态窗口下限/上限（低峰放宽、高峰收窄；`storage.l0_stall_min/max`）。
+    l0_stall_min: usize,
+    l0_stall_max: usize,
+    /// L 项：前台写压力（0~1，Ex-7.4 同源信号：MemTable 水位代理）——动态窗口反馈依据。
+    write_pressure: f64,
+    /// L 项：合并冷却轮次（`storage.compaction_cooldown`；0 = 关闭）。
+    compaction_cooldown: u32,
+    /// L 项：当前合并轮次（每次 compact 成功 +1；冷却到期基准）。
+    merge_round: u64,
+    /// L 项：冷却中的段（新段 path → 到期轮次）；到期后正常参与合并。纯内存调度态。
+    cooldown: std::collections::HashMap<std::path::PathBuf, u64>,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 文件（新→旧；读路径按序取首个命中，依赖"新文件在前"版本语义）。
@@ -234,6 +245,12 @@ impl ColumnFamily {
                 None
             },
             l0_stall_threshold: cfg.storage.l0_stall_threshold,
+            l0_stall_min: cfg.storage.l0_stall_min.max(2),
+            l0_stall_max: cfg.storage.l0_stall_max.max(cfg.storage.l0_stall_min.max(2)),
+            write_pressure: 0.0,
+            compaction_cooldown: cfg.storage.compaction_cooldown,
+            merge_round: 0,
+            cooldown: std::collections::HashMap::new(),
             memtable: MemTableBuffer::new(),
             ssts,
             sst_levels: sst_levels_loaded,
@@ -736,6 +753,41 @@ impl ColumnFamily {
         }
     }
 
+    /// L 项：设置前台写压力（0~1，Ex-7.4 同源信号：MemTable 水位代理）——动态窗口反馈依据。
+    /// 写压力高 → 有效 L0 阈值收窄（提前收敛防堆积 + 写 Stall）；低 → 放宽（降合并次数/写放大）。
+    pub fn set_write_pressure(&mut self, p: f64) {
+        self.write_pressure = p.clamp(0.0, 1.0);
+    }
+
+    /// L 项：有效 L0 阈值 = 基础阈值 ± 压力调整（clamp 在 [min, max]）。
+    /// 滞回由压力平滑（Ex-7.4 每次写后按水位重算）保证，防窗口振荡。
+    fn effective_l0_threshold(&self) -> usize {
+        let range = self.l0_stall_max.saturating_sub(self.l0_stall_min);
+        let shrink = (range as f64 * self.write_pressure) as usize;
+        self.l0_stall_threshold
+            .saturating_sub(shrink)
+            .clamp(self.l0_stall_min, self.l0_stall_max)
+    }
+
+    /// L 项：当前处于冷却期的段下标集合（按 path 匹配到期轮次 > 当前合并轮次）。
+    fn cooling_indices(&self) -> std::collections::HashSet<usize> {
+        let mut out = std::collections::HashSet::new();
+        if self.compaction_cooldown == 0 {
+            return out;
+        }
+        for (i, s) in self.ssts.iter().enumerate() {
+            if self
+                .cooldown
+                .get(&s.path().to_path_buf())
+                .map(|exp| *exp > self.merge_round)
+                .unwrap_or(false)
+            {
+                out.insert(i);
+            }
+        }
+        out
+    }
+
     /// Ex-7.4：当前后台 IO 限速（字节/秒；0 = 不限速/未配置）。
     pub fn io_rate(&self) -> u64 {
         self.io_limiter.as_ref().map_or(0, |l| l.rate())
@@ -745,8 +797,12 @@ impl ColumnFamily {
     /// （只重建元数据区），否则回退全量合并（等价 `compact_filtered(&|_| false)`）。
     pub fn compact(&mut self) -> Result<CompactReport> {
         let heat: Vec<u64> = self.ssts.iter().map(|s| s.heat()).collect();
-        let (sel, out_level) =
-            select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold, &heat);
+        let (sel, out_level) = select_compaction_inputs(
+            &self.sst_levels,
+            self.effective_l0_threshold(),
+            &heat,
+            &self.cooling_indices(),
+        );
         if sel.len() <= 1 {
             return Ok(CompactReport {
                 merged_ssts: 0,
@@ -774,8 +830,12 @@ impl ColumnFamily {
     /// - 后台 IO 限速：写完后按实际文件字节 acquire。
     pub fn compact_filtered(&mut self, drop_key: &dyn Fn(&[u8]) -> bool) -> Result<CompactReport> {
         let heat: Vec<u64> = self.ssts.iter().map(|s| s.heat()).collect();
-        let (sel, out_level) =
-            select_compaction_inputs(&self.sst_levels, self.l0_stall_threshold, &heat);
+        let (sel, out_level) = select_compaction_inputs(
+            &self.sst_levels,
+            self.effective_l0_threshold(),
+            &heat,
+            &self.cooling_indices(),
+        );
         if sel.len() <= 1 {
             return Ok(CompactReport {
                 merged_ssts: 0,
@@ -984,6 +1044,16 @@ impl ColumnFamily {
                 freed_bytes
             );
         }
+        // L 项：合并冷却——输出段 N 轮内不参与下一轮合并（防刚合并又合并的无谓重写）；
+        // 推进 merge_round + 清理到期项（纯内存调度态，重启后冷却重置，无一致性影响）
+        if self.compaction_cooldown > 0 {
+            self.merge_round += 1;
+            self.cooldown.insert(
+                path.to_path_buf(),
+                self.merge_round + self.compaction_cooldown as u64,
+            );
+            self.cooldown.retain(|_, exp| *exp > self.merge_round);
+        }
         Ok(CompactReport {
             merged_ssts: old_count,
             kept_keys: eliminated,
@@ -999,7 +1069,8 @@ impl ColumnFamily {
         let l0 = self.sst_levels.iter().filter(|l| **l == 0).count();
         let l1 = self.sst_levels.iter().filter(|l| **l == 1).count();
         let l2 = self.sst_levels.iter().filter(|l| **l >= 2).count();
-        l0 > self.l0_stall_threshold || (l0 == 0 && (l1 > 1 || l2 > 1))
+        // L 项：用动态有效阈值（写压力高 → 阈值收窄 → 更早触发收敛）
+        l0 > self.effective_l0_threshold() || (l0 == 0 && (l1 > 1 || l2 > 1))
     }
     /// 全部 SST 文件字节总和。
     pub fn sst_bytes(&self) -> u64 {
@@ -1268,32 +1339,53 @@ fn imm_scan_max_seq(imm: &MemTable) -> u64 {
 /// `limit` 段**（热段先下沉 L1 聚合，热点读路径段数更快减少）；无热度数据维持全量合并。
 ///
 /// 返回 `(选中段下标, 输出层)`；无需要压实的输入时返回 `(空, 0)`。
+/// L 项：`cooling` = 冷却期段下标集合（合并冷却，新段 N 轮内**优先**不参与合并）。
+/// 冷却为「软约束」：若冷却导致无可合并候选（候选 < 2），回退含冷却段——
+/// 防止冷却挡住收敛（needs_compact 用原始计数触发时，硬排除会造成合并空转死循环）。
 fn select_compaction_inputs(
     levels: &[u32],
     level_limit: usize,
     heat: &[u64],
+    cooling: &std::collections::HashSet<usize>,
+) -> (Vec<usize>, u32) {
+    let (sel, out) = select_inner(levels, level_limit, heat, cooling);
+    if sel.len() >= 2 {
+        return (sel, out);
+    }
+    // L 项回退：候选不足（冷却挡住收敛）→ 忽略冷却再选（保证收敛 / 防写 Stall）
+    select_inner(levels, level_limit, heat, &std::collections::HashSet::new())
+}
+
+fn select_inner(
+    levels: &[u32],
+    level_limit: usize,
+    heat: &[u64],
+    cooling: &std::collections::HashSet<usize>,
 ) -> (Vec<usize>, u32) {
     let l0: Vec<usize> = levels
         .iter()
         .enumerate()
         .filter(|(_, l)| **l == 0)
+        .filter(|(i, _)| !cooling.contains(i))
         .map(|(i, _)| i)
         .collect();
     let l1: Vec<usize> = levels
         .iter()
         .enumerate()
         .filter(|(_, l)| **l == 1)
+        .filter(|(i, _)| !cooling.contains(i))
         .map(|(i, _)| i)
         .collect();
     let l2: Vec<usize> = levels
         .iter()
         .enumerate()
         .filter(|(_, l)| **l >= 2)
+        .filter(|(i, _)| !cooling.contains(i))
         .map(|(i, _)| i)
         .collect();
     if !l0.is_empty() {
         if l0.len() < 2 {
-            return (Vec::new(), 0); // 单个 L0 段：暂不压实（无收益重写）
+            return (Vec::new(), 0); // 单个 L0 段（或冷却后不足 2）：暂不压实（无收益重写）
         }
         if l1.len() < level_limit.max(1) {
             // Ex-5.9：L0 超阈值且存在热度 → 优先合并最热的 level_limit 段（热段先下沉 L1）
@@ -1792,10 +1884,15 @@ mod tests {
             assert_eq!(r.out_level, 1, "第 {round} 轮 L0→L1");
         }
         assert_eq!(cf.sst_levels.iter().filter(|l| **l == 1).count(), 4);
-        // L0 空、L1 > 1 → L1 → L2（压实下沉）
+        // L0 空、L1 > 1 → L1 → L2（压实下沉）。L 项合并冷却：新生成段 N 轮内不参与下一轮
+        // 合并 → 收敛需多轮（冷却段到期后正常参与），循环 compact 直到收敛
         assert!(cf.needs_compact(), "L1 多段应触发 L1→L2");
-        let rep2 = cf.compact().unwrap();
-        assert_eq!(rep2.out_level, 2);
+        let mut guard = 0;
+        while cf.needs_compact() && guard < 8 {
+            cf.compact().unwrap();
+            guard += 1;
+        }
+        assert!(guard < 8, "冷却后多轮应收敛");
         assert_eq!(cf.sst_count(), 1);
         assert_eq!(cf.sst_levels, vec![2]);
         // 全量数据仍完整
@@ -1817,35 +1914,56 @@ mod tests {
     #[test]
     fn select_compaction_inputs_picks_levels() {
         let no_heat = &[];
+        let no_cooling = &std::collections::HashSet::new();
         // 2 个 L0 + L1 未满 → 仅 L0
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1], 8, no_heat),
+            select_compaction_inputs(&[0, 0, 1], 8, no_heat, no_cooling),
             (vec![0, 1], 1)
         );
         // 单个 L0 → 暂不压实
         assert_eq!(
-            select_compaction_inputs(&[0, 1], 8, no_heat),
+            select_compaction_inputs(&[0, 1], 8, no_heat, no_cooling),
             (Vec::new(), 0)
         );
         // L0 ≥ 2 且 L1 已满 → L0 + 全部 L1 收敛
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2, no_heat),
+            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2, no_heat, no_cooling),
             (vec![0, 1, 2, 3, 4, 5], 1)
         );
         // L0 空、L1 > 1 → L1 → L2
         assert_eq!(
-            select_compaction_inputs(&[1, 1], 8, no_heat),
+            select_compaction_inputs(&[1, 1], 8, no_heat, no_cooling),
             (vec![0, 1], 2)
         );
         // L0 空、L1 单段 → 无压实
         assert_eq!(
-            select_compaction_inputs(&[1], 8, no_heat),
+            select_compaction_inputs(&[1], 8, no_heat, no_cooling),
             (Vec::new(), 0)
         );
         // L0/L1 空、L2 > 1 → 收敛 L2
         assert_eq!(
-            select_compaction_inputs(&[2, 2], 8, no_heat),
+            select_compaction_inputs(&[2, 2], 8, no_heat, no_cooling),
             (vec![0, 1], 2)
+        );
+    }
+
+    #[test]
+    fn select_compaction_excludes_cooling_segments() {
+        // L 项：冷却段优先不参与合并；候选不足时回退（冷却为软约束，保证收敛）
+        let no_heat = &[];
+        let mut cooling = std::collections::HashSet::new();
+        cooling.insert(0);
+        // L0 段 0 冷却 + 段 1 → 冷却后不足 2 → 回退含冷却段（全量合并，防收敛死循环）
+        assert_eq!(
+            select_compaction_inputs(&[0, 0], 8, no_heat, &cooling),
+            (vec![0, 1], 1)
+        );
+        // L0 段 1 冷却 → 段 0 + 段 2 足够 → 冷却生效，排除段 1
+        let mut cooling2 = std::collections::HashSet::new();
+        cooling2.insert(1);
+        assert_eq!(
+            select_compaction_inputs(&[0, 0, 0], 8, no_heat, &cooling2),
+            (vec![0, 2], 1)
         );
     }
 
@@ -1854,14 +1972,15 @@ mod tests {
         // Ex-5.9：L0 段数超过 limit 且存在热度 → 优先合并最热的 limit 段（热段先下沉 L1）
         let levels = [0u32, 0, 0, 0, 0]; // 5 个 L0，limit=3
         let heat = [0u64, 0, 100, 50, 10]; // 段 2 最热
-        let (sel, out) = select_compaction_inputs(&levels, 3, &heat);
+        let no_cooling = &std::collections::HashSet::new();
+        let (sel, out) = select_compaction_inputs(&levels, 3, &heat, no_cooling);
         assert_eq!(out, 1);
         assert_eq!(sel, vec![2, 3, 4], "应选最热 3 段（100/50/10）");
         // 无热度数据 → 维持全量合并
-        let (sel2, _) = select_compaction_inputs(&levels, 3, &[]);
+        let (sel2, _) = select_compaction_inputs(&levels, 3, &[], no_cooling);
         assert_eq!(sel2, vec![0, 1, 2, 3, 4], "无热度全量合并");
         // L0 未超阈值 → 全量（热度不参与）
-        let (sel3, _) = select_compaction_inputs(&[0, 0], 3, &heat);
+        let (sel3, _) = select_compaction_inputs(&[0, 0], 3, &heat, no_cooling);
         assert_eq!(sel3, vec![0, 1]);
     }
 

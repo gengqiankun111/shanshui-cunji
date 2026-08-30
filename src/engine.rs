@@ -176,7 +176,12 @@ impl Engine {
         )?;
         let mut inverted = InvertedIndex::open_with_gc(
             &inverted_root.join("inverted"),
-            1_000_000,
+            // L 项：倒排刷盘阈值可配（config.inverted.flush_threshold；0 = 默认 100 万 term 对）
+            if cfg.inverted.flush_threshold > 0 {
+                cfg.inverted.flush_threshold
+            } else {
+                1_000_000
+            },
             &cfg.inverted.engine,
             cfg.inverted.segment_max_size_mb * 1024 * 1024,
         )?;
@@ -352,13 +357,20 @@ impl Engine {
     /// Ex-7.4：动态限流——按主数据 MemTable 水位（前台写压力代理）下调 Compaction 限速：
     /// 压力 p → 限速 = base × (1 - 0.5p)——压力 0 全速追赶 L0 合并，压力 1 让路 50%
     /// 磁盘带宽给前台写（design_extension 12.6：写压力高时压缩 Compaction 带宽）。
+    /// L 项：同源压力同步给各列族 set_write_pressure（动态 L0 阈值反馈），独立于限速配置。
     fn adjust_compaction_io_rate(&mut self) {
-        if self.io_rate_base_bytes == 0 {
-            return; // 未配置限速（io_rate_limit_mb = 0）
-        }
         let used = self.primary.memtable_bytes() as f64;
         let max = self.memtable_max_bytes.max(1) as f64;
         let pressure = (used / max).clamp(0.0, 1.0);
+        // L 项：写压力 → 各列族动态 L0 阈值（高峰收窄提前收敛）
+        self.primary.set_write_pressure(pressure);
+        self.delta.set_write_pressure(pressure);
+        if let Some(c) = &mut self.cidx {
+            c.set_write_pressure(pressure);
+        }
+        if self.io_rate_base_bytes == 0 {
+            return; // 未配置限速（io_rate_limit_mb = 0）
+        }
         let rate = (self.io_rate_base_bytes as f64 * (1.0 - 0.5 * pressure)) as u64;
         self.primary.set_io_rate_bytes(rate);
         self.delta.set_io_rate_bytes(rate);
