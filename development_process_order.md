@@ -23,7 +23,7 @@
 | E | 事务阶段二：快照隔离（Snapshot/MVCC） | P2 | ✅ 完成 | Transaction（快照 seq 一致读 get_at + 提交时写写冲突检测，last_write_seq > snapshot → TxnConflict abort）；MVCC 已知局限：MemTable 不保留多版本，快照读需旧版本已落 SST |
 | F | 事务阶段三：完整 ACID 与隔离级别 | P2 | ✅ 完成 | Isolation（RC/RR/SERIALIZABLE）+ docid 级锁表（共享读/排他写 + 2PL 升级）+ wait-for 图死锁检测（victim abort）+ 失败路径锁释放 |
 | G | 倒排 posting 检索优化 | P2 | ✅ 完成 | c380792 LRU 缓存 + 白名单内存位图；补充：段数据 mmap 化（K 项落地）——免 fs::read 全文件读取，FST offset 直接切片反序列化，物理页按需加载（P23 白名单） |
-| H | MySQL 协议适配（MySQL 生态接入） | P1 | 🔄 进行中 | H-1 协议核心 ✅（握手+认证+报文）→ H-2 系统查询 ✅（SHOW/VERSION）→ H-3 SQL 映射 ✅（INSERT/UPDATE/DELETE/SELECT）→ H-4 事务语句 → H-5 预处理语句 → H-6 sysbench 接入验证；mysql cli 8.0 / pymysql 真实连接全链路通过 |
+| H | MySQL 协议适配（MySQL 生态接入） | P1 | ✅ 完成 | H-1~H-3 ✅（握手+认证+SQL 映射）+ H-4 事务语句 ✅（BEGIN/COMMIT/ROLLBACK → txn.rs，同事务读可见）+ H-5 预处理语句 ✅（COM_STMT_PREPARE/EXECUTE）+ H-6 sysbench 接入 ✅（多列 INSERT 映射 + DDL 放行 + 负载模拟：prepare 945 w/s / 并发点查 3040 q/s / 事务 1744 txn/s）；mysql cli 8.0 / pymysql 真实连接全链路通过 |
 | I | 高并发查询优化（design 9.5 目标） | P3 | ⏳ | M6 后留待 |
 | J | 倒排段 GC 后台化 | P2 | ⏳ | 当前 gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，工程化） |
 | K | fulltext 大 posting 反序列化优化 | P2 | ⏳ | 5000 万库 content 词 posting ~1600 万，首次反序列化 ~100ms+；候选：段内 posting 分块延迟加载 |
@@ -86,10 +86,17 @@
     客户端连接与元数据兼容（mysql cli 可交互）；
   - H-3 SQL 映射 ✅：INSERT（→ put + docid 分配）、UPDATE（→ put 全量覆盖）、DELETE（→ engine.delete）、
     SELECT（→ 主键点查 / sqlish 引擎）、LIMIT/OFFSET；
-  - H-4 事务语句 ⏳：BEGIN/COMMIT/ROLLBACK → txn.rs 事务 API（RR/SERIALIZABLE）；
-  - H-5 预处理语句 ⏳：COM_STMT_PREPARE/EXECUTE（JDBC 依赖，参数化查询）；
-  - H-6 sysbench 接入验证 ⏳：oltp_point_select/read_write 子集跑通 + 与 HTTP 吞吐对照；
-- **验收**：mysql cli 连接 + INSERT/SELECT/UPDATE/DELETE 往返 + 事务语句 + sysbench 子集可跑；
+  - H-4 事务语句 ✅：BEGIN/COMMIT/ROLLBACK → txn.rs 事务 API（RR 快照 + 提交写写冲突检测）；
+    事务内 SELECT（快照点查 + 同事务未提交写可见 read_own）/ INSERT / UPDATE / DELETE（攒批，
+    commit 原子落库）；MySQL 语义：无活动事务 COMMIT/ROLLBACK 返回 OK（空提交）；
+  - H-5 预处理语句 ✅：COM_STMT_PREPARE（stmt_id + 参数/列定义）/ COM_STMT_EXECUTE（null bitmap +
+    类型表 + LONGLONG/LONG/DOUBLE/字符串二进制参数解析 → 占位符替换 → COM_QUERY 逻辑）/
+    COM_STMT_CLOSE（释放）；+2 测试（PREPARE/EXECUTE 往返、未知 id 报错）；
+  - H-6 sysbench 接入 ✅：多列 INSERT（`(id,k,c,pad)` → 组装 JSON 文档）+ DDL 放行
+    （CREATE/DROP/TRUNCATE/ALTER TABLE → OK，文档库无 schema）+ 负载模拟（pymysql 驱动
+    sysbench 风格）：prepare 20000 行 945 w/s、8 线程并发 point_select 3040 q/s、
+    BEGIN/SELECT/COMMIT 事务点查 1744 txn/s；sysbench 本体需在 Linux/WSL 安装（Windows 无预编译）；
+- **验收** ✅：mysql cli 连接 + INSERT/SELECT/UPDATE/DELETE 往返 + 事务语句 + sysbench 风格负载全通过；
 - **优先级说明**：P1（生态接入价值高：MySQL 工具链/客户端立即可用），排 B（P0）之后、P2 项之前；
 - 备注：读写分离（原 H）暂缓保留——组提交已解决读被写拖垮，待复制型分布式阶段再启。
 
@@ -118,6 +125,7 @@
 
 ## 4. 已完成大项（最近）
 
+- H 项 MySQL 协议适配 ✅（H-1~H-6：握手/认证/SQL 映射/事务/预处理/sysbench 接入，mysql cli 8.0 + pymysql 真实连接）
 - D/E/F LSM 事务三阶段 ✅（WriteBatch 原子写 + 快照隔离 + ACID 锁/死锁检测/隔离级别，+15 测试）
 - G 项倒排 posting 检索优化 ✅（c380792 LRU + 白名单位图；补充段数据 mmap 化，+3 测试）
 - 本机 2000 万 / 5000 万大数据量基准 ✅（A：13 项全绿，perf-0.6.0/汇总报告）

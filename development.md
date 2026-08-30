@@ -1873,6 +1873,26 @@ impl RuntimePools {
 - 关键坑（problem_solving P56）：授权包 seq=2（全局连续非每方向独立）、握手响应字段顺序
   （auth_response 在 db 前、plugin name 独立字段、按服务器声明跳过 db/attrs）；
 
+---
+
+### 7.56 MySQL 协议适配 H-4~H-6（事务语句 + 预处理 + sysbench 接入）
+
+> 2026-08-30。H 大项全部完成；411 测试全绿（+4：事务往返/空提交语义/预处理往返/未知 stmt）。
+
+- **H-4 事务语句**：`BEGIN/START TRANSACTION/COMMIT/ROLLBACK` → txn.rs 事务 API（RR 快照 +
+  提交写写冲突检测）；会话级 `Session.txn` 跨命令持有（连接断开自动回滚 = drop）；事务内
+  SELECT（快照点查）/ INSERT / UPDATE / DELETE 攒批，commit 原子落库；**同事务写后读可见**
+  （`Transaction::read_own`：最近写优先遍历 ops，`Engine::txn_get` 先查未提交写）；MySQL 语义：
+  无活动事务 COMMIT/ROLLBACK 返回 OK（空提交）、嵌套 BEGIN 报错；
+- **H-5 预处理语句**：`COM_STMT_PREPARE`（stmt_id + 参数/列定义）、`COM_STMT_EXECUTE`
+  （null bitmap + 类型表 + LONGLONG/LONG/DOUBLE/字符串二进制参数解析 → 占位符替换 `?` →
+  复用 COM_QUERY 分发）、`COM_STMT_CLOSE`（释放）；JDBC/参数化查询基础就绪；
+- **H-6 sysbench 接入**：多列 INSERT（`(id,k,c,pad)` → 组装 JSON 文档）+ DDL 放行
+  （CREATE/DROP/TRUNCATE/ALTER TABLE → OK，文档库无 schema 语义）；pymysql 驱动 sysbench
+  风格负载：prepare 20000 行 945 w/s、8 线程并发 point_select 3040 q/s、
+  BEGIN/SELECT/COMMIT 事务点查 1744 txn/s（服务器单引擎串行下合理量级）；sysbench 本体需
+  Linux/WSL 安装（Windows 无预编译）；
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

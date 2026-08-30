@@ -469,6 +469,7 @@ impl Engine {
 
     /// E/F：事务读。RC = 最新已提交（`get`）；RR/SERIALIZABLE = 快照一致读（`get_at`）；
     /// SERIALIZABLE 读目标额外加共享锁（2PL，读锁持有至提交）。
+    /// H-4：先查本事务未提交的写（`read_own`，同事务写后读可见），再走引擎。
     pub fn txn_get(
         &mut self,
         txn: &mut crate::txn::Transaction,
@@ -479,6 +480,10 @@ impl Engine {
                 "txn#{} 已结束",
                 txn.id
             )));
+        }
+        // 同事务写后读可见（未提交的攒批写优先）
+        if let Some(own) = txn.read_own(docid) {
+            return Ok(own.map(|v| v.to_vec()));
         }
         if txn.isolation.locks_reads() {
             self.txn_locks.acquire_shared(txn.id, docid)?;

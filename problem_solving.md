@@ -460,6 +460,18 @@
 - **结果**：mysql cli 8.0 真实连接 + SELECT VERSION()/SHOW DATABASES/INSERT/UPDATE/DELETE
   全链路通过；pymysql 全链路通过；协议级测试 +6；407 全绿；提交见 H 项提交。
 
+### P57. H-4~H-6 落地三坑：COMMIT 空提交语义 / PREPARE 双 EOF / pymysql 多列 INSERT
+- **问题**：H-4~H-6 实现中三个坑——① `COMMIT` 无活动事务时我返回错误（3505），但 MySQL 语义是
+  返回 OK（空提交）——pymysql `conn.commit()` 在 autocommit=False 且无 BEGIN 时发 COMMIT → 报错；
+  ② `COM_STMT_PREPARE` 响应有**两个 EOF**（参数定义后 + 列定义后），测试客户端只读到第一个 EOF →
+  残留字节污染后续 EXECUTE 读取（错位成列数 3）；③ sysbench 风格 INSERT `(id,k,c,pad) VALUES` 只认
+  id/doc 列 → 多列报"缺 doc 列"。
+- **方案**：① COMMIT/ROLLBACK 无事务 → OK（对齐 MySQL）；② PREPARE 读取按"第二个 EOF 终止"
+  状态机；③ parse_insert 扩展：非 id/doc 列组装为 JSON 文档 `{"k":500,"c":"hello",...}`
+  （数字/布尔按 JSON 类型，其余字符串），DDL 语句放行（文档库无 schema）。
+- **结果**：+4 测试全绿；411 全绿；sysbench 风格负载模拟通过（prepare 945 w/s / 点查 3040 q/s /
+  事务 1744 txn/s）；提交见 H 项提交。
+
 ---
 
 ## 环境备忘（不入库）

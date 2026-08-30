@@ -377,6 +377,24 @@ impl Transaction {
         self.ops.push(Op::Delete { docid });
     }
 
+    /// 同事务读可见（H-4）：读取本事务未提交的写（最近写优先）。
+    /// 返回 `None` = 事务未写该 docid（应走引擎）；`Some(Some(v))` = 本事务 put 的最新值；
+    /// `Some(None)` = 本事务已 delete（读为空）。
+    pub fn read_own(&self, docid: u64) -> Option<Option<&[u8]>> {
+        for op in self.ops.iter().rev() {
+            match op {
+                Op::Put {
+                    docid: d,
+                    value,
+                    ..
+                } if *d == docid => return Some(Some(value.as_slice())),
+                Op::Delete { docid: d } if *d == docid => return Some(None),
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// 标记已获取 docid 锁（Engine 的 txn_get/txn_put 调用锁表后登记）。
     pub(crate) fn add_lock(&mut self, docid: u64) {
         if !self.locks.contains(&docid) {

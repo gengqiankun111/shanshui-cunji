@@ -48,6 +48,9 @@ const COM_QUIT: u8 = 0x01;
 const COM_INIT_DB: u8 = 0x02;
 const COM_QUERY: u8 = 0x03;
 const COM_PING: u8 = 0x0e;
+const COM_STMT_PREPARE: u8 = 0x16;
+const COM_STMT_EXECUTE: u8 = 0x17;
+const COM_STMT_CLOSE: u8 = 0x19;
 
 // 包类型
 const OK_PACKET: u8 = 0x00;
@@ -57,6 +60,9 @@ const ERR_PACKET: u8 = 0xff;
 // 列类型
 const MYSQL_TYPE_LONGLONG: u8 = 8;
 const MYSQL_TYPE_VAR_STRING: u8 = 253;
+const MYSQL_TYPE_LONG: u8 = 3;
+const MYSQL_TYPE_STRING: u8 = 254;
+const MYSQL_TYPE_DOUBLE: u8 = 5;
 
 // ============ 报文编解码 ============
 
@@ -180,8 +186,11 @@ pub fn check_native_password(auth_response: &[u8], scramble: &[u8], password: &s
 struct Session {
     user: String,
     authenticated: bool,
-    // 每包序号（客户端 → 服务器方向独立计数）。
-    seq: u8,
+    /// H-4：活动事务（BEGIN 后创建，COMMIT/ROLLBACK 结束；连接断开自动回滚 = drop）。
+    txn: Option<crate::txn::Transaction>,
+    /// H-5：预处理语句表（stmt_id → 原始 SQL，占位符 `?`）。
+    statements: std::collections::HashMap<u32, String>,
+    next_stmt_id: u32,
 }
 
 // ============ MySQL 服务器 ============
@@ -254,7 +263,9 @@ fn handle_connection(
     let mut session = Session {
         user: String::new(),
         authenticated: false,
-        seq: 0,
+        txn: None,
+        statements: std::collections::HashMap::new(),
+        next_stmt_id: 1,
     };
     // ① 握手（HandshakeV10）
     let scramble = gen_scramble(conn_id);
@@ -357,8 +368,30 @@ fn handle_connection(
             COM_QUERY => {
                 let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
                 let mut guard = engine.lock().unwrap();
-                let resp = dispatch_query(&mut guard, &sql);
+                let resp = dispatch_query(&mut guard, &sql, &mut session);
                 write_query_response(stream, seq0, resp)?;
+            }
+            COM_STMT_PREPARE => {
+                // H-5：预处理语句（JDBC 依赖）。请求 = 0x16 + SQL
+                let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
+                let packets = stmt_prepare(&mut session, &sql);
+                let mut seq = seq0;
+                for p in packets {
+                    write_packet(stream, seq, &p)?;
+                    seq = seq.wrapping_add(1);
+                }
+            }
+            COM_STMT_EXECUTE => {
+                let mut guard = engine.lock().unwrap();
+                let resp = stmt_execute(&mut guard, &mut session, &cmd);
+                write_query_response(stream, seq0, resp)?;
+            }
+            COM_STMT_CLOSE => {
+                // H-5：释放 statement（无响应包）
+                if cmd.len() >= 5 {
+                    let stmt_id = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
+                    session.statements.remove(&stmt_id);
+                }
             }
             other => {
                 let msg = format!("command {other:#x} not supported");
@@ -378,13 +411,57 @@ enum QueryResponse {
     },
 }
 
-/// 分发 COM_QUERY。
-fn dispatch_query(engine: &mut Engine, sql: &str) -> QueryResponse {
+/// 分发 COM_QUERY（H-4：会话级事务 BEGIN/COMMIT/ROLLBACK + 事务内 SQL）。
+fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> QueryResponse {
     let upper = sql.trim().to_uppercase();
     // 空 / 注释
     if sql.trim().is_empty() || sql.trim().starts_with("--") {
         return QueryResponse::Ok(0, 0);
     }
+    // ---- 事务控制语句（H-4）----
+    if upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION") {
+        if session.txn.is_some() {
+            return QueryResponse::Err(3502, "已有活动事务，不支持嵌套".to_string());
+        }
+        session.txn = Some(engine.txn_begin(crate::txn::Isolation::RepeatableRead));
+        return QueryResponse::Ok(0, 0);
+    }
+    if upper.starts_with("COMMIT") {
+        // MySQL 语义：无活动事务时 COMMIT 返回 OK（空提交）
+        return match session.txn.take() {
+            Some(t) => match engine.txn_commit(t) {
+                Ok(_) => QueryResponse::Ok(0, 0),
+                Err(e) => QueryResponse::Err(3500, format!("commit 失败（已回滚）: {e}")),
+            },
+            None => QueryResponse::Ok(0, 0),
+        };
+    }
+    if upper.starts_with("ROLLBACK") {
+        if let Some(t) = session.txn.take() {
+            engine.txn_rollback(t);
+        }
+        return QueryResponse::Ok(0, 0);
+    }
+    // ---- 事务内语句：快照点查 + 攒批写（同事务可见，commit 原子落库）----
+    if session.txn.is_some() {
+        if upper.starts_with("SELECT") {
+            return txn_select(engine, session, sql);
+        }
+        if upper.starts_with("INSERT") {
+            return txn_insert(session, sql);
+        }
+        if upper.starts_with("UPDATE") {
+            return txn_update(session, sql);
+        }
+        if upper.starts_with("DELETE") {
+            return txn_delete(session, sql);
+        }
+        if upper.starts_with("SET") {
+            return QueryResponse::Ok(0, 0);
+        }
+        return QueryResponse::Err(1064, format!("事务内暂不支持该语句: {sql}"));
+    }
+    // ---- 非事务语句 ----
     if upper.starts_with("SHOW") {
         return show_response(&upper);
     }
@@ -400,13 +477,228 @@ fn dispatch_query(engine: &mut Engine, sql: &str) -> QueryResponse {
     if upper.starts_with("DELETE") {
         return delete_response(engine, sql);
     }
-    if upper.starts_with("SET") || upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION")
-        || upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") || upper.starts_with("USE")
+    if upper.starts_with("SET") || upper.starts_with("USE") {
+        return QueryResponse::Ok(0, 0);
+    }
+    // H-6：DDL 放行（文档库无 schema——CREATE/DROP/TRUNCATE TABLE 映射为 OK 空操作，
+    // 使 sysbench prepare/cleanup 可跑通；表统一映射 documents）
+    if upper.starts_with("CREATE TABLE")
+        || upper.starts_with("DROP TABLE")
+        || upper.starts_with("TRUNCATE TABLE")
+        || upper.starts_with("ALTER TABLE")
     {
-        // H-4 事务语义在会话级实现前先放行（SET/USE/BEGIN/COMMIT/ROLLBACK → OK）
         return QueryResponse::Ok(0, 0);
     }
     QueryResponse::Err(1064, format!("syntax error: unsupported statement: {sql}"))
+}
+
+/// 事务内 SELECT：`WHERE id=N` 快照点查（含同事务未提交写可见）；其余暂不支持。
+fn txn_select(
+    engine: &mut Engine,
+    session: &mut Session,
+    sql: &str,
+) -> QueryResponse {
+    let columns = vec![
+        column_payload("id", MYSQL_TYPE_LONGLONG, 63),
+        column_payload("doc", MYSQL_TYPE_VAR_STRING, 45),
+    ];
+    let Some(id) = extract_point_id(sql) else {
+        return QueryResponse::Err(1064, "事务内仅支持 WHERE id= 点查".to_string());
+    };
+    let txn = session.txn.as_mut().unwrap();
+    match engine.txn_get(txn, id) {
+        Ok(Some(v)) => QueryResponse::Set {
+            columns,
+            rows: vec![vec![id.to_string().into_bytes(), v]],
+        },
+        Ok(None) => QueryResponse::Set {
+            columns,
+            rows: Vec::new(),
+        },
+        Err(e) => QueryResponse::Err(3500, format!("事务读失败: {e}")),
+    }
+}
+
+/// 事务内 INSERT：攒批到事务（commit 时原子应用）。
+fn txn_insert(session: &mut Session, sql: &str) -> QueryResponse {
+    match parse_insert(sql) {
+        Ok(Some((id, doc))) => {
+            let txn = session.txn.as_mut().unwrap();
+            match put_doc_txn(txn, id, &doc) {
+                Ok(_) => QueryResponse::Ok(1, id),
+                Err(e) => QueryResponse::Err(1064, format!("insert error: {e}")),
+            }
+        }
+        Ok(None) => QueryResponse::Ok(0, 0),
+        Err(e) => QueryResponse::Err(1064, format!("insert syntax: {e}")),
+    }
+}
+
+/// 事务内 UPDATE：攒批覆盖。
+fn txn_update(session: &mut Session, sql: &str) -> QueryResponse {
+    match parse_update(sql) {
+        Ok((id, doc)) => {
+            let txn = session.txn.as_mut().unwrap();
+            match put_doc_txn(txn, id, &doc) {
+                Ok(_) => QueryResponse::Ok(1, 0),
+                Err(e) => QueryResponse::Err(1064, format!("update error: {e}")),
+            }
+        }
+        Err(e) => QueryResponse::Err(1064, format!("update syntax: {e}")),
+    }
+}
+
+/// 事务内 DELETE：攒批删除。
+fn txn_delete(session: &mut Session, sql: &str) -> QueryResponse {
+    match parse_delete(sql) {
+        Ok(id) => {
+            let txn = session.txn.as_mut().unwrap();
+            txn.delete(id);
+            QueryResponse::Ok(1, 0)
+        }
+        Err(e) => QueryResponse::Err(1064, format!("delete syntax: {e}")),
+    }
+}
+
+/// H-5：COM_STMT_PREPARE。分配 stmt_id 存 SQL，返回 PREPARE_OK + [参数定义 + EOF] + 列定义 + EOF。
+fn stmt_prepare(session: &mut Session, sql: &str) -> Vec<Vec<u8>> {
+    let num_params = sql.bytes().filter(|b| *b == b'?').count() as u16;
+    let stmt_id = session.next_stmt_id;
+    session.next_stmt_id += 1;
+    session.statements.insert(stmt_id, sql.to_string());
+    let mut packets = Vec::new();
+    // PREPARE_OK：0x00 + stmt_id(4) + num_columns(2) + num_params(2) + filler(1) + warnings(2)
+    let mut ok = vec![0x00];
+    ok.extend_from_slice(&stmt_id.to_le_bytes());
+    ok.extend_from_slice(&2u16.to_le_bytes()); // 列 = id, doc
+    ok.extend_from_slice(&num_params.to_le_bytes());
+    ok.push(0);
+    ok.extend_from_slice(&0u16.to_le_bytes());
+    packets.push(ok);
+    // 参数定义（ParameterDefinition41 与 ColumnDefinition41 同构）
+    for _ in 0..num_params {
+        packets.push(column_payload("?", MYSQL_TYPE_VAR_STRING, 45));
+    }
+    if num_params > 0 {
+        packets.push(eof_payload());
+    }
+    // 列定义 + EOF（id / doc）
+    packets.push(column_payload("id", MYSQL_TYPE_LONGLONG, 63));
+    packets.push(column_payload("doc", MYSQL_TYPE_VAR_STRING, 45));
+    packets.push(eof_payload());
+    packets
+}
+
+/// H-5：COM_STMT_EXECUTE。解析参数（null bitmap + 类型 + 二进制值）→ 占位符替换 →
+/// 复用 COM_QUERY 分发逻辑。
+fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> QueryResponse {
+    if cmd.len() < 10 {
+        return QueryResponse::Err(1094, "EXECUTE 包过短".to_string());
+    }
+    let stmt_id = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
+    let Some(sql) = session.statements.get(&stmt_id).cloned() else {
+        return QueryResponse::Err(1094, format!("未知 statement id {stmt_id}"));
+    };
+    let num_params = sql.bytes().filter(|b| *b == b'?').count();
+    let null_len = (num_params + 7) / 8;
+    let mut pos = 10usize;
+    if pos + null_len > cmd.len() {
+        return QueryResponse::Err(1094, "EXECUTE 参数位图越界".to_string());
+    }
+    let null_bitmap = &cmd[pos..pos + null_len];
+    pos += null_len;
+    // new_params_bound_flag = 1 → 参数类型表
+    let mut types: Vec<u8> = Vec::new();
+    if cmd.get(pos).copied() == Some(1) {
+        pos += 1;
+        if pos + num_params * 2 > cmd.len() {
+            return QueryResponse::Err(1094, "EXECUTE 类型表越界".to_string());
+        }
+        for _ in 0..num_params {
+            types.push(cmd[pos]);
+            pos += 2; // type + unsigned_flag
+        }
+    }
+    // 解析参数值
+    let mut values: Vec<String> = Vec::new();
+    for i in 0..num_params {
+        if null_bitmap[i / 8] & (1 << (i % 8)) != 0 {
+            values.push("NULL".to_string());
+            continue;
+        }
+        let t = types.get(i).copied().unwrap_or(MYSQL_TYPE_VAR_STRING);
+        match t {
+            MYSQL_TYPE_LONGLONG => {
+                if pos + 8 > cmd.len() {
+                    return QueryResponse::Err(1094, "EXECUTE LONGLONG 越界".to_string());
+                }
+                let v = u64::from_le_bytes(cmd[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                values.push(v.to_string());
+            }
+            MYSQL_TYPE_LONG => {
+                if pos + 4 > cmd.len() {
+                    return QueryResponse::Err(1094, "EXECUTE LONG 越界".to_string());
+                }
+                let v = u32::from_le_bytes(cmd[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                values.push(v.to_string());
+            }
+            MYSQL_TYPE_DOUBLE => {
+                if pos + 8 > cmd.len() {
+                    return QueryResponse::Err(1094, "EXECUTE DOUBLE 越界".to_string());
+                }
+                let bits = u64::from_le_bytes(cmd[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                values.push(f64::from_bits(bits).to_string());
+            }
+            // 字符串类（VAR_STRING/STRING/BLOB）：lenenc 长度 + 数据
+            _ => {
+                let len = match read_lenenc_raw(cmd, &mut pos) {
+                    Ok(l) => l as usize,
+                    Err(e) => return QueryResponse::Err(1094, format!("参数长度越界: {e}")),
+                };
+                if pos + len > cmd.len() {
+                    return QueryResponse::Err(1094, "EXECUTE 字符串越界".to_string());
+                }
+                let s = String::from_utf8_lossy(&cmd[pos..pos + len]).to_string();
+                pos += len;
+                // 字符串参数按 SQL 字面量（转义单引号）
+                values.push(format!("'{}'", s.replace('\'', "''")));
+            }
+        }
+    }
+    // 占位符替换 → 走 COM_QUERY 分发
+    let exec_sql = replace_params(&sql, &values);
+    dispatch_query(engine, &exec_sql, session)
+}
+
+/// 按顺序把 SQL 中的 `?` 替换为参数值（values 已是 SQL 字面量形式）。
+fn replace_params(sql: &str, values: &[String]) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut vi = 0usize;
+    let mut in_str = false;
+    let mut quote = ' ';
+    for c in sql.chars() {
+        if in_str {
+            out.push(c);
+            if c == quote {
+                in_str = false;
+            }
+        } else if c == '\'' || c == '"' {
+            in_str = true;
+            quote = c;
+            out.push(c);
+        } else if c == '?' {
+            if let Some(v) = values.get(vi) {
+                out.push_str(v);
+            }
+            vi += 1;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// 写 COM_QUERY 响应（ResultSet 多包 / OK / ERR）。
@@ -576,11 +868,23 @@ fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
 
 /// put 文档（doc JSON → 提取倒排 term 复用 HTTP 路径语义）。
 fn put_doc(engine: &mut Engine, id: u64, doc: &str) -> Result<()> {
-    let parsed: serde_json::Value = serde_json::from_str(doc)
-        .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-    let terms = crate::server::extract_terms(&parsed);
+    let terms = doc_terms(doc)?;
     let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
     engine.put(id, doc.as_bytes().to_vec(), &refs)
+}
+
+/// 事务内 put：攒批到事务（H-4，commit 时原子应用）。
+fn put_doc_txn(txn: &mut crate::txn::Transaction, id: u64, doc: &str) -> Result<()> {
+    let terms = doc_terms(doc)?;
+    txn.put(id, doc.as_bytes().to_vec(), terms);
+    Ok(())
+}
+
+/// 从 JSON 文档提取倒排词条。
+fn doc_terms(doc: &str) -> Result<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(doc)
+        .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+    Ok(crate::server::extract_terms(&parsed))
 }
 
 // ============ 简易 SQL 解析（INSERT/UPDATE/DELETE 子集）============
@@ -611,14 +915,18 @@ fn parse_insert(sql: &str) -> Result<Option<(u64, String)>> {
         let cols = split_values(&cols_part[cols_open + 1..cols_close]);
         let mut idv: Option<String> = None;
         let mut docv: Option<String> = None;
+        // H-6（sysbench 兼容）：非 id/doc 列组装为 JSON 文档 {"列名":值}
+        let mut extra: Vec<(String, String)> = Vec::new();
         for (i, c) in cols.iter().enumerate() {
-            match c.trim().to_lowercase().as_str() {
+            let name = c.trim().to_lowercase();
+            match name.as_str() {
                 "id" | "docid" => idv = parts.get(i).cloned(),
                 "doc" | "value" => docv = parts.get(i).cloned(),
-                _ => {}
-            }
-            if idv.is_some() && docv.is_some() {
-                break;
+                _ => {
+                    if let Some(v) = parts.get(i) {
+                        extra.push((c.trim().to_string(), unquote(v)));
+                    }
+                }
             }
         }
         id = idv
@@ -626,7 +934,19 @@ fn parse_insert(sql: &str) -> Result<Option<(u64, String)>> {
             .trim()
             .parse::<u64>()
             .map_err(|_| Error::Cluster("id 非法".into()))?;
-        doc = docv.ok_or_else(|| Error::Cluster("INSERT 缺 doc 列".into()))?;
+        doc = match docv {
+            Some(d) => unquote(&d),
+            None => {
+                // 组装 JSON（数字/布尔按 JSON 类型，其余字符串）
+                let mut obj = serde_json::Map::new();
+                for (k, v) in extra {
+                    let val: serde_json::Value = serde_json::from_str(&v)
+                        .unwrap_or_else(|_| serde_json::Value::String(v));
+                    obj.insert(k, val);
+                }
+                serde_json::Value::Object(obj).to_string()
+            }
+        };
     } else {
         id = parts[0]
             .trim()
@@ -871,6 +1191,17 @@ mod tests {
             .unwrap();
         assert_eq!(id2, 7);
         assert_eq!(doc2, "x");
+        // H-6：sysbench 风格多列（非 id 列组装 JSON 文档）
+        let (id3, doc3) = parse_insert(
+            "INSERT INTO sbtest1 (id, k, c, pad) VALUES (3, 500, 'hello', 'world')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(id3, 3);
+        let v: serde_json::Value = serde_json::from_str(&doc3).unwrap();
+        assert_eq!(v["k"], 500);
+        assert_eq!(v["c"], "hello");
+        assert_eq!(v["pad"], "world");
     }
 
     #[test]
@@ -984,6 +1315,87 @@ mod tests {
             }
             packets
         }
+
+        /// 发 COM_STMT_PREPARE，收全部响应包（PREPARE_OK + 参数定义 + EOF + 列定义 + EOF）。
+        fn stmt_prepare(&mut self, sql: &str) -> Vec<Vec<u8>> {
+            let mut cmd = vec![COM_STMT_PREPARE];
+            cmd.extend_from_slice(sql.as_bytes());
+            write_packet(&mut self.stream, 0, &cmd).unwrap();
+            let mut packets = Vec::new();
+            let (_, first) = read_packet(&mut self.stream).unwrap();
+            packets.push(first);
+            // PREPARE_OK 后：参数定义 + EOF + 列定义 + EOF（直到第二个 EOF）
+            let mut saw_eof = false;
+            loop {
+                let (_, payload) = read_packet(&mut self.stream).unwrap();
+                let is_eof = payload.first() == Some(&EOF_PACKET) && payload.len() < 9;
+                let last = is_eof && saw_eof;
+                if is_eof {
+                    saw_eof = true;
+                }
+                packets.push(payload);
+                if last {
+                    break;
+                }
+            }
+            packets
+        }
+
+        /// 发 COM_STMT_EXECUTE（LONGLONG 单参数），收全部响应包。
+        fn stmt_execute(&mut self, stmt_id: u32, param: u64) -> Vec<Vec<u8>> {
+            let mut cmd = vec![COM_STMT_EXECUTE];
+            cmd.extend_from_slice(&stmt_id.to_le_bytes());
+            cmd.push(0); // flags
+            cmd.extend_from_slice(&1u32.to_le_bytes()); // iteration
+            cmd.push(0); // null_bitmap（无 NULL）
+            cmd.push(1); // new_params_bound_flag
+            cmd.push(MYSQL_TYPE_LONGLONG);
+            cmd.push(0); // unsigned
+            cmd.extend_from_slice(&param.to_le_bytes());
+            self.send_command_and_read(&cmd)
+        }
+
+        /// 发 COM_STMT_EXECUTE（LONGLONG + 字符串参数）。
+        fn stmt_execute_str(&mut self, stmt_id: u32, id: u64, doc: &str) -> Vec<Vec<u8>> {
+            let mut cmd = vec![COM_STMT_EXECUTE];
+            cmd.extend_from_slice(&stmt_id.to_le_bytes());
+            cmd.push(0);
+            cmd.extend_from_slice(&1u32.to_le_bytes());
+            cmd.push(0); // null_bitmap
+            cmd.push(1); // new_params_bound_flag
+            cmd.push(MYSQL_TYPE_LONGLONG);
+            cmd.push(0);
+            cmd.push(MYSQL_TYPE_VAR_STRING);
+            cmd.push(0);
+            cmd.extend_from_slice(&id.to_le_bytes());
+            cmd.push(doc.len() as u8); // lenenc（短串）
+            cmd.extend_from_slice(doc.as_bytes());
+            self.send_command_and_read(&cmd)
+        }
+
+        /// 发命令并读取响应（OK/ERR 单包；ResultSet 直到第二个 EOF）。
+        fn send_command_and_read(&mut self, cmd: &[u8]) -> Vec<Vec<u8>> {
+            write_packet(&mut self.stream, 0, cmd).unwrap();
+            let (_, first) = read_packet(&mut self.stream).unwrap();
+            if first.first() == Some(&OK_PACKET) || first.first() == Some(&ERR_PACKET) {
+                return vec![first];
+            }
+            let mut packets = vec![first];
+            let mut saw_eof = false;
+            loop {
+                let (_, payload) = read_packet(&mut self.stream).unwrap();
+                let is_eof = payload.first() == Some(&EOF_PACKET) && payload.len() < 9;
+                let last = is_eof && saw_eof;
+                if is_eof {
+                    saw_eof = true;
+                }
+                packets.push(payload);
+                if last {
+                    break;
+                }
+            }
+            packets
+        }
     }
 
     #[test]
@@ -1041,5 +1453,126 @@ mod tests {
         let (scramble, _) = c.handshake();
         // 错误密码：直接验证 check 函数（连接级拒绝在 serve_once 单连接后关闭）
         assert!(!check_native_password(&[0u8; 20], &scramble, "secret"));
+    }
+
+    // ---------- H-4：事务语句 ----------
+
+    #[test]
+    fn txn_begin_rollback_and_commit_roundtrip() {
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let addr = server.serve_once("127.0.0.1:0").unwrap();
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+
+        // BEGIN → 事务内 INSERT（攒批）→ 同事务 SELECT 可见 → ROLLBACK → 无数据
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        let ins = c.query("INSERT INTO documents (id, doc) VALUES (5, '{\"tx\":1}')");
+        assert_eq!(ins[0][0], OK_PACKET);
+        // 同事务读可见（read_own）
+        let sel = c.query("SELECT * FROM documents WHERE id=5");
+        let row = &sel[sel.len() - 2];
+        let mut p = 0usize;
+        let _ = read_lenenc(&row, &mut p).unwrap();
+        assert_eq!(&row[p..p + 1], b"5", "事务内读到自己未提交的写");
+        // ROLLBACK 后无数据
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+        let sel2 = c.query("SELECT * FROM documents WHERE id=5");
+        assert_eq!(sel2.len(), 5, "回滚后空结果集");
+
+        // BEGIN → INSERT → COMMIT → 持久可见
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(
+            c.query("INSERT INTO documents (id, doc) VALUES (6, '{\"tx\":2}')")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(c.query("COMMIT")[0][0], OK_PACKET);
+        let sel3 = c.query("SELECT * FROM documents WHERE id=6");
+        assert_eq!(sel3[0][0], 2, "提交后两列");
+        let row3 = &sel3[sel3.len() - 2];
+        let mut p3 = 0usize;
+        let _ = read_lenenc(&row3, &mut p3).unwrap();
+        assert_eq!(&row3[p3..p3 + 1], b"6");
+    }
+
+    #[test]
+    fn txn_nested_begin_is_error_and_idle_commit_ok() {
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let addr = server.serve_once("127.0.0.1:0").unwrap();
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+        // 无活动事务 COMMIT → OK（MySQL 空提交语义）
+        assert_eq!(c.query("COMMIT")[0][0], OK_PACKET);
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+        // 嵌套 BEGIN → 错误
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        let r2 = c.query("BEGIN");
+        assert_eq!(r2[0][0], ERR_PACKET);
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    // ---------- H-5：预处理语句 ----------
+
+    #[test]
+    fn stmt_prepare_execute_roundtrip() {
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let addr = server.serve_once("127.0.0.1:0").unwrap();
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+
+        // 预插入一条
+        assert_eq!(
+            c.query("INSERT INTO documents (id, doc) VALUES (7, '{\"p\":1}')")[0][0],
+            OK_PACKET
+        );
+        // PREPARE：SELECT * FROM documents WHERE id=?
+        let prep = c.stmt_prepare("SELECT * FROM documents WHERE id=?");
+        assert_eq!(prep[0][0], OK_PACKET, "PREPARE_OK 头");
+        let stmt_id = u32::from_le_bytes(prep[0][1..5].try_into().unwrap());
+        assert_eq!(stmt_id, 1);
+        assert_eq!(u16::from_le_bytes(prep[0][7..9].try_into().unwrap()), 1, "1 个参数");
+
+        // EXECUTE：参数 LONGLONG=7 → 结果集
+        let packets = c.stmt_execute(stmt_id, 7u64);
+        assert_eq!(packets[0][0], 2, "两列 id/doc");
+        let row = &packets[packets.len() - 2];
+        let mut p = 0usize;
+        let n = read_lenenc(&row, &mut p).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&row[p..p + 1], b"7", "EXECUTE 参数 7 命中");
+
+        // EXECUTE 字符串参数（doc 搜索参数场景：INSERT 占位）
+        let prep2 = c.stmt_prepare("INSERT INTO documents (id, doc) VALUES (?, ?)");
+        assert_eq!(
+            u16::from_le_bytes(prep2[0][7..9].try_into().unwrap()),
+            2,
+            "2 个参数"
+        );
+        let stmt_id2 = u32::from_le_bytes(prep2[0][1..5].try_into().unwrap());
+        // EXECUTE：LONGLONG=8 + 字符串 '{"x":1}'
+        let ok = c.stmt_execute_str(stmt_id2, 8u64, r#"{"x":1}"#);
+        assert_eq!(ok[0][0], OK_PACKET);
+        let sel = c.query("SELECT * FROM documents WHERE id=8");
+        let row8 = &sel[sel.len() - 2];
+        let mut p8 = 0usize;
+        let _ = read_lenenc(&row8, &mut p8).unwrap();
+        assert_eq!(&row8[p8..p8 + 1], b"8", "预处理 INSERT 生效");
+    }
+
+    #[test]
+    fn stmt_execute_unknown_id_is_error() {
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let addr = server.serve_once("127.0.0.1:0").unwrap();
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+        let r = c.stmt_execute(999, 1u64);
+        assert_eq!(r[0][0], ERR_PACKET, "未知 stmt_id → 错误");
     }
 }
