@@ -335,20 +335,35 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     let mut batches = 0u64;
     let mut b_ok = 0u64;
     let mut lat_batch = LatencyStat::new();
-    for start in (1..=batch_n).step_by(batch_size as usize) {
-        let end = (start + batch_size).min(batch_n + 1);
-        let items: Vec<(u64, Vec<u8>, Vec<String>)> = (start..end)
-            .map(|docid| {
-                let (doc, terms) = make_doc(scale + docid, &ft);
-                (scale + docid, doc, terms)
-            })
-            .collect();
+    // 双缓冲流水线：构造线程 + 提交线程（sync_channel 深度 2 → 构造下一批与提交当前批重叠）。
+    // 此前 put_batch 吞吐受「用户端构造串行」限制（构造占批耗时 ~58%，perf 报告 2.5 节）；
+    // 流水线使构造与数据库 IO 重叠，lat_batch 只计纯 put_batch 调用 = 数据库侧上限
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<(u64, Vec<u8>, Vec<String>)>>(2);
+    let ft_build = ft.clone();
+    let builder = std::thread::spawn(move || {
+        let t_build = Instant::now();
+        for start in (1..=batch_n).step_by(batch_size as usize) {
+            let end = (start + batch_size).min(batch_n + 1);
+            let items: Vec<(u64, Vec<u8>, Vec<String>)> = (start..end)
+                .map(|docid| {
+                    let (doc, terms) = make_doc(scale + docid, &ft_build);
+                    (scale + docid, doc, terms)
+                })
+                .collect();
+            if tx.send(items).is_err() {
+                break; // 提交端已关闭（正常结束）
+            }
+        }
+        t_build.elapsed().as_secs_f64() * 1000.0
+    });
+    for items in rx.iter() {
         let t0 = Instant::now();
         bengine.put_batch(&items)?;
         lat_batch.record(t0.elapsed());
         b_ok += items.len() as u64;
         batches += 1;
     }
+    let build_ms = builder.join().unwrap_or(0.0);
     bengine.flush_inverted()?;
     let b_ms = t.elapsed().as_secs_f64() * 1000.0;
     let per_batch_ms = lat_batch.sum_us / lat_batch.n.max(1) as f64 / 1000.0;
@@ -357,7 +372,7 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
         "批量插入",
         b_ok == batch_n,
         format!(
-            "独立引擎 put_batch 批量插入 {batch_n} 条（{batch_size} 条/批 × {batches} 批，每批原子提交），{:.0} ms（{:.0} 条/s；每批 avg {per_batch_ms:.1} ms / max {batch_max_ms:.1} ms）",
+            "独立引擎 put_batch 批量插入 {batch_n} 条（{batch_size} 条/批 × {batches} 批，原子提交），双缓冲流水线（构造与提交重叠）端到端 {:.0} ms（{:.0} 条/s）；纯 put_batch 提交 avg {per_batch_ms:.1} ms / max {batch_max_ms:.1} ms；构造线程 {build_ms:.0} ms",
             b_ms,
             b_ok as f64 / b_ms * 1000.0
         ),
