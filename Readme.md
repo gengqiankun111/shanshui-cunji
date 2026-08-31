@@ -128,6 +128,7 @@
 - 🛡️ **7x24 自愈**：内存限流、Compaction 假死自愈、慢查询熔断、进程探针
 - 🔄 **平滑迁移**：MySQL 全量/增量导入，类 SQL WHERE 语法
 - 📦 **数据安全**：WAL 崩溃安全 + Tombstone 删除 + 备份还原 + TTL 自动过期
+- 🧾 **事务与隔离级别**：本地原子事务（WriteBatch 单次 WAL fsync 提交）+ 三种隔离级别 **READ COMMITTED / REPEATABLE READ / SERIALIZABLE**（快照读 + 提交时写冲突检测 + docid 级锁 + 死锁检测）；MySQL 协议默认 **REPEATABLE READ**，与 MySQL 语义对齐
 
 ---
 

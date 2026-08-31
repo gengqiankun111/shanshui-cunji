@@ -56,6 +56,10 @@
 | **scan 游标续扫**（after + 提前终止，全库遍历每页 O(limit)） | ✅ | M8-P11（`scan_after` + `/range?after`） |
 | 类 SQL 解析（sqlish，SELECT...WHERE AND/OR 子集，零依赖递归下降） | ✅ | `441282d`（等值走倒排/比较+BETWEEN 扫描+AND 后过滤快路径+看门狗熔断；`/sql?q=` 路由） |
 | 写入 Enrich（预连接，design 19.2 ②，join::put_with_enrich） | ✅ | `706c33b`（`[enrich] enabled && source=local` 时 /put WAL 前按 from_field→to_field 展开关联文档；fail_policy reject/degrade；`_enrich.related`） |
+| WriteBatch 原子写（攒批 put/delete，单次 WAL fsync 原子提交，失败零副作用） | ✅ | D/E/F `81c0350`（`src/txn.rs`；崩溃按 WAL 批次整体重放无中间态） |
+| 事务隔离级别：**RC / RR / SERIALIZABLE**（RR=快照读+提交时写冲突检测；SERIALIZABLE=快照+读共享/写排他锁 2PL+wait-for 死锁检测） | ✅ | D/E/F `81c0350`（`Isolation` 枚举 + `LockTable`；393 测试全绿，见 development 7.53） |
+| MySQL 协议事务：BEGIN/COMMIT/ROLLBACK，**默认 REPEATABLE READ**（非事务 SELECT 走实时最新） | ✅ | H 项 `99ee10e`（mysql.rs `txn_begin(Isolation::RepeatableRead)`；连接断开自动回滚） |
+| **倒排回表批量读 batch_get**（posting 命中 docid 集合 → 一次批量回表：SST 按块分组、每块只读/解压一次，Delta 单次范围扫描分组覆盖；替代逐 docid 独立点查） | ✅ | N 项（`sstable.scan_block_for_keys` + `column_family.get_many` + `engine.batch_get`；倒排/全文检索回表改批量，万级 posting 从万次随机读降为块级顺序读） |
 
 ## E. 数据管道 / 迁移 / 导入导出
 

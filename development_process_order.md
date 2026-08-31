@@ -28,6 +28,8 @@
 | J | 倒排段 GC 后台化 | P2 | ⏳ | 当前 gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，工程化） |
 | K | fulltext 大 posting 反序列化优化 | P2 | ⏳ | 5000 万库 content 词 posting ~1600 万，首次反序列化 ~100ms+；候选：段内 posting 分块延迟加载 |
 | L | Compaction 智能调度（合并冷却 + 动态窗口 + 倒排阈值） | P1 | ✅ 完成 | 28eae9d：①合并冷却（compaction_cooldown=2，软约束防收敛死循环）②动态窗口（l0_stall_min/max=8/16，写压力驱动）③倒排刷盘阈值参数化（flush_threshold，二分收敛推荐 500 万：段数 -80%、吞吐仅 -6%）；+demo 13 项单条 avg/max 统计 |
+| M | 事务类查询优化（范围查询改一次扫描） | P0 | ⏳ 待开发 | 1 亿库 sysbench 实测：oltp_read_only 42 TPS / read_write 29.5 TPS（点查类 5k-7k TPS）。根因：BETWEEN 范围/SUM 聚合被展开为**逐 id 独立 txn_get**（每事务 ~700 次 LSM 点查）。方案：范围查询走 `scan_range_at`（MemTable+SSTable 合并扫描 + 快照 seq 过滤），SUM/ORDER BY/DISTINCT 在扫描结果上处理；预期事务类 TPS 提升 ~50× |
+| N | 倒排回表批量读（batch_get） | P0 | 🔄 开发中 | 借鉴 batch_get 架构建议：倒排/全文 posting 回表从**逐 docid 点查**改为**批量读**——SST 层按块分组（同块多 key 只读/解压一次）+ 整文件/分区布隆批量粗筛 + Delta 单次范围扫描分组覆盖；万级 posting 回表从万次随机读降为块级顺序读 |
 
 ## 3. 大项详情
 
@@ -122,6 +124,44 @@
   （P23 只读映射白名单，与 dicts 同模式）；flush 预注册 + 重开懒加载 + gc 先换映射再删旧文件
   （Windows 已映射不可删）；大段文件未命中查询（首次反序列化）IO 成本显著下降；
 - 测试：+3 mmap 测试（flush 注册/重开懒加载/GC 后正确）；收益预估：重复 term 10-50×（LRU）+ 首次查询段读取优化（mmap）。
+
+### M. 事务类查询优化：范围查询改一次扫描（P0，开发中）
+- **背景**：1 亿库 sysbench 全套实测（2026-08-31）：单语句读写 5k-32 万 TPS、延迟 sub-ms；但事务类
+  `oltp_read_only` 仅 42 TPS（mean 189ms）、`oltp_read_write` 29.5 TPS（mean 270ms）——与点查类差两个数量级。
+- **根因**（mysql.rs `txn_select`/`extract_target_ids`）：`WHERE id BETWEEN A AND B` 被**展开为逐 id 列表**
+  （上限 10000），SUM(k) 聚合/ORDER BY/DISTINCT 同样**逐 id 独立 `engine.txn_get`**——oltp_read_only 每事务
+  ~700 次完整 LSM 点查（MemTable + 78 SST 逐层布隆/二分/解压 + JSON 解析），范围扫描的活被退化成 700 次随机点查。
+  叠加 RR 快照读 `get_at` 不走 HotCache + 并发写冲突（1213）。
+- **方案（P0）**：
+  1. `column_family` 新增 `scan_range_at(start, end, snapshot_seq)`：MemTable + SSTable 合并扫描，
+     键/值按全局 seq 过滤（对齐 `get_bytes_at` 快照语义）；
+  2. `Engine::scan_range_at`（事务读入口，复用快照 + 同事务写 `read_own` 覆盖，SERIALIZABLE 不加读锁——
+     范围读为只读投影，后续按需）；
+  3. `txn_select`：BETWEEN 走一次 `scan_range_at`（点查/IN 保持逐 id `txn_get`），SUM 在扫描时累加，
+     ORDER BY / DISTINCT 在扫描结果上处理（LIMIT 截断）；
+  4. `select_response`（非事务）BETWEEN 同步换 `scan_range` 一次扫描（实时语义，无快照）；
+- **预期**：事务类 TPS ~50×（700 次点查 → 4 次范围扫描 + 少量点查），read_only 42 → 数千 TPS；
+- 测试：范围快照一致性（扫描 vs 逐 id 同结果）、SUM 累加正确、ORDER BY/LIMIT、事务内写后扫描可见；
+- 交付：1 亿库复测 read_only / read_write 记录（images/perf-0.7.0/sysbench-100m/构建记录.md 更新）。
+
+### N. 倒排回表批量读（batch_get，P0，开发中）
+- **背景**（架构建议借鉴）：倒排/全文检索的 posting 命中 docid 集合后需**回表**取文档。旧实现
+  `search_term_paged` 对每个 docid 逐次 `engine.get()`——每 key 独立走完整 LSM 点查（MemTable +
+  全部分层 SST 的布隆/二分/读块/解压 + Delta 扫描 + JSON 合并）。posting 返回 1 万主键 = 1 万次
+  随机点查，是倒排链路的下一性能瓶颈（G/K 项已解决 posting 查询端，回表端未批量）。
+- **方案（借鉴建议的三步批量接口）**：
+  1. `sstable.rs` 新增 `scan_block_for_keys`：数据块一次解码，命中 targets 集合全部 key；
+  2. `column_family.rs` 新增 `get_many(docids)` + `get_many_from_sst`：① MemTable 批量（Tombstone
+     直接终结）② 逐 SST：整文件布隆粗筛 → 逐 key 二分定位块 → **按块分组** → 分区布隆校验 →
+     每块只读/解压一次（块缓存复用）→ 块内一次扫描；语义与 `get_bytes` 一致（最新版本优先，
+     Tombstone 视为不存在）；
+  3. `engine.rs` 新增 `batch_get(docids)`：删除位图 O(1) 批量过滤 → HotCache 批量命中 → primary
+     `get_many` → Delta 覆盖用**单次范围扫描 [min..max] 按 docid 分组**（替代逐 docid 扫描）；
+  4. `search_term_paged`/`fulltext_search_paged` 回表改走 `batch_get`（bitmap 迭代 docid 升序，
+     天然满足批量输入要求）；
+- **预期**：万级 posting 回表从万次随机读降为块级顺序读（同块多 key 共享一次 IO/解压）；
+- 测试：get_many vs 逐条 get 一致（跨 flush + tombstone）、batch_get vs get 一致（Delta 覆盖 +
+  删除位图）、倒排回表分页/删除过滤；交付后 1 亿库 fulltext/倒排复测。
 
 ## 4. 已完成大项（最近）
 

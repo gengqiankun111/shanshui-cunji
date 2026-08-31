@@ -29,7 +29,9 @@ use crate::config::model::{Config, MemtableConfig};
 use crate::error::{Error, Result};
 use crate::keys::{decode_docid, encode_docid};
 use crate::memtable::{MemTable, MemTableBuffer};
-use crate::sstable::{Compression, SstFooter, SstReader, SstWriter, FLAG_DELETE, FLAG_PUT};
+use crate::sstable::{
+    Compression, IndexEntry, SstFooter, SstReader, SstWriter, FLAG_DELETE, FLAG_PUT,
+};
 use crate::wal::{RingWal, WalBackend, WalMode, WalReader, WalWriter, OP_DELETE, OP_PUT};
 
 /// SST 文件前缀。
@@ -446,6 +448,51 @@ impl ColumnFamily {
         Ok(None)
     }
 
+    /// 批量点查（N 项：借鉴 batch_get 建议落地，倒排/全文检索回表基础）。
+    /// 语义与 `get_bytes` 一致：每 key 取最新版本（MemTable 优先，SST 新→旧首个命中即终），
+    /// Tombstone 视为不存在；但一次处理多个 key——
+    /// ① MemTable 批量命中（含 Tombstone 直接终结，跳过 SST 层）；
+    /// ② 逐 SST：整文件布隆粗筛 → 逐 key 二分定位数据块 → 按块分组 →
+    ///    每数据块仅读/解压/解码一次（块缓存复用），同块多 key 一次取出。
+    /// 返回与输入 docids 顺序对齐的 `Vec<Option<(value, seq)>>`。
+    pub fn get_many(&self, docids: &[u64]) -> Result<Vec<Option<(Vec<u8>, u64)>>> {
+        let keys: Vec<Vec<u8>> = docids.iter().map(|d| encode_docid(*d).to_vec()).collect();
+        let mut out: Vec<Option<(Vec<u8>, u64)>> = vec![None; keys.len()];
+        // ① MemTable 批量（最新版本；Tombstone → 保持 None 并终结，不再查 SST）
+        let mut remain: Vec<usize> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            if let Some(e) = self.memtable.get(k) {
+                if let Some(v) = e.value {
+                    out[i] = Some((v, e.seq));
+                }
+            } else {
+                remain.push(i);
+            }
+        }
+        if remain.is_empty() {
+            return Ok(out);
+        }
+        // ② 逐 SST（新→旧），未命中 key 继续下沉旧层
+        let cache = Arc::clone(&self.block_cache);
+        for sst in &self.ssts {
+            if remain.is_empty() {
+                break;
+            }
+            let hits = get_many_from_sst(sst, &cache, &keys, &remain)?;
+            let mut next = Vec::with_capacity(remain.len());
+            for (j, &idx) in remain.iter().enumerate() {
+                match &hits[j] {
+                    Some((Some(v), seq)) => out[idx] = Some((v.clone(), *seq)),
+                    // Tombstone：该 SST 为最新版本且为删除 → 视为不存在
+                    Some((None, _)) => {}
+                    None => next.push(idx),
+                }
+            }
+            remain = next;
+        }
+        Ok(out)
+    }
+
     /// 快照读（design 4.7 二期 MVCC，M6-3）：返回 **seq ≤ `snapshot_seq`** 的最新版本。
     /// 遍历 MemTable + 全部 SST，取满足条件的最大 seq；该 seq 为 Tombstone 则视为不存在
     /// （快照点已删除；快照点之前的历史版本仍可见）。
@@ -496,6 +543,26 @@ impl ColumnFamily {
         Ok(out)
     }
 
+    /// 快照范围扫描 [start, end]（M 项，事务类查询优化 P0）：按快照 seq 过滤版本，
+    /// 返回按 docid 升序的 (docid, value) 列表（快照点已删除的 key 跳过）。
+    pub fn scan_range_at(
+        &mut self,
+        snapshot_seq: u64,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let start_key = start.map(|s| encode_docid(s).to_vec());
+        let end_key = end.map(|e| encode_docid(e).to_vec());
+        let mut out = Vec::new();
+        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), |key, val| {
+            let docid = decode_docid(key)
+                .map_err(|_| Error::Corrupted("scan_at key 非 docid 编码".into()))?;
+            out.push((docid, val.to_vec()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
     /// 原始字节键范围扫描（组合索引前缀查询使用）。返回升序 (key, value) 列表，Tombstone 已过滤。
     pub fn scan_raw_range(
         &mut self,
@@ -534,6 +601,20 @@ impl ColumnFamily {
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
+        f: F,
+    ) -> Result<()> {
+        // 最新视图 = 快照 seq 无上限（取最大版本）
+        self.scan_stream_at(u64::MAX, start, end, f)
+    }
+
+    /// 快照范围流式扫描（M 项，事务类查询优化 P0）：同 key 多版本取
+    /// **seq ≤ snapshot_seq 的最大版本**（对齐 `get_bytes_at` 快照语义）；
+    /// 快照点前为删除（Tombstone）→ 跳过该 key。其余与 `scan_stream` 一致。
+    pub fn scan_stream_at<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
+        &mut self,
+        snapshot_seq: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         mut f: F,
     ) -> Result<()> {
         // 源：memtable（immutable + mutable）借用 &self.memtable；SST 借用 &mut self.ssts
@@ -567,7 +648,7 @@ impl ColumnFamily {
             let Some(std::cmp::Reverse((min_key, i0))) = heap.pop() else {
                 break; // 全部耗尽
             };
-            // 收集所有 key == min_key 的源（同 key 候选），取最大 seq（最新版本覆盖旧版本）
+            // 收集所有 key == min_key 的源（同 key 候选），取快照点前最大 seq（最新可见版本）
             let mut to_advance: Vec<usize> = vec![i0];
             while let Some(std::cmp::Reverse((k, i))) = heap.peek() {
                 if *k == min_key {
@@ -582,7 +663,7 @@ impl ColumnFamily {
             for i in to_advance {
                 let (k, v, seq) = cur[i].take().unwrap();
                 debug_assert!(k == min_key, "同 key 归并");
-                if seq >= best_seq {
+                if seq <= snapshot_seq && seq >= best_seq {
                     best_seq = seq;
                     best_val = v;
                 }
@@ -596,7 +677,7 @@ impl ColumnFamily {
                     heap.push(std::cmp::Reverse((nk.clone(), i)));
                 }
             }
-            // Tombstone（最新版本 value=None）→ 该 key 视为删除，不输出
+            // 快照点前最新版本为 Tombstone → 该 key 在快照点已删除，不输出
             if let Some(v) = best_val {
                 if !f(min_key.as_slice(), &v)? {
                     break; // 提前终止（游标续扫取满页）
@@ -1315,6 +1396,99 @@ fn get_from_sst(
         b
     };
     sst.scan_block_for_key(&block, key)
+}
+
+/// 单 SST 批量等值查询（N 项）：整文件布隆粗筛 → 逐 key 二分定位数据块 → 按块分组 →
+/// 分区布隆校验 → 每块只读一次（块缓存/磁盘）→ 块内一次扫描命中全部 key。
+/// 返回与 `idxs`（输入原始下标）对齐：`Some((value, seq))`（value=None = Tombstone）/
+/// `None`（该 SST 无此 key，调用方继续下沉旧层）。
+fn get_many_from_sst(
+    sst: &SstReader,
+    cache: &BlockCache,
+    keys: &[Vec<u8>],
+    idxs: &[usize],
+) -> Result<Vec<Option<(Option<Vec<u8>>, u64)>>> {
+    let mut out: Vec<Option<(Option<Vec<u8>>, u64)>> = vec![None; idxs.len()];
+    if idxs.is_empty() {
+        return Ok(out);
+    }
+    let legacy = sst.legacy_bloom();
+    // 定位：原始下标 + 块号 + 块条目（借用精确索引二分，只克隆单条条目）
+    let mut located: Vec<(usize, usize, IndexEntry)> = Vec::new();
+    for &i in idxs {
+        let k = &keys[i];
+        if let Some(b) = legacy {
+            if !b.maybe_contains(k) {
+                continue;
+            }
+        }
+        if let Some((block_idx, entry)) = sst.locate_indexed_block(k)? {
+            located.push((i, block_idx, entry));
+        }
+    }
+    if located.is_empty() {
+        return Ok(out);
+    }
+    // 按块分组（块号升序 → 块读取顺序化）
+    located.sort_by_key(|&(_, bi, _)| bi);
+    let slot_of: std::collections::HashMap<usize, usize> = idxs
+        .iter()
+        .enumerate()
+        .map(|(slot, &i)| (i, slot))
+        .collect();
+    let mut pos = 0usize;
+    while pos < located.len() {
+        let block_idx = located[pos].1;
+        let mut end = pos;
+        while end < located.len() && located[end].1 == block_idx {
+            end += 1;
+        }
+        // 分区布隆（v5）校验：放行的 key 才真正读块
+        let mut targets: Vec<usize> = Vec::new();
+        let mut pruned = false;
+        if let Some(pb) = sst.partition_blooms() {
+            if let Some(bytes) = pb.get(block_idx) {
+                if let Some(b) = BloomFilter::from_bytes(bytes) {
+                    for &(i, _, _) in &located[pos..end] {
+                        if b.maybe_contains(&keys[i]) {
+                            targets.push(i);
+                        }
+                    }
+                    pruned = true;
+                }
+            }
+        }
+        if !pruned {
+            targets.extend(located[pos..end].iter().map(|&(i, _, _)| i));
+        }
+        if !targets.is_empty() {
+            // 布隆放行 → 读热度 +1（冷热感知 Compaction 数据源，与 get_from_sst 一致）
+            sst.touch();
+            let entry = located[pos].2.clone();
+            let ck = BlockCacheKey {
+                file: sst.path().to_path_buf(),
+                offset: entry.offset,
+            };
+            let block = if let Some(b) = cache.get(&ck) {
+                b
+            } else {
+                let b = sst.read_block(&entry)?;
+                cache.put(ck, b.clone());
+                b
+            };
+            let target_set: std::collections::HashSet<Vec<u8>> =
+                targets.iter().map(|&i| keys[i].clone()).collect();
+            for (k, v, seq) in sst.scan_block_for_keys(&block, &target_set)? {
+                if let Some(i) = targets.iter().copied().find(|&i| keys[i] == k) {
+                    if let Some(&slot) = slot_of.get(&i) {
+                        out[slot] = Some((v, seq));
+                    }
+                }
+            }
+        }
+        pos = end;
+    }
+    Ok(out)
 }
 
 /// 扫描 Immutable 记录的最大 seq（环形 WAL 覆盖安全游标：<= 该 seq 均已刷盘）。
@@ -2048,6 +2222,40 @@ mod tests {
                 "key {i} 丢失"
             );
         }
+    }
+
+    #[test]
+    fn get_many_matches_individual_get_across_flush_and_tombstone() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for i in 0..60u64 {
+            cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+        }
+        cf.delete(7).unwrap();
+        // 刷盘：数据落 SST（多 key 共享数据块 → 按块分组批量命中路径）
+        cf.switch_and_flush().unwrap();
+        // 混入 MemTable 层新写 + 新删除（tombstone 终结路径）
+        cf.put(100, b"v-100".to_vec()).unwrap();
+        cf.delete(100).unwrap();
+        let ids = [0u64, 7, 30, 59, 60, 100, 101];
+        let got = cf.get_many(&ids).unwrap();
+        assert_eq!(got.len(), ids.len());
+        for (i, &d) in ids.iter().enumerate() {
+            let expect = cf.get(d).unwrap();
+            assert_eq!(
+                got[i].as_ref().map(|(v, _)| v.as_slice()),
+                expect.as_ref().map(|(v, _)| v.as_slice()),
+                "docid {d} get_many 与 get 结果不一致"
+            );
+        }
+        // 删除语义：7（SST tombstone）与 100（MemTable tombstone）均为 None
+        assert!(got[1].is_none(), "SST tombstone 应视为不存在");
+        assert!(got[5].is_none(), "MemTable tombstone 应视为不存在");
+        assert!(got[6].is_none(), "不存在的 key 应为 None");
+        assert!(got[2].is_some() && got[3].is_some(), "未删除 key 应命中");
+        // 空输入
+        assert!(cf.get_many(&[]).unwrap().is_empty());
     }
 
     #[test]

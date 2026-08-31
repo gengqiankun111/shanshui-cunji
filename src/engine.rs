@@ -108,6 +108,43 @@ fn merge_report(base: &mut crate::column_family::CompactReport, other: &crate::c
     base.freed_bytes += other.freed_bytes;
 }
 
+/// N 项：Delta 批量覆盖收集——单次范围扫描 `[min..max]`（docid 编码 + 字段变长前缀），
+/// 按 docid 分组返回字段覆盖列表（`null` 值 = 删除字段），替代逐 docid 扫描。
+/// key 布局与 `Engine::patch`/`get` 一致：8 字节 docid ++ 4 字节 VarLen 前缀 ++ 字段名。
+fn batch_delta_overrides(
+    delta: &mut ColumnFamily,
+    docids: &[u64],
+) -> Result<std::collections::HashMap<u64, Vec<(String, serde_json::Value)>>> {
+    let mut out: std::collections::HashMap<u64, Vec<(String, serde_json::Value)>> =
+        std::collections::HashMap::new();
+    let (Some(&min), Some(&max)) = (docids.iter().min(), docids.iter().max()) else {
+        return Ok(out);
+    };
+    let start = encode_docid(min).to_vec();
+    let mut end = encode_docid(max).to_vec();
+    end.extend_from_slice(&[0xFF; 4]);
+    let rows = delta.scan_raw_range(Some(&start), Some(&end))?;
+    for (k, v) in rows {
+        if k.len() < 12 {
+            continue;
+        }
+        let docid = match decode_docid(&k[..8]) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let field = match String::from_utf8(k[12..].to_vec()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let val: serde_json::Value = match serde_json::from_slice(&v) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        out.entry(docid).or_default().push((field, val));
+    }
+    Ok(out)
+}
+
 /// 分页查询结果（M8-P8）：`total` = 全量命中数（倒排 bitmap.len()，O(1)），
 /// `rows` = 当前页（只回表 limit 行，内存 O(limit) 不随 total 膨胀——
 /// 大结果集命中数百万行时全量回表 + JSON 构造会内存爆炸，实测 5M 行 → 10GB+ 卡死）。
@@ -770,6 +807,77 @@ impl Engine {
         Ok(Some(merged))
     }
 
+    /// 批量回表（N 项：借鉴 batch_get 建议落地；倒排/全文检索 posting 回表路径）。
+    /// 语义与 `get` 一致（删除位图 / HotCache / Delta 字段覆盖），但一次处理多个 docid：
+    /// ① 删除位图 O(1) 批量过滤；② HotCache 批量命中；③ primary `get_many` 批量读
+    /// （SST 层按块分组，同块多 key 只读/解压一次，块缓存复用）；④ Delta 覆盖用**单次
+    /// 范围扫描** [min..max] 按 docid 分组，替代逐 docid 扫描。
+    /// 输入要求：docids 升序且无重复（倒排 bitmap 迭代天然满足）。
+    /// 返回与输入顺序对齐的 `Vec<Option<value>>`。
+    pub fn batch_get(&mut self, docids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
+        let n = docids.len();
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; n];
+        if n == 0 {
+            return Ok(out);
+        }
+        // ① 删除位图 + ② HotCache
+        let mut need_primary: Vec<usize> = Vec::new();
+        for (i, &d) in docids.iter().enumerate() {
+            if let Some(bm) = &self.deletion_bitmap {
+                if bm.is_deleted(d) {
+                    continue;
+                }
+            }
+            if let Some(v) = self.hotcache.get(d) {
+                out[i] = Some(v);
+            } else {
+                need_primary.push(i);
+            }
+        }
+        if need_primary.is_empty() {
+            return Ok(out);
+        }
+        let sub: Vec<u64> = need_primary.iter().map(|&i| docids[i]).collect();
+        let found = self.primary.get_many(&sub)?; // Vec<Option<(value, seq)>>
+        // ④ Delta 批量覆盖（单次范围扫描，按 docid 分组）
+        let overrides = batch_delta_overrides(&mut self.delta, &sub)?;
+        for (j, &i) in need_primary.iter().enumerate() {
+            let d = docids[i];
+            let Some((bv, _seq)) = &found[j] else {
+                continue;
+            };
+            let obj: serde_json::Value = match serde_json::from_slice(bv) {
+                Ok(v) => v,
+                Err(_) => {
+                    // 非 JSON 原始字节文档：无 Delta 覆盖
+                    out[i] = Some(bv.clone());
+                    continue;
+                }
+            };
+            let mut map = match obj {
+                serde_json::Value::Object(m) => m,
+                _ => {
+                    out[i] = Some(bv.clone());
+                    continue;
+                }
+            };
+            if let Some(over) = overrides.get(&d) {
+                for (field, val) in over {
+                    if val.is_null() {
+                        map.shift_remove(field);
+                    } else {
+                        map.insert(field.clone(), val.clone());
+                    }
+                }
+            }
+            let merged = serde_json::to_vec(&map)
+                .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+            self.hotcache.put(d, merged.clone());
+            out[i] = Some(merged);
+        }
+        Ok(out)
+    }
+
     /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
     pub fn begin_snapshot(&self) -> u64 {
         self.primary.wal_next_seq().saturating_sub(1)
@@ -857,17 +965,26 @@ impl Engine {
         let total = bitmap.len() as u64;
         let mut rows = Vec::new();
         let cap = limit.unwrap_or(u64::MAX);
+        // N 项：收集可见窗口 docid（bitmap 升序）→ 一次 `batch_get` 批量回表。
+        // 旧实现逐 docid `get`：每 key 独立走完整 LSM 点查（78 SST 布隆/二分/读块 +
+        // Delta 扫描 + JSON 合并），万级 posting 退化为万次随机读；批量化后按块分组、
+        // 每数据块只读/解压一次，Delta 单次范围扫描分组覆盖。
+        let mut ids: Vec<u64> = Vec::new();
         let mut skipped = 0u64;
         for docid in bitmap {
             if skipped < offset {
                 skipped += 1;
                 continue;
             }
-            if rows.len() as u64 >= cap {
+            if ids.len() as u64 >= cap {
                 break;
             }
-            if let Some(v) = self.get(docid as u64)? {
-                rows.push((docid as u64, v));
+            ids.push(docid as u64);
+        }
+        let vals = self.batch_get(&ids)?;
+        for (d, v) in ids.into_iter().zip(vals) {
+            if let Some(v) = v {
+                rows.push((d, v));
             }
         }
         Ok(PagedRows { total, rows })
@@ -965,6 +1082,41 @@ impl Engine {
     /// 主键范围扫描。
     pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<QueryRow>> {
         self.primary.scan_range(start, end)
+    }
+
+    /// 事务范围扫描（M 项，事务类查询优化 P0）：RR/SERIALIZABLE 走 `scan_range_at`
+    /// 快照版本过滤（一次 k-way merge 扫描，替代逐 id `txn_get`）；同事务未提交写
+    /// （`read_own`）覆盖扫描结果；事务内删除的 docid 从结果中排除。
+    pub fn scan_range_txn(
+        &mut self,
+        txn: &mut crate::txn::Transaction,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Vec<QueryRow>> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        // 扫描快照视图（RC 语义 = 最新视图；RR/SERIALIZABLE = 快照过滤）
+        let snapshot = if txn.isolation.uses_snapshot() {
+            txn.snapshot()
+        } else {
+            u64::MAX
+        };
+        let mut out: Vec<QueryRow> = self.primary.scan_range_at(snapshot, start, end)?;
+        // 同事务写覆盖：write_set 中的 docid 用 read_own 值替换/排除
+        for row in out.iter_mut() {
+            if let Some(own) = txn.read_own(row.0) {
+                match own {
+                    Some(v) => row.1 = v.to_vec(),
+                    None => row.1.clear(), // 事务内已删除：标记为空（下方过滤）
+                }
+            }
+        }
+        out.retain(|(_, v)| !v.is_empty());
+        Ok(out)
     }
 
     /// 组合索引前缀查询：编码前缀键范围扫描 → 回表主数据。
@@ -1411,6 +1563,79 @@ mod tests {
         let got = e.txn_get(&mut txn, 1).unwrap();
         assert_eq!(got.unwrap(), b"v0", "RR 应读事务开始前的快照值");
         e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn scan_range_txn_snapshot_filter_and_own_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=5u64 {
+            e.put(i, format!("v0-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap(); // 旧版本落 SST（MemTable 不保留多版本）
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 快照后并发写 docid 3 → 扫描应显示快照值 v0-3（隔离并发写）
+        e.put(3, b"v1-3".to_vec(), &["t"]).unwrap();
+        // 事务内写 docid 2 / 事务内删除 docid 4 → 扫描应覆盖/排除
+        txn.put(2, b"own-2".to_vec(), vec!["t".into()]);
+        txn.delete(4);
+        let rows = e.scan_range_txn(&mut txn, Some(1), Some(5)).unwrap();
+        let map: std::collections::HashMap<u64, Vec<u8>> = rows.into_iter().collect();
+        assert_eq!(map.get(&1).unwrap(), b"v0-1");
+        assert_eq!(map.get(&2).unwrap(), b"own-2", "同事务写应覆盖扫描结果");
+        assert_eq!(map.get(&3).unwrap(), b"v0-3", "快照隔离：并发写不可见");
+        assert_eq!(map.len(), 4, "事务内删除 docid 4 应从扫描排除");
+        assert!(!map.contains_key(&4));
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn batch_get_matches_get_with_delta_and_deletion_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..40u64 {
+            let doc = serde_json::json!({"k": format!("d{i}"), "n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["t"]).unwrap();
+        }
+        // Delta 字段级覆盖（patch）+ 删除位图删除
+        e.patch(1, &[("k", serde_json::Value::String("patched".into()))]).unwrap();
+        e.patch(2, &[("extra", serde_json::Value::from(42))]).unwrap();
+        e.delete(4).unwrap();
+        let ids: Vec<u64> = (0..45).filter(|i| i % 2 == 0).collect();
+        let batch = e.batch_get(&ids).unwrap();
+        assert_eq!(batch.len(), ids.len());
+        for (i, &d) in ids.iter().enumerate() {
+            let single = e.get(d).unwrap();
+            assert_eq!(batch[i], single, "docid {d} batch_get 与 get 结果不一致");
+        }
+        // 删除语义：docid 4 在两条路径均为 None
+        assert!(e.get(4).unwrap().is_none());
+        let idx4 = ids.iter().position(|&x| x == 4).unwrap();
+        assert!(batch[idx4].is_none());
+    }
+
+    #[test]
+    fn search_term_paged_batch_backfill_matches_individual_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..30u64 {
+            let doc = serde_json::json!({"city": "beijing", "i": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["city=beijing"]).unwrap();
+        }
+        // 倒排回表：批量路径应与逐条 get 一致（含分页 offset/limit 语义）
+        let p1 = e.search_term_paged("city=beijing", Some(10), 5).unwrap();
+        assert_eq!(p1.total, 30);
+        assert_eq!(p1.rows.len(), 10);
+        for (d, v) in &p1.rows {
+            assert_eq!(e.get(*d).unwrap().unwrap(), *v, "docid {d} 回表值不一致");
+        }
+        let p2 = e.search_term_paged("city=beijing", Some(5), 25).unwrap();
+        assert_eq!(p2.rows.len(), 5, "末页应返回剩余 5 行");
+        // 删除后回表应过滤（Tombstone / 删除位图）
+        e.delete(3).unwrap();
+        let p3 = e.search_term_paged("city=beijing", None, 0).unwrap();
+        assert_eq!(p3.total, 30, "posting 含已删 docid（回表过滤）");
+        assert!(!p3.rows.iter().any(|(d, _)| *d == 3), "已删 docid 不应回表");
     }
 
     #[test]

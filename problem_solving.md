@@ -472,6 +472,20 @@
 - **结果**：+4 测试全绿；411 全绿；sysbench 风格负载模拟通过（prepare 945 w/s / 点查 3040 q/s /
   事务 1744 txn/s）；提交见 H 项提交。
 
+### P58. 倒排回表逐 id 点查 → batch_get：SST 按块分组 + Delta 单次范围扫描
+- **问题**：倒排/全文检索 posting 回表（`search_term_paged`）对每个 docid 逐次 `engine.get()`——
+  每 key 独立走完整 LSM 点查（MemTable + 分层 SST 的布隆/二分/读块/解压 + Delta 扫描 + JSON 合并）。
+  posting 返回 1 万主键 = 1 万次随机点查（G/K 项优化了 posting 查询端，回表端未批量），
+  是倒排链路的下一性能瓶颈。
+- **方案**（借鉴 batch_get 架构建议的三步批量接口）：`sstable.scan_block_for_keys`（块一次解码命中
+  多 key）→ `column_family.get_many`（MemTable 批量 + 逐 SST **按块分组**：整文件/分区布隆粗筛、
+  每数据块只读/解压一次、块缓存复用；Tombstone 语义与 get_bytes 一致）→ `engine.batch_get`
+  （删除位图 O(1) 批量过滤 + HotCache 批量命中 + Delta **单次范围扫描按 docid 分组**覆盖）；
+  `search_term_paged`/`fulltext_search_paged` 回表改走批量（bitmap 迭代 docid 升序，天然满足输入要求）。
+- **结果**：万级 posting 回表从万次随机读降为块级顺序读（同块多 key 共享一次 IO/解压）；
+  语义与逐条 get 完全一致（+3 测试：get_many 跨 flush+tombstone、batch_get vs get 含 Delta 覆盖/
+  删除位图、倒排回表分页/删除过滤）；419 全绿；提交见 N 项。
+
 ---
 
 ## 环境备忘（不入库）

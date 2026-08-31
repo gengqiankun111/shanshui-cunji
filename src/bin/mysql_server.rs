@@ -2,7 +2,7 @@
 //! （mysql cli、JDBC、Navicat、sysbench）直接接入本数据库。
 //!
 //! 用法：
-//!   shanshui-cunji-mysql-server --data-dir <dir> [--bind 0.0.0.0:3307] [--user root] [--password 密码]
+//!   shanshui-cunji-mysql-server --data-dir <dir> [--config config.toml] [--bind 0.0.0.0:3307] [--user root] [--password 密码]
 //!
 //! 数据模型：库 `scc`，表 `documents`，列 `id`（BIGINT 主键）+ `doc`（JSON 文档）。
 //! 支持：握手 + mysql_native_password 认证 + SHOW DATABASES/TABLES/VARIABLES +
@@ -16,7 +16,7 @@ use shanshui_cunji::mysql::MySqlServer;
 
 fn usage() -> ! {
     eprintln!(
-        "用法: --data-dir <dir> [--bind 0.0.0.0:3307] [--user root] [--password 密码]"
+        "用法: --data-dir <dir> [--config config.toml] [--bind 0.0.0.0:3307] [--user root] [--password 密码]"
     );
     std::process::exit(2);
 }
@@ -52,11 +52,25 @@ fn main() {
         usage();
     }
     let data_dir = PathBuf::from(arg(&args, "--data-dir"));
+    let config_path = opt_arg(&args, "--config", "");
     let bind = opt_arg(&args, "--bind", "0.0.0.0:3307");
     let user = opt_arg(&args, "--user", "root");
     let password = opt_arg(&args, "--password", "");
 
-    let cfg = Config::default();
+    let cfg = if config_path.is_empty() {
+        Config::default()
+    } else {
+        match Config::load(std::path::Path::new(&config_path)) {
+            Ok(c) => {
+                println!("[mysql-server] 配置加载: {config_path}");
+                c
+            }
+            Err(e) => {
+                eprintln!("❌ 配置加载失败: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
     let engine = Engine::open(&data_dir, &cfg).expect("打开引擎失败");
     println!(
         "[mysql-server] 数据目录 {} 打开完成，启动 MySQL 协议服务: {bind}",

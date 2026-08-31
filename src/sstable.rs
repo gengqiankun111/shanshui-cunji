@@ -993,6 +993,22 @@ impl SstReader {
         Ok(None)
     }
 
+    /// 块内批量等值扫描（N 项 batch_get）：一次解码数据块，返回 `targets` 集合中全部命中。
+    /// 同块多 key 共享一次解压/解码，避免逐 key 重复读块。
+    pub fn scan_block_for_keys(
+        &self,
+        block: &[u8],
+        targets: &std::collections::HashSet<Vec<u8>>,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, u64)>> {
+        let mut hits = Vec::new();
+        for (k, v, seq) in decode_data_block(block, self.format)? {
+            if targets.contains(&k) {
+                hits.push((k, v, seq));
+            }
+        }
+        Ok(hits)
+    }
+
     /// 定位包含 key 的数据块（二分首个 first_key <= key 的块）。触发 Level 2 懒加载。
     fn locate_block(&self, key: &[u8]) -> Result<Option<IndexEntry>> {
         self.ensure_index()?;
@@ -1123,7 +1139,8 @@ impl SstReader {
 /// 但可暂停/推进（k-way merge 多源归并用），内存 O(块) 而非 O(全量)。
 pub struct SstRangeIter<'a> {
     reader: &'a mut SstReader,
-    index: Vec<IndexEntry>,
+    /// 当前候选块下标（自起始块起，不再持有全索引副本——M 项 P0 修复：
+    /// 原 `reader.index()` 每次克隆整个块索引（78 个 SST × 全量深拷贝）致小范围扫描初始化成本秒级）。
     block_idx: usize,
     rows: Vec<DecodedRow>,
     row_idx: usize,
@@ -1137,10 +1154,14 @@ impl<'a> SstRangeIter<'a> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Self> {
+        // 二分定位起始块（start 无值从 0 开始；Level 2 索引懒加载后缓存，后续零 IO）
+        let start_idx = match start {
+            Some(s) => reader.locate_block_index(s)?.unwrap_or(0),
+            None => 0,
+        };
         Ok(Self {
-            index: reader.index(),
             reader,
-            block_idx: 0,
+            block_idx: start_idx,
             rows: Vec::new(),
             row_idx: 0,
             start: start.map(|s| s.to_vec()),
@@ -1150,8 +1171,8 @@ impl<'a> SstRangeIter<'a> {
 
     /// 推进到下一个候选块（Zone Map 剪枝），加载并解码；无更多块返回 false。
     fn advance_block(&mut self) -> Result<bool> {
-        while self.block_idx < self.index.len() {
-            let e = self.index[self.block_idx].clone();
+        while self.block_idx < self.reader.index_len() {
+            let e = self.reader.block_entry(self.block_idx)?;
             self.block_idx += 1;
             // Zone Map 剪枝（与 scan_range 相同）
             if let Some(s) = &self.start {
