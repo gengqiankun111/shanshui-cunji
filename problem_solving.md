@@ -484,7 +484,7 @@
   `search_term_paged`/`fulltext_search_paged` 回表改走批量（bitmap 迭代 docid 升序，天然满足输入要求）。
 - **结果**：万级 posting 回表从万次随机读降为块级顺序读（同块多 key 共享一次 IO/解压）；
   语义与逐条 get 完全一致（+3 测试：get_many 跨 flush+tombstone、batch_get vs get 含 Delta 覆盖/
-  删除位图、倒排回表分页/删除过滤）；419 全绿；提交见 N 项。
+  删除位图、倒排回表分页/删除过滤）；419 全绿；提交 `d044b4c`（N 项，与 M 项同提交）。
 
 ---
 

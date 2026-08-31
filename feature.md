@@ -59,7 +59,7 @@
 | WriteBatch 原子写（攒批 put/delete，单次 WAL fsync 原子提交，失败零副作用） | ✅ | D/E/F `81c0350`（`src/txn.rs`；崩溃按 WAL 批次整体重放无中间态） |
 | 事务隔离级别：**RC / RR / SERIALIZABLE**（RR=快照读+提交时写冲突检测；SERIALIZABLE=快照+读共享/写排他锁 2PL+wait-for 死锁检测） | ✅ | D/E/F `81c0350`（`Isolation` 枚举 + `LockTable`；393 测试全绿，见 development 7.53） |
 | MySQL 协议事务：BEGIN/COMMIT/ROLLBACK，**默认 REPEATABLE READ**（非事务 SELECT 走实时最新） | ✅ | H 项 `99ee10e`（mysql.rs `txn_begin(Isolation::RepeatableRead)`；连接断开自动回滚） |
-| **倒排回表批量读 batch_get**（posting 命中 docid 集合 → 一次批量回表：SST 按块分组、每块只读/解压一次，Delta 单次范围扫描分组覆盖；替代逐 docid 独立点查） | ✅ | N 项（`sstable.scan_block_for_keys` + `column_family.get_many` + `engine.batch_get`；倒排/全文检索回表改批量，万级 posting 从万次随机读降为块级顺序读） |
+| **倒排回表批量读 batch_get**（posting 命中 docid 集合 → 一次批量回表：SST 按块分组、每块只读/解压一次，Delta 单次范围扫描分组覆盖；替代逐 docid 独立点查） | ✅ | N 项 `d044b4c`（`sstable.scan_block_for_keys` + `column_family.get_many` + `engine.batch_get`；倒排/全文检索回表改批量，万级 posting 从万次随机读降为块级顺序读） |
 
 ## E. 数据管道 / 迁移 / 导入导出
 
