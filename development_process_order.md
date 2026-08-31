@@ -31,6 +31,9 @@
 | M | 事务类查询优化（范围查询改一次扫描） | P0 | ✅ 完成 | 1 亿库 sysbench 实测：oltp_read_only 42 TPS / read_write 29.5 TPS（点查类 5k-7k TPS）。根因：BETWEEN 范围/SUM 聚合被展开为**逐 id 独立 txn_get**（每事务 ~700 次 LSM 点查）。方案：范围查询走 `scan_range_at`（MemTable+SSTable 合并扫描 + 快照 seq 过滤），SUM/ORDER BY/DISTINCT 在扫描结果上处理；复测（d044b4c）：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%）；未达 50× 预估——真实瓶颈为引擎单 Mutex 每语句串行（~1ms×14 语句），后续 P1 并发模型改造 |
 | N | 倒排回表批量读（batch_get） | P0 | ✅ 完成 | 借鉴 batch_get 架构建议：倒排/全文 posting 回表从**逐 docid 点查**改为**批量读**——SST 层按块分组（同块多 key 只读/解压一次）+ 整文件/分区布隆批量粗筛 + Delta 单次范围扫描分组覆盖；万级 posting 回表从万次随机读降为块级顺序读 |
 | O | MySQL 服务并发模型改造（引擎单 Mutex → 读读并行） | P1 | ⏳ 待排期 | 1 亿库复测定位：事务类 TPS 天花板 = 引擎全局单 Mutex 每语句串行（~1ms×14 语句/事务 → ~1000 stmt/s）。方案：读路径 `RwLock` 化 / 多引擎分片 / 事务内语句批处理；预期事务类 TPS 数倍提升 |
+| P | 事件驱动自动 Compaction（写路径自触发 + 大小阈值 + 背压） | P0 | ✅ 完成 | 24861c6：写路径 `auto_compact`（Flush 后 L0 段数/大小超阈值 → 同步合并收敛，写入自然退避=背压）+ `l0_max_size_mb` 大小软阈值（≥2 段才触发，单段不无收益重写）+ mysql_server 保底 10 分钟定时器；422 测试全绿 |
+| Q | ssts ArcSwap 化（合并不阻塞读） | P1 | ⏳ 待排期 | 借鉴 inverted Ex-6.2/6.3 同款模式：`ColumnFamily.ssts → ArcSwap<Arc<Vec<Arc<SstReader>>>>`，读路径 load 快照无锁、合并后台执行、store 原子切换。前置：① scan_raw_range/delta 读改 &self ② manifest 持久化归入 swap 事务 ③ 旧文件先换映射再删（P53 模式） |
+| R | L0/层全局布隆预过滤（点查每层 1 次布隆替代逐 SST 布隆） | P1 | ⏳ 待排期 | 架构评审缺口：点查遍历全部 SST 逐个布隆（78 段 = 78 次布隆+索引定位）。方案：每层维护全局布隆（L0 段布隆 OR 合并，重建成本 O(段数) 可接受），`get_bytes` 先层布隆粗筛整层跳过；预期大 L0/大 L1 下点查 IO 与 CPU 数倍下降 |
 
 ## 3. 大项详情
 
@@ -163,6 +166,30 @@
 - **预期**：万级 posting 回表从万次随机读降为块级顺序读（同块多 key 共享一次 IO/解压）；
 - 测试：get_many vs 逐条 get 一致（跨 flush + tombstone）、batch_get vs get 一致（Delta 覆盖 +
   删除位图）、倒排回表分页/删除过滤；交付后 1 亿库 fulltext/倒排复测。
+
+### P. 事件驱动自动 Compaction（P0，✅ 完成 24861c6）
+- **背景**（架构评审修正：检查≠触发）：Compaction 原仅 CLI/demo 显式调用（`engine.compact`），写路径
+  零触发 → server 长跑 L0 只增不减（1 亿库 78 个 L0 段全留在读路径）。事件驱动才是 LSM 标准形态——
+  写入路径自己负责触发合并，不依赖外部定时器；定时器只作保底。
+- **方案**：
+  1. `engine.put_nosync` 写后调 `auto_compact()`：`needs_compact()`（L0 段数超动态阈值 / L0 大小超
+     `l0_max_size_mb` / L1/L2 需收敛）→ 同步 `compact()`，guard ≤8 轮（正常 1~2 轮收敛）；
+     同步执行 = 写入自然退避 = **背压**（Q 项 ArcSwap 化后改后台无锁，本函数退化为触发调度）；
+  2. `needs_compact` 大小阈值需 **L0 ≥ 2 段**（单段为已排序文件，合并是纯无收益重写）；
+  3. `mysql_server` 保底守护线程（10 分钟周期，`try_lock` 非阻塞兜底 flush 未触发/合并失败）；
+  4. `auto_compact` / `l0_max_size_mb` 配置化（默认开 / 0=仅段数阈值）。
+- **测试**：+3（auto_compact 收敛 L0 至阈值内且数据完整、关闭后 L0 累积、大小阈值多段触发/单段不触发）；
+  422 全绿。
+
+### 架构评审 6 点对照（2026-08-31）
+| 评审点 | 现状 | 结论 |
+|---|---|---|
+| ① L0 自动触发 Compaction | 写路径零触发（仅 CLI 显式） | ✅ 已修（P 项 24861c6） |
+| ② L0 层全局布隆预过滤 | 点查遍历全部 SST 逐个布隆（78 段=78 次） | ⏳ 真实缺口 → R 项（P1） |
+| ③ 倒排并发读锁 | 读路径已 ArcSwap 无锁快照（Ex-6.2/6.3 `c8183cf`） | ✅ 已实现（文档澄清；引擎级全局 Mutex 归 O 项） |
+| ④ 环形 WAL 回绕覆盖 vs 崩溃恢复 | 已实现：Flush 后 `set_flushed_seq`，回绕仅覆盖已刷盘记录，未刷盘 → `WalFull` → 强制 Flush（M6-1 + P35） | ✅ 已实现（文档澄清） |
+| ⑤ 4KB 块 IO 放大（预读合并） | 块缓存 LRU 已摊薄重复读；zstd 压缩 + 分区布隆 | 评估：冷扫预读合并可作 P3（低优先，块缓存 + 顺序块已覆盖主流） |
+| ⑥ io_uring SQPOLL 与绑核冲突 | io_uring 后端未落地（io_queue.rs 仅队列抽象，`io_uring_enabled` 默认关，Linux 专属） | 备注：后端落地时需给 SQPOLL 预留独立核（affinity 分区扩展） |
 
 ## 4. 已完成大项（最近）
 

@@ -11,13 +11,14 @@
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
 | WAL 预写日志（append 模式，崩溃回放） | ✅ | M1 |
-| WAL 环形模式（预分配环形文件，回绕覆盖安全） | ✅ | M6-1 `66813c9` |
+| WAL 环形模式（预分配环形文件，回绕覆盖安全：Flush 后上报 `flushed_seq`，回绕仅覆盖已刷盘记录；未刷盘 → `WalFull` → 上层强制 Flush 后重试） | ✅ | M6-1 `66813c9`（+M8-P12 tail 合并 fsync `49d4f55`） |
 | WAL 截断回收（append 模式 flush 后截断 + 文件头持久化 seq） | ✅ | M8-P5 `a4d829a` |
 | MemTable 跳表 + 双缓冲（Mutable/Immutable） | ✅ | M1 |
 | SSTable 读写 + 块级压缩 + 分区布隆过滤（v5） | ✅ | M4 `e1eebce` |
 | SSTable 两级索引（Level 1 常驻摘要 + Level 2 精确懒加载） | ✅ | M5 `8bcc077` |
 | 基础 Compaction（全量合并，崩溃安全） | ✅ | P3-3 `3c48521` |
 | Leveled-Compaction（L0→L1→L2 分层压实） | ✅ | M6-2 `4c2e17a` |
+| **事件驱动自动 Compaction**（写路径自触发：Flush 后 L0 段数/大小超阈值 → 同步合并收敛；`auto_compact` + `l0_max_size_mb`；MySQL 服务保底 10 分钟定时器兜底） | ✅ | P 项 `24861c6`（写入自然退避 = 背压；Q 项 ArcSwap 化后改后台无锁） |
 | IO 速率调度器（Token Bucket 限速） | ✅ | P3-2 `4884a58` |
 | **scan 范围扫描流式化**（k-way merge，内存 O(page) 不随总量膨胀） | ✅ | M8-P10（`scan_stream` + 分页接入） |
 
@@ -121,7 +122,7 @@
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
 | 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；读路径 &self 基础已落 `c48a7c1`（read_block 位置读 + ColumnFamily get &self）；剩余阻塞：HotCache 内部 Mutex 化 + 倒排 pending 刷盘归属（搜索类读仍走写锁）；复制型 read_from_replica 属分布式阶段 |
-| 倒排并发读（Seqlock/Arc：段清单 + FST 字典指针无锁读） | 🔄 | Ex-6（Ex-6.1 原语 ✅ `1946161`；Ex-6.2/6.3 ArcSwap 段清单+FST 字典快照化 ✅ `c8183cf`；真实读写并发待读写分离） |
+| 倒排并发读（ArcSwap 段清单 + FST 字典指针无锁读） | ✅ | Ex-6（Ex-6.1 原语 `1946161`；Ex-6.2/6.3 ArcSwap 段清单 + FST 字典快照化 `c8183cf`——search/iter 读路径 `segments.load()`/`dicts.load()` 无锁快照，flush/gc rcu 原子发布；剩余引擎级全局 Mutex 见 O 项并发模型） |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
 ## J. SSD 原生优化（v0.7 起，Ex-5，放弃 HDD 兼容）
