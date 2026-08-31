@@ -135,26 +135,26 @@
   （Windows 已映射不可删）；大段文件未命中查询（首次反序列化）IO 成本显著下降；
 - 测试：+3 mmap 测试（flush 注册/重开懒加载/GC 后正确）；收益预估：重复 term 10-50×（LRU）+ 首次查询段读取优化（mmap）。
 
-### M. 事务类查询优化：范围查询改一次扫描（P0，开发中）
+### M. 事务类查询优化：范围查询改一次扫描（P0，✅ 完成 d044b4c）
 - **背景**：1 亿库 sysbench 全套实测（2026-08-31）：单语句读写 5k-32 万 TPS、延迟 sub-ms；但事务类
   `oltp_read_only` 仅 42 TPS（mean 189ms）、`oltp_read_write` 29.5 TPS（mean 270ms）——与点查类差两个数量级。
 - **根因**（mysql.rs `txn_select`/`extract_target_ids`）：`WHERE id BETWEEN A AND B` 被**展开为逐 id 列表**
   （上限 10000），SUM(k) 聚合/ORDER BY/DISTINCT 同样**逐 id 独立 `engine.txn_get`**——oltp_read_only 每事务
   ~700 次完整 LSM 点查（MemTable + 78 SST 逐层布隆/二分/解压 + JSON 解析），范围扫描的活被退化成 700 次随机点查。
   叠加 RR 快照读 `get_at` 不走 HotCache + 并发写冲突（1213）。
-- **方案（P0）**：
-  1. `column_family` 新增 `scan_range_at(start, end, snapshot_seq)`：MemTable + SSTable 合并扫描，
-     键/值按全局 seq 过滤（对齐 `get_bytes_at` 快照语义）；
-  2. `Engine::scan_range_at`（事务读入口，复用快照 + 同事务写 `read_own` 覆盖，SERIALIZABLE 不加读锁——
-     范围读为只读投影，后续按需）；
-  3. `txn_select`：BETWEEN 走一次 `scan_range_at`（点查/IN 保持逐 id `txn_get`），SUM 在扫描时累加，
-     ORDER BY / DISTINCT 在扫描结果上处理（LIMIT 截断）；
-  4. `select_response`（非事务）BETWEEN 同步换 `scan_range` 一次扫描（实时语义，无快照）；
-- **预期**：事务类 TPS ~50×（700 次点查 → 4 次范围扫描 + 少量点查），read_only 42 → 数千 TPS；
-- 测试：范围快照一致性（扫描 vs 逐 id 同结果）、SUM 累加正确、ORDER BY/LIMIT、事务内写后扫描可见；
-- 交付：1 亿库复测 read_only / read_write 记录（images/perf-0.7.0/sysbench-100m/构建记录.md 更新）。
+- **方案（P0，4 小项全部落地 d044b4c）**：
+  1. ✅ `column_family::scan_range_at`（622 行）：MemTable + SSTable 合并扫描，键/值按全局 seq 过滤
+     （对齐 `get_bytes_at` 快照语义）；
+  2. ✅ `Engine::scan_range_txn`（engine.rs 1169 行）：事务读入口，快照 + 同事务写 `read_own` 覆盖，
+     SERIALIZABLE 不加读锁（范围读只读投影）；
+  3. ✅ `txn_select`（mysql.rs 685 行）：BETWEEN 走一次 `scan_range_txn`（点查/IN 保持逐 id `txn_get`），
+     SUM 扫描时累加，ORDER BY / DISTINCT 在扫描结果上处理（LIMIT 截断）；
+  4. ✅ `select_response`（mysql.rs 1157 行）：非事务 BETWEEN 同步换 `scan_range` 一次扫描（实时语义，无快照）；
+- **达成**：read_only 42 → **71 TPS（+68%）**、read_write 29.5 → **53（+80%）**（1 亿库复测，构建记录 images/perf-0.7.0/sysbench-100m/）；
+- 测试：范围快照一致性（扫描 vs 逐 id 同结果）、SUM 累加正确、ORDER BY/LIMIT、事务内写后扫描可见
+  （scan_range* 7 测试全绿）；提交 `d044b4c`（419 全绿）。
 
-### N. 倒排回表批量读（batch_get，P0，开发中）
+### N. 倒排回表批量读（batch_get，P0，✅ 完成 d044b4c）
 - **背景**（架构建议借鉴）：倒排/全文检索的 posting 命中 docid 集合后需**回表**取文档。旧实现
   `search_term_paged` 对每个 docid 逐次 `engine.get()`——每 key 独立走完整 LSM 点查（MemTable +
   全部分层 SST 的布隆/二分/读块/解压 + Delta 扫描 + JSON 合并）。posting 返回 1 万主键 = 1 万次
