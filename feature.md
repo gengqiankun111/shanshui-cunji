@@ -18,6 +18,7 @@
 | SSTable 两级索引（Level 1 常驻摘要 + Level 2 精确懒加载） | ✅ | M5 `8bcc077` |
 | 基础 Compaction（全量合并，崩溃安全） | ✅ | P3-3 `3c48521` |
 | Leveled-Compaction（L0→L1→L2 分层压实） | ✅ | M6-2 `4c2e17a` |
+| Compaction 智能调度（动态窗口 + 合并冷却 + 倒排刷盘阈值参数化） | ✅ | L 项 `28eae9d`（l0_stall_min/max 随写压力收窄/放宽、compaction_cooldown=2 防刚合并又合并、inverted flush_threshold 500 万段数 -80%） |
 | **事件驱动自动 Compaction**（写路径自触发：Flush 后 L0 段数/大小超阈值 → 同步合并收敛；`auto_compact` + `l0_max_size_mb`；MySQL 服务保底 10 分钟定时器兜底） | ✅ | P 项 `24861c6`（写入自然退避 = 背压；Q 项 ArcSwap 化后改后台无锁） |
 | IO 速率调度器（Token Bucket 限速） | ✅ | P3-2 `4884a58` |
 | **scan 范围扫描流式化**（k-way merge，内存 O(page) 不随总量膨胀） | ✅ | M8-P10（`scan_stream` + 分页接入） |
@@ -36,6 +37,8 @@
 | 倒排索引基础（内存字典 + 磁盘段 + FST 术语字典 / hash 引擎） | ✅ | M3 |
 | 倒排架构升级：预分片 Chunk + 段 GC | ✅ | M5 `7db4764` |
 | 位图索引（枚举字段白名单，COUNT/AND/GROUP BY 快速路径） | ✅ | M7-2 `4a19550` |
+| 倒排 posting 缓存（term→bitmap LRU 256 项，Arc 浅拷贝 O(1)，写路径 add/flush/gc 失效） | ✅ | G 项 `c380792` |
+| 倒排段数据 mmap 化（`data_files: ArcSwap<HashMap<seg, Arc<MmapFile>>>`，FST offset 直接切片反序列化，免 fs::read 全量读） | ✅ | G/K 项（P50 `data_files` ArcSwap 化 + P53：gc 先换映射再删旧文件，Windows 已映射不可删） |
 | 字段白名单 / 黑名单 / 长文本保护（max_term_len，防字典膨胀） | ✅ | M8-P4 `cde4f18`（字典压缩 45 万倍） |
 | fulltext 分词索引（长文本可检索，`ft:field:token`） | ✅ | M8-P7 `545682f` |
 | 中文 bigram 分词（中英混合文本检索） | ✅ | M8-P9 `72badfe` |
@@ -61,6 +64,9 @@
 | 事务隔离级别：**RC / RR / SERIALIZABLE**（RR=快照读+提交时写冲突检测；SERIALIZABLE=快照+读共享/写排他锁 2PL+wait-for 死锁检测） | ✅ | D/E/F `81c0350`（`Isolation` 枚举 + `LockTable`；393 测试全绿，见 development 7.53） |
 | MySQL 协议事务：BEGIN/COMMIT/ROLLBACK，**默认 REPEATABLE READ**（非事务 SELECT 走实时最新） | ✅ | H 项 `99ee10e`（mysql.rs `txn_begin(Isolation::RepeatableRead)`；连接断开自动回滚） |
 | **倒排回表批量读 batch_get**（posting 命中 docid 集合 → 一次批量回表：SST 按块分组、每块只读/解压一次，Delta 单次范围扫描分组覆盖；替代逐 docid 独立点查） | ✅ | N 项 `d044b4c`（`sstable.scan_block_for_keys` + `column_family.get_many` + `engine.batch_get`；倒排/全文检索回表改批量，万级 posting 从万次随机读降为块级顺序读） |
+| **事务范围查询一次扫描**（M 项：BETWEEN/SUM/ORDER BY 从逐 id `txn_get` 展开改为 `scan_range_txn` 一次快照扫描 + `scan_range_at` 快照 seq 过滤；SstRangeIter 二分定位起始块修复全索引克隆） | ✅ | M 项 `d044b4c`（1 亿库 read_only 42→71 TPS +68%、read_write 29.5→53 +80%；未达 50× 因引擎全局 Mutex 串行，见 O 项） |
+| 组合索引列族（`encode_composite_key` 前缀编码 + 前缀范围扫描回表；cidx 独立列族刷盘/合并） | ✅ | M5 起（`Engine::query_by_composite_prefix` + `/query?composite=`） |
+| MySQL 协议适配（HandshakeV10 + native_password 认证 + SHOW/SELECT/INSERT/UPDATE/DELETE + COM_STMT_PREPARE/EXECUTE + sysbench 接入 + `SET TRANSACTION ISOLATION LEVEL` 四级别解析） | ✅ | H 项 `4249869`/`99ee10e`（mysql cli 8.0 + pymysql 真实连接全链路；写冲突映射 1213） |
 
 ## E. 数据管道 / 迁移 / 导入导出
 
@@ -112,7 +118,7 @@
 | 配置热加载（reload 校验 + 变更区块报告） | ✅ | P3-1 `69b39dc` |
 | 全局分配器（mimalloc 默认 / jemalloc 可选） | ✅ | M4 `b0eaa58` |
 | YCSB 压测工具（负载 a/b/c/f + 分位数） | ✅ | M7-3 `d918c47` |
-| 质量文档体系（quality_system P1~P41 / problem_solving） | ✅ | 持续维护 |
+| 质量文档体系（quality_system / problem_solving P1~P58） | ✅ | 持续维护 |
 | 三规模性能实测（1000万/2000万/5000万 + 截屏存档） | ✅ | v0.1.0~v0.5.0 发布系列 |
 
 ## I. 前沿探索（frontier）
@@ -121,7 +127,7 @@
 |---|---|---|
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
-| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；读路径 &self 基础已落 `c48a7c1`（read_block 位置读 + ColumnFamily get &self）；剩余阻塞：HotCache 内部 Mutex 化 + 倒排 pending 刷盘归属（搜索类读仍走写锁）；复制型 read_from_replica 属分布式阶段 |
+| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；读路径 &self 基础已落 `c48a7c1`（read_block 位置读 + ColumnFamily get &self）；倒排内部读已 ArcSwap 无锁（Ex-6.2/6.3），**剩余阻塞在引擎级**：全局 Mutex 串行（O 项）+ HotCache 内部 Mutex；复制型 read_from_replica 属分布式阶段 |
 | 倒排并发读（ArcSwap 段清单 + FST 字典指针无锁读） | ✅ | Ex-6（Ex-6.1 原语 `1946161`；Ex-6.2/6.3 ArcSwap 段清单 + FST 字典快照化 `c8183cf`——search/iter 读路径 `segments.load()`/`dicts.load()` 无锁快照，flush/gc rcu 原子发布；剩余引擎级全局 Mutex 见 O 项并发模型） |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
@@ -193,3 +199,52 @@
 ## 下一候选
 
 - 类 SQL 解析 / 写入 Enrich / 读写分离（⏸）
+
+---
+
+## 架构评审与补充（2026-08-31，以代码为准的 feature 对照审计）
+
+> 本节对照代码逐条核对 feature 清单并修正不一致；**以代码为准**。分析、判断与后续排期见下。
+
+### 1. 本次修正（代码已实现、清单缺行/状态过时）
+
+| 点 | 代码现状（已核实） | 修正 |
+|---|---|---|
+| 事件驱动自动 Compaction | ✅ P 项 `24861c6`：写路径自触发 + `l0_max_size_mb` 大小阈值 + 保底定时器 | A 模块补行 |
+| Compaction 智能调度（L 项） | ✅ `28eae9d`：动态窗口 + 合并冷却 + 倒排阈值 | A 模块补行 |
+| 倒排 posting 缓存 + 段数据 mmap | ✅ `c380792` / P50-P53（`data_files` ArcSwap） | C 模块补行 |
+| 事务范围查询一次扫描（M 项） | ✅ `d044b4c`：`scan_range_at`/`scan_range_txn` | D 模块补行 |
+| 组合索引列族（cidx） | ✅ `encode_composite_key` + `query_by_composite_prefix` | D 模块补行 |
+| MySQL 协议适配（H 项全量） | ✅ `4249869`/`99ee10e`（含 SET ISOLATION LEVEL） | D 模块补行 |
+| 环形 WAL 回绕覆盖安全 | ✅ 已实现（`set_flushed_seq` + WalFull 强制 Flush） | A 模块机制说明补全 |
+| 倒排并发读 | ✅ ArcSwap 无锁快照（Ex-6.2/6.3）；引擎级仍经全局 Mutex | I 模块 🔄→✅ + 读写分离行澄清 |
+| problem_solving 范围 | P1~P58 | H 模块更新 |
+
+### 2. 架构缺陷（已知，按优先级与排期映射）
+
+1. **引擎全局单 Mutex 串行**（→ O 项 P1）：mysql.rs `Arc<Mutex<Engine>>` 每语句持锁执行（~1ms），
+   事务类 14 语句/事务 → 吞吐天花板 ≈ 1000 stmt/s。1 亿库复测 read_only 71 TPS 即此界。
+   方案：读路径 RwLock 化 / 多引擎分片 / 事务内语句批处理。
+2. **L0/L1 层无全局布隆预过滤**（→ R 项 P1）：点查遍历全部 SST 逐个布隆 + 索引定位
+   （78 段 = 78 次布隆检查 + 78 次二分）。方案：每层维护 OR 合并布隆，整层粗筛一次跳过。
+3. **Compaction 同步阻塞读写**（→ Q 项 P1）：P 项写路径同步合并期间全局阻塞（单写者模型下的
+   背压副作用）。方案：`ColumnFamily.ssts → ArcSwap<Arc<Vec<Arc<SstReader>>>>`，合并后台执行、
+   原子切换（3 前置：scan_raw_range/delta 读改 &self、manifest 入 swap 事务、旧文件先换映射再删）。
+4. **MemTable 不保留多版本**（design 4.7 已知局限）：快照读需旧版本已落 SST；MVCC 依赖 LSM 层级。
+5. **4KB 块冷扫 IO 放大**（P3 评估）：块缓存 LRU 摊薄重复读；冷顺序扫描可做预读合并（4×4KB→16KB 一次 IO）。
+6. **io_uring 后端未落地**（K 项 Ex-7.3）：io_queue.rs 仅队列抽象，unsafe liburing 封装待接入；
+   Linux 落地时需在 affinity 三池外给 SQPOLL 预留独立核。
+
+### 3. 已实现的「优于常见实现」点（评审确认，不修改）
+
+- **删除位图**（Ex-5.6）：delete 跳 Tombstone（1bit + 1 页 fsync，-99% IO），compaction 物理丢弃——RocksDB 亦无。
+- **块级复用 Compaction**（Ex-5.8）：无重叠 L0 合并零解压重写（4041ms→毫秒级）。
+- **倒排内部无锁读**（Ex-6.2/6.3）+ 段数据 mmap（P50/P53）：查询零外部锁 + 按需缺页。
+- **事件驱动自动 Compaction**（P 项）：写入路径自负责合并（检查≠触发，定时器仅保底）。
+- **batch_get 批量回表**（N 项）：万级 posting 回表块级顺序读。
+
+### 4. 已验证性能结论（1 亿库，2026-08-31）
+
+- M 项事务范围扫描一次化：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%）；
+  未达预估 50×——瓶颈为引擎 Mutex 串行（O 项），非扫描路径本身（单连接实测范围查询 0.2ms/条）。
+- 事件驱动自动 Compaction 上线后 1 亿库 78 个 L0 段由写路径自触发收敛（SST 文件数下降，L1 层聚合）。
