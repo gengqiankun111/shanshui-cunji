@@ -1119,6 +1119,39 @@ impl SstReader {
         }
     }
 
+    /// U 项：合并读连续数据块（冷扫预读）——一次 `read_at` 覆盖整组
+    /// （4×4KB → 1×16KB，减少顺序扫描 syscall/IO 次数），逐块切片 + CRC 校验 + 解压。
+    /// 布局假设：块紧凑连续（`compressed + TRAILER_LEN` 紧邻）；校验失败回退逐块读（安全）。
+    pub(crate) fn read_block_group(&self, entries: &[IndexEntry]) -> Result<Vec<Vec<u8>>> {
+        let n = entries.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n == 1 {
+            return Ok(vec![self.read_block(&entries[0])?]);
+        }
+        let start = entries[0].offset;
+        let last = &entries[n - 1];
+        let end = last.offset + last.comp_len as u64 + TRAILER_LEN as u64;
+        let mut buf = vec![0u8; (end - start) as usize];
+        read_at(&self.file, &mut buf, start)?;
+        let mut out = Vec::with_capacity(n);
+        for e in entries {
+            let rel = (e.offset - start) as usize;
+            let comp = &buf[rel..rel + e.comp_len as usize];
+            let tr = &buf[rel + e.comp_len as usize..rel + e.comp_len as usize + TRAILER_LEN];
+            let raw_len = u32::from_le_bytes(tr[0..4].try_into().unwrap()) as usize;
+            let comp_len = u32::from_le_bytes(tr[4..8].try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(tr[8..12].try_into().unwrap());
+            if comp_len != e.comp_len as usize || crc32(comp) != crc {
+                // 布局假设失效（防御）：回退逐块读
+                return entries.iter().map(|en| self.read_block(en)).collect();
+            }
+            out.push(self.decompress(comp, raw_len)?);
+        }
+        Ok(out)
+    }
+
     /// Ex-5.8 元数据-数据解耦：读取块的**原始压缩字节** + 解码内容，供块级复用 Compaction
     /// 原样拷贝数据块（不解压校验 trailer，由复用写入方 `add_raw_block` 重建）。
     /// O 项第③步：`&self`——compact 经 `Arc<SstReader>` 并发读输入段（内部 `read_at` 无状态 seek）。
@@ -1195,6 +1228,9 @@ pub struct SstRangeIter<'a> {
     row_idx: usize,
     start: Option<Vec<u8>>,
     end: Option<Vec<u8>>,
+    /// U 项：块预读缓存（块下标 → 解码行）——`advance_block` 一次组读 ≤4 块
+    /// （合并 read_at + 预解码），后续块直接消费（冷顺序扫描 IO 放大 4×4KB → 1×16KB）。
+    prefetch: std::collections::VecDeque<(usize, Vec<DecodedRow>)>,
 }
 
 impl<'a> SstRangeIter<'a> {
@@ -1216,27 +1252,50 @@ impl<'a> SstRangeIter<'a> {
             row_idx: 0,
             start: start.map(|s| s.to_vec()),
             end: end.map(|e| e.to_vec()),
+            prefetch: std::collections::VecDeque::new(),
         })
     }
 
     /// 推进到下一个候选块（Zone Map 剪枝），加载并解码；无更多块返回 false。
+    /// U 项：一次组读当前块起 ≤4 块（合并 read_at + 预解码进 prefetch 缓存）。
     fn advance_block(&mut self) -> Result<bool> {
-        while self.block_idx < self.reader.index_len() {
-            let e = self.reader.block_entry(self.block_idx)?;
-            self.block_idx += 1;
-            // Zone Map 剪枝（与 scan_range 相同）
+        // 优先消费预读缓存
+        if let Some((_, rows)) = self.prefetch.pop_front() {
+            self.rows = rows;
+            self.row_idx = 0;
+            return Ok(true);
+        }
+        // 组读：当前块起 ≤4 块（Zone Map 剪枝）
+        let mut picks: Vec<(usize, IndexEntry)> = Vec::new();
+        let mut bidx = self.block_idx;
+        while bidx < self.reader.index_len() && picks.len() < 4 {
+            let e = self.reader.block_entry(bidx)?;
             if let Some(s) = &self.start {
                 if e.max_key.as_slice() < s.as_slice() {
+                    bidx += 1;
                     continue;
                 }
             }
             if let Some(en) = &self.end {
                 if e.first_key.as_slice() > en.as_slice() {
-                    return Ok(false); // 索引按 key 有序，后续块更大
+                    break; // 索引按 key 有序，后续块更大
                 }
             }
-            let data = self.reader.read_block(&e)?;
-            self.rows = decode_data_block(&data, self.reader.format)?;
+            picks.push((bidx, e));
+            bidx += 1;
+        }
+        if picks.is_empty() {
+            return Ok(false);
+        }
+        self.block_idx = picks.last().map(|(i, _)| *i + 1).unwrap_or(self.block_idx);
+        let entries: Vec<IndexEntry> = picks.iter().map(|(_, e)| e.clone()).collect();
+        let blocks = self.reader.read_block_group(&entries)?;
+        for ((i, _), block) in picks.into_iter().zip(blocks) {
+            self.prefetch
+                .push_back((i, decode_data_block(&block, self.reader.format)?));
+        }
+        if let Some((_, rows)) = self.prefetch.pop_front() {
+            self.rows = rows;
             self.row_idx = 0;
             return Ok(true);
         }
@@ -1517,6 +1576,44 @@ mod tests {
         for w in it_all.windows(2) {
             assert!(w[0].0 < w[1].0, "迭代必须按 key 升序");
         }
+    }
+
+    #[test]
+    fn range_iter_prefetch_multi_block_consistency() {
+        // U 项：组读预读（≤4 块合并 read_at）——多块段扫描与单块逐读结果一致
+        // （覆盖 read_block_group 合并读取 + 预解码缓存路径）
+        let path = tmp();
+        write_sample(&path, 2000); // ~10 块（4096 块/20B key）→ 覆盖组读
+        let r = SstReader::open(&path).unwrap();
+        assert!(r.index_len() > 4, "样本应 >4 块（实际 {}）", r.index_len());
+        // 全量：组读路径
+        let mut it_all: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        for row in SstRangeIter::new(&r, None, None).unwrap() {
+            it_all.push(row.unwrap());
+        }
+        assert_eq!(it_all.len(), 2000, "全量行数");
+        for (i, (k, v, seq)) in it_all.iter().enumerate() {
+            assert_eq!(k, &format!("user-{i:08}").into_bytes(), "key {i}");
+            assert_eq!(v.as_deref(), Some(format!("value-of-{i}").as_bytes()), "val {i}");
+            assert_eq!(*seq, i as u64, "seq {i}");
+        }
+        // 跨块边界范围扫描（Zone Map 剪枝 + 预读）
+        let lo = b"user-00000900".to_vec();
+        let hi = b"user-00001100".to_vec();
+        let mut it_rng: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        for row in SstRangeIter::new(&r, Some(&lo), Some(&hi)).unwrap() {
+            it_rng.push(row.unwrap());
+        }
+        assert_eq!(it_rng.len(), 201, "闭区间 [900,1100] 行数");
+        assert_eq!(it_rng[0].0, lo);
+        assert_eq!(it_rng[200].0, hi);
+        // 与 scan_range 对照（逐块路径）
+        let mut sc: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        r.scan_range(Some(&lo), Some(&hi), |k, v, seq| {
+            sc.push((k.to_vec(), v.map(|x| x.to_vec()), seq))
+        })
+        .unwrap();
+        assert_eq!(it_rng, sc, "预读迭代器应与逐块 scan_range 一致");
     }
 
     #[test]
