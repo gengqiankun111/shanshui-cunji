@@ -617,6 +617,128 @@ mod tests {
         assert!(st.last_error.as_deref().unwrap().contains("缺少补偿定义"), "{:?}", st.last_error);
     }
 
+    // -----------------------------------------------------------------------
+    // 补充：缺步骤定义修复（170bf21）变体覆盖
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn missing_definition_direct_compensate_call() {
+        // 直接调 compensate()（不经 run）同样保持 Compensating（修复作用点本身）
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx12");
+        st.status = SagaStatus::Executing;
+        st.executed_steps = vec!["a".to_string()];
+        write_state(dir.path(), &st);
+
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        // steps 缺 a → compensate 无法执行补偿
+        let steps: Vec<Box<dyn SagaStep>> =
+            vec![Box::new(SimpleStep { name: "b", fail_forward: false })];
+        let s = c.compensate("tx12", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Compensating, "直接补偿路径同样保持 Compensating");
+        let st = c.status("tx12").unwrap();
+        assert!(st.last_error.as_deref().unwrap().contains("缺少补偿定义"), "{:?}", st.last_error);
+    }
+
+    #[test]
+    fn missing_definition_partial_progress_kept() {
+        // 逆序补偿：b 有定义先补偿成功登记；a 缺定义 → 保持 Compensating，部分进度不丢
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx13");
+        st.status = SagaStatus::Compensating;
+        st.executed_steps = vec!["a".to_string(), "b".to_string()];
+        write_state(dir.path(), &st);
+
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        // 只提供 b 的定义（缺 a）→ 逆序先补 b（成功），a 缺定义 → Compensating
+        let steps: Vec<Box<dyn SagaStep>> =
+            vec![Box::new(SimpleStep { name: "b", fail_forward: false })];
+        let s = c.compensate("tx13", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Compensating, "部分缺定义 → 保持 Compensating");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1, "b 已被补偿");
+        let st = c.status("tx13").unwrap();
+        assert!(st.compensated_steps.contains("b"), "b 补偿进度已登记");
+        assert!(!st.compensated_steps.contains("a"), "a 未补偿");
+        assert!(st.last_error.as_deref().unwrap().contains("缺少补偿定义"), "{:?}", st.last_error);
+    }
+
+    #[test]
+    fn missing_definition_retry_then_compensated() {
+        // 缺定义 → 补全定义重试 → 续补偿剩余分支 → Compensated（不重复已补偿）
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx14");
+        st.status = SagaStatus::Compensating;
+        st.executed_steps = vec!["a".to_string(), "b".to_string()];
+        write_state(dir.path(), &st);
+
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let partial: Vec<Box<dyn SagaStep>> =
+            vec![Box::new(SimpleStep { name: "b", fail_forward: false })];
+        let s = c.compensate("tx14", &refs(&partial)).unwrap();
+        assert_eq!(s, SagaStatus::Compensating, "首次缺 a 定义");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1);
+
+        // 补全定义重试 → 续补 a（b 已补偿不重复）
+        let full: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(SimpleStep { name: "a", fail_forward: false }),
+            Box::new(SimpleStep { name: "b", fail_forward: false }),
+        ];
+        let s = c.compensate("tx14", &refs(&full)).unwrap();
+        assert_eq!(s, SagaStatus::Compensated, "补全定义后补偿完成");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 2, "第二次只补 a");
+        let st = c.status("tx14").unwrap();
+        assert!(st.compensated_steps.contains("a") && st.compensated_steps.contains("b"));
+        assert!(st.last_error.is_none(), "终态清空错误");
+    }
+
+    #[test]
+    fn missing_definition_state_persists_across_reopen() {
+        // 缺定义 → Compensating + last_error 持久化到磁盘，重开协调器可见（对账/回查依据）
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut st = SagaState::new("tx15");
+            st.status = SagaStatus::Compensating;
+            st.executed_steps = vec!["a".to_string()];
+            write_state(dir.path(), &st);
+            let mut c = SagaCoordinator::open(dir.path()).unwrap();
+            let steps: Vec<Box<dyn SagaStep>> =
+                vec![Box::new(SimpleStep { name: "b", fail_forward: false })];
+            c.compensate("tx15", &refs(&steps)).unwrap();
+        } // 协调器丢弃 = 网关崩溃/重启
+        let c2 = SagaCoordinator::open(dir.path()).unwrap();
+        let st = c2.status("tx15").unwrap();
+        assert_eq!(st.status, SagaStatus::Compensating, "重启后仍 Compensating（未误终态）");
+        assert!(st.last_error.as_deref().unwrap().contains("缺少补偿定义"), "{:?}", st.last_error);
+    }
+
+    #[test]
+    fn compensate_on_terminal_is_noop() {
+        // 终态（Succeeded/Compensated）调 compensate → 直接返回终态，状态不变
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx16");
+        st.status = SagaStatus::Succeeded;
+        st.executed_steps = vec!["a".to_string()];
+        write_state(dir.path(), &st);
+
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let steps: Vec<Box<dyn SagaStep>> =
+            vec![Box::new(SimpleStep { name: "a", fail_forward: false })];
+        let s = c.compensate("tx16", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Succeeded, "终态 compensate no-op");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 0, "终态不发起补偿");
+        let st = c.status("tx16").unwrap();
+        assert!(st.compensated_steps.is_empty(), "终态不登记补偿进度");
+        assert_eq!(st.last_error, None);
+    }
+
     /// 慢业务节点：接受连接后 sleep 再响应（客户端超时前不应收到响应）。
     fn slow_node() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
