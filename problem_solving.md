@@ -526,6 +526,66 @@
   （read_only 519-550 / read_write 236-246 TPS）；小库端到端验证后台合并链路
   （flush→信号→worker 读锁合并→日志"Compaction 完成"）；提交 `e9f7d39`（O 项第③步，O 项完结）。
 
+### P62. R 项：层布隆 OR 合并数学上不可行 → 层/段两级 Zone Map 范围粗筛
+- **问题**：排期原方案「层布隆 = 段布隆 OR 合并」经推演不可行——① **num_bits 冲突**：块/段布隆
+  按各自 key 数分配位数组，查询 `%num_bits` 定位，num_bits 不一致无法位级 OR（哈希位错位）；
+  强制统一 num_bits=层容量 → 每段布隆=层容量（1 亿库 125MB×78 段≈9.75GB 磁盘/内存）爆炸；
+  ② **L0 层布隆 = 历史全 key 集**（所有写入都经 L0）→ 位数组必然填满、假阳性 100% 无效；
+  ③ meta-only compact 不读数据块无 key 列表 → 无法增量维护层布隆（假阴性=丢数据）。
+- **落地**：等价目标改用 **Zone Map（min/max）两级范围粗筛**（精确、零假阴性、零格式变更）——
+  SstSnapshot 增 layer_ranges/layer_indices（快照构建 O(段数) 聚合，层范围=段范围精确并集，
+  含无范围段→层不可跳过）+ get_bytes/get_bytes_at/get_many 按层遍历整层跳过 +
+  get_from_sst 段级 O(1) 越界跳过（省二分+布隆反序列化）。
+- **结果**：demo 16 段点查 ≈ 单段（0.95×）；431 全绿；提交 `388a916`（R 项）。
+
+### P63. T 项：事务点查快照缓存落地
+- **问题**：RR 快照读 `get_at` 刻意不走 HotCache（防污染全局热缓存）→ 事务内重复点查冷读放大。
+- **落地**：Transaction 内 256 项 snap_cache（HashMap，超限清空）——快照读先查缓存（命中免 LSM
+  冷读 + 跳过重复加锁，首次读已加）；RC 不缓存（读最新语义）；错误结果不缓存；提交/回滚随
+  Transaction drop 即弃。正确性：快照 seq 事务内恒定 → 缓存结果一致。
+- **结果**：+1 测试（RR 缓存命中一致/RC 不缓存/新事务缓存空）；432 全绿；提交 `0eca7a5`。
+
+### P64. V 项：io_uring 后端（Linux 门控独立 crate）
+- **问题**：io_queue.rs 仅队列抽象（Ex-7.3），liburing 封装待接入；主库 forbid(unsafe_code)。
+- **落地**：crates/io-uring-file（unsafe 白名单，`#![cfg(target_os="linux")]` 非 Linux 空编译，
+  与 mmap-file 同模式）——io-uring 0.7 API 踩坑：0.7 无 `submit_entry`/`wait_for_cqe`/`IoUringBuilder`，
+  实际为 `IoUring::builder()`+`setup_sqpoll_cpu`+`SubmissionQueue::push`(unsafe)+`submit_and_wait`+
+  迭代 CompletionQueue；封装 read_at/write_at/fsync 同步提交-等待（缓冲生命周期论证）。主库
+  IoUringPool 三队列 + Engine 持池 + affinity SQPOLL 预留核。主库 Linux 交叉编译受 zstd-sys
+  原生依赖阻塞（Windows 无 x86_64-linux-gnu-gcc）→ Linux 代码为简单转发调用（API 已分别交叉
+  check 验证），留 Linux 部署验证。
+- **结果**：io-uring-file 4 运行测试交叉 check 通过；Windows 构建零影响；提交 `f09e9fb`。
+
+### P65. W 项：Compaction 跨列族紧迫度调度
+- **问题**：多列族同时需合并时无优先级——后台 worker 每次全压三列族，热/压力大的主数据列族
+  不保证优先收敛。
+- **落地**：column_family::compaction_urgency（L0 段数×10 + 大小超限 +8）为跨列族调度主因子
+  （热段选段已由 select_compaction_inputs 在列族内承担）；Engine::compact 每轮仅压最高紧迫度
+  档列族（并列档并行保留 SSD 并发），其余由 worker `while needs_compact` 多轮压实——压力最大
+  列族（primary 主数据）优先收敛，读路径最快受益。
+- **结果**：+1 测试（urgency 随 L0/大小压力增长）；433 全绿；提交 `f09e9fb`。
+
+### P66. X 项：Metrics（Prometheus 风格 /metrics）分层埋点
+- **问题**：无 QPS/延迟分位数/Compaction 速率/L0 文件数指标，运维不可观测。
+- **落地**：src/metrics.rs 原子计数器（读写 ops/compact）+ 延迟对数直方图（7 桶 0.1ms..+inf）+
+  Prometheus 文本渲染；引擎层埋点（put 写计数+延迟、get/get_at 读计数、compact 次数）、列族层
+  flush_counter（switch_and_flush +1）、网络层（mysql 连接活跃/累计 + COM_QUERY 语句计数）；
+  server.rs `GET /metrics`（counter/histogram/gauge，L0/SST/内存/磁盘水位实时）。
+- **结果**：+3 测试；436 全绿；提交 `0257835`。
+
+### P67. U 项：4KB 块冷扫预读合并 + 1 亿库复测无回归结论
+- **问题**：冷顺序扫描逐块 4KB read_at → IO/syscall 放大（低优先）。
+- **落地**：SstReader::read_block_group（一次 read_at 覆盖整组，逐块切片 + CRC + 解压，布局假设
+  校验失败回退逐块读——安全）+ SstRangeIter advance_block 组读 ≤4 块预解码缓存。
+- **复测发现（重要）**：1 亿库 read_only 复测 51 TPS（此前 O③ 519 TPS）——经 git 回滚二分
+  （checkout e9f7d39 恢复 O③ 代码同测 67 TPS）+ 单语句诊断（pymysql 事务范围 7-8ms、非事务范围
+  正常、点查正常）确认 **非本批六项（R/T/V/W/X/U）回归**，而是 DB 状态差异：14:43 的 519 TPS
+  时 memtable（WAL 回放 473MB）覆盖 sysbench 查询热点（5000 万附近）→ 范围查询内存命中；当前
+  memtable（110 万 insert 数据）热点落 SST 冷区 → 事务范围查询冷块读 7-8ms → 事务类 TPS 降至
+  ~60。该现象 O③ 与新 binary 一致（57 vs 69 TPS）。**结论：无代码回归；事务范围查询的冷块读
+  延迟为 M 项后既有行为**（后续可优化：范围查询块预读已由本项 U 覆盖一部分）。
+- **结果**：+1 测试（多块段全量/跨块范围 vs scan_range 对照一致）；437 全绿；提交 `85b9a62`。
+
 ---
 
 ## 环境备忘（不入库）

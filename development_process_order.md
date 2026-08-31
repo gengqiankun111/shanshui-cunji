@@ -33,13 +33,13 @@
 | O | 读路径无锁化改造（&self 化 → RwLock 读读并行 → ssts ArcSwap 后台合并，O/Q 合并） | P1 | ✅ 完成 | 评审修正（设计不一致）：O（RwLock）与 Q（ArcSwap）共享前置——读 API `&self` 化，原两条存在循环依赖 → 合并为大项：① 读 API `&self` 化（✅ `df16058`：SstReader::get/scan_range/SstRangeIter + ColumnFamily 六扫描方法 &self）→ ② RwLock 读读并行（✅ `4585bb9`：引擎读方法 &self + HotCache/txn_locks/pending_inverted/SstReader.full_index 内部 Mutex + mysql.rs `Arc<RwLock<Engine>>` 读写锁拆分；1 亿库 read_only 42→561 TPS +13.3×、read_write 29.5→230 TPS +7.8×）→ ③ ssts ArcSwap 原子发布 + 后台合并（✅ `e9f7d39`：`ssts → ArcSwap<SstSnapshot>`（读 load 无锁快照 / 写 store 原子切换）+ CF/Engine compact 全链 &self + mysql 后台 worker（写路径置 `compact_pending` 信号、worker try_read 读锁合并、10 分钟兜底）——合并期间读读并行不阻塞，写互斥由 RwLock 保证；430 测试全绿，1 亿库无读回归） |
 | P | 事件驱动自动 Compaction（写路径自触发 + 大小阈值 + 背压） | P0 | ✅ 完成 | 24861c6：写路径 `auto_compact`（Flush 后 L0 段数/大小超阈值 → 同步合并收敛，写入自然退避=背压）+ `l0_max_size_mb` 大小软阈值（≥2 段才触发，单段不无收益重写）+ mysql_server 保底 10 分钟定时器；422 测试全绿 |
 | Q | ssts ArcSwap 化（合并不阻塞读） | P1 | ⏳ 并入 O | 已并入 O 项第三阶段（&self 前置由 O 承担），不再独立排期 |
-| R | L0/层全局布隆预过滤（点查每层 1 次布隆替代逐 SST 布隆） | P1 | ⏳ 待排期 | 架构评审缺口：点查遍历全部 SST 逐个布隆（78 段 = 78 次布隆+索引定位）。方案：每层维护全局布隆（L0 段布隆 OR 合并，重建成本 O(段数) 可接受），`get_bytes` 先层布隆粗筛整层跳过；预期大 L0/大 L1 下点查 IO 与 CPU 数倍下降 |
+| R | L0/层全局布隆预过滤（点查每层 1 次粗筛替代逐 SST 布隆） | P1 | ✅ 完成 | 388a916：排期原方案「层布隆 = 段布隆 OR 合并」经分析**数学上不可行**（P62：块/段布隆按各自 key 数分配 num_bits 无法 OR；强制统一则段布隆=层容量→磁盘爆炸；L0 层布隆=历史全 key 集必然假阳性爆表；meta-only compact 无 key 无法增量维护）→ 落地等价目标**层/段两级 Zone Map（min/max）范围粗筛**：SstSnapshot 层范围/层索引（快照构建 O(段数) 聚合）+ 点查层遍历整层跳过 + 段级 O(1) 越界跳过；零格式变更、零假阴性；demo 16 段点查 ≈ 单段（0.95×）；431 测试全绿 |
 | S | MemTable 多版本（严格 MVCC，RR 快照读正确性） | P1 | ✅ 完成 | e7a413a：MemTable 版本链（put/delete 追加版本）+ SST 多版本落盘（同 key 版本不跨块）+ 版本感知读（`get_at`/`scan_block_for_key_at`/`get_from_sst_at`）——修复 RR 快照在未刷盘时读到新版本的正确性缺陷；compaction 仍按 max seq 收敛旧版本；428 测试全绿 |
-| T | 事务点查快照缓存（get_at per-txn 小缓存） | P2 | ⏳ 待排期 | 架构评审补充：RR 快照读 `get_at` 刻意不走 HotCache（防污染全局热缓存）→ 事务内重复点查冷读放大。方案：事务对象内挂小容量（如 256 项）快照缓存，同事务同 key 二次读直达；提交/回滚即弃 |
-| U | 4KB 块冷扫预读合并（4×4KB → 16KB 一次 IO） | P3 | ⏳ 待排期 | 架构评审缺陷 4（低优先）：块缓存 LRU 已摊薄重复读；冷顺序扫描场景可对相邻数据块合并一次 read_at + 预填充块缓存 |
-| V | io_uring 后端落地 + SQPOLL 预留核 | P2 | ⏳ 待排期 | 架构评审缺陷 5：io_queue.rs 仅队列抽象（Ex-7.3），unsafe liburing 封装待接入（Linux 部署 `runtime.io_uring_enabled=true`）；落地时在 affinity 三池外给 SQPOLL 预留独立核（防与用户线程抢核） |
-| W | Compaction 优先级队列 | P2 | ⏳ 待排期 | 架构评审补充：多列族/多层级同时需合并时无优先级调度。方案：合并任务入优先级队列（热段 > 冷却到期 > L0 文件数压力），后台调度器按序执行；与 O 项后台合并线程联动 |
-| X | Metrics（Prometheus 风格 /metrics） | P2 | ⏳ 待排期 | 架构评审补充：无 QPS/延迟分位数/Compaction 速率/L0 文件数指标。方案：admin 暴露 `/metrics`，计数器 + 分位直方图分层埋点（引擎/列族/网络三层） |
+| T | 事务点查快照缓存（get_at per-txn 小缓存） | P2 | ✅ 完成 | 0eca7a5：Transaction 内 256 项快照缓存（snap_get/snap_put，超限清空）——RR/SERIALIZABLE 快照读同 key 二次读直达（免 LSM 冷读放大，快照 seq 恒定结果一致）；命中跳过重复加锁；RC 不缓存保读最新语义；提交/回滚随 Transaction drop 即弃；432 测试全绿 |
+| U | 4KB 块冷扫预读合并（SstRangeIter 组读 4×4KB → 1×16KB） | P3 | ✅ 完成 | 85b9a62：SstReader::read_block_group（一次 read_at 覆盖整组 + 逐块切片/CRC/解压，布局假设校验失败回退逐块读）+ SstRangeIter advance_block 一次组读 ≤4 块预解码缓存；扫描语义与逐块一致；437 测试全绿 |
+| V | io_uring 后端落地 + SQPOLL 预留核 | P2 | ✅ 完成（Linux 部署验证） | f09e9fb：crates/io-uring-file（unsafe 白名单独立 crate，Linux 门控非 Linux 空编译）——io-uring 0.7 封装 read_at/write_at/fsync 同步提交-等待 + 可选 SQPOLL/绑核，4 个运行测试经 --target x86_64-unknown-linux-gnu 交叉 check 通过；主库 IoUringPool 三队列（WAL/SST/倒排按 IoClass 路由）+ Engine 持池（Linux + `runtime.io_uring_enabled` 初始化）+ affinity SQPOLL 预留核；热路径接入（sstable/wal）留 Linux 部署验证（主库 Linux 交叉编译受 zstd-sys 原生依赖阻塞） |
+| W | Compaction 优先级队列 | P2 | ✅ 完成 | f09e9fb：跨列族**紧迫度调度**——column_family::compaction_urgency（L0 段数×10 + 大小超限 +8），Engine::compact 每轮仅压最高紧迫度档列族（并列并行保留 SSD 并发），其余由后台 worker 后续轮次压实（while needs_compact 多轮）；压力最大列族（primary 主数据）优先收敛，读路径最快受益；433 测试全绿 |
+| X | Metrics（Prometheus 风格 /metrics） | P2 | ✅ 完成 | 0257835：新增 src/metrics.rs（原子计数器 + 延迟对数直方图 + Prometheus 文本渲染）分层埋点——引擎层（读写 ops/延迟/compact 次数）+ 列族层（flush_counter）+ 网络层（mysql 连接/语句计数）；server.rs `GET /metrics`（counter/histogram/gauge）；436 测试全绿 |
 
 ## 3. 大项详情
 
@@ -191,10 +191,10 @@
 | 评审点 | 现状 | 结论 |
 |---|---|---|
 | ① L0 自动触发 Compaction | 写路径零触发（仅 CLI 显式） | ✅ 已修（P 项 24861c6） |
-| ② L0 层全局布隆预过滤 | 点查遍历全部 SST 逐个布隆（78 段=78 次） | ⏳ 真实缺口 → R 项（P1） |
+| ② L0 层全局布隆预过滤 | 点查遍历全部 SST 逐个布隆（78 段=78 次） | ✅ 已修（R 项 388a916：层/段两级 Zone Map 范围粗筛——排期原布隆 OR 方案数学不可行，P62 论证） |
 | ③ 倒排并发读锁 | 读路径已 ArcSwap 无锁快照（Ex-6.2/6.3 `c8183cf`） | ✅ 已实现（文档澄清；引擎级全局 Mutex 归 O 项） |
 | ④ 环形 WAL 回绕覆盖 vs 崩溃恢复 | 已实现：Flush 后 `set_flushed_seq`，回绕仅覆盖已刷盘记录，未刷盘 → `WalFull` → 强制 Flush（M6-1 + P35） | ✅ 已实现（文档澄清） |
-| ⑤ 4KB 块 IO 放大（预读合并） | 块缓存 LRU 已摊薄重复读；zstd 压缩 + 分区布隆 | 评估：冷扫预读合并可作 P3（低优先，块缓存 + 顺序块已覆盖主流） |
+| ⑤ 4KB 块 IO 放大（预读合并） | 块缓存 LRU 已摊薄重复读；zstd 压缩 + 分区布隆 | ✅ 已修（U 项 85b9a62：SstRangeIter 组读预读 4×4KB → 1×16KB） |
 | ⑥ io_uring SQPOLL 与绑核冲突 | io_uring 后端未落地（io_queue.rs 仅队列抽象，`io_uring_enabled` 默认关，Linux 专属） | 备注：后端落地时需给 SQPOLL 预留独立核（affinity 分区扩展） |
 
 ### 缺陷 → 优化方案路线（与 feature.md「架构评审与补充」对齐）

@@ -225,7 +225,13 @@
 | **RwLock 读读并行（O 项第②步）** | ✅ `4585bb9`：引擎读方法（get/get_at/txn_get/scan_range/scan_range_txn/batch_get/inverted_posting）改 `&self` + HotCache/txn_locks/pending_inverted/SstReader.full_index 内部 Mutex（SstReader: Sync）+ mysql.rs `Arc<RwLock<Engine>>` 读写锁拆分（读语句读锁并行、写语句写锁互斥；sqlish 读路径同步 &Engine） | I 模块读写分离行更新 |
 | **ssts ArcSwap 原子发布 + 后台合并（O 项第③步）** | ✅ `e9f7d39`：`ssts: Vec<SstReader>` → `ArcSwap<SstSnapshot>`（读路径 `load()` 无锁快照、写路径 flush/compact `store()` 原子切换；next_sst_id/merge_round AtomicU64、cooldown/io_limiter 内部 Mutex）；CF compact 全链 + Engine::compact `&self` 化（后台读锁下执行）；写路径 `auto_compact` 双分支——挂载 worker 只置 `compact_pending` 信号，无 worker 保持同步背压；mysql `spawn_compaction_worker`（100ms 信号轮询 + 10 分钟兜底，`try_read` 读锁合并）——**合并期间读读并行不阻塞**，写互斥由 RwLock 保证（消除 deletion_bitmap/manifest/索引漂移竞争面）；430 测试全绿，1 亿库无读回归（read_only 519-550 / read_write 236-246 TPS） | I 模块读写分离行更新 |
 | 倒排并发读 | ✅ ArcSwap 无锁快照（Ex-6.2/6.3）；引擎级仍经全局 Mutex | I 模块 🔄→✅ + 读写分离行澄清 |
-| problem_solving 范围 | P1~P61 | H 模块更新 |
+| **层/段两级 Zone Map 范围粗筛（R 项）** | ✅ `388a916`：层布隆 OR 合并数学不可行（P62：num_bits 冲突/L0=全集/meta-only 无 key）→ 层范围/层索引 + 点查层遍历整层跳过 + 段级越界跳过（精确零假阴性） | I 模块点查路径 |
+| **事务点查快照缓存（T 项）** | ✅ `0eca7a5`：Transaction 256 项 snap_cache（RR/SERIALIZABLE 同 key 二次读直达，提交/回滚即弃；RC 不缓存） | E/F 事务读 |
+| **io_uring 后端（V 项）** | ✅ `f09e9fb`（Linux 部署验证）：crates/io-uring-file（unsafe 白名单，io-uring 0.7 同步提交-等待 + SQPOLL/绑核）+ 主库 IoUringPool 三队列 + affinity SQPOLL 预留核 | io_queue 模块落地 |
+| **Compaction 紧迫度调度（W 项）** | ✅ `f09e9fb`：compaction_urgency（L0 段数×10+大小超限+8）跨列族调度——每轮压最高紧迫度档（并列并行），worker 多轮收敛 | D 模块调度 |
+| **Metrics /metrics（X 项）** | ✅ `0257835`：计数器 + 延迟对数直方图分层埋点（引擎/列族/网络）+ server.rs `GET /metrics`（Prometheus 文本） | 运维可观测 |
+| **4KB 块冷扫预读合并（U 项）** | ✅ `85b9a62`：SstRangeIter 组读 ≤4 块（合并 read_at + 预解码缓存，布局校验失败回退逐块） | I 模块扫描路径 |
+| problem_solving 范围 | P1~P67 | H 模块更新 |
 
 ### 2. 架构缺陷（已知，按优先级与排期映射）
 
