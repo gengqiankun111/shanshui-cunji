@@ -683,6 +683,11 @@ pub struct SstReader {
     partition_blooms: Option<Vec<Vec<u8>>>,
     /// v3/v4 整文件布隆（旧格式兼容）。
     bloom: Option<BloomFilter>,
+    /// R 项：段 key 范围 [min, max]（open 时从解码索引首尾取，O(1) 内存）——
+    /// 点查段级 Zone Map 粗筛（key 越界段 O(1) 跳过，不做二分 + 布隆反序列化）。
+    /// 空段（无块）为全空 Vec，`key_range()` 返回 None = 无约束。
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
     compression: Compression,
     /// 文件格式版本（v3=纯行式，v4=PAX，v5=分区布隆）。
     format: u16,
@@ -843,6 +848,9 @@ impl SstReader {
             full_index: Mutex::new(None),
             partition_blooms,
             bloom,
+            // R 项：段 [min, max] 从解码索引首尾取（索引按 key 升序；空段无约束）
+            min_key: index.first().map(|e| e.first_key.clone()).unwrap_or_default(),
+            max_key: index.last().map(|e| e.max_key.clone()).unwrap_or_default(),
             compression,
             format: version,
             heat: PerCpuCounter::new(),
@@ -851,6 +859,15 @@ impl SstReader {
 
     pub fn footer(&self) -> &SstFooter {
         &self.footer
+    }
+
+    /// R 项：段 key 范围 [min, max]（闭区间）。空段（无块/无 key）或单侧缺失返回 None
+    /// = 无约束（调用方不得跳过）。用于点查段级 Zone Map 粗筛。
+    pub fn key_range(&self) -> Option<(&[u8], &[u8])> {
+        if self.min_key.is_empty() || self.max_key.is_empty() {
+            return None;
+        }
+        Some((&self.min_key, &self.max_key))
     }
 
     /// Ex-5.9：读命中递增热度（冷热感知 Compaction 数据源；Ex-7.1 按核无竞争）。

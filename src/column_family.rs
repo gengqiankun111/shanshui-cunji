@@ -61,6 +61,13 @@ pub struct SstSnapshot {
     pub ssts: Vec<Arc<SstReader>>,
     /// 与 `ssts` 平行的层号（design 4.5 二期 Leveled Compaction，M6-2）。
     pub levels: Vec<u32>,
+    /// R 项：每层 key 范围 [min, max]（按层号索引 [L0, L1, L2]；层空或含无范围段 → None
+    /// = 该层不可跳过）。点查层级 Zone Map 粗筛：key 越出层范围 → 整层 O(1) 跳过
+    /// （省逐段二分 + 分区布隆反序列化；精确判断，无假阴性）。
+    pub layer_ranges: Vec<Option<(Vec<u8>, Vec<u8>)>>,
+    /// R 项：每层段下标（按层号索引；组内保持快照顺序 = 新→旧，层序 L0→L1→L2 与
+    /// "新→旧"一致——flush 只进 L0、compact 下沉，层间版本语义安全）。
+    pub layer_indices: Vec<Vec<usize>>,
 }
 
 /// 列族：主数据 / 组合索引 / Delta 共用骨架。
@@ -269,10 +276,17 @@ impl ColumnFamily {
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
             memtable: MemTableBuffer::new(),
-            ssts: ArcSwap::new(Arc::new(SstSnapshot {
-                ssts: ssts.into_iter().map(Arc::new).collect(),
-                levels: sst_levels_loaded,
-            })),
+            ssts: {
+                let loaded: Vec<Arc<SstReader>> = ssts.into_iter().map(Arc::new).collect();
+                let (layer_ranges, layer_indices) =
+                    Self::build_layer_meta(&loaded, &sst_levels_loaded);
+                ArcSwap::new(Arc::new(SstSnapshot {
+                    ssts: loaded,
+                    levels: sst_levels_loaded,
+                    layer_ranges,
+                    layer_indices,
+                }))
+            },
             block_cache,
             seq: AtomicU64::new(1),
             next_sst_id: AtomicU64::new(next_sst_id),
@@ -450,16 +464,28 @@ impl ColumnFamily {
     }
 
     /// 查询原始字节键。返回 (value, seq)，已过滤 Tombstone。
+    /// R 项：按层遍历（L0→L1→L2，层序与"新→旧"一致）——每层先层级 Zone Map 粗筛
+    /// （key 越出层范围 → 整层 O(1) 跳过，省逐段二分 + 布隆反序列化），层内逐段。
     pub fn get_bytes(&self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         if let Some(e) = self.memtable.get(key) {
             return Ok(e.value.map(|v| (v, e.seq)));
         }
         let cache = Arc::clone(&self.block_cache);
-        for sst in self.ssts.load().ssts.iter() {
-            match get_from_sst(sst, &cache, key)? {
-                // 命中：最新版本。value=None 为 Tombstone → 视为不存在
-                Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
-                None => continue, // 未命中该 SST，继续查更旧的
+        let snap = self.ssts.load();
+        for (lv, idxs) in snap.layer_indices.iter().enumerate() {
+            // 层级 Zone Map 粗筛（精确：层范围 = 层内各段范围并集）
+            if let Some((lmin, lmax)) = &snap.layer_ranges[lv] {
+                if key < lmin.as_slice() || key > lmax.as_slice() {
+                    continue; // 整层跳过
+                }
+            }
+            for &i in idxs {
+                let sst = &snap.ssts[i];
+                match get_from_sst(sst, &cache, key)? {
+                    // 命中：最新版本。value=None 为 Tombstone → 视为不存在
+                    Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
+                    None => continue, // 未命中该 SST，继续查更旧的
+                }
             }
         }
         Ok(None)
@@ -489,23 +515,38 @@ impl ColumnFamily {
         if remain.is_empty() {
             return Ok(out);
         }
-        // ② 逐 SST（新→旧），未命中 key 继续下沉旧层
+        // ② 逐层（L0→L1→L2，层序与"新→旧"一致），层内逐 SST（新→旧），未命中 key 继续下沉
         let cache = Arc::clone(&self.block_cache);
-        for sst in self.ssts.load().ssts.iter() {
+        let snap = self.ssts.load();
+        for (lv, idxs) in snap.layer_indices.iter().enumerate() {
             if remain.is_empty() {
                 break;
             }
-            let hits = get_many_from_sst(sst, &cache, &keys, &remain)?;
-            let mut next = Vec::with_capacity(remain.len());
-            for (j, &idx) in remain.iter().enumerate() {
-                match &hits[j] {
-                    Some((Some(v), seq)) => out[idx] = Some((v.clone(), *seq)),
-                    // Tombstone：该 SST 为最新版本且为删除 → 视为不存在
-                    Some((None, _)) => {}
-                    None => next.push(idx),
+            // R 项：层级 Zone Map 粗筛——所有剩余 key 均越出层范围 → 整层跳过
+            if let Some((lmin, lmax)) = &snap.layer_ranges[lv] {
+                if remain
+                    .iter()
+                    .all(|&i| keys[i].as_slice() < lmin.as_slice() || keys[i].as_slice() > lmax.as_slice())
+                {
+                    continue;
                 }
             }
-            remain = next;
+            for &i in idxs {
+                if remain.is_empty() {
+                    break;
+                }
+                let hits = get_many_from_sst(&snap.ssts[i], &cache, &keys, &remain)?;
+                let mut next = Vec::with_capacity(remain.len());
+                for (j, &idx) in remain.iter().enumerate() {
+                    match &hits[j] {
+                        Some((Some(v), seq)) => out[idx] = Some((v.clone(), *seq)),
+                        // Tombstone：该 SST 为最新版本且为删除 → 视为不存在
+                        Some((None, _)) => {}
+                        None => next.push(idx),
+                    }
+                }
+                remain = next;
+            }
         }
         Ok(out)
     }
@@ -527,10 +568,21 @@ impl ColumnFamily {
             }
         }
         let cache = Arc::clone(&self.block_cache);
-        for sst in self.ssts.load().ssts.iter() {
-            if let Some((value, seq)) = get_from_sst_at(sst, &cache, key, snapshot_seq)? {
-                if best.as_ref().map_or(true, |(s, _)| seq > *s) {
-                    best = Some((seq, value));
+        // R 项：按层遍历（快照语义取全部层中 seq ≤ snapshot 的最大版本）；层级粗筛跳过
+        // key 越界的层（层范围 = 精确并集，不产生假阴性）。
+        let snap = self.ssts.load();
+        for (lv, idxs) in snap.layer_indices.iter().enumerate() {
+            if let Some((lmin, lmax)) = &snap.layer_ranges[lv] {
+                if key < lmin.as_slice() || key > lmax.as_slice() {
+                    continue;
+                }
+            }
+            for &i in idxs {
+                if let Some((value, seq)) = get_from_sst_at(&snap.ssts[i], &cache, key, snapshot_seq)?
+                {
+                    if best.as_ref().map_or(true, |(s, _)| seq > *s) {
+                        best = Some((seq, value));
+                    }
                 }
             }
         }
@@ -761,6 +813,40 @@ impl ColumnFamily {
         Ok(())
     }
 
+    /// R 项：快照构建时计算层聚合元数据（O(段数)）——每层 key 范围 + 每层段下标。
+    /// 层范围 = 层内各段范围并集；层内存在"无范围段"（无约束）→ 该层 None（不可跳过，
+    /// 防假阴性——布隆/范围粗筛只允许假阳性，不允许假阴性）。
+    fn build_layer_meta(
+        ssts: &[Arc<SstReader>],
+        levels: &[u32],
+    ) -> (
+        Vec<Option<(Vec<u8>, Vec<u8>)>>,
+        Vec<Vec<usize>>,
+    ) {
+        let mut ranges: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None, None, None];
+        let mut indices: Vec<Vec<usize>> = vec![Vec::new(), Vec::new(), Vec::new()];
+        for (i, (s, lv)) in ssts.iter().zip(levels).enumerate() {
+            let lv = (*lv as usize).min(2);
+            indices[lv].push(i);
+            match s.key_range() {
+                Some((min, max)) => match &mut ranges[lv] {
+                    Some((lo, hi)) => {
+                        if min < lo.as_slice() {
+                            *lo = min.to_vec();
+                        }
+                        if max > hi.as_slice() {
+                            *hi = max.to_vec();
+                        }
+                    }
+                    None => ranges[lv] = Some((min.to_vec(), max.to_vec())),
+                },
+                // 段无范围（空段/无索引）→ 层不可粗筛跳过（保守，防假阴性）
+                None => ranges[lv] = None,
+            }
+        }
+        (ranges, indices)
+    }
+
     /// O 项第③步：原子插入新 SST（快照 `store()`）——新文件插最前（读路径优先命中），层号 L0。
     fn snapshot_insert(&self, reader: SstReader) {
         let cur = self.ssts.load();
@@ -768,7 +854,13 @@ impl ColumnFamily {
         ssts.insert(0, Arc::new(reader));
         let mut levels = cur.levels.clone();
         levels.insert(0, 0);
-        self.ssts.store(Arc::new(SstSnapshot { ssts, levels }));
+        let (layer_ranges, layer_indices) = Self::build_layer_meta(&ssts, &levels);
+        self.ssts.store(Arc::new(SstSnapshot {
+            ssts,
+            levels,
+            layer_ranges,
+            layer_indices,
+        }));
     }
 
     /// 原逻辑：整个 Immutable 落盘为单个 SST。
@@ -1136,8 +1228,13 @@ impl ColumnFamily {
             Arc::new(SstReader::open_with_granularity(path, self.index_granularity)?),
         );
         kept_levels.insert(0, out_level);
-        self.ssts
-            .store(Arc::new(SstSnapshot { ssts: kept_ssts, levels: kept_levels }));
+        let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
+        self.ssts.store(Arc::new(SstSnapshot {
+            ssts: kept_ssts,
+            levels: kept_levels,
+            layer_ranges,
+            layer_indices,
+        }));
         self.persist_manifest()?;
 
         // ⑤ 删除旧段（换快照后再删；并发读仍持 Arc → 句柄有效，引用归零后实际释放）
@@ -1424,6 +1521,13 @@ fn get_from_sst(
     cache: &BlockCache,
     key: &[u8],
 ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    // R 项：段级 Zone Map 粗筛——key 越出段范围 → O(1) 跳过（不做二分 + 布隆反序列化；
+    // 精确判断，无假阴性）。
+    if let Some((min, max)) = sst.key_range() {
+        if key < min || key > max {
+            return Ok(None);
+        }
+    }
     // v3/v4：整文件布隆粗筛
     if let Some(b) = sst.legacy_bloom() {
         if !b.maybe_contains(&key.to_vec()) {
@@ -1468,6 +1572,12 @@ fn get_from_sst_at(
     key: &[u8],
     snapshot_seq: u64,
 ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    // R 项：段级 Zone Map 粗筛（同 get_from_sst）
+    if let Some((min, max)) = sst.key_range() {
+        if key < min || key > max {
+            return Ok(None);
+        }
+    }
     if let Some(b) = sst.legacy_bloom() {
         if !b.maybe_contains(&key.to_vec()) {
             return Ok(None);
@@ -1515,10 +1625,17 @@ fn get_many_from_sst(
         return Ok(out);
     }
     let legacy = sst.legacy_bloom();
+    // R 项：段级 Zone Map 粗筛（取一次，逐 key 判断；越界 key O(1) 跳过）
+    let seg_range = sst.key_range();
     // 定位：原始下标 + 块号 + 块条目（借用精确索引二分，只克隆单条条目）
     let mut located: Vec<(usize, usize, IndexEntry)> = Vec::new();
     for &i in idxs {
         let k = &keys[i];
+        if let Some((min, max)) = seg_range {
+            if k.as_slice() < min || k.as_slice() > max {
+                continue;
+            }
+        }
         if let Some(b) = legacy {
             if !b.maybe_contains(k) {
                 continue;
@@ -2358,6 +2475,77 @@ mod tests {
         assert!(got[2].is_some() && got[3].is_some(), "未删除 key 应命中");
         // 空输入
         assert!(cf.get_many(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn layered_range_skip_preserves_reads_across_levels() {
+        // R 项：层/段两级 Zone Map 粗筛——多段多层（L0/L1 混合）下点查/get_at/get_many
+        // 跨层命中正确、越界 key 不假阴性（层范围 = 段范围精确并集）。
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 3 个 L0 段：段 i 覆盖 [i*100, i*100+100)
+        for seg in 0..3u64 {
+            for i in seg * 100..seg * 100 + 100 {
+                cf.put(i, format!("v{seg}-{i}").into_bytes()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+        }
+        // 3 段 compact → L1（覆盖 [0,299]）；再 flush 第 4 段 → L0（覆盖 [300,399]）混合
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.out_level, 1);
+        for i in 300..400u64 {
+            cf.put(i, format!("v3-{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        // 快照层元数据：L0 1 段（[300,399]）、L1 1 段（[0,299]）
+        let snap = cf.ssts.load();
+        assert_eq!(snap.layer_indices[0].len(), 1, "L0 为第 4 段");
+        assert_eq!(snap.layer_indices[1].len(), 1, "L1 为合并输出");
+        assert_eq!(
+            snap.layer_ranges[1],
+            Some((
+                crate::keys::encode_docid(0).to_vec(),
+                crate::keys::encode_docid(299).to_vec()
+            )),
+            "L1 范围应覆盖 [0,299]"
+        );
+        assert_eq!(
+            snap.layer_ranges[0],
+            Some((
+                crate::keys::encode_docid(300).to_vec(),
+                crate::keys::encode_docid(399).to_vec()
+            )),
+            "L0 范围应覆盖 [300,399]"
+        );
+        drop(snap);
+        // 跨层/边界点查（get / get_at / get_many 一致）
+        for i in [0u64, 50, 99, 100, 199, 299, 300, 350, 399] {
+            let expect = format!("v{}-{i}", i / 100).into_bytes();
+            assert_eq!(cf.get(i).unwrap().unwrap().0, expect, "get key {i}");
+            let at = cf
+                .get_bytes_at(&crate::keys::encode_docid(i), u64::MAX)
+                .unwrap()
+                .unwrap()
+                .0;
+            assert_eq!(at, expect, "get_at key {i}");
+        }
+        let got = cf.get_many(&[0, 100, 299, 300, 399]).unwrap();
+        assert_eq!(got[0].as_ref().unwrap().0, b"v0-0".to_vec());
+        assert_eq!(got[1].as_ref().unwrap().0, b"v1-100".to_vec());
+        assert_eq!(got[2].as_ref().unwrap().0, b"v2-299".to_vec());
+        assert_eq!(got[3].as_ref().unwrap().0, b"v3-300".to_vec());
+        assert_eq!(got[4].as_ref().unwrap().0, b"v3-399".to_vec());
+        // 越界 key（层范围外）→ None，不假阴性
+        for miss in [400u64, 999, 10000] {
+            assert!(cf.get(miss).unwrap().is_none(), "get miss {miss}");
+            assert!(
+                cf.get_bytes_at(&crate::keys::encode_docid(miss), u64::MAX)
+                    .unwrap()
+                    .is_none(),
+                "get_at miss {miss}"
+            );
+        }
     }
 
     #[test]
