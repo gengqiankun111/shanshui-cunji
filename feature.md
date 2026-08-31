@@ -223,17 +223,19 @@
 | WAL / SST 校验和（评审补充 P3） | ✅ 均已实现：WAL 每记录 `Length ++ CRC32 ++ Payload`（wal.rs，读到 CRC 损坏/截断即停）；SST 每数据块 trailer CRC32 校验（read_block 校验） | A 模块补行 |
 | **读路径 &self 化（O 项第①步）** | ✅ `df16058`：SstReader::get/scan_range/SstRangeIter + ColumnFamily 六扫描方法（scan_range/scan_range_at/scan_raw_range/scan_raw_range_with_seq/scan_stream/scan_stream_at）改 `&self`——delta Merge-on-Read 与范围扫描读路径共享，RwLock 读读并行 + ssts ArcSwap 前置 | I 模块读写分离行更新 |
 | **RwLock 读读并行（O 项第②步）** | ✅ `4585bb9`：引擎读方法（get/get_at/txn_get/scan_range/scan_range_txn/batch_get/inverted_posting）改 `&self` + HotCache/txn_locks/pending_inverted/SstReader.full_index 内部 Mutex（SstReader: Sync）+ mysql.rs `Arc<RwLock<Engine>>` 读写锁拆分（读语句读锁并行、写语句写锁互斥；sqlish 读路径同步 &Engine） | I 模块读写分离行更新 |
+| **ssts ArcSwap 原子发布 + 后台合并（O 项第③步）** | ✅ `e9f7d39`：`ssts: Vec<SstReader>` → `ArcSwap<SstSnapshot>`（读路径 `load()` 无锁快照、写路径 flush/compact `store()` 原子切换；next_sst_id/merge_round AtomicU64、cooldown/io_limiter 内部 Mutex）；CF compact 全链 + Engine::compact `&self` 化（后台读锁下执行）；写路径 `auto_compact` 双分支——挂载 worker 只置 `compact_pending` 信号，无 worker 保持同步背压；mysql `spawn_compaction_worker`（100ms 信号轮询 + 10 分钟兜底，`try_read` 读锁合并）——**合并期间读读并行不阻塞**，写互斥由 RwLock 保证（消除 deletion_bitmap/manifest/索引漂移竞争面）；430 测试全绿，1 亿库无读回归（read_only 519-550 / read_write 236-246 TPS） | I 模块读写分离行更新 |
 | 倒排并发读 | ✅ ArcSwap 无锁快照（Ex-6.2/6.3）；引擎级仍经全局 Mutex | I 模块 🔄→✅ + 读写分离行澄清 |
-| problem_solving 范围 | P1~P58 | H 模块更新 |
+| problem_solving 范围 | P1~P61 | H 模块更新 |
 
 ### 2. 架构缺陷（已知，按优先级与排期映射）
 
-1. **引擎全局单 Mutex 串行 + Compaction 同步阻塞**（→ O 项 P1，读路径无锁化合并 O/Q）：
+1. **引擎全局单 Mutex 串行 + Compaction 同步阻塞**（→ O 项 P1，已解决 ✅ `e9f7d39`）：
    mysql.rs `Arc<Mutex<Engine>>` 每语句持锁执行（~1ms）→ 事务类 14 语句/事务 → 吞吐天花板 ≈ 1000
    stmt/s（1 亿库 read_only 71 TPS 即此界）；P 项写路径同步合并期间全局阻塞。
    **评审修正（设计不一致）**：O（RwLock）与 Q（ArcSwap）共享同一前置——读 API `&self` 化
    （scan_raw_range/delta），存在循环依赖 → **合并为一个大项「读路径无锁化改造」**：
-   ① 读 API `&self` 化（O/Q/R 共同前置）→ ② RwLock 读读并行 → ③ ssts ArcSwap + 后台合并。
+   ① 读 API `&self` 化 → ② RwLock 读读并行（read_only 42→561 TPS +13.3×）→
+   ③ ssts ArcSwap 原子发布 + 后台合并（`e9f7d39`：合并读锁下执行，读读并行不阻塞）。
 2. **L0/L1 层无全局布隆预过滤**（→ R 项 P1）：点查遍历全部 SST 逐个布隆 + 索引定位
    （78 段 = 78 次布隆检查 + 78 次二分）。方案：每层维护 OR 合并布隆，整层粗筛一次跳过。
 3. **RR 事务点查冷读**（→ T 项 P2）：`get_at` 不走 HotCache（防污染）→ 事务内重复点查冷读放大。

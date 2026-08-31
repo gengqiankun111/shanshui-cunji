@@ -509,6 +509,23 @@
   事务平均延迟 -87%（突破 ~1000 stmt/s 串行天花板）；+1 并发测试（4 读线程 + 1 写线程共享
   Arc<RwLock<Engine>>）；429 全绿；提交 `4585bb9`（O 项第②步）。
 
+### P61. O 项第③步落地三坑：ArcSwap 双层 Arc 类型 / 索引漂移依赖写互斥 / 后台合并持读锁
+- **问题**：ssts ArcSwap 化（O 项第③步）编译期三坑——① 字段 `ArcSwap<Arc<SstSnapshot>>` 与
+  `store(Arc::new(SstSnapshot{..}))` 类型不匹配（ArcSwap 内部已持 Arc，应 `ArcSwap<SstSnapshot>`，
+  参考 inverted.rs 的 `segments: ArcSwap<Vec<String>>`）；② `scan_stream_at` 的
+  `self.ssts.load().ssts.iter()` 临时值借用（E0716，需先 `let snap = self.ssts.load();`）；
+  ③ `SstReader::iterate/block_raw` 为 `&mut self`（内部 file seek），compact 经 `Arc<SstReader>`
+  调用不能借可变——`block_raw` 改用无状态 `read_at` 后 `&self` 化。
+- **设计决策**：后台合并**必须持引擎读锁**（`try_read`）执行而非完全无锁——DeletionBitmap
+  （Vec<u64>+HashSet，无内部同步）与 manifest 文件在 compact（读）与写路径（写）并发时存在
+  数据竞争；读锁下写被互斥、读读并行 → 竞争面消除，且快照 store 无并发丢失、compact 链内
+  `self.ssts.load()` 索引稳定（flush 需写锁，不会在 compact 中途插入新段）。写路径 `auto_compact`
+  双分支：挂载 worker（`compact_worker=true`）只置 `compact_pending` 信号；无 worker（demo/rpc/
+  测试）保持同步收敛=背压（既有行为不变，`auto_compact_keeps_l0_bounded_on_flush` 原样通过）。
+- **结果**：+1 测试（后台触发置位 + `&Engine` 读锁合并收敛）；430 全绿；1 亿库复测无读回归
+  （read_only 519-550 / read_write 236-246 TPS）；小库端到端验证后台合并链路
+  （flush→信号→worker 读锁合并→日志"Compaction 完成"）；提交 `e9f7d39`（O 项第③步，O 项完结）。
+
 ---
 
 ## 环境备忘（不入库）
