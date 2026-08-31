@@ -1596,6 +1596,32 @@ mod tests {
     }
 
     #[test]
+    fn txn_rr_snapshot_sees_old_version_in_memtable_without_flush() {
+        // S 项（严格 MVCC）：旧实现快照读需旧版本已落 SST（MemTable 仅保最新）——
+        // 事务活跃期 + 并发写同 key 且未 flush 时，快照读会读到新版本（正确性缺陷）。
+        // 修复后 MemTable 保留版本链，未刷盘也能读到快照点版本。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // 不 flush：v0 留在 MemTable
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 快照后并发写同 key（仍不 flush）→ MemTable 出现新版本
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let got = e.txn_get(&mut txn, 1).unwrap();
+        assert_eq!(
+            got.unwrap(),
+            b"v0",
+            "RR 快照应读到旧版本（无需 flush 落 SST）"
+        );
+        // 同事务写覆盖（read_own 优先）
+        txn.put(1, b"own".to_vec(), vec![]);
+        assert_eq!(e.txn_get(&mut txn, 1).unwrap().unwrap(), b"own");
+        e.txn_rollback(txn);
+        // 提交后最新可见
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+    }
+
+    #[test]
     fn scan_range_txn_snapshot_filter_and_own_write() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &cfg()).unwrap();

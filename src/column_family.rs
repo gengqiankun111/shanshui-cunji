@@ -506,15 +506,16 @@ impl ColumnFamily {
         snapshot_seq: u64,
     ) -> Result<Option<(Vec<u8>, u64)>> {
         let mut best: Option<(u64, Option<Vec<u8>>)> = None; // (seq, value)
-        if let Some(e) = self.memtable.get(key) {
-            if e.seq <= snapshot_seq && best.as_ref().map_or(true, |(s, _)| e.seq > *s) {
+        // S 项：MemTable 多版本——取 seq ≤ snapshot 的最新版本（未刷盘也可正确快照读）
+        if let Some(e) = self.memtable.get_at(key, snapshot_seq) {
+            if best.as_ref().map_or(true, |(s, _)| e.seq > *s) {
                 best = Some((e.seq, e.value));
             }
         }
         let cache = Arc::clone(&self.block_cache);
         for sst in &self.ssts {
-            if let Some((value, seq)) = get_from_sst(sst, &cache, key)? {
-                if seq <= snapshot_seq && best.as_ref().map_or(true, |(s, _)| seq > *s) {
+            if let Some((value, seq)) = get_from_sst_at(sst, &cache, key, snapshot_seq)? {
+                if best.as_ref().map_or(true, |(s, _)| seq > *s) {
                     best = Some((seq, value));
                 }
             }
@@ -1423,6 +1424,46 @@ fn get_from_sst(
     sst.scan_block_for_key(&block, key)
 }
 
+/// 单 SST 快照等值查询（S 项）：同 `get_from_sst`，但返回 **seq ≤ snapshot_seq** 的
+/// 最大版本（块内多版本过滤；Tombstone value=None 保留）。整体 None = 该 SST 无 ≤ 快照版本。
+fn get_from_sst_at(
+    sst: &SstReader,
+    cache: &BlockCache,
+    key: &[u8],
+    snapshot_seq: u64,
+) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    if let Some(b) = sst.legacy_bloom() {
+        if !b.maybe_contains(&key.to_vec()) {
+            return Ok(None);
+        }
+    }
+    let Some((block_idx, entry)) = sst.locate_indexed_block(key)? else {
+        return Ok(None);
+    };
+    if let Some(pb) = sst.partition_blooms() {
+        if let Some(bytes) = pb.get(block_idx) {
+            if let Some(b) = BloomFilter::from_bytes(bytes) {
+                if !b.maybe_contains(&key.to_vec()) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    sst.touch();
+    let ck = BlockCacheKey {
+        file: sst.path().to_path_buf(),
+        offset: entry.offset,
+    };
+    let block = if let Some(b) = cache.get(&ck) {
+        b
+    } else {
+        let b = sst.read_block(&entry)?;
+        cache.put(ck, b.clone());
+        b
+    };
+    sst.scan_block_for_key_at(&block, key, snapshot_seq)
+}
+
 /// 单 SST 批量等值查询（N 项）：整文件布隆粗筛 → 逐 key 二分定位数据块 → 按块分组 →
 /// 分区布隆校验 → 每块只读一次（块缓存/磁盘）→ 块内一次扫描命中全部 key。
 /// 返回与 `idxs`（输入原始下标）对齐：`Some((value, seq))`（value=None = Tombstone）/
@@ -2318,6 +2359,47 @@ mod tests {
         cf2.switch_and_flush().unwrap();
         assert_eq!(cf2.l0_count(), 1);
         assert!(!cf2.needs_compact(), "单段超大小阈值不应触发合并");
+    }
+
+    // ---------- S 项：MemTable 多版本（严格 MVCC 快照读） ----------
+
+    #[test]
+    fn snapshot_read_sees_old_version_while_both_in_memtable() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 同一 key 连续写入两次（均未刷盘，旧实现仅保留最新 → 快照读漏掉旧版本）
+        let s1 = cf.put(1, b"v1".to_vec()).unwrap();
+        let s2 = cf.put(1, b"v2".to_vec()).unwrap();
+        assert!(s2 > s1);
+        // 快照落在 s1..s2 → 应读到 v1（S 项修复点）
+        assert_eq!(cf.get_bytes_at(&encode_docid(1), s1).unwrap().unwrap().0, b"v1");
+        assert_eq!(cf.get_bytes_at(&encode_docid(1), s2).unwrap().unwrap().0, b"v2");
+        assert!(cf.get_bytes_at(&encode_docid(1), s1 - 1).unwrap().is_none());
+        // 非快照读最新
+        assert_eq!(cf.get(1).unwrap().unwrap().0, b"v2");
+        // 刷盘后快照仍可读旧版本（SST 多版本落盘）
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.get_bytes_at(&encode_docid(1), s1).unwrap().unwrap().0, b"v1");
+        assert_eq!(cf.get_bytes_at(&encode_docid(1), s2).unwrap().unwrap().0, b"v2");
+        assert_eq!(cf.get(1).unwrap().unwrap().0, b"v2");
+    }
+
+    #[test]
+    fn snapshot_read_sees_deleted_as_tombstone_after_memtable_delete() {
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        let s1 = cf.put(1, b"v1".to_vec()).unwrap();
+        let sd = cf.delete(1).unwrap();
+        // 快照在删除前 → 可见 v1；删除点后 → None
+        assert_eq!(cf.get_bytes_at(&encode_docid(1), s1).unwrap().unwrap().0, b"v1");
+        assert!(cf.get_bytes_at(&encode_docid(1), sd).unwrap().is_none());
+        assert!(cf.get(1).unwrap().is_none(), "非快照读：当前已删除");
+        // 刷盘后语义保持
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.get_bytes_at(&encode_docid(1), s1).unwrap().unwrap().0, b"v1");
+        assert!(cf.get_bytes_at(&encode_docid(1), sd).unwrap().is_none());
     }
 
     #[test]

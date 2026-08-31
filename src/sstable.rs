@@ -313,9 +313,10 @@ impl SstWriter {
 
     fn add_inner(&mut self, key: &[u8], value: Option<&[u8]>, flag: u8, seq: u64) -> Result<()> {
         if let Some(last) = &self.last_key {
-            if key <= last.as_slice() {
+            // S 项：允许相等 key（同 key 多版本，seq 升序）；仅拒绝严格逆序
+            if key < last.as_slice() {
                 return Err(Error::Corrupted(format!(
-                    "SST 写入 key 必须严格升序: {:?} <= {:?}",
+                    "SST 写入 key 逆序: {:?} < {:?}",
                     key, last
                 )));
             }
@@ -328,11 +329,19 @@ impl SstWriter {
         });
         self.key_count += 1;
         self.last_key = Some(key.to_vec());
+        // S 项：同 key 多版本**不跨块**——仅当换 key 且块达阈值时刷块。
+        // 否则版本被拆到相邻两块，locate_indexed_block 二分（取首个 first_key<=key 的
+        // 最后一块）会漏读前一块中的旧版本。
+        // 注意：必须先更新 buf_last_key 再刷块（flush_block 以它作块 max_key）。
+        let new_key = self
+            .buf_last_key
+            .as_ref()
+            .map_or(true, |l| l != key);
         self.buf_last_key = Some(key.to_vec());
-
-        if self.estimate_block_bytes() >= self.block_size {
+        if new_key && self.estimate_block_bytes() >= self.block_size {
             self.flush_block()?;
         }
+
         Ok(())
     }
 
@@ -985,12 +994,31 @@ impl SstReader {
         block: &[u8],
         key: &[u8],
     ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+        // S 项：同 key 多版本取最大 seq（最新版本）；Tombstone value=None 保留
+        let mut best: Option<(Option<Vec<u8>>, u64)> = None;
         for (k, v, seq) in decode_data_block(block, self.format)? {
-            if k == key {
-                return Ok(Some((v, seq)));
+            if k == key && best.as_ref().map_or(true, |(_, bs)| seq > *bs) {
+                best = Some((v, seq));
             }
         }
-        Ok(None)
+        Ok(best)
+    }
+
+    /// 块内快照等值查询（S 项）：返回 **seq ≤ snapshot_seq** 的最大版本。
+    /// 该版本为 Tombstone → value=None（快照点已删除）；无 ≤ 快照版本 → None。
+    pub fn scan_block_for_key_at(
+        &self,
+        block: &[u8],
+        key: &[u8],
+        snapshot_seq: u64,
+    ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+        let mut best: Option<(Option<Vec<u8>>, u64)> = None;
+        for (k, v, seq) in decode_data_block(block, self.format)? {
+            if k == key && seq <= snapshot_seq && best.as_ref().map_or(true, |(_, bs)| seq > *bs) {
+                best = Some((v, seq));
+            }
+        }
+        Ok(best)
     }
 
     /// 块内批量等值扫描（N 项 batch_get）：一次解码数据块，返回 `targets` 集合中全部命中。
