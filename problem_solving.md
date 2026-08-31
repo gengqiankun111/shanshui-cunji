@@ -497,6 +497,18 @@
 - **结果**：+6 测试（memtable 版本链/get_at/delete 历史、CF 未刷盘快照读旧版本、SST 刷盘后快照保持、
   RR 事务无 flush 读旧版本）；428 全绿；提交 `e7a413a`（S 项）。
 
+### P60. RwLock 读读并行落地：SstReader RefCell → Mutex（Sync 阻断）+ 内部可变四件套
+- **问题**：O 项第②步把 mysql.rs `Arc<Mutex<Engine>>` 换 `Arc<RwLock<Engine>>` 后编译报
+  "SstReader cannot be shared between threads safely"——`RwLock<T>: Sync` 要求 `T: Sync`，而
+  `SstReader.full_index` 用 `RefCell`（!Sync）懒加载 Level 2 精确索引 → 引擎无法跨线程共享。
+- **修复**：`SstReader.full_index` RefCell → Mutex（读路径共享锁）；同时为引擎读方法 `&self` 化补
+  内部可变四件套：`HotCache → Mutex`、`txn_locks → Mutex<LockTable>`、`pending_inverted → Mutex`、
+  `SstReader.full_index → Mutex`；读语句（SELECT/SHOW/SET）走读锁并行、写语句写锁互斥，
+  sqlish 读路径同步 `&Engine` 化。
+- **结果**：1 亿库 read_only 42→561 TPS（+13.3×）、read_write 29.5→230 TPS（+7.8×）、
+  事务平均延迟 -87%（突破 ~1000 stmt/s 串行天花板）；+1 并发测试（4 读线程 + 1 写线程共享
+  Arc<RwLock<Engine>>）；429 全绿；提交 `4585bb9`（O 项第②步）。
+
 ---
 
 ## 环境备忘（不入库）

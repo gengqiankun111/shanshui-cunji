@@ -128,7 +128,7 @@
 |---|---|---|
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
-| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；读路径 &self 基础已落 `c48a7c1` + **O 项第①步 `df16058` 全量扫描读 &self 化**（SstReader::get/scan_range + CF 六扫描方法）；倒排内部读已 ArcSwap 无锁（Ex-6.2/6.3），**剩余阻塞在引擎级**：全局 Mutex 串行（O 项第②步 RwLock）+ HotCache 内部 Mutex；复制型 read_from_replica 属分布式阶段 |
+| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；**O 项第①②步已落地等价能力**：读路径全量 &self 化（`df16058`）+ 引擎级 RwLock 读读并行（`4585bb9`，读语句读锁并行、写语句写锁互斥），1 亿库 read_only 42→561 TPS；剩余：HotCache 内部 Mutex 粒度 + 写路径（txn_commit/compaction）仍串行；复制型 read_from_replica 属分布式阶段 |
 | 倒排并发读（ArcSwap 段清单 + FST 字典指针无锁读） | ✅ | Ex-6（Ex-6.1 原语 `1946161`；Ex-6.2/6.3 ArcSwap 段清单 + FST 字典快照化 `c8183cf`——search/iter 读路径 `segments.load()`/`dicts.load()` 无锁快照，flush/gc rcu 原子发布；剩余引擎级全局 Mutex 见 O 项并发模型） |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
@@ -222,6 +222,7 @@
 | **环形 WAL 崩溃边界（评审漏洞 3）** | ✅ 已核实安全：`sync()` 回绕前检查 `max_written_seq ≤ flushed_seq`，超则**先返回 WalFull 不写任何记录**（覆盖动作在检查通过后 + 同一次 fsync 原子提交）；`ensure_wal_room` → `switch_and_flush()` **同步且持锁**（`?` 传播失败）；崩溃于 fsync 前 → 头尾均未落盘 → 恢复上次提交状态 | 无需修改（A 模块机制说明已覆盖） |
 | WAL / SST 校验和（评审补充 P3） | ✅ 均已实现：WAL 每记录 `Length ++ CRC32 ++ Payload`（wal.rs，读到 CRC 损坏/截断即停）；SST 每数据块 trailer CRC32 校验（read_block 校验） | A 模块补行 |
 | **读路径 &self 化（O 项第①步）** | ✅ `df16058`：SstReader::get/scan_range/SstRangeIter + ColumnFamily 六扫描方法（scan_range/scan_range_at/scan_raw_range/scan_raw_range_with_seq/scan_stream/scan_stream_at）改 `&self`——delta Merge-on-Read 与范围扫描读路径共享，RwLock 读读并行 + ssts ArcSwap 前置 | I 模块读写分离行更新 |
+| **RwLock 读读并行（O 项第②步）** | ✅ `4585bb9`：引擎读方法（get/get_at/txn_get/scan_range/scan_range_txn/batch_get/inverted_posting）改 `&self` + HotCache/txn_locks/pending_inverted/SstReader.full_index 内部 Mutex（SstReader: Sync）+ mysql.rs `Arc<RwLock<Engine>>` 读写锁拆分（读语句读锁并行、写语句写锁互斥；sqlish 读路径同步 &Engine） | I 模块读写分离行更新 |
 | 倒排并发读 | ✅ ArcSwap 无锁快照（Ex-6.2/6.3）；引擎级仍经全局 Mutex | I 模块 🔄→✅ + 读写分离行澄清 |
 | problem_solving 范围 | P1~P58 | H 模块更新 |
 
@@ -260,5 +261,6 @@
 - M 项事务范围扫描一次化：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%）；
   未达预估 50×——瓶颈为引擎 Mutex 串行（O 项），非扫描路径本身（单连接实测范围查询 0.2ms/条）。
 - 事件驱动自动 Compaction 上线后 1 亿库 78 个 L0 段由写路径自触发收敛（78→1 段，read_only 75.8 TPS +80%）。
+- **O 项第②步 RwLock 读读并行**（4585bb9）：1 亿库 read_only **42→561 TPS（+13.3×）**、read_write **29.5→230 TPS（+7.8×）**、事务平均延迟 -87%（突破 ~1000 stmt/s 串行天花板）；剩余写侧串行 + max 尾延迟留 O 项第③步（ssts ArcSwap 后台合并）。
 - S 项严格 MVCC：RR 快照读在 MemTable 未刷盘时读到快照点旧版本（修复前读到新版本 → 余额/库存类业务
   逻辑错误风险）；SST 多版本落盘 + 版本感知读，428 测试全绿无性能回退。
