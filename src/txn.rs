@@ -330,6 +330,11 @@ pub struct Transaction {
     write_set: HashSet<u64>,
     /// 已加锁的 docid（提交/回滚时释放）。
     locks: Vec<u64>,
+    /// T 项：事务内点查快照缓存（docid → 快照读结果）——RR 快照读刻意不走 HotCache
+    /// （防污染全局热缓存）→ 事务内重复点查冷读放大；小容量（≤256 项）同 key 二次读直达，
+    /// 提交/回滚随 Transaction drop 即弃。仅 RR/SERIALIZABLE 快照读启用（RC 读最新不缓存）。
+    /// 命中前置条件：快照 seq 事务内恒定 → 重复读结果一致（正确性无副作用）。
+    snap_cache: std::collections::HashMap<u64, Option<Vec<u8>>>,
     finished: bool,
 }
 
@@ -342,6 +347,7 @@ impl Transaction {
             ops: Vec::new(),
             write_set: HashSet::new(),
             locks: Vec::new(),
+            snap_cache: std::collections::HashMap::new(),
             finished: false,
         }
     }
@@ -393,6 +399,21 @@ impl Transaction {
             }
         }
         None
+    }
+
+    /// T 项：事务内点查快照缓存查询。命中返回 `Some(结果)`；未命中返回 `None`（应走引擎）。
+    /// 缓存仅存快照读结果（docid → value），`Some(None)` = 快照点该 key 不存在/已删除。
+    pub fn snap_get(&self, docid: u64) -> Option<Option<Vec<u8>>> {
+        self.snap_cache.get(&docid).cloned()
+    }
+
+    /// T 项：写入事务内点查快照缓存。容量超限（>256 项）清空重置（事务内唯一 key 通常
+    /// 远小于 256；清空比 LRU 更简单且命中损失可忽略）。
+    pub fn snap_put(&mut self, docid: u64, value: Option<Vec<u8>>) {
+        if self.snap_cache.len() >= 256 {
+            self.snap_cache.clear();
+        }
+        self.snap_cache.insert(docid, value);
     }
 
     /// 标记已获取 docid 锁（Engine 的 txn_get/txn_put 调用锁表后登记）。

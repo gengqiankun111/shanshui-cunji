@@ -541,15 +541,29 @@ impl Engine {
         if let Some(own) = txn.read_own(docid) {
             return Ok(own.map(|v| v.to_vec()));
         }
+        // T 项：RR/SERIALIZABLE 快照读——事务内点查小缓存（同 key 二次读直达，免 LSM 冷读
+        // 放大；快照 seq 事务内恒定 → 缓存结果一致）。命中跳过加锁（首次读已加）。
+        if txn.isolation.uses_snapshot() {
+            if let Some(v) = txn.snap_get(docid) {
+                return Ok(v);
+            }
+        }
         if txn.isolation.locks_reads() {
             self.txn_locks.lock().unwrap().acquire_shared(txn.id, docid)?;
             txn.add_lock(docid);
         }
-        if txn.isolation.uses_snapshot() {
+        let result = if txn.isolation.uses_snapshot() {
             self.get_at(docid, txn.snapshot())
         } else {
             self.get(docid)
+        };
+        // 仅快照读写缓存（RC 读最新，缓存会破坏语义）；错误结果不缓存
+        if txn.isolation.uses_snapshot() {
+            if let Ok(v) = &result {
+                txn.snap_put(docid, v.clone());
+            }
         }
+        result
     }
 
     /// E/F：事务提交。写锁（write_set 全目标排他，含共享→排他升级）→
@@ -1647,6 +1661,43 @@ mod tests {
         e.txn_rollback(txn);
         // 提交后最新可见
         assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+    }
+
+    #[test]
+    fn txn_snapshot_cache_repeated_get_hits_without_stale() {
+        // T 项：RR 快照读事务内点查小缓存——同 key 二次读直达（snap_get 命中）且结果一致
+        // （快照 seq 恒定）；RC 不缓存（读最新语义）；事务 drop 即弃（重新 begin 缓存为空）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        e.flush_primary().unwrap();
+
+        // RR：第一次读写入缓存，第二次读命中缓存（外部已改但快照一致）
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        assert_eq!(txn.snap_get(1), None, "缓存初始为空");
+        let first = e.txn_get(&mut txn, 1).unwrap().unwrap();
+        assert_eq!(first, b"v0");
+        assert_eq!(txn.snap_get(1), Some(Some(b"v0".to_vec())), "首读后已缓存");
+        // 外部并发写（seq > 快照）→ 二次读仍走缓存返回快照值
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.txn_get(&mut txn, 1).unwrap().unwrap(), b"v0", "缓存命中=快照一致");
+        assert_eq!(txn.snap_get(2), None, "未读过的 key 不在缓存");
+        // 同事务写后读 → read_own 优先于缓存
+        txn.put(1, b"own".to_vec(), vec![]);
+        assert_eq!(e.txn_get(&mut txn, 1).unwrap().unwrap(), b"own");
+        e.txn_rollback(txn);
+
+        // 新事务缓存为空（随 Transaction drop 即弃）
+        let mut txn2 = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        assert_eq!(txn2.snap_get(1), None, "新事务缓存应为空");
+        assert_eq!(e.txn_get(&mut txn2, 1).unwrap().unwrap(), b"v1", "读最新已提交");
+        e.txn_rollback(txn2);
+
+        // RC：不缓存（每次读最新，缓存会破坏语义）
+        let mut txn3 = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        assert_eq!(e.txn_get(&mut txn3, 1).unwrap().unwrap(), b"v1");
+        assert_eq!(txn3.snap_get(1), None, "RC 不写缓存");
+        e.txn_rollback(txn3);
     }
 
     #[test]
