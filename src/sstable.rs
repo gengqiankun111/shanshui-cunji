@@ -1104,18 +1104,17 @@ impl SstReader {
 
     /// Ex-5.8 元数据-数据解耦：读取块的**原始压缩字节** + 解码内容，供块级复用 Compaction
     /// 原样拷贝数据块（不解压校验 trailer，由复用写入方 `add_raw_block` 重建）。
-    pub fn block_raw(&mut self, e: &IndexEntry) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// O 项第③步：`&self`——compact 经 `Arc<SstReader>` 并发读输入段（内部 `read_at` 无状态 seek）。
+    pub fn block_raw(&self, e: &IndexEntry) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut comp = vec![0u8; e.comp_len as usize];
-        self.file
-            .seek(std::io::SeekFrom::Start(e.offset))
-            .map_err(Error::Io)?;
-        self.file.read_exact(&mut comp).map_err(Error::Io)?;
+        read_at(&self.file, &mut comp, e.offset)?;
         let raw = self.decompress(&comp, e.raw_len as usize)?;
         Ok((comp, raw))
     }
 
     /// 迭代：按块顺序扫描全部条目。回调 `f(key, value, seq)`，`value=None` 表示 Tombstone。
-    pub fn iterate<F: FnMut(&[u8], Option<&[u8]>, u64)>(&mut self, mut f: F) -> Result<()> {
+    /// O 项第③步：`&self`（compact 经 `Arc<SstReader>` 并发读）。
+    pub fn iterate<F: FnMut(&[u8], Option<&[u8]>, u64)>(&self, mut f: F) -> Result<()> {
         let entries = self.index();
         for e in entries {
             let data = self.read_block(&e)?;

@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -52,7 +53,17 @@ struct Manifest {
     next_sst_id: u64,
 }
 
-/// 主数据列族（每 CF 一把粗粒度锁，MVP 保证正确性；并发细化在阶段 1.5 拆分）。
+/// SST 快照（O 项第③步）：ssts + 层号**原子打包**——读路径 `load()` 无锁快照（与后台合并并发读），
+/// 写路径（flush/compact/加载）构建新快照 `store()` 原子切换；旧 Arc 引用计数归零后文件才可删
+/// （P53 模式：先换快照再删旧文件，读线程持 Arc 期间文件句柄保持有效）。
+pub struct SstSnapshot {
+    /// SST 文件（新→旧；读路径按序取首个命中，依赖"新文件在前"版本语义）。
+    pub ssts: Vec<Arc<SstReader>>,
+    /// 与 `ssts` 平行的层号（design 4.5 二期 Leveled Compaction，M6-2）。
+    pub levels: Vec<u32>,
+}
+
+/// 列族：主数据 / 组合索引 / Delta 共用骨架。
 pub struct ColumnFamily {
     name: String,
     dir: PathBuf,
@@ -71,7 +82,8 @@ pub struct ColumnFamily {
     /// 两级索引粒度（`sstable.index_granularity`，每 N 块一条 Level 1 摘要）。
     index_granularity: usize,
     /// 后台 IO 限速器（design 4.5 阶段 3；`storage.io_rate_limit_mb`，None = 不限速）。
-    io_limiter: Option<crate::io_scheduler::IoRateLimiter>,
+    /// O 项第③步：内部 `Mutex`——compact `&self` 读路径并发 acquire。
+    io_limiter: Option<Mutex<crate::io_scheduler::IoRateLimiter>>,
     /// L0 段数阈值（`storage.l0_stall_threshold`，超过判需要 Compaction）。
     l0_stall_threshold: usize,
     /// L 项：动态窗口下限/上限（低峰放宽、高峰收窄；`storage.l0_stall_min/max`）。
@@ -84,21 +96,21 @@ pub struct ColumnFamily {
     /// L 项：合并冷却轮次（`storage.compaction_cooldown`；0 = 关闭）。
     compaction_cooldown: u32,
     /// L 项：当前合并轮次（每次 compact 成功 +1；冷却到期基准）。
-    merge_round: u64,
+    /// O 项第③步：原子（compact `&self` 更新）。
+    merge_round: AtomicU64,
     /// L 项：冷却中的段（新段 path → 到期轮次）；到期后正常参与合并。纯内存调度态。
-    cooldown: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// O 项第③步：内部 `Mutex`（compact `&self` 读写）。
+    cooldown: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
-    /// SST 文件（新→旧；读路径按序取首个命中，依赖"新文件在前"版本语义）。
-    ssts: Vec<SstReader>,
-    /// 与 `ssts` 平行的层号（design 4.5 二期 Leveled Compaction，M6-2）。
-    sst_levels: Vec<u32>,
+    /// SST 快照（O 项第③步：ArcSwap 原子发布——读路径 load 无锁，写路径 store 切换）。
+    ssts: ArcSwap<SstSnapshot>,
     /// 共享块缓存（跨 CF 共享）。
     block_cache: Arc<BlockCache>,
     /// 单调 seq 分配器（跨重启由 WAL 恢复推进）。
     seq: AtomicU64,
-    /// 下一个 SST 文件 id（跨重启由 Manifest 恢复，防止覆盖旧文件）。
-    next_sst_id: u64,
+    /// 下一个 SST 文件 id（跨重启由 Manifest 恢复，防止覆盖旧文件）。O 项第③步：原子。
+    next_sst_id: AtomicU64,
     /// 当前 WAL 写入器（append 追加 / ring 环形，design 4.3 阶段 3）。
     /// `Arc<Mutex>` 共享：组提交后台线程（M8）可独立触发落盘兜底。
     wal: Arc<Mutex<WalBackend>>,
@@ -242,9 +254,9 @@ impl ColumnFamily {
             ttl_field: cfg.storage.ttl_field.clone(),
             index_granularity: cfg.sstable.index_granularity as usize,
             io_limiter: if cfg.storage.io_rate_limit_mb > 0 {
-                Some(crate::io_scheduler::IoRateLimiter::new(
+                Some(Mutex::new(crate::io_scheduler::IoRateLimiter::new(
                     cfg.storage.io_rate_limit_mb * 1024 * 1024,
-                ))
+                )))
             } else {
                 None
             },
@@ -254,14 +266,16 @@ impl ColumnFamily {
             write_pressure: 0.0,
             l0_max_size_bytes: cfg.storage.l0_max_size_mb * 1024 * 1024,
             compaction_cooldown: cfg.storage.compaction_cooldown,
-            merge_round: 0,
-            cooldown: std::collections::HashMap::new(),
+            merge_round: AtomicU64::new(0),
+            cooldown: Mutex::new(std::collections::HashMap::new()),
             memtable: MemTableBuffer::new(),
-            ssts,
-            sst_levels: sst_levels_loaded,
+            ssts: ArcSwap::new(Arc::new(SstSnapshot {
+                ssts: ssts.into_iter().map(Arc::new).collect(),
+                levels: sst_levels_loaded,
+            })),
             block_cache,
             seq: AtomicU64::new(1),
-            next_sst_id,
+            next_sst_id: AtomicU64::new(next_sst_id),
             wal: Arc::new(Mutex::new(wal)),
             external_seq: None,
         };
@@ -441,7 +455,7 @@ impl ColumnFamily {
             return Ok(e.value.map(|v| (v, e.seq)));
         }
         let cache = Arc::clone(&self.block_cache);
-        for sst in &self.ssts {
+        for sst in self.ssts.load().ssts.iter() {
             match get_from_sst(sst, &cache, key)? {
                 // 命中：最新版本。value=None 为 Tombstone → 视为不存在
                 Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
@@ -477,7 +491,7 @@ impl ColumnFamily {
         }
         // ② 逐 SST（新→旧），未命中 key 继续下沉旧层
         let cache = Arc::clone(&self.block_cache);
-        for sst in &self.ssts {
+        for sst in self.ssts.load().ssts.iter() {
             if remain.is_empty() {
                 break;
             }
@@ -513,7 +527,7 @@ impl ColumnFamily {
             }
         }
         let cache = Arc::clone(&self.block_cache);
-        for sst in &self.ssts {
+        for sst in self.ssts.load().ssts.iter() {
             if let Some((value, seq)) = get_from_sst_at(sst, &cache, key, snapshot_seq)? {
                 if best.as_ref().map_or(true, |(s, _)| seq > *s) {
                     best = Some((seq, value));
@@ -585,7 +599,7 @@ impl ColumnFamily {
         });
 
         // SST 范围扫描（Zone Map 剪枝已内置在 scan_range）
-        for sst in &self.ssts {
+        for sst in self.ssts.load().ssts.iter() {
             sst.scan_range(start, end, |k, v, seq| {
                 merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
             })?;
@@ -626,7 +640,8 @@ impl ColumnFamily {
         // 源：memtable（immutable + mutable）借用 &self.memtable；SST 借用 &self.ssts
         let mut mem_iters = self.memtable.iter_range(start, end);
         let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
-        for sst in &self.ssts {
+        let snap = self.ssts.load();
+        for sst in snap.ssts.iter() {
             sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
         }
         let mem_count = mem_iters.len();
@@ -705,7 +720,7 @@ impl ColumnFamily {
         self.memtable.scan_range(start, end, |key, e| {
             merge_candidate_bytes(&mut merged, key.to_vec(), e.seq, e.value.clone());
         });
-        for sst in &self.ssts {
+        for sst in self.ssts.load().ssts.iter() {
             sst.scan_range(start, end, |k, v, seq| {
                 merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
             })?;
@@ -746,21 +761,27 @@ impl ColumnFamily {
         Ok(())
     }
 
+    /// O 项第③步：原子插入新 SST（快照 `store()`）——新文件插最前（读路径优先命中），层号 L0。
+    fn snapshot_insert(&self, reader: SstReader) {
+        let cur = self.ssts.load();
+        let mut ssts = cur.ssts.clone();
+        ssts.insert(0, Arc::new(reader));
+        let mut levels = cur.levels.clone();
+        levels.insert(0, 0);
+        self.ssts.store(Arc::new(SstSnapshot { ssts, levels }));
+    }
+
     /// 原逻辑：整个 Immutable 落盘为单个 SST。
     fn flush_single(&mut self, imm: &MemTable) -> Result<()> {
-        let sst_id = self.next_sst_id;
-        self.next_sst_id += 1;
+        let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
         self.write_sst(&path, imm)?;
 
         // 新文件插到最前（读路径优先命中）
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
         self.io_acquire(&path)?;
-        self.ssts.insert(
-            0,
-            SstReader::open_with_granularity(&path, self.index_granularity)?,
-        );
-        self.sst_levels.insert(0, 0); // 刷盘产物 → L0
+        let reader = SstReader::open_with_granularity(&path, self.index_granularity)?;
+        self.snapshot_insert(reader);
         self.persist_manifest()?;
         info!(
             "列族 [{}] 刷盘完成: {} ({} 条)",
@@ -793,8 +814,7 @@ impl ColumnFamily {
         });
         let bucket_count = buckets.len();
         for (days, rows) in buckets {
-            let sst_id = self.next_sst_id;
-            self.next_sst_id += 1;
+            let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
             let fname = match days {
                 Some(d) => format!("{SST_PREFIX}{d:08}-{sst_id:08}.sst"),
                 None => format!("{SST_PREFIX}{sst_id:08}.sst"),
@@ -802,11 +822,8 @@ impl ColumnFamily {
             let path = self.dir.join(&fname);
             self.write_rows(&path, &rows)?;
             self.io_acquire(&path)?;
-            self.ssts.insert(
-                0,
-                SstReader::open_with_granularity(&path, self.index_granularity)?,
-            );
-            self.sst_levels.insert(0, 0); // 刷盘产物 → L0
+            let reader = SstReader::open_with_granularity(&path, self.index_granularity)?;
+            self.snapshot_insert(reader);
         }
         self.persist_manifest()?;
         info!(
@@ -825,18 +842,19 @@ impl ColumnFamily {
 
     /// 按行序列写一个 SST（TTL 分桶用；行内 key 已升序）。
     /// 后台 IO 限速：刷盘完成后按实际文件字节数 acquire（design 4.5 阶段 3；不限速时为空操作）。
-    fn io_acquire(&mut self, path: &Path) -> Result<()> {
-        if let Some(limiter) = &mut self.io_limiter {
+    /// O 项第③步：`&self`（io_limiter 内部 Mutex，compact 读路径并发限速）。
+    fn io_acquire(&self, path: &Path) -> Result<()> {
+        if let Some(limiter) = &self.io_limiter {
             let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            limiter.acquire(sz)?;
+            limiter.lock().unwrap().acquire(sz)?;
         }
         Ok(())
     }
 
     /// Ex-7.4：动态调整后台 IO 限速（前台写压力驱动，Engine 调 Compaction 让路）。
-    pub fn set_io_rate_bytes(&mut self, bytes_per_sec: u64) {
-        if let Some(limiter) = &mut self.io_limiter {
-            limiter.set_rate(bytes_per_sec);
+    pub fn set_io_rate_bytes(&self, bytes_per_sec: u64) {
+        if let Some(limiter) = &self.io_limiter {
+            limiter.lock().unwrap().set_rate(bytes_per_sec);
         }
     }
 
@@ -862,11 +880,12 @@ impl ColumnFamily {
         if self.compaction_cooldown == 0 {
             return out;
         }
-        for (i, s) in self.ssts.iter().enumerate() {
-            if self
-                .cooldown
+        let cooldown = self.cooldown.lock().unwrap();
+        let round = self.merge_round.load(Ordering::Relaxed);
+        for (i, s) in self.ssts.load().ssts.iter().enumerate() {
+            if cooldown
                 .get(&s.path().to_path_buf())
-                .map(|exp| *exp > self.merge_round)
+                .map(|exp| *exp > round)
                 .unwrap_or(false)
             {
                 out.insert(i);
@@ -877,15 +896,19 @@ impl ColumnFamily {
 
     /// Ex-7.4：当前后台 IO 限速（字节/秒；0 = 不限速/未配置）。
     pub fn io_rate(&self) -> u64 {
-        self.io_limiter.as_ref().map_or(0, |l| l.rate())
+        self.io_limiter
+            .as_ref()
+            .map_or(0, |l| l.lock().unwrap().rate())
     }
 
     /// 基础 Compaction（无删除位图过滤）。Ex-5.8：无重叠 L0 段合并走**数据块级复用**
     /// （只重建元数据区），否则回退全量合并（等价 `compact_filtered(&|_| false)`）。
-    pub fn compact(&mut self) -> Result<CompactReport> {
-        let heat: Vec<u64> = self.ssts.iter().map(|s| s.heat()).collect();
+    /// O 项第③步：`&self`（ssts 快照 load/store 原子发布）——后台合并线程读锁下执行。
+    pub fn compact(&self) -> Result<CompactReport> {
+        let snap = self.ssts.load();
+        let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
         let (sel, out_level) = select_compaction_inputs(
-            &self.sst_levels,
+            &snap.levels,
             self.effective_l0_threshold(),
             &heat,
             &self.cooling_indices(),
@@ -915,10 +938,13 @@ impl ColumnFamily {
     ///   位图标记保留，put 复活时清位）；
     /// - 崩溃安全：新段写入 → fsync → 原子更新 Manifest → 删除旧段；
     /// - 后台 IO 限速：写完后按实际文件字节 acquire。
-    pub fn compact_filtered(&mut self, drop_key: &dyn Fn(&[u8]) -> bool) -> Result<CompactReport> {
-        let heat: Vec<u64> = self.ssts.iter().map(|s| s.heat()).collect();
+    /// O 项第③步：`&self`（ssts 快照 load + store 原子发布）——后台合并线程可在读锁下
+    /// 执行（合并不阻塞读；与写互斥由 Engine 锁保证，快照 store 无并发丢失）。
+    pub fn compact_filtered(&self, drop_key: &dyn Fn(&[u8]) -> bool) -> Result<CompactReport> {
+        let snap = self.ssts.load();
+        let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
         let (sel, out_level) = select_compaction_inputs(
-            &self.sst_levels,
+            &snap.levels,
             self.effective_l0_threshold(),
             &heat,
             &self.cooling_indices(),
@@ -935,17 +961,19 @@ impl ColumnFamily {
     }
 
     /// 全量合并压实主体（sel 已由调用方选出）：读全部输入行 → 排序去重 → 位图过滤 → 重写。
+    /// O 项第③步：`&self`（输入走快照 Arc，写输出独立文件，提交走 snapshot store）。
     fn compact_merge(
-        &mut self,
+        &self,
         sel: &[usize],
         out_level: u32,
         drop_key: &dyn Fn(&[u8]) -> bool,
     ) -> Result<CompactReport> {
         let old_count = sel.len();
-        // ① 读取选中条目
+        // ① 读取选中条目（快照 Arc 持有文件句柄，与并发读共享）
+        let snap = self.ssts.load();
         let mut rows: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::new();
         for idx in sel {
-            self.ssts[*idx].iterate(|k, v, seq| {
+            snap.ssts[*idx].iterate(|k, v, seq| {
                 rows.push((k.to_vec(), seq, v.map(|x| x.to_vec())));
             })?;
         }
@@ -959,8 +987,7 @@ impl ColumnFamily {
         let dropped_keys = dropped_keys - rows.len();
 
         // ③ 写新段（读路径新文件插最前）
-        let sst_id = self.next_sst_id;
-        self.next_sst_id += 1;
+        let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
         {
             let mut w = SstWriter::new_with_pax(
@@ -998,18 +1025,20 @@ impl ColumnFamily {
     /// 前提：行式列族（pax_hot_fields 为空）+ 相邻段 key 无重叠（前段 max < 后段 min）。
     /// 收益：Compaction 读放大归零、压缩 CPU 免除（demo 实测全量重写 4041ms vs 块级复用毫秒级）。
     /// 返回 Some(report) = 已复用完成；None = 条件不满足（调用方回退全量合并）。
+    /// O 项第③步：`&self`（快照读输入段）。
     fn try_meta_only_compact(
-        &mut self,
+        &self,
         sel: &[usize],
         out_level: u32,
     ) -> Result<Option<CompactReport>> {
         if !self.pax_hot_fields.is_empty() {
             return Ok(None); // PAX 列族：块内字段 Zone Map 无法重建，回退全量
         }
+        let snap = self.ssts.load();
         // 读取每段 key 范围 [min, max]（仅解码元数据索引，不碰数据块）
         let mut ranges: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::with_capacity(sel.len());
         for &i in sel {
-            let idx = self.ssts[i].index();
+            let idx = snap.ssts[i].index();
             let min = idx
                 .first()
                 .map(|e| e.first_key.clone())
@@ -1029,8 +1058,7 @@ impl ColumnFamily {
         }
         // 块级复用：按 key 序逐段原样拷贝数据块，重建元数据
         let old_count = sel.len();
-        let sst_id = self.next_sst_id;
-        self.next_sst_id += 1;
+        let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
         let mut kept = 0u64;
         {
@@ -1044,12 +1072,12 @@ impl ColumnFamily {
                 self.bloom_fpr,
             )?;
             for &(i, _, _) in &ranges {
-                let entries = self.ssts[i].index();
+                let entries = snap.ssts[i].index();
                 for e in entries {
-                    let (comp, raw) = self.ssts[i].block_raw(&e)?;
+                    let (comp, raw) = snap.ssts[i].block_raw(&e)?;
                     w.add_raw_block(&raw, &comp)?;
                 }
-                kept += self.ssts[i].footer().key_count;
+                kept += snap.ssts[i].footer().key_count;
             }
             w.finish()?;
         }
@@ -1064,10 +1092,12 @@ impl ColumnFamily {
         Ok(Some(rep))
     }
 
-    /// 压实收尾（④⑤）：原子更新 Manifest（新段插最前）→ 删除旧段 → 报告。
+    /// 压实收尾（④⑤）：原子发布新快照（旧段移除 + 新段插最前）→ 更新 Manifest →
+    /// 删除旧段（换快照后再删，并发读持 Arc 句柄有效）→ 报告。
+    /// O 项第③步：`&self`（snapshot store 原子切换 + merge_round/cooldown 内部可变）。
     #[allow(clippy::too_many_arguments)]
     fn finalize_compact(
-        &mut self,
+        &self,
         sel: &[usize],
         path: &Path,
         out_level: u32,
@@ -1076,11 +1106,12 @@ impl ColumnFamily {
         eliminated: usize,
         dropped: usize,
     ) -> Result<CompactReport> {
-        // ④ 原子更新 Manifest（先 Manifest 后删旧文件）
+        // ④ 原子发布新快照（先 store 后删旧文件；读线程持旧快照 Arc 期间句柄有效）
+        let cur = self.ssts.load();
         let old_bytes: u64 = sel
             .iter()
             .map(|&i| {
-                std::fs::metadata(self.ssts[i].path())
+                std::fs::metadata(cur.ssts[i].path())
                     .map(|m| m.len())
                     .unwrap_or(0)
             })
@@ -1088,28 +1119,28 @@ impl ColumnFamily {
         let mut old_ssts = Vec::new();
         let mut kept_ssts = Vec::new();
         let mut kept_levels = Vec::new();
-        let mut removed = vec![false; self.ssts.len()];
+        let mut removed = vec![false; cur.ssts.len()];
         for &i in sel {
             removed[i] = true;
         }
-        for (i, sst) in std::mem::take(&mut self.ssts).into_iter().enumerate() {
+        for (i, sst) in cur.ssts.iter().enumerate() {
             if removed[i] {
-                old_ssts.push(sst);
+                old_ssts.push(sst.clone());
             } else {
-                kept_ssts.push(sst);
-                kept_levels.push(self.sst_levels[i]);
+                kept_ssts.push(sst.clone());
+                kept_levels.push(cur.levels[i]);
             }
         }
-        self.ssts = kept_ssts;
-        self.sst_levels = kept_levels;
-        self.ssts.insert(
+        kept_ssts.insert(
             0,
-            SstReader::open_with_granularity(path, self.index_granularity)?,
+            Arc::new(SstReader::open_with_granularity(path, self.index_granularity)?),
         );
-        self.sst_levels.insert(0, out_level);
+        kept_levels.insert(0, out_level);
+        self.ssts
+            .store(Arc::new(SstSnapshot { ssts: kept_ssts, levels: kept_levels }));
         self.persist_manifest()?;
 
-        // ⑤ 删除旧段（孤儿无害，启动只加载 Manifest）
+        // ⑤ 删除旧段（换快照后再删；并发读仍持 Arc → 句柄有效，引用归零后实际释放）
         for r in &old_ssts {
             let _ = std::fs::remove_file(r.path());
         }
@@ -1134,12 +1165,10 @@ impl ColumnFamily {
         // L 项：合并冷却——输出段 N 轮内不参与下一轮合并（防刚合并又合并的无谓重写）；
         // 推进 merge_round + 清理到期项（纯内存调度态，重启后冷却重置，无一致性影响）
         if self.compaction_cooldown > 0 {
-            self.merge_round += 1;
-            self.cooldown.insert(
-                path.to_path_buf(),
-                self.merge_round + self.compaction_cooldown as u64,
-            );
-            self.cooldown.retain(|_, exp| *exp > self.merge_round);
+            let round = self.merge_round.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut cd = self.cooldown.lock().unwrap();
+            cd.insert(path.to_path_buf(), round + self.compaction_cooldown as u64);
+            cd.retain(|_, exp| *exp > round);
         }
         Ok(CompactReport {
             merged_ssts: old_count,
@@ -1154,9 +1183,10 @@ impl ColumnFamily {
     /// 或 L0/L1 均空但 L2 段数 > 1（L2 收敛）。
     /// P 项：启用 `l0_max_size_mb` 时叠加**大小阈值**——L0 文件总字节超限即触发（防大段少量堆积）。
     pub fn needs_compact(&self) -> bool {
-        let l0 = self.sst_levels.iter().filter(|l| **l == 0).count();
-        let l1 = self.sst_levels.iter().filter(|l| **l == 1).count();
-        let l2 = self.sst_levels.iter().filter(|l| **l >= 2).count();
+        let snap = self.ssts.load();
+        let l0 = snap.levels.iter().filter(|l| **l == 0).count();
+        let l1 = snap.levels.iter().filter(|l| **l == 1).count();
+        let l2 = snap.levels.iter().filter(|l| **l >= 2).count();
         // L 项：用动态有效阈值（写压力高 → 阈值收窄 → 更早触发收敛）
         l0 > self.effective_l0_threshold()
             // P 项：大小阈值需 ≥2 段（单段为已排序文件，合并是纯无收益重写）
@@ -1166,14 +1196,15 @@ impl ColumnFamily {
 
     /// 当前 L0 段数（层号 == 0）。
     pub fn l0_count(&self) -> usize {
-        self.sst_levels.iter().filter(|l| **l == 0).count()
+        self.ssts.load().levels.iter().filter(|l| **l == 0).count()
     }
 
     /// 当前 L0 段文件总字节（按层号过滤后取磁盘元数据）。
     pub fn l0_bytes(&self) -> u64 {
+        let snap = self.ssts.load();
         let mut total = 0u64;
-        for (i, s) in self.ssts.iter().enumerate() {
-            if self.sst_levels.get(i).copied().unwrap_or(0) == 0 {
+        for (i, s) in snap.ssts.iter().enumerate() {
+            if snap.levels.get(i).copied().unwrap_or(0) == 0 {
                 if let Ok(m) = std::fs::metadata(s.path()) {
                     total += m.len();
                 }
@@ -1184,6 +1215,8 @@ impl ColumnFamily {
     /// 全部 SST 文件字节总和。
     pub fn sst_bytes(&self) -> u64 {
         self.ssts
+            .load()
+            .ssts
             .iter()
             .filter_map(|r| std::fs::metadata(r.path()).ok().map(|m| m.len()))
             .sum()
@@ -1230,10 +1263,11 @@ impl ColumnFamily {
 
     fn persist_manifest(&self) -> Result<()> {
         // 以磁盘扫描维护清单（新→旧：id 降序），避免依赖 SstReader 内部状态；
-        // 层号按文件名从内存 ssts/sst_levels 映射（缺省 0 = L0，兼容旧格式）
+        // 层号按文件名从内存快照映射（缺省 0 = L0，兼容旧格式）
+        let snap = self.ssts.load();
         let mut level_by_file: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
-        for (sst, lv) in self.ssts.iter().zip(&self.sst_levels) {
+        for (sst, lv) in snap.ssts.iter().zip(&snap.levels) {
             if let Some(name) = sst.path().file_name() {
                 level_by_file.insert(name.to_string_lossy().to_string(), *lv);
             }
@@ -1254,7 +1288,7 @@ impl ColumnFamily {
         let m = Manifest {
             sst_files: files,
             levels,
-            next_sst_id: self.next_sst_id,
+            next_sst_id: self.next_sst_id.load(Ordering::Relaxed),
         };
         let text = serde_json::to_string_pretty(&m)
             .map_err(|e| Error::Serialize(format!("Manifest 序列化失败: {e}")))?;
@@ -1270,12 +1304,12 @@ impl ColumnFamily {
     }
 
     pub fn sst_count(&self) -> usize {
-        self.ssts.len()
+        self.ssts.load().ssts.len()
     }
 
     /// Ex-5.9：指定 SST 的读热度（冷热感知 Compaction 监控/策略数据源）。
     pub fn sst_heat(&self, idx: usize) -> u64 {
-        self.ssts.get(idx).map_or(0, |s| s.heat())
+        self.ssts.load().ssts.get(idx).map_or(0, |s| s.heat())
     }
 
     /// 当前 WAL 下一可分配 seq（Engine 快照点来源，design 4.7 MVCC）。
@@ -2090,13 +2124,13 @@ mod tests {
             cf.put(i, format!("a{i}").into_bytes()).unwrap();
         }
         cf.switch_and_flush().unwrap();
-        assert_eq!(cf.sst_levels, vec![0, 0], "刷盘产物均为 L0");
+        assert_eq!(cf.ssts.load().levels, vec![0, 0], "刷盘产物均为 L0");
         assert!(!cf.needs_compact(), "2 个 L0 未超阈值");
         // 手动压实 → L1
         let rep = cf.compact().unwrap();
         assert_eq!(rep.out_level, 1);
         assert_eq!(cf.sst_count(), 1);
-        assert_eq!(cf.sst_levels, vec![1]);
+        assert_eq!(cf.ssts.load().levels, vec![1]);
         // 数据完整
         for i in (0..200u64).step_by(7) {
             assert!(cf.get(i).unwrap().is_some());
@@ -2104,7 +2138,7 @@ mod tests {
         // 重启：Manifest 持久化层号
         drop(cf);
         let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
-        assert_eq!(cf2.sst_levels, vec![1], "Manifest 应持久化层号");
+        assert_eq!(cf2.ssts.load().levels, vec![1], "Manifest 应持久化层号");
         assert!(cf2.get(150).unwrap().is_some());
     }
 
@@ -2125,7 +2159,7 @@ mod tests {
             let r = cf.compact().unwrap();
             assert_eq!(r.out_level, 1, "第 {round} 轮 L0→L1");
         }
-        assert_eq!(cf.sst_levels.iter().filter(|l| **l == 1).count(), 4);
+        assert_eq!(cf.ssts.load().levels.iter().filter(|l| **l == 1).count(), 4);
         // L0 空、L1 > 1 → L1 → L2（压实下沉）。L 项合并冷却：新生成段 N 轮内不参与下一轮
         // 合并 → 收敛需多轮（冷却段到期后正常参与），循环 compact 直到收敛
         assert!(cf.needs_compact(), "L1 多段应触发 L1→L2");
@@ -2136,7 +2170,7 @@ mod tests {
         }
         assert!(guard < 8, "冷却后多轮应收敛");
         assert_eq!(cf.sst_count(), 1);
-        assert_eq!(cf.sst_levels, vec![2]);
+        assert_eq!(cf.ssts.load().levels, vec![2]);
         // 全量数据仍完整
         for round in 0..4u64 {
             for i in (0..50u64).step_by(9) {
@@ -2149,7 +2183,7 @@ mod tests {
         // 重启：L2 持久化 + 数据完整
         drop(cf);
         let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
-        assert_eq!(cf2.sst_levels, vec![2]);
+        assert_eq!(cf2.ssts.load().levels, vec![2]);
         assert!(cf2.get(300 + 10).unwrap().is_some());
     }
 

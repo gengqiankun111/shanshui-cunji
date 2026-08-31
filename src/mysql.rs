@@ -221,16 +221,33 @@ impl MySqlServer {
         }
     }
 
-    /// O 项第②步：保底自动 Compaction 守护线程（10 分钟周期）。事件驱动的写路径自触发
-    /// （`Engine::auto_compact`）是主机制；本线程仅兜底异常路径（flush 未触发/合并失败）。
-    /// `try_write` 非阻塞：引擎正忙（有语句在执行）时跳过本轮，不干扰前台。
-    fn spawn_compaction_guard(&self) {
+    /// O 项第③步：后台合并 worker。写路径（Engine::auto_compact）检测 L0 超阈值后只置
+    /// `compact_pending` 信号；本线程读取信号后在引擎**读锁**（`try_read` 非阻塞）下执行
+    /// `Engine::compact`——合并期间读语句仍可并行（读读共享锁），不阻塞读。
+    /// - 信号驱动（100ms 轮询）：写后即时收敛 L0（替代 P 项写路径同步合并）；
+    /// - 10 分钟兜底：覆盖 flush 未触发 / 信号丢失等异常路径（原 guard 线程语义）。
+    /// - `try_read` 非阻塞：引擎正忙（写语句持写锁）时跳过本轮，不干扰前台写。
+    /// - 单后台线程 + compact 内部并行度：多列族压实由 Engine::compact 内部 thread::scope 承担。
+    fn spawn_compaction_worker(&self) {
         let engine = self.engine.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(600));
-            if let Ok(mut g) = engine.try_write() {
-                if g.needs_compact() {
-                    let _ = g.compact();
+        let pending = self.engine.read().unwrap().compact_pending.clone();
+        let worker = self.engine.read().unwrap().compact_worker.clone();
+        worker.store(true, Ordering::Release); // 写路径此后只发信号
+        std::thread::spawn(move || {
+            let mut last_backstop = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let signaled = pending.swap(false, Ordering::AcqRel);
+                let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
+                if signaled || backstop {
+                    if engine.read().unwrap().needs_compact() {
+                        if let Ok(g) = engine.try_read() {
+                            let _ = g.compact();
+                        }
+                    }
+                    if backstop {
+                        last_backstop = std::time::Instant::now();
+                    }
                 }
             }
         });
@@ -238,10 +255,9 @@ impl MySqlServer {
 
     /// 绑定并接受连接（阻塞）。每连接 spawn 线程处理。
     pub fn serve(self, addr: &str) -> Result<()> {
-        // P 项：保底自动 Compaction 定时器（10 分钟级）——事件驱动（写路径自触发，
-        // engine.put_nosync → auto_compact）之外的兜底：覆盖 flush 未触发 / 合并失败等
-        // 异常路径。`try_lock` 非阻塞：服务繁忙时不打扰前台（Q 项 ArcSwap 化后改后台无锁）。
-        self.spawn_compaction_guard();
+        // O 项第③步：后台合并 worker（信号驱动 + 10 分钟兜底）——写路径只发信号，
+        // 合并读锁下执行，读写均不被合并阻塞（替代 P 项写路径同步合并 + guard 定时器）。
+        self.spawn_compaction_worker();
         let listener = TcpListener::bind(addr)?;
         tracing::info!("MySQL 协议服务已启动: mysql://{addr}（库 {DEFAULT_DB}，表 {DEFAULT_TABLE}）");
         for stream in listener.incoming() {

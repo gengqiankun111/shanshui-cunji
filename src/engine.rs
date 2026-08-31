@@ -80,6 +80,12 @@ pub struct Engine {
     /// P 项：事件驱动自动 Compaction（`storage.auto_compact`）——写入路径自触发：
     /// 写前 L0 达硬顶（l0_stall_max）先合并（背压），写后 L0 超阈值（段数/大小）合并收敛。
     auto_compact: bool,
+    /// O 项第③步：后台合并信号——写路径检测 L0 超阈值时置位（AcqRel）；mysql 服务
+    /// 的后台 worker 读取后读锁下合并。无 worker 场景（demo/rpc/测试）由同步路径直接消费。
+    pub compact_pending: Arc<AtomicBool>,
+    /// O 项第③步：后台合并 worker 挂载标记（服务进程 spawn 时置 true）——
+    /// true 时写路径只发信号（合并不阻塞读写）；false 保持同步合并（写入退避=背压）。
+    pub compact_worker: Arc<AtomicBool>,
     /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
     /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
     deletion_bitmap: Option<DeletionBitmap>,
@@ -317,6 +323,8 @@ impl Engine {
             pending_inverted: Mutex::new(Vec::new()),
             compaction_parallel: cfg.storage.compaction_parallel,
             auto_compact: cfg.storage.auto_compact,
+            compact_pending: Arc::new(AtomicBool::new(false)),
+            compact_worker: Arc::new(AtomicBool::new(false)),
             deletion_bitmap,
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
@@ -1286,9 +1294,11 @@ impl Engine {
 
     /// 基础 Compaction（design 4.5，阶段 3；Ex-5.4 并行化）：primary/cidx/delta 三列族压实。
     /// 并行度 `compaction_parallel`：0 = 自动（min(4, 核数/2)）；1 = 串行；>1 = 指定。
-    /// 并行压实利用 SSD 并发 IO（demo 实测 3 CF 并行 2.14×）；每列族独立压实（&mut 字段拆分借用）。
+    /// 并行压实利用 SSD 并发 IO（demo 实测 3 CF 并行 2.14×）；每列族独立压实（字段拆分借用）。
     /// Ex-5.6：删除位图开启时 primary 压实按位图**物理丢弃**已删 docid 的旧数据（墓碑不污染层级）。
-    pub fn compact(&mut self) -> Result<crate::column_family::CompactReport> {
+    /// O 项第③步：`&self`——后台合并 worker 在引擎**读锁**下执行（合并不阻塞读；
+    /// 与写互斥由 Engine RwLock 保证，快照 store 无并发丢失）。
+    pub fn compact(&self) -> Result<crate::column_family::CompactReport> {
         let parallel = if self.compaction_parallel == 0 {
             std::thread::available_parallelism()
                 .map(|n| (n.get() / 2).clamp(1, 4))
@@ -1311,7 +1321,7 @@ impl Engine {
             } else {
                 self.primary.compact()?
             };
-            if let Some(c) = self.cidx.as_mut() {
+            if let Some(c) = self.cidx.as_ref() {
                 let r = c.compact()?;
                 merge_report(&mut rep, &r);
             }
@@ -1319,9 +1329,9 @@ impl Engine {
             merge_report(&mut rep, &r);
             return Ok(rep);
         }
-        // 并行：三列族独立 &mut 借用（字段拆分）→ thread::scope 并发压实，聚合返回
+        // 并行：三列族独立共享借用（字段拆分）→ thread::scope 并发压实，聚合返回
         let compute_cores = self.affinity.compute.clone(); // Ex-7.2：Compaction 并行线程绑 compute 核
-        let (p, c, d) = (&mut self.primary, self.cidx.as_mut(), &mut self.delta);
+        let (p, c, d) = (&self.primary, self.cidx.as_ref(), &self.delta);
         let merged = std::thread::scope(|s| -> Result<crate::column_family::CompactReport> {
             let h1 = if needs_filter {
                 let cc = compute_cores.clone();
@@ -1386,11 +1396,20 @@ impl Engine {
     }
 
     /// P 项：事件驱动自动 Compaction——写入路径自触发（Flush 后 L0 段数/大小超阈值 → 合并收敛）。
-    /// 当前为**同步执行**（单写者模型：合并期间阻塞读写，写入自然退避 = 背压；
-    /// Q 项 ssts ArcSwap 化后改后台无锁，本函数只负责触发调度）。
+    /// O 项第③步双分支：
+    /// - **有后台 worker**（mysql 服务挂载，`compact_worker=true`）：只置 `compact_pending` 信号，
+    ///   实际合并由 worker 在引擎**读锁**下执行——读写均不被合并阻塞（合并不阻塞读）；
+    /// - **无 worker**（demo/rpc/测试）：保持同步执行（单写者模型：合并期间阻塞读写，
+    ///   写入自然退避 = 背压，L0 有界）。
     /// guard 上限 8：一次写入最多收敛 8 轮（正常 1~2 轮即收敛，防异常空转死循环）。
     fn auto_compact(&mut self) -> Result<()> {
         if !self.auto_compact {
+            return Ok(());
+        }
+        if self.compact_worker.load(Ordering::Acquire) {
+            if self.needs_compact() {
+                self.compact_pending.store(true, Ordering::Release);
+            }
             return Ok(());
         }
         let mut guard = 0;
@@ -1741,6 +1760,27 @@ mod tests {
         assert!(!e.needs_compact(), "收敛后不应再需要合并");
         assert!(e.get(0).unwrap().is_some(), "数据应完整可读");
         assert!(e.get(12 * 64 - 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn background_trigger_sets_pending_and_readlock_compact_converges() {
+        // O 项第③步：挂载后台 worker（compact_worker=true）后，写路径只置信号不阻塞；
+        // Engine::compact 可在 &self（读锁语义）下执行并收敛 L0。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &p_compact_cfg()).unwrap();
+        e.compact_worker.store(true, Ordering::Release);
+        fill_small_docs(&mut e, 12, 64);
+        assert!(
+            e.compact_pending.load(Ordering::Acquire),
+            "写路径应置 pending 信号（后台合并触发）"
+        );
+        assert!(e.needs_compact(), "L0 超阈值应判需要合并");
+        // 后台语义：合并经 &Engine（读锁）执行——验证 &self 路径收敛
+        let eng = &e;
+        let _ = eng.compact().unwrap();
+        assert!(!eng.needs_compact(), "读锁合并后应收敛");
+        assert!(eng.get(0).unwrap().is_some(), "数据应完整可读");
+        assert!(eng.get(12 * 64 - 1).unwrap().is_some());
     }
 
     #[test]
