@@ -102,7 +102,8 @@
      场景极少（多 docid 批量事务）；② 现有 L1 outbox + L2 SAGA 已覆盖异步/最终一致需求；
      ③ Calvin 需全局事务序协调器（单点）+ 读写集预声明（倒排词表难静态预声明）——投入产出
      不匹配。**触发条件**：出现强一致多 docid 跨分区事务需求时，再按"全局事务序 + 状态机
-     衔接 ReplicationLog"落地。
+     衔接 ReplicationLog"落地（完整协议设计见 design_extension **第 14 章**：全局 gseq 分配 /
+     确定性锁 / 幂等键 `(gseq,docid)` / 故障恢复 / SAGA vs Calvin 判据，远期蓝图 v0.7）。
 
 ### 验证
 
