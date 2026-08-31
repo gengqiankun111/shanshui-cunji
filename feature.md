@@ -10,11 +10,11 @@
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
-| WAL 预写日志（append 模式，崩溃回放） | ✅ | M1 |
+| WAL 预写日志（append 模式，崩溃回放；**每条记录 CRC32 校验**——读到首条 CRC 损坏/截断即停，部分写入安全） | ✅ | M1（`Length ++ CRC32 ++ Payload`，wal.rs） |
 | WAL 环形模式（预分配环形文件，回绕覆盖安全：Flush 后上报 `flushed_seq`，回绕仅覆盖已刷盘记录；未刷盘 → `WalFull` → 上层强制 Flush 后重试） | ✅ | M6-1 `66813c9`（+M8-P12 tail 合并 fsync `49d4f55`） |
 | WAL 截断回收（append 模式 flush 后截断 + 文件头持久化 seq） | ✅ | M8-P5 `a4d829a` |
 | MemTable 跳表 + 双缓冲（Mutable/Immutable） | ✅ | M1 |
-| SSTable 读写 + 块级压缩 + 分区布隆过滤（v5） | ✅ | M4 `e1eebce` |
+| SSTable 读写 + 块级压缩 + 分区布隆过滤（v5；**每数据块 trailer CRC32 校验**——读取时校验损坏即报错） | ✅ | M4 `e1eebce` |
 | SSTable 两级索引（Level 1 常驻摘要 + Level 2 精确懒加载） | ✅ | M5 `8bcc077` |
 | 基础 Compaction（全量合并，崩溃安全） | ✅ | P3-3 `3c48521` |
 | Leveled-Compaction（L0→L1→L2 分层压实） | ✅ | M6-2 `4c2e17a` |
@@ -52,6 +52,7 @@
 |---|---|---|
 | 查询执行器 + 优化器静态路由（AccessPath 枚举） | ✅ | M2 |
 | MVCC 快照读（get_at 按快照点过滤） | ✅ | M6-3 `07f556e` |
+| **MemTable 多版本（严格 MVCC）**（每 key 版本链：RR 快照读在事务活跃期 + 未刷盘时也能读到快照点版本；SST 多版本落盘且同 key 版本不跨块；`get_at`/`scan_block_for_key_at` 版本感知读） | ✅ | S 项 `e7a413a`（修复旧实现"仅保最新 → 未刷盘时快照读到新版本"的正确性缺陷；compaction 仍按 max seq 收敛旧版本） |
 | MVCC 全局 seq 一致性（跨列族共享 seq 分配） | ✅ | M7-1 `4283568` |
 | 热点缓存 HotCache（LRU/LFU + 保护区自动晋升） | ✅ | M6-4 `e34ea87` |
 | HotCache 内存缺陷修复（stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴） | ✅ | P41 `5a937ea` |
@@ -118,7 +119,7 @@
 | 配置热加载（reload 校验 + 变更区块报告） | ✅ | P3-1 `69b39dc` |
 | 全局分配器（mimalloc 默认 / jemalloc 可选） | ✅ | M4 `b0eaa58` |
 | YCSB 压测工具（负载 a/b/c/f + 分位数） | ✅ | M7-3 `d918c47` |
-| 质量文档体系（quality_system / problem_solving P1~P58） | ✅ | 持续维护 |
+| 质量文档体系（quality_system / problem_solving P1~P59） | ✅ | 持续维护 |
 | 三规模性能实测（1000万/2000万/5000万 + 截屏存档） | ✅ | v0.1.0~v0.5.0 发布系列 |
 
 ## I. 前沿探索（frontier）
@@ -216,24 +217,32 @@
 | 事务范围查询一次扫描（M 项） | ✅ `d044b4c`：`scan_range_at`/`scan_range_txn` | D 模块补行 |
 | 组合索引列族（cidx） | ✅ `encode_composite_key` + `query_by_composite_prefix` | D 模块补行 |
 | MySQL 协议适配（H 项全量） | ✅ `4249869`/`99ee10e`（含 SET ISOLATION LEVEL） | D 模块补行 |
+| **MemTable 多版本（严格 MVCC）** | ✅ S 项 `e7a413a`：版本链 + SST 多版本落盘（同 key 不跨块）+ 版本感知读 | D 模块补行 |
 | 环形 WAL 回绕覆盖安全 | ✅ 已实现（`set_flushed_seq` + WalFull 强制 Flush） | A 模块机制说明补全 |
+| **环形 WAL 崩溃边界（评审漏洞 3）** | ✅ 已核实安全：`sync()` 回绕前检查 `max_written_seq ≤ flushed_seq`，超则**先返回 WalFull 不写任何记录**（覆盖动作在检查通过后 + 同一次 fsync 原子提交）；`ensure_wal_room` → `switch_and_flush()` **同步且持锁**（`?` 传播失败）；崩溃于 fsync 前 → 头尾均未落盘 → 恢复上次提交状态 | 无需修改（A 模块机制说明已覆盖） |
+| WAL / SST 校验和（评审补充 P3） | ✅ 均已实现：WAL 每记录 `Length ++ CRC32 ++ Payload`（wal.rs，读到 CRC 损坏/截断即停）；SST 每数据块 trailer CRC32 校验（read_block 校验） | A 模块补行 |
 | 倒排并发读 | ✅ ArcSwap 无锁快照（Ex-6.2/6.3）；引擎级仍经全局 Mutex | I 模块 🔄→✅ + 读写分离行澄清 |
 | problem_solving 范围 | P1~P58 | H 模块更新 |
 
 ### 2. 架构缺陷（已知，按优先级与排期映射）
 
-1. **引擎全局单 Mutex 串行**（→ O 项 P1）：mysql.rs `Arc<Mutex<Engine>>` 每语句持锁执行（~1ms），
-   事务类 14 语句/事务 → 吞吐天花板 ≈ 1000 stmt/s。1 亿库复测 read_only 71 TPS 即此界。
-   方案：读路径 RwLock 化 / 多引擎分片 / 事务内语句批处理。
+1. **引擎全局单 Mutex 串行 + Compaction 同步阻塞**（→ O 项 P1，读路径无锁化合并 O/Q）：
+   mysql.rs `Arc<Mutex<Engine>>` 每语句持锁执行（~1ms）→ 事务类 14 语句/事务 → 吞吐天花板 ≈ 1000
+   stmt/s（1 亿库 read_only 71 TPS 即此界）；P 项写路径同步合并期间全局阻塞。
+   **评审修正（设计不一致）**：O（RwLock）与 Q（ArcSwap）共享同一前置——读 API `&self` 化
+   （scan_raw_range/delta），存在循环依赖 → **合并为一个大项「读路径无锁化改造」**：
+   ① 读 API `&self` 化（O/Q/R 共同前置）→ ② RwLock 读读并行 → ③ ssts ArcSwap + 后台合并。
 2. **L0/L1 层无全局布隆预过滤**（→ R 项 P1）：点查遍历全部 SST 逐个布隆 + 索引定位
    （78 段 = 78 次布隆检查 + 78 次二分）。方案：每层维护 OR 合并布隆，整层粗筛一次跳过。
-3. **Compaction 同步阻塞读写**（→ Q 项 P1）：P 项写路径同步合并期间全局阻塞（单写者模型下的
-   背压副作用）。方案：`ColumnFamily.ssts → ArcSwap<Arc<Vec<Arc<SstReader>>>>`，合并后台执行、
-   原子切换（3 前置：scan_raw_range/delta 读改 &self、manifest 入 swap 事务、旧文件先换映射再删）。
-4. **MemTable 不保留多版本**（design 4.7 已知局限）：快照读需旧版本已落 SST；MVCC 依赖 LSM 层级。
-5. **4KB 块冷扫 IO 放大**（P3 评估）：块缓存 LRU 摊薄重复读；冷顺序扫描可做预读合并（4×4KB→16KB 一次 IO）。
-6. **io_uring 后端未落地**（K 项 Ex-7.3）：io_queue.rs 仅队列抽象，unsafe liburing 封装待接入；
+3. **RR 事务点查冷读**（→ T 项 P2）：`get_at` 不走 HotCache（防污染）→ 事务内重复点查冷读放大。
+   方案：事务对象内 256 项快照小缓存，提交/回滚即弃。
+4. **4KB 块冷扫 IO 放大**（→ U 项 P3）：块缓存 LRU 摊薄重复读；冷顺序扫描可做预读合并（4×4KB→16KB 一次 IO）。
+5. **io_uring 后端未落地**（→ V 项 P2）：io_queue.rs 仅队列抽象，unsafe liburing 封装待接入；
    Linux 落地时需在 affinity 三池外给 SQPOLL 预留独立核。
+6. **Compaction 优先级队列缺失**（→ W 项 P2）：多列族/多层级同时需合并时无优先级调度
+   （热段 > 冷却到期 > 文件数压力）。方案：合并任务入优先级队列，后台调度器按序执行。
+7. **Metrics 缺失**（→ X 项 P2）：无 Prometheus 风格指标（QPS/延迟分位数/Compaction 速率/L0 文件数）。
+   方案：`admin` 暴露 `/metrics`，计数器/分位/直方图分层埋点。
 
 ### 3. 已实现的「优于常见实现」点（评审确认，不修改）
 
@@ -242,9 +251,13 @@
 - **倒排内部无锁读**（Ex-6.2/6.3）+ 段数据 mmap（P50/P53）：查询零外部锁 + 按需缺页。
 - **事件驱动自动 Compaction**（P 项）：写入路径自负责合并（检查≠触发，定时器仅保底）。
 - **batch_get 批量回表**（N 项）：万级 posting 回表块级顺序读。
+- **MemTable 多版本（S 项）**：RR 快照读在未刷盘时也严格一致（无业务层补偿）。
+- **WAL/SST 双层 CRC32 校验**：磁盘位翻转可检测（WAL 每记录 + SST 每数据块）。
 
-### 4. 已验证性能结论（1 亿库，2026-08-31）
+### 4. 已验证性能与正确性结论（2026-08-31）
 
 - M 项事务范围扫描一次化：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%）；
   未达预估 50×——瓶颈为引擎 Mutex 串行（O 项），非扫描路径本身（单连接实测范围查询 0.2ms/条）。
-- 事件驱动自动 Compaction 上线后 1 亿库 78 个 L0 段由写路径自触发收敛（SST 文件数下降，L1 层聚合）。
+- 事件驱动自动 Compaction 上线后 1 亿库 78 个 L0 段由写路径自触发收敛（78→1 段，read_only 75.8 TPS +80%）。
+- S 项严格 MVCC：RR 快照读在 MemTable 未刷盘时读到快照点旧版本（修复前读到新版本 → 余额/库存类业务
+  逻辑错误风险）；SST 多版本落盘 + 版本感知读，428 测试全绿无性能回退。

@@ -486,6 +486,17 @@
   语义与逐条 get 完全一致（+3 测试：get_many 跨 flush+tombstone、batch_get vs get 含 Delta 覆盖/
   删除位图、倒排回表分页/删除过滤）；419 全绿；提交 `d044b4c`（N 项，与 M 项同提交）。
 
+### P59. MemTable 多版本落地两坑：同 key 版本不得跨块 + flush 前先更新 buf_last_key
+- **问题**：S 项（严格 MVCC）实现中发现两个坑——① **同 key 多版本不得跨数据块**：`locate_indexed_block`
+  二分取"首个 first_key ≤ key 的最后一块"，若同 key 版本被拆到相邻两块，会漏读前一块的旧版本 →
+  快照读丢数据；② 刷块时 `flush_block` 以 `buf_last_key` 作块 max_key（Zone Map 上界），若在
+  更新 `buf_last_key` 前刷块，max_key 缺失当前行 key → 范围扫描按 Zone Map 剪枝漏行
+  （`zone_map_prunes_out_of_range_blocks` 10 vs 11 暴露）。
+- **修复**：`SstWriter::add_inner` 改为"仅当换 key 且块达阈值时刷块"（同 key 版本强制同块），且
+  **先更新 `buf_last_key` 再刷块**（max_key 含当前行）。
+- **结果**：+6 测试（memtable 版本链/get_at/delete 历史、CF 未刷盘快照读旧版本、SST 刷盘后快照保持、
+  RR 事务无 flush 读旧版本）；428 全绿；提交 `e7a413a`（S 项）。
+
 ---
 
 ## 环境备忘（不入库）

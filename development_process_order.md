@@ -30,14 +30,16 @@
 | L | Compaction 智能调度（合并冷却 + 动态窗口 + 倒排阈值） | P1 | ✅ 完成 | 28eae9d：①合并冷却（compaction_cooldown=2，软约束防收敛死循环）②动态窗口（l0_stall_min/max=8/16，写压力驱动）③倒排刷盘阈值参数化（flush_threshold，二分收敛推荐 500 万：段数 -80%、吞吐仅 -6%）；+demo 13 项单条 avg/max 统计 |
 | M | 事务类查询优化（范围查询改一次扫描） | P0 | ✅ 完成 | 1 亿库 sysbench 实测：oltp_read_only 42 TPS / read_write 29.5 TPS（点查类 5k-7k TPS）。根因：BETWEEN 范围/SUM 聚合被展开为**逐 id 独立 txn_get**（每事务 ~700 次 LSM 点查）。方案：范围查询走 `scan_range_at`（MemTable+SSTable 合并扫描 + 快照 seq 过滤），SUM/ORDER BY/DISTINCT 在扫描结果上处理；复测（d044b4c）：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%）；未达 50× 预估——真实瓶颈为引擎单 Mutex 每语句串行（~1ms×14 语句），后续 P1 并发模型改造 |
 | N | 倒排回表批量读（batch_get） | P0 | ✅ 完成 | 借鉴 batch_get 架构建议：倒排/全文 posting 回表从**逐 docid 点查**改为**批量读**——SST 层按块分组（同块多 key 只读/解压一次）+ 整文件/分区布隆批量粗筛 + Delta 单次范围扫描分组覆盖；万级 posting 回表从万次随机读降为块级顺序读 |
-| O | MySQL 服务并发模型改造（引擎单 Mutex → 读读并行） | P1 | ⏳ 待排期 | 1 亿库复测定位：事务类 TPS 天花板 = 引擎全局单 Mutex 每语句串行（~1ms×14 语句/事务 → ~1000 stmt/s）。方案：读路径 `RwLock` 化 / 多引擎分片 / 事务内语句批处理；预期事务类 TPS 数倍提升 |
+| O | 读路径无锁化改造（&self 化 → RwLock 读读并行 → ssts ArcSwap 后台合并，O/Q 合并） | P1 | ⏳ 待排期 | 评审修正（设计不一致）：O（RwLock）与 Q（ArcSwap）共享前置——读 API `&self` 化，原两条存在循环依赖 → 合并为大项：① 读 API `&self` 化（scan_raw_range/delta，O/Q/R 共同前置）→ ② `RwLock` 读读并行（RR 快照读只读，事务类 TPS 突破 ~1000 stmt/s 天花板）→ ③ `ssts → ArcSwap<Arc<Vec<Arc<SstReader>>>>` 后台合并 + store 原子切换（含 manifest swap 事务 + 旧文件先换映射再删 P53 模式） |
 | P | 事件驱动自动 Compaction（写路径自触发 + 大小阈值 + 背压） | P0 | ✅ 完成 | 24861c6：写路径 `auto_compact`（Flush 后 L0 段数/大小超阈值 → 同步合并收敛，写入自然退避=背压）+ `l0_max_size_mb` 大小软阈值（≥2 段才触发，单段不无收益重写）+ mysql_server 保底 10 分钟定时器；422 测试全绿 |
-| Q | ssts ArcSwap 化（合并不阻塞读） | P1 | ⏳ 待排期 | 借鉴 inverted Ex-6.2/6.3 同款模式：`ColumnFamily.ssts → ArcSwap<Arc<Vec<Arc<SstReader>>>>`，读路径 load 快照无锁、合并后台执行、store 原子切换。前置：① scan_raw_range/delta 读改 &self ② manifest 持久化归入 swap 事务 ③ 旧文件先换映射再删（P53 模式） |
+| Q | ssts ArcSwap 化（合并不阻塞读） | P1 | ⏳ 并入 O | 已并入 O 项第三阶段（&self 前置由 O 承担），不再独立排期 |
 | R | L0/层全局布隆预过滤（点查每层 1 次布隆替代逐 SST 布隆） | P1 | ⏳ 待排期 | 架构评审缺口：点查遍历全部 SST 逐个布隆（78 段 = 78 次布隆+索引定位）。方案：每层维护全局布隆（L0 段布隆 OR 合并，重建成本 O(段数) 可接受），`get_bytes` 先层布隆粗筛整层跳过；预期大 L0/大 L1 下点查 IO 与 CPU 数倍下降 |
-| S | MemTable 多版本（严格 MVCC，RR 快照读正确性） | P1 | ⏳ 待排期 | 架构评审缺陷 4：MemTable 仅保留每 key 最新版本（design 4.7 已知局限）——事务 begin 后、flush 前并发写同 key，`get_at` 读 MemTable 读到最新值而非快照值（旧版本未落 SST 时语义不严格）。方案：MemTable 按 seq 保留 ≤快照点的可见版本（双版本或版本链），读路径取最大 ≤snapshot 版本；对齐 `get_bytes_at` 的 SST 语义 |
+| S | MemTable 多版本（严格 MVCC，RR 快照读正确性） | P1 | ✅ 完成 | e7a413a：MemTable 版本链（put/delete 追加版本）+ SST 多版本落盘（同 key 版本不跨块）+ 版本感知读（`get_at`/`scan_block_for_key_at`/`get_from_sst_at`）——修复 RR 快照在未刷盘时读到新版本的正确性缺陷；compaction 仍按 max seq 收敛旧版本；428 测试全绿 |
 | T | 事务点查快照缓存（get_at per-txn 小缓存） | P2 | ⏳ 待排期 | 架构评审补充：RR 快照读 `get_at` 刻意不走 HotCache（防污染全局热缓存）→ 事务内重复点查冷读放大。方案：事务对象内挂小容量（如 256 项）快照缓存，同事务同 key 二次读直达；提交/回滚即弃 |
-| U | 4KB 块冷扫预读合并（4×4KB → 16KB 一次 IO） | P3 | ⏳ 待排期 | 架构评审缺陷 5（低优先）：块缓存 LRU 已摊薄重复读；冷顺序扫描场景可对相邻数据块合并一次 read_at + 预填充块缓存 |
-| V | io_uring 后端落地 + SQPOLL 预留核 | P2 | ⏳ 待排期 | 架构评审缺陷 6：io_queue.rs 仅队列抽象（Ex-7.3），unsafe liburing 封装待接入（Linux 部署 `runtime.io_uring_enabled=true`）；落地时在 affinity 三池外给 SQPOLL 预留独立核（防与用户线程抢核） |
+| U | 4KB 块冷扫预读合并（4×4KB → 16KB 一次 IO） | P3 | ⏳ 待排期 | 架构评审缺陷 4（低优先）：块缓存 LRU 已摊薄重复读；冷顺序扫描场景可对相邻数据块合并一次 read_at + 预填充块缓存 |
+| V | io_uring 后端落地 + SQPOLL 预留核 | P2 | ⏳ 待排期 | 架构评审缺陷 5：io_queue.rs 仅队列抽象（Ex-7.3），unsafe liburing 封装待接入（Linux 部署 `runtime.io_uring_enabled=true`）；落地时在 affinity 三池外给 SQPOLL 预留独立核（防与用户线程抢核） |
+| W | Compaction 优先级队列 | P2 | ⏳ 待排期 | 架构评审补充：多列族/多层级同时需合并时无优先级调度。方案：合并任务入优先级队列（热段 > 冷却到期 > L0 文件数压力），后台调度器按序执行；与 O 项后台合并线程联动 |
+| X | Metrics（Prometheus 风格 /metrics） | P2 | ⏳ 待排期 | 架构评审补充：无 QPS/延迟分位数/Compaction 速率/L0 文件数指标。方案：admin 暴露 `/metrics`，计数器 + 分位直方图分层埋点（引擎/列族/网络三层） |
 
 ## 3. 大项详情
 
@@ -198,17 +200,23 @@
 ### 缺陷 → 优化方案路线（与 feature.md「架构评审与补充」对齐）
 | 缺陷（按严重度） | 性质 | 方案要点 | 排期项 |
 |---|---|---|---|
-| 引擎全局单 Mutex 每语句串行 | 性能（吞吐天花板 ~1000 stmt/s） | 读路径 `RwLock` 化（RR 快照读只读可并行，前置读 API &self 化）/ 多引擎 docid 分片 / 事务内语句批处理 | O（P1） |
-| Compaction 同步阻塞读写 | 性能（合并期间全局阻塞） | `ssts → ArcSwap<Arc<Vec<Arc<SstReader>>>>` + 后台合并线程 + store 原子切换（3 前置：scan_raw_range &self、manifest swap 事务、旧文件先换映射再删） | Q（P1） |
+| 引擎全局单 Mutex 串行 + Compaction 同步阻塞 | 性能（吞吐天花板 ~1000 stmt/s） | **读路径无锁化合并**：① 读 API `&self` 化（O/Q/R 共同前置）→ ② RwLock 读读并行（RR 快照读只读）→ ③ ssts ArcSwap + 后台合并 | O（P1，O/Q 合并） |
 | L0/L1 层无全局布隆 | 性能（点查逐 SST 布隆+二分） | 每层 OR 合并布隆，`get_bytes` 整层粗筛一次跳过 | R（P1） |
-| MemTable 不保留多版本 | **正确性**（RR 快照读在 flush 前语义不严格） | MemTable 按 seq 保留 ≤快照点可见版本，对齐 `get_bytes_at` | S（P1） |
 | RR 事务点查冷读（get_at 不走 HotCache） | 性能（事务内重复点查放大） | 事务对象内 256 项快照小缓存，提交/回滚即弃 | T（P2） |
 | io_uring 后端未落地 | 平台（Linux 性能上限未兑现） | liburing unsafe 封装 + `io_uring_enabled` 接入 + SQPOLL 预留核 | V（P2） |
+| Compaction 优先级队列缺失 | 调度（多列族/层级无序） | 合并任务入优先级队列（热段 > 冷却 > 文件数压力） | W（P2） |
+| Metrics 缺失 | 运维（无观测指标） | admin `/metrics` + 计数器/分位直方图分层埋点 | X（P2） |
 | 4KB 块冷扫 IO 放大 | 性能（低优先） | 相邻块合并 read_at + 预填充块缓存 | U（P3） |
 
-> 依赖链：O 项读路径 &self 化是 Q/R 项前置（scan_raw_range/delta 读改 &self）；S 项独立（正确性）；建议顺序 O → Q → R → S。
+> 依赖链：O 项第①步（读 API &self 化）是 O 第②③步与 R 项共同前置；S 项已独立完成（✅ e7a413a，
+> 不依赖并发改造）；建议顺序 O → R → T/W/X → V → U。
 
 ## 4. 已完成大项（最近）
+
+- S 项 MemTable 多版本（严格 MVCC）✅（e7a413a：RR 快照读未刷盘也一致，+6 测试，428 全绿）
+- P 项事件驱动自动 Compaction ✅（24861c6：写路径自触发 + 大小阈值 + 背压 + 保底定时器，1 亿库 78→1 段验证）
+- N 项倒排回表批量读 batch_get ✅（d044b4c：SST 按块分组 + Delta 单次范围扫描，万级 posting 块级顺序读）
+- M 项事务范围查询一次扫描 ✅（d044b4c：read_only 42→71 TPS +68%、read_write 29.5→53 +80%）
 
 - H 项 MySQL 协议适配 ✅（H-1~H-6：握手/认证/SQL 映射/事务/预处理/sysbench 接入，mysql cli 8.0 + pymysql 真实连接）
 - D/E/F LSM 事务三阶段 ✅（WriteBatch 原子写 + 快照隔离 + ACID 锁/死锁检测/隔离级别，+15 测试）
