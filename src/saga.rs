@@ -224,7 +224,13 @@ impl SagaCoordinator {
                 continue; // 补偿幂等
             }
             let Some(step) = by_name.get(name.as_str()) else {
-                continue;
+                // 13.5：已登记分支必须可补偿——步骤定义缺失时保持 Compensating 待重试，
+                // 不得静默标记 Compensated（未补偿分支不能终态）。
+                st.last_error = Some(format!(
+                    "步骤 {name} 缺少补偿定义（本次 steps 未提供 compensate_url），保持待补偿"
+                ));
+                self.persist(&st)?;
+                return Ok(st.status); // Compensating
             };
             match step.compensate() {
                 Ok(()) => {
@@ -362,8 +368,10 @@ impl SagaStep for HttpStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     /// 副作用记录（多测试并行互斥共享计数）。
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -505,5 +513,146 @@ mod tests {
         let mut c = SagaCoordinator::open(dir.path()).unwrap();
         c.start("tx6").unwrap();
         assert!(c.start("tx6").is_err(), "重复登记被拒（幂等键 tx_id）");
+    }
+
+    // -----------------------------------------------------------------------
+    // 13.5 SAGA 补偿协议：中间态崩溃恢复（13.5.3）+ 超时屏障空转（13.5.2）
+    // 中间态用「构造磁盘状态文件」模拟崩溃点（SagaState 可序列化，等价真实崩溃）
+    // -----------------------------------------------------------------------
+
+    /// 直接写磁盘状态文件（模拟网关在该状态崩溃后的恢复起点）。
+    fn write_state(dir: &std::path::Path, st: &SagaState) {
+        std::fs::write(
+            dir.join(format!("saga-{}.json", st.tx_id)),
+            serde_json::to_string(st).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn executing_midway_resume_forward() {
+        // 13.5.3「正向执行中（部分登记）」：a 已登记、b 未执行时崩溃 → 重开 run → 续跑 b，不重复 a
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx7");
+        st.status = SagaStatus::Executing; // 崩溃点：a 已登记、正向未完成
+        st.executed_steps = vec!["a".to_string()];
+        write_state(dir.path(), &st);
+
+        // 重开（崩溃恢复）→ 提供完整步骤 a+b
+        FWD_CALLS.store(0, Ordering::SeqCst);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let full: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(SimpleStep { name: "a", fail_forward: false }),
+            Box::new(SimpleStep { name: "b", fail_forward: false }),
+        ];
+        let s = c.run("tx7", &refs(&full)).unwrap();
+        assert_eq!(s, SagaStatus::Succeeded, "续跑正向完成");
+        assert_eq!(FWD_CALLS.load(Ordering::SeqCst), 1, "已登记 a 不重复执行，只执行 b");
+        assert_eq!(
+            c.status("tx7").unwrap().executed_steps,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn failed_state_resume_compensates() {
+        // 13.5.3「正向失败后、补偿完成前（Failed）」：磁盘状态 Failed → 重开 run → 补偿完成
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx8");
+        st.status = SagaStatus::Failed;
+        st.executed_steps = vec!["a".to_string()];
+        st.last_error = Some("业务失败".into());
+        write_state(dir.path(), &st);
+
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let steps: Vec<Box<dyn SagaStep>> =
+            vec![Box::new(SimpleStep { name: "a", fail_forward: false })];
+        let s = c.run("tx8", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Compensated, "Failed 恢复 → 续补偿完成");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1, "补偿已登记分支 a");
+        assert!(c.status("tx8").unwrap().last_error.is_none(), "终态清空 last_error");
+    }
+
+    #[test]
+    fn compensating_partial_resume() {
+        // 13.5.3「Compensating 中（部分已补偿）」：a 已补偿、b 未补偿 → 重开 run → 续补偿 b
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx9");
+        st.status = SagaStatus::Compensating;
+        st.executed_steps = vec!["a".to_string(), "b".to_string()];
+        st.compensated_steps.insert("a".to_string());
+        write_state(dir.path(), &st);
+
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let steps: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(SimpleStep { name: "a", fail_forward: false }),
+            Box::new(SimpleStep { name: "b", fail_forward: false }),
+        ];
+        let s = c.run("tx9", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Compensated, "续补偿剩余分支完成");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1, "a 已补偿不重复，只补 b");
+    }
+
+    #[test]
+    fn missing_step_definition_keeps_compensating() {
+        // 13.5 修复：已登记分支缺补偿定义 → 保持 Compensating（不得静默 Compensated）
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("tx10");
+        st.status = SagaStatus::Compensating;
+        st.executed_steps = vec!["a".to_string()];
+        write_state(dir.path(), &st);
+
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        // 本次 steps 缺 a（只有 b）→ 补偿无法执行 a → 保持 Compensating + last_error
+        let steps: Vec<Box<dyn SagaStep>> =
+            vec![Box::new(SimpleStep { name: "b", fail_forward: false })];
+        let s = c.run("tx10", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Compensating, "缺步骤定义不得终态");
+        let st = c.status("tx10").unwrap();
+        assert!(st.last_error.as_deref().unwrap().contains("缺少补偿定义"), "{:?}", st.last_error);
+    }
+
+    /// 慢业务节点：接受连接后 sleep 再响应（客户端超时前不应收到响应）。
+    fn slow_node() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn timeout_unregistered_step_not_compensated() {
+        // 13.5.2 超时不确定性：慢节点超时（50ms < 300ms 响应）→ 该步未登记 →
+        // 屏障空转不补偿（宁可漏补偿，不可错补偿）；已登记分支正常逆序补偿
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        c.start("tx11").unwrap();
+        let base = slow_node();
+        let steps: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(SimpleStep { name: "fast", fail_forward: false }),
+            Box::new(
+                HttpStep::new("slow", format!("{base}/slow/action"), format!("{base}/slow/compensate"), vec![])
+                    .with_timeout(50),
+            ),
+        ];
+        FWD_CALLS.store(0, Ordering::SeqCst);
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let s = c.run("tx11", &refs(&steps)).unwrap();
+        assert_eq!(s, SagaStatus::Compensated, "超时失败 → 逆序补偿完成");
+        let st = c.status("tx11").unwrap();
+        assert_eq!(st.executed_steps, vec!["fast"], "超时未登记分支不在 executed_steps（屏障空转依据）");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1, "只补偿已登记 fast");
+        assert!(st.last_error.is_none(), "补偿完成后终态清空错误（终态语义）");
     }
 }
