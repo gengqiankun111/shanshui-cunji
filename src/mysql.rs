@@ -275,9 +275,23 @@ impl MySqlServer {
             let auto_id = self.auto_id.clone();
             let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
-                if let Err(e) =
-                    handle_connection(&mut stream, engine, &user, &password, conn_id, auto_id)
-                {
+                // X 项：连接计数（活跃/累计，/metrics 指标）
+                if let Ok(g) = engine.read() {
+                    g.metrics.active_conns.fetch_add(1, Ordering::Relaxed);
+                    g.metrics.total_conns.fetch_add(1, Ordering::Relaxed);
+                }
+                let r = handle_connection(
+                    &mut stream,
+                    engine.clone(),
+                    &user,
+                    &password,
+                    conn_id,
+                    auto_id,
+                );
+                if let Ok(g) = engine.read() {
+                    g.metrics.active_conns.fetch_add(-1, Ordering::Relaxed);
+                }
+                if let Err(e) = r {
                     tracing::warn!("MySQL 会话结束: {e}");
                 }
             });
@@ -416,6 +430,10 @@ fn handle_connection(
                 write_packet(stream, seq0, &ok_payload(0, 0))?;
             }
             COM_QUERY => {
+                // X 项：语句计数（/metrics 指标）
+                if let Ok(g) = engine.read() {
+                    g.metrics.statements.fetch_add(1, Ordering::Relaxed);
+                }
                 let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
                 // O 项第②步：读语句走 RwLock 读锁（多连接 SELECT 并行）；写语句走写锁互斥
                 let resp = if is_read_statement(&sql) {

@@ -109,6 +109,9 @@ pub struct Engine {
     /// 热路径接入（sstable/wal）随 Linux 部署验证后启用。
     #[cfg(target_os = "linux")]
     iou: Option<crate::io_queue::backend::IoUringPool>,
+    /// X 项：Prometheus 风格指标（读写计数 + 延迟直方图 + Compaction/Flush 次数；
+    /// 网络层连接/语句由服务进程写入共享 Metrics）。
+    pub metrics: crate::metrics::Metrics,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -352,6 +355,7 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             #[cfg(target_os = "linux")]
             iou,
+            metrics: crate::metrics::Metrics::default(),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -429,7 +433,9 @@ impl Engine {
     /// 写入文档（docid + 序列化字节 + 该文档涉及的倒排词条）。
     /// 写失效链：先失效 HotCache 与组合索引旧条目，最后写 LSM（design 6.6）。
     /// OOM Guardian：写入前按水位限流/熔断（design 14.1.1）。
+    /// X 项：写操作计数 + 延迟直方图。
     pub fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
+        let t = std::time::Instant::now();
         // 看门狗统一检查（P52）：内存硬水位熔断 + 磁盘剩余空间熔断；软水位放行记录
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.put_nosync(docid, value, terms)?;
@@ -437,6 +443,8 @@ impl Engine {
         self.maybe_group_commit()?;
         // Ex-7.4：按前台写压力动态调整 Compaction 限速（MemTable 水位让路）
         self.adjust_compaction_io_rate();
+        self.metrics.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_latency(t.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -818,7 +826,10 @@ impl Engine {
     /// 点查文档：HotCache 命中直达，否则主数据 LSM + Delta Merge-on-Read。
     /// Ex-5.6：删除位图开启时先 O(1) 判定，已删文档直接返回 None（零 LSM 读）。
     /// O 项第②步：读路径 `&self`（HotCache 内部 Mutex）。
+    /// X 项：读操作计数 + 延迟直方图（完整路径）。
     pub fn get(&self, docid: u64) -> Result<Option<Vec<u8>>> {
+        self.metrics.read_ops.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::Instant::now();
         if let Some(bm) = &self.deletion_bitmap {
             if bm.is_deleted(docid) {
                 return Ok(None);
@@ -861,6 +872,7 @@ impl Engine {
         let merged =
             serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         self.hotcache.lock().unwrap().put(docid, merged.clone());
+        self.metrics.record_latency(t.elapsed().as_nanos() as u64);
         Ok(Some(merged))
     }
 
@@ -949,7 +961,9 @@ impl Engine {
     /// Ex-5.6：删除位图开启时已删文档在任何快照点均不可见（位图删除为立即/全局语义，
     /// 快照隔离仅保证更新可见性；位图置位后该 docid 视为物理删除）。
     /// O 项第②步：读路径 `&self`。
+    /// X 项：读操作计数（事务内点查）。
     pub fn get_at(&self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
+        self.metrics.read_ops.fetch_add(1, Ordering::Relaxed);
         if let Some(bm) = &self.deletion_bitmap {
             if bm.is_deleted(docid) {
                 return Ok(None);
@@ -1385,6 +1399,7 @@ impl Engine {
                 let r = self.delta.compact()?;
                 merge_report(&mut rep, &r);
             }
+            self.metrics.compact_count.fetch_add(1, Ordering::Relaxed);
             return Ok(rep);
         }
         // 并行：仅最高紧迫度档（并列）列族
@@ -1429,6 +1444,7 @@ impl Engine {
                 let r = h.join().unwrap()?;
                 merge_report(&mut merged, &r);
             }
+            self.metrics.compact_count.fetch_add(1, Ordering::Relaxed);
             Ok(merged)
         })?;
         Ok(merged)
@@ -1444,6 +1460,13 @@ impl Engine {
     /// 主数据列族当前 L0 段数（P 项自动 Compaction 收敛性观测 / 测试）。
     pub fn primary_l0_count(&self) -> usize {
         self.primary.l0_count()
+    }
+
+    /// X 项：全列族累计刷盘次数（/metrics flush 指标）。
+    pub fn total_flush_count(&self) -> u64 {
+        self.primary.flush_count()
+            + self.delta.flush_count()
+            + self.cidx.as_ref().map_or(0, |c| c.flush_count())
     }
 
     /// P 项：事件驱动自动 Compaction——写入路径自触发（Flush 后 L0 段数/大小超阈值 → 合并收敛）。
@@ -1869,6 +1892,44 @@ mod tests {
         assert!(!eng.needs_compact(), "读锁合并后应收敛");
         assert!(eng.get(0).unwrap().is_some(), "数据应完整可读");
         assert!(eng.get(12 * 64 - 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn metrics_count_reads_writes_flush_compact() {
+        // X 项：读写操作计数 + 延迟直方图 + flush/compact 计数埋点
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = p_compact_cfg();
+        c.memtable.max_size_mb = 1; // 小 MemTable → 写入过程触发 flush
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        assert_eq!(e.metrics.read_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(e.metrics.write_ops.load(Ordering::Relaxed), 0);
+        for i in 0..64u64 {
+            e.put(i, format!("v{i}").into_bytes(), &["t"]).unwrap();
+        }
+        assert!(e.metrics.write_ops.load(Ordering::Relaxed) >= 64, "put 应计数");
+        let _ = e.get(0).unwrap();
+        assert_eq!(e.metrics.read_ops.load(Ordering::Relaxed), 1, "get 应计数");
+        // flush：64 条 × ~12B 远小于 1MB → 显式刷盘触发计数
+        let f0 = e.total_flush_count();
+        e.flush_primary().unwrap();
+        assert!(e.total_flush_count() >= f0 + 1, "flush 应计数");
+        // 延迟直方图：64 次 put 记录延迟（get 命中 hotcache 提前返回不计延迟）
+        let sum: u64 = e
+            .metrics
+            .latency_buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .sum();
+        assert!(sum >= 64, "put 应记录延迟（实际 {sum}）");
+        // compact 计数
+        let c0 = e.metrics.compact_count.load(Ordering::Relaxed);
+        if e.needs_compact() {
+            let _ = e.compact().unwrap();
+            assert!(
+                e.metrics.compact_count.load(Ordering::Relaxed) >= c0 + 1,
+                "compact 应计数"
+            );
+        }
     }
 
     #[test]

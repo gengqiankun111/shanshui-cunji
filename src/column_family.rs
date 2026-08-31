@@ -108,6 +108,8 @@ pub struct ColumnFamily {
     /// L 项：冷却中的段（新段 path → 到期轮次）；到期后正常参与合并。纯内存调度态。
     /// O 项第③步：内部 `Mutex`（compact `&self` 读写）。
     cooldown: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+    /// X 项：累计刷盘次数（switch_and_flush 成功 +1；/metrics 指标）。
+    flush_counter: AtomicU64,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 快照（O 项第③步：ArcSwap 原子发布——读路径 load 无锁，写路径 store 切换）。
@@ -275,6 +277,7 @@ impl ColumnFamily {
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
+            flush_counter: AtomicU64::new(0),
             memtable: MemTableBuffer::new(),
             ssts: {
                 let loaded: Vec<Arc<SstReader>> = ssts.into_iter().map(Arc::new).collect();
@@ -799,6 +802,8 @@ impl ColumnFamily {
         let Some(imm) = self.memtable.take_immutable() else {
             return Ok(());
         };
+        // X 项：flush 计数（写路径刷盘指标）
+        self.flush_counter.fetch_add(1, Ordering::Relaxed);
         // 环形 WAL 覆盖安全：Flush 完成后上报 imm 内最大 seq（<= 该 seq 的记录已刷盘可覆盖）
         let flushed_max = imm_scan_max_seq(&imm);
         if self.ttl_days.is_none() {
@@ -811,6 +816,11 @@ impl ColumnFamily {
         // （避免无限增长 + 大文件 fsync 拖慢写入）；ring 模式自带覆盖回收（no-op）
         self.wal.lock().unwrap().truncate_and_reset()?;
         Ok(())
+    }
+
+    /// X 项：本列族累计刷盘次数（写路径 flush 指标）。
+    pub fn flush_count(&self) -> u64 {
+        self.flush_counter.load(Ordering::Relaxed)
     }
 
     /// R 项：快照构建时计算层聚合元数据（O(段数)）——每层 key 范围 + 每层段下标。

@@ -38,6 +38,7 @@ pub mod join;
 pub mod keys;
 pub mod memtable;
 pub mod meta;
+pub mod metrics;
 pub mod migrate;
 pub mod mv;
 pub mod mysql;

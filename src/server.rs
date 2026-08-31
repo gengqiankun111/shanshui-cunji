@@ -465,6 +465,7 @@ fn route_request(
         ("GET", "/groupby") => handle_group_by(engine, query),
         ("GET", "/join") => handle_join(engine, query, broadcast),
         ("GET", "/admin/status") => handle_admin_status(engine),
+        ("GET", "/metrics") => handle_metrics(engine),
         ("GET", "/explain") => handle_explain(engine, query),
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
@@ -506,6 +507,19 @@ fn handle_admin_status(engine: &mut Engine) -> (u16, String) {
         Ok(s) => (200, s),
         Err(e) => (500, json!({"error": e.to_string()}).to_string()),
     }
+}
+
+/// Prometheus 指标（X 项）：`GET /metrics` → 文本格式（计数/直方图/gauge 分层埋点）。
+fn handle_metrics(engine: &mut Engine) -> (u16, String) {
+    let s = engine.stats();
+    let l0 = engine.primary_l0_count() as u64;
+    let flush = engine.total_flush_count();
+    (
+        200,
+        engine
+            .metrics
+            .render(s.sst_file_count as u64, l0, s.mem_ratio, s.disk_ratio, flush),
+    )
 }
 
 /// 执行计划推演（development 5.26）：`GET /explain?filter=status%3Dactive` → ExplainPlan JSON。
