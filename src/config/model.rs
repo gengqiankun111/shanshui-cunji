@@ -622,6 +622,12 @@ pub struct StorageConfig {
     /// L 项：合并冷却轮次（compact 输出段 N 轮内不参与下一轮合并，防"刚合并又合并"的
     /// 无谓重写，写放大 -10~20%）；0 = 关闭。纯调度策略，不改数据格式（崩溃安全）。
     pub compaction_cooldown: u32,
+    /// P 项：事件驱动自动 Compaction——写入路径自触发（Flush 后 L0 文件数/大小超阈值 →
+    /// 同步合并收敛，替代仅 CLI 显式 compact）。true = 开启（默认）；false = 保持仅显式调用。
+    pub auto_compact: bool,
+    /// P 项：L0 大小软阈值（MB）——L0 文件总字节超此值触发合并（与段数阈值互补，
+    /// 防大段少量堆积；0 = 仅用段数阈值，默认关闭）。
+    pub l0_max_size_mb: u64,
 }
 
 impl Default for StorageConfig {
@@ -656,6 +662,10 @@ impl Default for StorageConfig {
             l0_stall_min: 8,
             l0_stall_max: 16,
             compaction_cooldown: 2,
+            // P 项：事件驱动自动 Compaction 默认开启；大小阈值默认关闭（仅段数阈值，
+            // 保持既有行为；需按段大小触发时配置 l0_max_size_mb）。
+            auto_compact: true,
+            l0_max_size_mb: 0,
         }
     }
 }

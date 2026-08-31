@@ -6,6 +6,10 @@
 data_dir = "D:/shanshui-data/db-100m-v070"
 # 组提交窗口 2ms：构建期攒批 fsync，吞吐最大化
 group_commit_us = 2000
+# P 项：事件驱动自动 Compaction（默认开启）——写路径自触发，Flush 后 L0 段数/大小超阈值 → 合并收敛
+auto_compact = true
+# P 项：L0 大小软阈值 1GB（段数阈值外的补充，防大段少量堆积；0=仅用段数阈值）
+l0_max_size_mb = 1024
 
 [inverted]
 engine = "fst"

@@ -76,6 +76,9 @@ pub struct Engine {
     /// Compaction 并行度（Ex-5.4）：并行压实 primary/cidx/delta 三列族；
     /// 0 = 自动（min(4, 核数/2)），1 = 串行，>1 = 指定并行数。
     compaction_parallel: usize,
+    /// P 项：事件驱动自动 Compaction（`storage.auto_compact`）——写入路径自触发：
+    /// 写前 L0 达硬顶（l0_stall_max）先合并（背压），写后 L0 超阈值（段数/大小）合并收敛。
+    auto_compact: bool,
     /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
     /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
     deletion_bitmap: Option<DeletionBitmap>,
@@ -310,6 +313,7 @@ impl Engine {
             skip_hotcache: false,
             pending_inverted: Vec::new(),
             compaction_parallel: cfg.storage.compaction_parallel,
+            auto_compact: cfg.storage.auto_compact,
             deletion_bitmap,
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
@@ -459,6 +463,9 @@ impl Engine {
         if !self.skip_hotcache {
             self.hotcache.put(docid, value);
         }
+        // P 项：事件驱动自动 Compaction——写后检查（Flush 可能刚新增 L0 段），
+        // L0 段数/大小超阈值 → 同步合并收敛（写入自然退避 = 背压）。
+        self.auto_compact()?;
         Ok(())
     }
 
@@ -1357,9 +1364,32 @@ impl Engine {
         Ok(merged)
     }
 
-    /// 是否需要 Compaction（主数据列族 L0 段数超过阈值）。
+    /// 是否需要 Compaction（主数据 / delta / cidx 任一列族 L0 超阈值或 L1/L2 需收敛）。
     pub fn needs_compact(&self) -> bool {
         self.primary.needs_compact()
+            || self.delta.needs_compact()
+            || self.cidx.as_ref().map_or(false, |c| c.needs_compact())
+    }
+
+    /// 主数据列族当前 L0 段数（P 项自动 Compaction 收敛性观测 / 测试）。
+    pub fn primary_l0_count(&self) -> usize {
+        self.primary.l0_count()
+    }
+
+    /// P 项：事件驱动自动 Compaction——写入路径自触发（Flush 后 L0 段数/大小超阈值 → 合并收敛）。
+    /// 当前为**同步执行**（单写者模型：合并期间阻塞读写，写入自然退避 = 背压；
+    /// Q 项 ssts ArcSwap 化后改后台无锁，本函数只负责触发调度）。
+    /// guard 上限 8：一次写入最多收敛 8 轮（正常 1~2 轮即收敛，防异常空转死循环）。
+    fn auto_compact(&mut self) -> Result<()> {
+        if !self.auto_compact {
+            return Ok(());
+        }
+        let mut guard = 0;
+        while self.needs_compact() && guard < 8 {
+            self.compact()?;
+            guard += 1;
+        }
+        Ok(())
     }
 
     /// Ex-7.2：网络核列表（server 主线程绑核用）。
@@ -1636,6 +1666,61 @@ mod tests {
         let p3 = e.search_term_paged("city=beijing", None, 0).unwrap();
         assert_eq!(p3.total, 30, "posting 含已删 docid（回表过滤）");
         assert!(!p3.rows.iter().any(|(d, _)| *d == 3), "已删 docid 不应回表");
+    }
+
+    // ---------- P 项：事件驱动自动 Compaction ----------
+
+    fn p_compact_cfg() -> Config {
+        let mut c = cfg();
+        c.storage.auto_compact = true;
+        c.storage.l0_stall_min = 2;
+        c.storage.l0_stall_max = 3;
+        c.storage.l0_stall_threshold = 2; // L0 > 2 即触发
+        c.memtable.max_size_mb = 1; // 1MB MemTable → 快速多次 flush
+        c.storage.group_commit_us = 2000; // 组提交避免逐条 fsync 拖慢测试
+        c
+    }
+
+    fn fill_small_docs(e: &mut Engine, rounds: u32, per_round: u32) {
+        let mut id = 0u64;
+        for _ in 0..rounds {
+            for _ in 0..per_round {
+                let doc = serde_json::json!({"k": id, "c": "x".repeat(8000)});
+                e.put(id, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+                id += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn auto_compact_keeps_l0_bounded_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &p_compact_cfg()).unwrap();
+        // ~6MB 数据 → 多次 MemTable flush → 写路径自触发合并收敛 L0
+        fill_small_docs(&mut e, 12, 64);
+        assert!(
+            e.primary_l0_count() <= 3,
+            "auto_compact 应把 L0 收敛到阈值内（实际 {}）",
+            e.primary_l0_count()
+        );
+        assert!(!e.needs_compact(), "收敛后不应再需要合并");
+        assert!(e.get(0).unwrap().is_some(), "数据应完整可读");
+        assert!(e.get(12 * 64 - 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn auto_compact_off_leaves_l0_accumulated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = p_compact_cfg();
+        c.storage.auto_compact = false;
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        fill_small_docs(&mut e, 12, 64);
+        assert!(
+            e.primary_l0_count() >= 4,
+            "关闭 auto_compact 后 L0 应累积（实际 {}）",
+            e.primary_l0_count()
+        );
+        assert!(e.needs_compact(), "L0 超阈值应判需要合并");
     }
 
     #[test]

@@ -221,8 +221,27 @@ impl MySqlServer {
         }
     }
 
+    /// P 项：保底自动 Compaction 守护线程（10 分钟周期）。事件驱动的写路径自触发
+    /// （`Engine::auto_compact`）是主机制；本线程仅兜底异常路径（flush 未触发/合并失败）。
+    /// `try_lock` 非阻塞：引擎正忙（有语句在执行）时跳过本轮，不干扰前台。
+    fn spawn_compaction_guard(&self) {
+        let engine = self.engine.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            if let Ok(mut g) = engine.try_lock() {
+                if g.needs_compact() {
+                    let _ = g.compact();
+                }
+            }
+        });
+    }
+
     /// 绑定并接受连接（阻塞）。每连接 spawn 线程处理。
     pub fn serve(self, addr: &str) -> Result<()> {
+        // P 项：保底自动 Compaction 定时器（10 分钟级）——事件驱动（写路径自触发，
+        // engine.put_nosync → auto_compact）之外的兜底：覆盖 flush 未触发 / 合并失败等
+        // 异常路径。`try_lock` 非阻塞：服务繁忙时不打扰前台（Q 项 ArcSwap 化后改后台无锁）。
+        self.spawn_compaction_guard();
         let listener = TcpListener::bind(addr)?;
         tracing::info!("MySQL 协议服务已启动: mysql://{addr}（库 {DEFAULT_DB}，表 {DEFAULT_TABLE}）");
         for stream in listener.incoming() {

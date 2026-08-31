@@ -79,6 +79,8 @@ pub struct ColumnFamily {
     l0_stall_max: usize,
     /// L 项：前台写压力（0~1，Ex-7.4 同源信号：MemTable 水位代理）——动态窗口反馈依据。
     write_pressure: f64,
+    /// P 项：L0 大小软阈值（字节；`storage.l0_max_size_mb`；0 = 禁用，仅用段数阈值）。
+    l0_max_size_bytes: u64,
     /// L 项：合并冷却轮次（`storage.compaction_cooldown`；0 = 关闭）。
     compaction_cooldown: u32,
     /// L 项：当前合并轮次（每次 compact 成功 +1；冷却到期基准）。
@@ -250,6 +252,7 @@ impl ColumnFamily {
             l0_stall_min: cfg.storage.l0_stall_min.max(2),
             l0_stall_max: cfg.storage.l0_stall_max.max(cfg.storage.l0_stall_min.max(2)),
             write_pressure: 0.0,
+            l0_max_size_bytes: cfg.storage.l0_max_size_mb * 1024 * 1024,
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: 0,
             cooldown: std::collections::HashMap::new(),
@@ -1146,12 +1149,34 @@ impl ColumnFamily {
     /// 是否需要 Compaction（design 4.5 二期）：
     /// L0 段数超过 `storage.l0_stall_threshold`（L0→L1），或 L0 为空但 L1 段数 > 1（L1→L2），
     /// 或 L0/L1 均空但 L2 段数 > 1（L2 收敛）。
+    /// P 项：启用 `l0_max_size_mb` 时叠加**大小阈值**——L0 文件总字节超限即触发（防大段少量堆积）。
     pub fn needs_compact(&self) -> bool {
         let l0 = self.sst_levels.iter().filter(|l| **l == 0).count();
         let l1 = self.sst_levels.iter().filter(|l| **l == 1).count();
         let l2 = self.sst_levels.iter().filter(|l| **l >= 2).count();
         // L 项：用动态有效阈值（写压力高 → 阈值收窄 → 更早触发收敛）
-        l0 > self.effective_l0_threshold() || (l0 == 0 && (l1 > 1 || l2 > 1))
+        l0 > self.effective_l0_threshold()
+            // P 项：大小阈值需 ≥2 段（单段为已排序文件，合并是纯无收益重写）
+            || (l0 >= 2 && self.l0_max_size_bytes > 0 && self.l0_bytes() > self.l0_max_size_bytes)
+            || (l0 == 0 && (l1 > 1 || l2 > 1))
+    }
+
+    /// 当前 L0 段数（层号 == 0）。
+    pub fn l0_count(&self) -> usize {
+        self.sst_levels.iter().filter(|l| **l == 0).count()
+    }
+
+    /// 当前 L0 段文件总字节（按层号过滤后取磁盘元数据）。
+    pub fn l0_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for (i, s) in self.ssts.iter().enumerate() {
+            if self.sst_levels.get(i).copied().unwrap_or(0) == 0 {
+                if let Ok(m) = std::fs::metadata(s.path()) {
+                    total += m.len();
+                }
+            }
+        }
+        total
     }
     /// 全部 SST 文件字节总和。
     pub fn sst_bytes(&self) -> u64 {
@@ -2256,6 +2281,43 @@ mod tests {
         assert!(got[2].is_some() && got[3].is_some(), "未删除 key 应命中");
         // 空输入
         assert!(cf.get_many(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn needs_compact_by_l0_size_threshold() {
+        let dir = tmp();
+        let mut cfg = small_cfg(256);
+        cfg.storage.l0_max_size_mb = 1; // 1MB 大小软阈值（叠加在段数阈值之上）
+        cfg.memtable.max_size_mb = 1; // 1MB MemTable → 写入过程自动多次 flush
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        let val = vec![0x42u8; 64 * 1024];
+        for i in 0..64u64 {
+            cf.put(i, val.clone()).unwrap(); // 64KB×64 ≈ 4MB → ~4 次 flush
+        }
+        cf.switch_and_flush().unwrap(); // 清空残余 MemTable
+        assert!(
+            cf.l0_count() >= 2,
+            "应产生多个 L0 段（实际 {}）",
+            cf.l0_count()
+        );
+        assert!(
+            cf.needs_compact(),
+            "L0 总大小超阈值（{} B > 1MB）应触发合并",
+            cf.l0_bytes()
+        );
+        // 多段合并收敛后大小阈值不再触发
+        cf.compact().unwrap();
+        assert!(!cf.needs_compact());
+        // 单段超大小阈值不触发合并（单段为已排序文件，合并是纯无收益重写）
+        let dir2 = tmp();
+        let mut cfg2 = small_cfg(256);
+        cfg2.storage.l0_max_size_mb = 1;
+        cfg2.memtable.max_size_mb = 8; // 大 MemTable：2MB 值不触发自动 flush
+        let mut cf2 = ColumnFamily::open("primary", &dir2, &cfg2).unwrap();
+        cf2.put(0, vec![0x42u8; 2 * 1024 * 1024]).unwrap(); // 单条 2MB > 1MB
+        cf2.switch_and_flush().unwrap();
+        assert_eq!(cf2.l0_count(), 1);
+        assert!(!cf2.needs_compact(), "单段超大小阈值不应触发合并");
     }
 
     #[test]
