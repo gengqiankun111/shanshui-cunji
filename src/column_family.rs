@@ -529,8 +529,9 @@ impl ColumnFamily {
 
     /// 范围扫描 [start, end]（闭区间，None 端无边界）：先收集 MemTable 与各 SST 候选，
     /// 以最大 seq 去重（最新覆盖，Tombstone 覆盖旧值），返回按 docid 升序的 (docid, value) 列表。
+    /// O 项第①步：读路径 `&self` 化（范围扫描共用，配合 RwLock 读读并行）。
     pub fn scan_range(
-        &mut self,
+        &self,
         start: Option<u64>,
         end: Option<u64>,
     ) -> Result<Vec<(u64, Vec<u8>)>> {
@@ -550,7 +551,7 @@ impl ColumnFamily {
     /// 快照范围扫描 [start, end]（M 项，事务类查询优化 P0）：按快照 seq 过滤版本，
     /// 返回按 docid 升序的 (docid, value) 列表（快照点已删除的 key 跳过）。
     pub fn scan_range_at(
-        &mut self,
+        &self,
         snapshot_seq: u64,
         start: Option<u64>,
         end: Option<u64>,
@@ -568,8 +569,9 @@ impl ColumnFamily {
     }
 
     /// 原始字节键范围扫描（组合索引前缀查询使用）。返回升序 (key, value) 列表，Tombstone 已过滤。
+    /// O 项第①步：原始键范围扫描读路径 `&self` 化（delta Merge-on-Read / 批量覆盖共用）。
     pub fn scan_raw_range(
-        &mut self,
+        &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -583,7 +585,7 @@ impl ColumnFamily {
         });
 
         // SST 范围扫描（Zone Map 剪枝已内置在 scan_range）
-        for sst in &mut self.ssts {
+        for sst in &self.ssts {
             sst.scan_range(start, end, |k, v, seq| {
                 merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
             })?;
@@ -602,7 +604,7 @@ impl ColumnFamily {
     /// 回调返回 `bool`：true=继续，**false=提前终止**（M8-P11 游标续扫：取满页即停，
     /// 不再全扫计数 total）。内存 O(块) 不随扫描总量膨胀，语义与 `scan_raw_range` 一致。
     pub fn scan_stream<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
-        &mut self,
+        &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         f: F,
@@ -615,16 +617,16 @@ impl ColumnFamily {
     /// **seq ≤ snapshot_seq 的最大版本**（对齐 `get_bytes_at` 快照语义）；
     /// 快照点前为删除（Tombstone）→ 跳过该 key。其余与 `scan_stream` 一致。
     pub fn scan_stream_at<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
-        &mut self,
+        &self,
         snapshot_seq: u64,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         mut f: F,
     ) -> Result<()> {
-        // 源：memtable（immutable + mutable）借用 &self.memtable；SST 借用 &mut self.ssts
+        // 源：memtable（immutable + mutable）借用 &self.memtable；SST 借用 &self.ssts
         let mut mem_iters = self.memtable.iter_range(start, end);
         let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
-        for sst in &mut self.ssts {
+        for sst in &self.ssts {
             sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
         }
         let mem_count = mem_iters.len();
@@ -694,7 +696,7 @@ impl ColumnFamily {
     /// 范围扫描并保留 seq 与 Tombstone（MVCC 快照 Delta 隔离用，M7-1）：
     /// 返回升序 `(key, seq, value)`，value=None 表示删除标记；每 key 仅保留最大 seq 版本。
     pub fn scan_raw_range_with_seq(
-        &mut self,
+        &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, u64, Option<Vec<u8>>)>> {
@@ -703,7 +705,7 @@ impl ColumnFamily {
         self.memtable.scan_range(start, end, |key, e| {
             merge_candidate_bytes(&mut merged, key.to_vec(), e.seq, e.value.clone());
         });
-        for sst in &mut self.ssts {
+        for sst in &self.ssts {
             sst.scan_range(start, end, |k, v, seq| {
                 merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
             })?;

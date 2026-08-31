@@ -935,7 +935,8 @@ impl SstReader {
 
     /// 等值查询：定位块 → 分区布隆剪枝（v5）/ 整文件布隆剪枝（v3/v4）→ 读块 → 块内扫描。
     /// 返回 `(value, seq)`：`value=None` 表示 Tombstone（已删除），`None` 整体表示不存在。
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
+    /// O 项第①步：读路径 `&self` 化（内部可变由 RefCell/原子承担）。
+    pub fn get(&self, key: &[u8]) -> Result<Option<(Option<Vec<u8>>, u64)>> {
         // v5 分区布隆：先定位块，再只校验目标块布隆（design 4.4.2 按需加载）
         if let Some(pb) = &self.partition_blooms {
             let Some(idx) = self.locate_block_index(key)? else {
@@ -1125,8 +1126,9 @@ impl SstReader {
     /// 范围扫描 [start, end]（闭区间；None 端无边界），利用块级 Zone Map 剪枝：
     /// 块范围 [first_key, max_key] 与查询区间无交集则跳过，不读块、不解压（design 4.4.1）。
     /// 回调 `f(key, value, seq)`，`value=None` 表示 Tombstone。
+    /// O 项第①步：范围扫描读路径 `&self` 化。
     pub fn scan_range<F: FnMut(&[u8], Option<&[u8]>, u64)>(
-        &mut self,
+        &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         mut f: F,
@@ -1166,7 +1168,7 @@ impl SstReader {
 /// 逐条 yield `(key, value, seq)`（value=None = Tombstone）。与 `scan_range` 语义一致，
 /// 但可暂停/推进（k-way merge 多源归并用），内存 O(块) 而非 O(全量)。
 pub struct SstRangeIter<'a> {
-    reader: &'a mut SstReader,
+    reader: &'a SstReader,
     /// 当前候选块下标（自起始块起，不再持有全索引副本——M 项 P0 修复：
     /// 原 `reader.index()` 每次克隆整个块索引（78 个 SST × 全量深拷贝）致小范围扫描初始化成本秒级）。
     block_idx: usize,
@@ -1177,8 +1179,9 @@ pub struct SstRangeIter<'a> {
 }
 
 impl<'a> SstRangeIter<'a> {
+    /// O 项第①步：`&SstReader`（读路径共享，配合 RwLock 读读并行）。
     pub fn new(
-        reader: &'a mut SstReader,
+        reader: &'a SstReader,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Self> {
