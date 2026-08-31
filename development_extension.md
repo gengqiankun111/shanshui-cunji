@@ -58,8 +58,11 @@
      补偿幂等键（tx_id+step）；回查接口 `status`/`all_states` 持久化 transactionId→status。
 - [x] **Ex-2.4 执行引擎**：`run`（启动/续跑，Failed/Compensating 自动转补偿）+
      `compensate`（逆序补偿），与现有 RPC 衔接由业务方实现 `SagaStep`。
-- [ ] **Ex-2.5 API**：网关 `/saga/start` `/saga/status` `/saga/compensate`（HTTP，参照 DTM 无侵入协议，
-     待网关路由接入时落地）。
+- [x] **Ex-2.5 网关 HTTP API**：`src/server.rs` `/saga/start`（POST `{tx_id, steps[]}`，
+     执行业务步骤并自动逆序补偿）/ `/saga/status`（GET transactionId→status 回查，屏障依据）/
+     `/saga/compensate`（POST 强制补偿重试）；`src/saga.rs` 增 `HttpStep`（HTTP 业务步骤）+
+     `http_post`（极简 HTTP/1.1 POST 客户端，非 2xx/超时 → 步骤失败）；
+     协调器目录 = `{data_dir}/saga`（崩溃恢复续跑）。
 
 ### 验证
 
@@ -67,8 +70,10 @@
   终态拒迟到正向（悬挂防护）/ 崩溃恢复状态机续跑 / 补偿失败重试 + 幂等。
 - kernel 集成（src/saga.rs 6 测试）：正向成功无补偿 / 中段失败逆序补偿 / 重启恢复终态 /
   终态拒绝重复正向 / 补偿重试 3 次成功 / 重复登记被拒。
-- ✅ 完成：`cargo test` **362 全绿**（含 saga 6）；提交 `990bf6b`。
-  注：Ex-2.5 网关 HTTP API 与 2 节点跨分片端到端联调留待分布式构建阶段。
+- Ex-2.5 网关 e2e（src/server.rs 3 测试，模拟业务节点）：正向全成功无补偿 + 状态文件持久化 /
+  中段失败逆序补偿 + 终态幂等（重发不重复执行/补偿）/ 网关重启后状态恢复。
+- ✅ 完成：`cargo test` **365 全绿**（saga 6 + 网关 3）；提交 `990bf6b`（Ex-2.5）。
+  跨分片 2 节点真实联调留待分布式构建阶段（设计见 design_extension 13.2）。
 
 ### 依赖
 
@@ -253,7 +258,7 @@ Ex-5.2（分片锁）/ Ex-6.1（Seqlock）已落地锁竞争；design_extension 
 |---|---|---|---|
 | L0 | 写路径单分片本地事务 + Group Commit | ✅ 已有 | `648d9bd` 等 |
 | Ex-1 | 本地消息表 + 幂等消费 | ✅ | `7348acd` |
-| Ex-2 | SAGA 编排 + 补偿状态机 | ✅ | `990bf6b`（Ex-2.5 网关 HTTP API 留待分布式阶段） |
+| Ex-2 | SAGA 编排 + 补偿状态机 + 网关 HTTP API | ✅ | `990bf6b`（Ex-2.5 网关 `/saga/*` 端点 + HttpStep） |
 | Ex-3 | Calvin 确定性事务评估 | ✅ 评估完成（🔍 不进入 kernel，远期方向保留） | demo `src/demo/calvin` |
 | Ex-4 | 倒排索引字段策略落地（db-50m 重建 + 配置模板） | ✅ | `db-50m-opt`（inverted 2231.8→144.3MB） |
 | Ex-5 | SSD 原生迁移（P0 ✅ + P1 环形 WAL/删除位图/FST/解耦 ✅ + P2 冷热/条带化 ✅） | ✅ | `e6a5610` 等 |

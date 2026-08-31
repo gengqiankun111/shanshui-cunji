@@ -216,6 +216,11 @@ pub struct EngineStats {
 }
 
 impl Engine {
+    /// 数据目录（Ex-2.5 网关 SAGA 状态持久化目录据此派生 `{data_dir}/saga`）。
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// 打开（或创建）引擎。倒排刷盘阈值取自内存预算的比例（MVP 固定 1M posting）。
     pub fn open(data_dir: &Path, cfg: &Config) -> Result<Self> {
         Self::open_with_timeout(data_dir, cfg, DEFAULT_QUERY_TIMEOUT)

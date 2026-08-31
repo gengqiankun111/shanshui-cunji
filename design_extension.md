@@ -408,3 +408,122 @@ impl PerCpuCounter {
 | Ex-7.2 | `[affinity]` 绑核默认开启 + 三池物理核分区（P99 验证）| P1 |
 | Ex-7.3 | io_uring SQPOLL + WAL/SSTable 多 NVMe 队列/多盘 | P1 |
 | Ex-7.4 | Compaction 动态限流（按前台负载调 rate_limit）| P2 |
+
+---
+
+# 第 13 章 分布式事务落地深化：SAGA 网关接入 + Calvin 蓝图（v0.6，2026-08-31）
+
+> 定位：v0.1 第 1~8 章完成**技术全景与分层决策**（L0 本地事务 ✅ / L1 本地消息表 ✅ / L2 SAGA ✅ 内核 /
+> L3 Calvin 🔍 评估完成）；本章深化**落地形态**——SAGA 由「内核机制」推进到「网关 HTTP 接入」
+> （Ex-2.5 闭环），并给出 Calvin 全局事务序在触发条件下的落地蓝图（远期方向保留，不写代码）。
+> 与 Ex-1（outbox）/ Ex-2（saga.rs）/ Ex-3（calvin demo）衔接。
+
+## 13.1 SAGA 网关 HTTP API（Ex-2.5，DTM 无侵入协议风格）
+
+> 设计目标：网关（server.rs HTTP-JSON 服务）作为 SAGA 协调器宿主，业务节点以普通 HTTP 端点
+> 提供正向/补偿步骤——客户端无需引入 SDK，仅声明步骤（参照 DTM 无侵入协议，不依赖 dtmrs 二进制）。
+
+### 13.1.1 端点定义
+
+| 端点 | 方法 | 请求体 | 响应 |
+|---|---|---|---|
+| `/saga/start` | POST | `{tx_id, steps: [{name, action_url, compensate_url, payload}]}` | `{tx_id, status, executed_steps}` |
+| `/saga/status` | GET | `?tx_id=` | `{tx_id, status, executed_steps, compensated_steps, last_error}` |
+| `/saga/compensate` | POST | `{tx_id}`（显式补偿/续跑重试） | `{tx_id, status}` |
+
+- `action_url`/`compensate_url`：业务节点步骤端点（`POST {url}`，body = 该步 `payload`）；
+  网关协调器发出 HTTP 请求调用（业务方实现幂等）。
+- 编排语义（复用 saga.rs 内核）：
+  1. `start` 登记（transactionId → Init 持久化）→ 按序 POST `action_url`；
+  2. 每步正向成功 → 分支登记（executed_steps += name）持久化（屏障：补偿只作用于已登记分支，
+     超时未执行分支不补偿——宁可多发由屏障空转）；
+  3. 任一步失败 → **逆序** POST 已登记分支的 `compensate_url`；补偿失败保持 Compensating 续跑
+     （`/saga/compensate` 重试）；补偿幂等键 = tx_id + step（重复补偿 no-op）；
+  4. 终态（Succeeded/Compensated）拒绝迟到正向（悬挂防护）。
+- 崩溃恢复：`saga-{tx_id}.json`（tmp+rename 原子写）持久化全部进度，网关重启后 `run` 续跑/续补偿。
+
+### 13.1.2 网关步骤执行模型
+
+```
+客户端 ──POST /saga/start──▶ 网关(SagaCoordinator)
+                              │ 1) 登记 Init
+                              │ 2) for step in steps:
+                              │      POST action_url(payload) ──▶ 业务节点A（docid 本地事务）
+                              │      ✔ 分支登记 + 持久化
+                              │ 3) 任一步失败 →
+                              │      for name in executed_steps.rev():
+                              │        POST compensate_url(payload) ──▶ 业务节点A/B（幂等补偿）
+                              └─ 终态持久化
+```
+
+- **步骤并发**：正向步骤可并行（步骤间无依赖声明时），补偿保持逆序串行（先补偿最后执行的）。
+  v0.6 先落地串行正向（简单正确），并行化留步骤依赖声明后（远期）。
+- **超时/重试**：HTTP 调用超时（默认 5s）→ 该步视为失败 → 触发补偿（超时分支未登记 → 屏障空转）；
+  网络抖动补偿失败 → Compensating 态由 `/saga/compensate` 或协调器后台续跑重试。
+
+### 13.1.3 与 Ex-1 outbox 的分工
+
+| 场景 | 机制 |
+|---|---|
+| 双写扩容 / 异步索引 / 物化视图刷新 | Ex-1 本地消息表（业务写 + 待办同本地事务，幂等键 docid+seq） |
+| 跨分片业务事务（多 docid 落不同分片，业务语义需原子/可补偿） | Ex-2 SAGA 网关编排（HTTP 步骤 + 补偿状态机） |
+
+## 13.2 跨分片端到端架构（网关编排 + 业务步骤端点）
+
+```
+                     ┌─────────────── 网关（HTTP-JSON 服务）───────────────┐
+客户端 ─────────────▶│ /saga/* (协调器 + saga-{tx}.json 持久化)            │
+                     │ /put /get /sql ...（既有路由，docid 一致性哈希路由） │
+                     └───────────────┬───────────────┬───────────────┘
+                          POST action│               │POST action/compensate
+                             /compensate_url          │
+                     ┌───────────────▼──┐    ┌────────▼──────────────┐
+                     │ 业务节点 A（分片1）│    │ 业务节点 B（分片2）     │
+                     │ 步骤端点: /step/transfer-debit   │  /step/transfer-credit     │
+                     │         /step/compensate-debit   │  /step/compensate-credit   │
+                     │ 每个步骤 = 本地 docid 事务（LSM）│                           │
+                     └──────────────────┘    └───────────────────────┘
+```
+
+- 典型场景（转账/库存预占）：跨两个分片的双 docid 业务事务，SAGA 正向 debit→credit，
+  失败逆序补偿（回滚 debit）。
+- 每个业务步骤 = 单节点本地事务（L0 保证）→ 无跨节点 2PC；最终一致由 SAGA 状态机 + 幂等保证。
+- 端到端联调（Ex-2.5 验证）：网关 + 2 个模拟业务节点（本地起 3 个 HTTP 服务）跑通
+  正向成功 / 中段失败补偿 / 补偿重试 / 重启续跑。
+
+## 13.3 Calvin 全局事务序落地蓝图（远期方向，触发条件评估）
+
+> Ex-3 已评估完成（demo 验证：确定性序零锁等待、吞吐与跨分区比例无关、副本无分歧），
+> **当前不进入 kernel**。若未来出现「强一致多 docid 跨分区事务」需求，按下述蓝图落地。
+
+### 13.3.1 触发条件（不满足不落地）
+
+1. 出现强一致跨节点事务需求（当前写路径 docid 一致性哈希路由 → 单 docid 天然不分片，
+   跨分片仅多 docid 批量事务，且可退化为 SAGA 最终一致）；
+2. 事务读写集可执行前静态声明（倒排词表 / 全文检索依赖读难预声明——需侦察阶段或接受放宽）。
+
+### 13.3.2 落地方案设计（参考 Ex-3.3 决策）
+
+- **全局事务序**：网关（或独立序节点）为每个跨分区事务分配全局单调 seq，事务先落
+  **复制日志**（复用 ReplicationLog：seq 游标 + 幂等 apply），各分区按日志序**确定性执行**
+  （预声明的读写集一次锁、无跨网络锁等待、副本无分歧 → 无需提交协议）。
+- **与现有架构衔接**：
+  - 写路径 = docid 一致性哈希路由 → 单 docid 事务本地化（L0 不变）；
+  - 多 docid 跨分区事务 → 进入全局序队列（网关），业务节点按序 apply（幂等键 docid+全局 seq）；
+  - 冲突检测：确定性序天然无死锁（按序执行）；读集预声明后无读-写乱序。
+- **代价与红线**（Ex-3 记录）：全局序协调器单点（可用 raft 复制兜底）、读写集预声明约束、
+  排除交互式多语句会话（CLI 直连引擎不受影响）。
+
+### 13.3.3 结论
+
+SAGA（Ex-2 + 本章 13.1 网关接入）是当前与近期的跨分片事务答案；Calvin 确定性事务作为
+**远期强一致方向**保留，触发条件出现时按 13.3.2 蓝图推进（全局事务序 + ReplicationLog 衔接）。
+
+## 13.4 落地任务（development_extension.md Ex-2.5 扩展）
+
+| 任务 | 内容 |
+|---|---|
+| Ex-2.5.1 | saga.rs 增 `HttpStep`（HTTP 正向/补偿步骤）+ 极简 HTTP 客户端（POST/超时） |
+| Ex-2.5.2 | server.rs 网关路由 `/saga/start` `/saga/status` `/saga/compensate`（协调器挂接 + 状态持久化目录配置） |
+| Ex-2.5.3 | 端到端测试：本地 3 服务（网关 + 2 业务步骤端点）跑通正向/中段失败补偿/补偿重试/重启续跑 |
+| Ex-2.5.4 | 文档回填：development_extension.md Ex-2 状态、feature.md G 模块、problem_solving P68 |

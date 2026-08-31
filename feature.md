@@ -106,7 +106,7 @@
 | 两节点真实 TCP 高并发强一致性测试（8 线程并发写 → 广播精确命中/跨节点路由可见） | ✅ | `3e22f80`（gateway `high_concurrency_writes_strong_consistency_two_nodes`） |
 | 真机两节点分布式强一致测试（本机 NVMe + 阿里云 2核/1.6GB/高效云盘，SSH 隧道跨机） | ✅ | 7.51（`src/bin/cluster_demo.rs`：--node 分片节点 + --gateway 网关；4 线程 2000 条跨机并发写 → 逐条点查全部可见 + 广播精确命中，52.4s） |
 | 本地消息表 + 幂等消费（Outbox，Ex-1） | ✅ | `7348acd`（列族 outbox：业务写+待办同一本地事务、投递器、按 (docid,seq) 幂等 apply、排空校验；异步索引补偿/扩容衔接基础） |
-| SAGA 编排 + 补偿状态机（Ex-2） | ✅ | `990bf6b`（src/saga.rs SagaCoordinator：SagaStep trait + 状态机 + 屏障防空回滚/悬挂 + JSON 持久化续跑 + 补偿幂等；Ex-2.5 网关 /saga/* HTTP 留待分布式阶段） |
+| SAGA 编排 + 补偿状态机 + 网关 HTTP API（Ex-2 + Ex-2.5） | ✅ | `990bf6b`（src/saga.rs SagaCoordinator：SagaStep trait + 状态机 + 屏障防空回滚/悬挂 + JSON 持久化续跑 + 补偿幂等；Ex-2.5 `src/server.rs` `/saga/start` `/saga/status` `/saga/compensate` + `HttpStep` HTTP 业务步骤 + `http_post` 客户端，协调器目录 `{data_dir}/saga` 崩溃恢复） |
 | Calvin 确定性事务评估（Ex-3，L3） | 🔍 | demo `src/demo/calvin`：确定性序零锁等待/无协调往返/吞吐与跨分区比例无关；**评估结论不进入 kernel**（单 docid 路由天然不分片 + L1/L2 已覆盖，远期触发再落地） |
 | 读写分离（Mutex/RwLock/COW 快照读） | ⏸ | M8-P1 `be09a07` demo 结论暂缓（组提交已解决读被写拖垮） |
 | 高并发查询优化（design 9.5 目标） | ⏳ | M6 后留待 |
@@ -174,9 +174,13 @@
 - **Ex-1 本地消息表 + 幂等消费**（`7348acd`）：src/outbox.rs Outbox 列族（docid+seq 复合键），
   业务写 + 待办同一本地事务（共享全局 seq 与 fsync 点）、投递器 dispatch、IdempotentConsumer
   按 (docid,seq) 去重、排空校验——分布式事务 L1 首选方案落地，双写扩容/异步索引补偿衔接基础
-- **Ex-2 SAGA 编排 + 补偿状态机**（`990bf6b`）：src/saga.rs SagaCoordinator——SagaStep trait +
+- **Ex-2 SAGA 编排 + 补偿状态机 + 网关**（`990bf6b`）：src/saga.rs SagaCoordinator——SagaStep trait +
   状态机（init→executing→succeeded/failed→compensating→compensated）+ JSON 持久化续跑 +
-  屏障（分支登记先于补偿/空回滚/悬挂防护/补偿幂等）+ 回查接口——L2 跨分片业务事务基础
+  屏障（分支登记先于补偿/空回滚/悬挂防护/补偿幂等）+ 回查接口——L2 跨分片业务事务基础；
+  Ex-2.5 网关 `src/server.rs` `/saga/start`（POST `{tx_id,steps[]}` 自动逆序补偿）/
+  `/saga/status`（transactionId→status 回查）/ `/saga/compensate`（强制补偿重试）+
+  `HttpStep`（HTTP 业务步骤，非 2xx/超时失败）+ `http_post`（极简 HTTP/1.1 POST 客户端），
+  协调器持久化 `{data_dir}/saga/saga-{tx_id}.json` 崩溃恢复续跑；3 个网关 e2e 测试（模拟业务节点）
 - **Ex-3 Calvin 确定性事务评估**（🔍 demo 结论）：确定性序零锁等待 / 无协调往返 / 吞吐与
   跨分区比例无关（10%/50%/90% 恒 11k vs 2PC 105k/125k/145k）；但本项目单 docid 路由天然
   不分片 + L1/L2 已覆盖 → **不进入 kernel**，远期强一致多 docid 需求触发再落地

@@ -586,6 +586,17 @@
   延迟为 M 项后既有行为**（后续可优化：范围查询块预读已由本项 U 覆盖一部分）。
 - **结果**：+1 测试（多块段全量/跨块范围 vs scan_range 对照一致）；437 全绿；提交 `85b9a62`。
 
+### P68. Ex-2.5：SAGA 网关 HTTP API 落地（跨分片业务事务对外接入）
+- **问题**：SAGA 协调器仅内核 API（SagaStep trait 由业务方实现），无 HTTP 接入——外部服务
+  无法发起/回查/重试分布式事务。
+- **落地**：网关三端点 `src/server.rs`：`POST /saga/start`（`{tx_id,steps[]}`，执行正向 + 失败
+  自动逆序补偿，终态幂等）/ `GET /saga/status?tx_id=`（transactionId→status 回查，屏障依据）/
+  `POST /saga/compensate`（强制补偿重试）；`src/saga.rs` 增 `HttpStep`（HTTP 业务步骤）+ `http_post`
+  （极简 HTTP/1.1 POST 客户端，非 2xx/超时 → 步骤失败）；协调器目录 `{data_dir}/saga`，
+  状态 JSON 原子持久化 → 网关重启自动续跑/续补偿。
+- **结果**：+3 网关 e2e 测试（模拟业务节点：正向全成功无补偿 + 状态文件 / 中段失败逆序补偿 +
+  终态幂等重发 / 重启恢复终态）；365 全绿；提交 `COMMIT_HASH`（Ex-2.5）。
+
 ---
 
 ## 环境备忘（不入库）
