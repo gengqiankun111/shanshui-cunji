@@ -377,7 +377,7 @@ pub fn parse_select(sql: &str) -> Result<Select> {
 // ---------------------------------------------------------------------------
 
 /// 全量 docid 位图（NOT/!=/比较运算的论域；逐批熔断防挂起）。
-fn full_docids(engine: &mut Engine, guard: &crate::watchdog::QueryGuard) -> Result<RoaringBitmap> {
+fn full_docids(engine: &Engine, guard: &crate::watchdog::QueryGuard) -> Result<RoaringBitmap> {
     let mut bm = RoaringBitmap::new();
     let mut scanned = 0u64;
     for (docid, _) in engine.scan_range(None, None)? {
@@ -462,7 +462,7 @@ fn scan_leaf<'a>(e: &'a WhereExpr) -> Option<Leaf<'a>> {
 }
 
 /// 单文档判定：字段值是否满足扫描叶子。
-fn leaf_passes(engine: &mut Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
+fn leaf_passes(engine: &Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
     let Some(raw) = engine.get(docid)? else { return Ok(false) };
     let Ok(val) = serde_json::from_slice::<Value>(&raw) else { return Ok(false) };
     match leaf {
@@ -479,7 +479,7 @@ fn leaf_passes(engine: &mut Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
 /// `limit` 下推：找到 limit 个命中即停——比较/BETWEEN 作后过滤时避免遍历全量命中集
 /// （千万级库 status=active 上 LIMIT 50 的 BETWEEN 若全量遍历 = 数百秒，提前停 = 毫秒级）。
 fn post_filter(
-    engine: &mut Engine,
+    engine: &Engine,
     bitmap: RoaringBitmap,
     leaf: &Leaf,
     limit: u64,
@@ -506,7 +506,7 @@ fn post_filter(
 
 /// 全量扫描过滤（比较/BETWEEN 独立求值，如 OR 分支或单独条件）。
 fn scan_all(
-    engine: &mut Engine,
+    engine: &Engine,
     leaf: &Leaf,
     limit: u64,
     guard: &crate::watchdog::QueryGuard,
@@ -517,7 +517,7 @@ fn scan_all(
 
 /// 单条件求值：`=` 走倒排 posting（docid 特例点查）；`!=` 全量 − posting；比较/BETWEEN 扫描。
 fn eval_cond(
-    engine: &mut Engine,
+    engine: &Engine,
     c: &Cond,
     limit: u64,
     guard: &crate::watchdog::QueryGuard,
@@ -558,7 +558,7 @@ fn eval_cond(
 /// WHERE 求值 → 命中位图。
 /// AND 快路径：比较/BETWEEN 分支作后过滤（只检查另一分支已命中文档，避免全量扫描）。
 fn eval(
-    engine: &mut Engine,
+    engine: &Engine,
     e: &WhereExpr,
     limit: u64,
     guard: &crate::watchdog::QueryGuard,
@@ -596,7 +596,7 @@ fn eval(
 
 /// 执行类 SQL：解析 + 求值 + 回表 + LIMIT/OFFSET（`cap` 为无 LIMIT 时的上限保护）。
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
-pub fn execute(engine: &mut Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
+pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);

@@ -14,7 +14,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use sha1::{Digest, Sha1};
 
@@ -199,10 +199,10 @@ struct Session {
 
 // ============ MySQL 服务器 ============
 
-/// MySQL 协议服务器：持有引擎（Arc<Mutex<Engine>>，与 rpc.rs 同模式），
-/// 每连接独立线程处理握手 → 认证 → 命令循环。
+/// MySQL 协议服务器：持有引擎（Arc<RwLock<Engine>>，O 项第②步：读语句读锁并行、
+/// 写语句写锁互斥；每连接独立线程处理握手 → 认证 → 命令循环。
 pub struct MySqlServer {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<RwLock<Engine>>,
     user: String,
     password: String,
     next_conn_id: AtomicU64,
@@ -213,7 +213,7 @@ pub struct MySqlServer {
 impl MySqlServer {
     pub fn new(engine: Engine, user: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(RwLock::new(engine)),
             user: user.into(),
             password: password.into(),
             next_conn_id: AtomicU64::new(1),
@@ -221,14 +221,14 @@ impl MySqlServer {
         }
     }
 
-    /// P 项：保底自动 Compaction 守护线程（10 分钟周期）。事件驱动的写路径自触发
+    /// O 项第②步：保底自动 Compaction 守护线程（10 分钟周期）。事件驱动的写路径自触发
     /// （`Engine::auto_compact`）是主机制；本线程仅兜底异常路径（flush 未触发/合并失败）。
-    /// `try_lock` 非阻塞：引擎正忙（有语句在执行）时跳过本轮，不干扰前台。
+    /// `try_write` 非阻塞：引擎正忙（有语句在执行）时跳过本轮，不干扰前台。
     fn spawn_compaction_guard(&self) {
         let engine = self.engine.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(600));
-            if let Ok(mut g) = engine.try_lock() {
+            if let Ok(mut g) = engine.try_write() {
                 if g.needs_compact() {
                     let _ = g.compact();
                 }
@@ -285,7 +285,7 @@ impl MySqlServer {
 /// 单连接处理：握手 → 认证 → 命令循环。
 fn handle_connection(
     stream: &mut TcpStream,
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<RwLock<Engine>>,
     user: &str,
     password: &str,
     conn_id: u64,
@@ -396,8 +396,14 @@ fn handle_connection(
             }
             COM_QUERY => {
                 let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
-                let mut guard = engine.lock().unwrap();
-                let resp = dispatch_query(&mut guard, &sql, &mut session);
+                // O 项第②步：读语句走 RwLock 读锁（多连接 SELECT 并行）；写语句走写锁互斥
+                let resp = if is_read_statement(&sql) {
+                    let guard = engine.read().unwrap();
+                    dispatch_query_read(&guard, &sql, &mut session)
+                } else {
+                    let mut guard = engine.write().unwrap();
+                    dispatch_query(&mut guard, &sql, &mut session)
+                };
                 write_query_response(stream, seq0, resp)?;
             }
             COM_STMT_PREPARE => {
@@ -411,7 +417,8 @@ fn handle_connection(
                 }
             }
             COM_STMT_EXECUTE => {
-                let mut guard = engine.lock().unwrap();
+                // O 项第②步：预处理执行暂走写锁（sysbench 用 COM_QUERY 为主；预读优化留后）
+                let mut guard = engine.write().unwrap();
                 let resp = stmt_execute(&mut guard, &mut session, &cmd);
                 write_query_response(stream, seq0, resp)?;
             }
@@ -544,6 +551,59 @@ fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> Quer
     QueryResponse::Err(1064, format!("syntax error: unsupported statement: {sql}"))
 }
 
+/// O 项第②步：语句读写分类——读语句（SELECT/SHOW/SET/USE/空/注释）走 RwLock **读锁**并行；
+/// 其余（事务控制/INSERT/UPDATE/DELETE/DDL）走写锁互斥。
+fn is_read_statement(sql: &str) -> bool {
+    let s = sql.trim();
+    if s.is_empty() || s.starts_with("--") {
+        return true;
+    }
+    let upper = s.to_uppercase();
+    upper.starts_with("SELECT")
+        || upper.starts_with("SHOW")
+        || upper.starts_with("SET")
+        || upper.starts_with("USE")
+}
+
+/// O 项第②步：读锁分发（`&Engine`）——仅处理纯读语句（SELECT/SHOW/SET/USE/空）。
+/// 事务内 SELECT 经 `txn_get`/`scan_range_txn`（已 `&self`），多连接快照读并行。
+fn dispatch_query_read(engine: &Engine, sql: &str, session: &mut Session) -> QueryResponse {
+    let upper = sql.trim().to_uppercase();
+    // 空 / 注释
+    if sql.trim().is_empty() || sql.trim().starts_with("--") {
+        return QueryResponse::Ok(0, 0);
+    }
+    // ---- 事务内读语句 ----
+    if session.txn.is_some() {
+        if upper.starts_with("SELECT") {
+            return txn_select(engine, session, sql);
+        }
+        if upper.starts_with("SET") {
+            return QueryResponse::Ok(0, 0);
+        }
+        // 写语句不应走读锁（is_read_statement 已拦截），防御性拒绝
+        return QueryResponse::Err(1064, format!("事务内暂不支持该语句: {sql}"));
+    }
+    // ---- 非事务读语句 ----
+    if upper.starts_with("SET") {
+        // 会话级 SET：支持 SET [SESSION] TRANSACTION ISOLATION LEVEL <level>；其余忽略
+        if let Some(lv) = parse_isolation_level(&upper) {
+            session.isolation = lv;
+        }
+        return QueryResponse::Ok(0, 0);
+    }
+    if upper.starts_with("SHOW") {
+        return show_response(&upper);
+    }
+    if upper.starts_with("SELECT") {
+        return select_response(engine, sql);
+    }
+    if upper.starts_with("USE") {
+        return QueryResponse::Ok(0, 0);
+    }
+    QueryResponse::Err(1064, format!("syntax error: unsupported statement: {sql}"))
+}
+
 /// 解析 `SET [SESSION] TRANSACTION ISOLATION LEVEL <level>`（会话级，大写输入）。
 /// 返回 None = 非隔离级别 SET（调用方忽略，返回 OK 保持客户端兼容）。
 /// READ UNCOMMITTED 未单独实现：映射到 READ COMMITTED（我们的事务写提交前
@@ -569,8 +629,9 @@ fn parse_isolation_level(upper: &str) -> Option<crate::txn::Isolation> {
 /// `id IN (...)` 多点 / `SUM(k)` 聚合 / `ORDER BY ... LIMIT N`（简化为排序截断）。
 /// M 项优化（P0）：BETWEEN 范围走一次快照扫描（`scan_range_txn`），替代逐 id `txn_get`；
 /// 点查 / IN 保持逐 id（目标少，逐 id 更快）。
+/// O 项第②步：`&Engine`（事务读在 RwLock 读锁下执行）。
 fn txn_select(
-    engine: &mut Engine,
+    engine: &Engine,
     session: &mut Session,
     sql: &str,
 ) -> QueryResponse {
@@ -1029,7 +1090,7 @@ fn show_response(upper: &str) -> QueryResponse {
 
 /// SELECT：VERSION() / @@ 系统值 → 单行结果；`WHERE id=N` → 主键点查；
 /// 否则走 sqlish 引擎。
-fn select_response(engine: &mut Engine, sql: &str) -> QueryResponse {
+fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     let upper = sql.trim().to_uppercase();
     if upper.contains("VERSION()") {
         let columns = vec![column_payload("VERSION()", MYSQL_TYPE_VAR_STRING, 45)];

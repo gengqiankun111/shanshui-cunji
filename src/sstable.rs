@@ -25,6 +25,7 @@
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// 位置读（`&File` 可并发，读写分离读路径基础）：Windows `seek_read` / Unix `read_at`，
 /// 不移动文件游标——多线程可同时对同一 SST 的不同块做读取。
@@ -676,7 +677,8 @@ pub struct SstReader {
     /// 两级索引粒度（每 N 个块一条摘要）。
     index_granularity: usize,
     /// Level 2：精确块索引（懒加载缓存；首次访问触发磁盘解码）。
-    full_index: std::cell::RefCell<Option<Vec<IndexEntry>>>,
+    /// O 项第②步：RefCell → Mutex（`SstReader: Sync`，支持 RwLock 读读并行跨线程共享）。
+    full_index: Mutex<Option<Vec<IndexEntry>>>,
     /// v5 分区布隆：每块一个（原始字节，查询时按需反序列化目标块）。
     partition_blooms: Option<Vec<Vec<u8>>>,
     /// v3/v4 整文件布隆（旧格式兼容）。
@@ -838,7 +840,7 @@ impl SstReader {
             summary,
             index_count,
             index_granularity,
-            full_index: std::cell::RefCell::new(None),
+            full_index: Mutex::new(None),
             partition_blooms,
             bloom,
             compression,
@@ -875,7 +877,7 @@ impl SstReader {
     /// 供测试 / 全量迭代使用；生产读路径走内部 `block_entry` 按需取单条。
     pub fn index(&self) -> Vec<IndexEntry> {
         self.ensure_index().expect("精确索引加载失败");
-        self.full_index.borrow().as_ref().unwrap().clone()
+        self.full_index.lock().unwrap().as_ref().unwrap().clone()
     }
 
     pub fn path(&self) -> &Path {
@@ -904,12 +906,12 @@ impl SstReader {
 
     /// Level 2 精确索引是否已懒加载（测试 / 监控）。
     pub fn level2_loaded(&self) -> bool {
-        self.full_index.borrow().is_some()
+        self.full_index.lock().unwrap().is_some()
     }
 
     /// Level 2 懒加载：首次访问从磁盘解码精确块索引并缓存（design 4.4.2 按需加载）。
     fn ensure_index(&self) -> Result<()> {
-        if self.full_index.borrow().is_some() {
+        if self.full_index.lock().unwrap().is_some() {
             return Ok(());
         }
         let mut ib = vec![0u8; self.footer.index_len];
@@ -917,7 +919,7 @@ impl SstReader {
         f.seek(std::io::SeekFrom::Start(self.footer.index_offset))?;
         f.read_exact(&mut ib)?;
         let index = decode_index(&ib, self.format)?;
-        *self.full_index.borrow_mut() = Some(index);
+        *self.full_index.lock().unwrap() = Some(index);
         Ok(())
     }
 
@@ -925,7 +927,8 @@ impl SstReader {
     fn block_entry(&self, idx: usize) -> Result<IndexEntry> {
         self.ensure_index()?;
         self.full_index
-            .borrow()
+            .lock()
+            .unwrap()
             .as_ref()
             .unwrap()
             .get(idx)
@@ -970,7 +973,7 @@ impl SstReader {
     /// 触发 Level 2 懒加载。
     fn locate_block_index(&self, key: &[u8]) -> Result<Option<usize>> {
         self.ensure_index()?;
-        let index = self.full_index.borrow();
+        let index = self.full_index.lock().unwrap();
         let index = index.as_ref().unwrap();
         let mut lo = 0usize;
         let mut hi = index.len();
@@ -1041,7 +1044,7 @@ impl SstReader {
     /// 定位包含 key 的数据块（二分首个 first_key <= key 的块）。触发 Level 2 懒加载。
     fn locate_block(&self, key: &[u8]) -> Result<Option<IndexEntry>> {
         self.ensure_index()?;
-        let index = self.full_index.borrow();
+        let index = self.full_index.lock().unwrap();
         let index = index.as_ref().unwrap();
         let mut lo = 0usize;
         let mut hi = index.len();
