@@ -104,6 +104,11 @@ pub struct Engine {
     txn_locks: Mutex<crate::txn::LockTable>,
     /// 数据目录（P52 看门狗磁盘水位检测目标）。
     data_dir: std::path::PathBuf,
+    /// V 项：io_uring 后端池（Linux + `runtime.io_uring_enabled` 时初始化；Windows 无此字段）。
+    /// 按 IoClass 三队列 SQPOLL，read_at/write_at/fsync 经 `io_uring_*` 方法转发；
+    /// 热路径接入（sstable/wal）随 Linux 部署验证后启用。
+    #[cfg(target_os = "linux")]
+    iou: Option<crate::io_queue::backend::IoUringPool>,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -287,6 +292,19 @@ impl Engine {
         delta.set_external_seq(Arc::clone(&global_seq));
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
+        // V 项：io_uring 后端池初始化（Linux + `runtime.io_uring_enabled`）——SQPOLL 三队列
+        // （WAL/SST/倒排）+ affinity 三池外预留核；Windows 编译为空（cfg 移除变量）。
+        #[cfg(target_os = "linux")]
+        let iou = {
+            let affinity = crate::affinity::plan_partition(&cfg.affinity);
+            if crate::io_queue::io_uring_enabled(&cfg.runtime) {
+                let sqpoll_cpu =
+                    crate::affinity::reserve_sqpoll_core(&affinity).map(|c| c as u32);
+                crate::io_queue::backend::IoUringPool::open(256, 1000, sqpoll_cpu).ok()
+            } else {
+                None
+            }
+        };
         let mut engine = Self {
             primary,
             cidx,
@@ -332,6 +350,8 @@ impl Engine {
             outbox,
             txn_locks: Mutex::new(crate::txn::LockTable::new()),
             data_dir: data_dir.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            iou,
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -1306,13 +1326,33 @@ impl Engine {
         self.inverted.bitmap_and(terms).map(|b| b.len())
     }
 
-    /// 基础 Compaction（design 4.5，阶段 3；Ex-5.4 并行化）：primary/cidx/delta 三列族压实。
+    /// 基础 Compaction（design 4.5，阶段 3；Ex-5.4 并行化）：primary/cidx/delta 列族压实。
     /// 并行度 `compaction_parallel`：0 = 自动（min(4, 核数/2)）；1 = 串行；>1 = 指定。
-    /// 并行压实利用 SSD 并发 IO（demo 实测 3 CF 并行 2.14×）；每列族独立压实（字段拆分借用）。
+    /// W 项：跨列族**紧迫度调度**——每轮仅压实紧迫度最高档（L0 压力/大小超限最大）的列族，
+    /// 并列档并行（保留 SSD 并发收益）；其余列族由后台 worker 后续轮次（`while needs_compact`）
+    /// 压实——压力最大的列族（通常 primary 主数据）优先收敛，读路径最快受益。
     /// Ex-5.6：删除位图开启时 primary 压实按位图**物理丢弃**已删 docid 的旧数据（墓碑不污染层级）。
     /// O 项第③步：`&self`——后台合并 worker 在引擎**读锁**下执行（合并不阻塞读；
     /// 与写互斥由 Engine RwLock 保证，快照 store 无并发丢失）。
     pub fn compact(&self) -> Result<crate::column_family::CompactReport> {
+        // W 项：紧迫度 = 列族 compaction_urgency（L0 段数×10 + 大小超限 +8）
+        let pu = self.primary.compaction_urgency();
+        let du = self.delta.compaction_urgency();
+        let cu = self.cidx.as_ref().map_or(0, |c| c.compaction_urgency());
+        let max = pu.max(du).max(cu);
+        let empty = crate::column_family::CompactReport {
+            merged_ssts: 0,
+            kept_keys: 0,
+            freed_bytes: 0,
+            out_level: 0,
+        };
+        if max == 0 {
+            return Ok(empty); // 无压力（调用方应在 needs_compact 下进入）
+        }
+        let do_p = pu == max;
+        let do_c = self.cidx.is_some() && cu == max;
+        let do_d = du == max;
+
         let parallel = if self.compaction_parallel == 0 {
             std::thread::available_parallelism()
                 .map(|n| (n.get() / 2).clamp(1, 4))
@@ -1320,77 +1360,74 @@ impl Engine {
         } else {
             self.compaction_parallel.max(1)
         };
-        let cf_count = 1 + usize::from(self.cidx.is_some()) + 1; // primary + (cidx) + delta
-        let threads = parallel.min(cf_count);
-        // Ex-5.6/5.8：位图不可变借用（与 primary/cidx/delta 的 &mut 拆分借用互不冲突）。
-        // 位图无已删 docid 时无过滤 → primary 走 Ex-5.8 无重叠块级复用压实（数据块零解压复用、
-        // 只重建元数据区）；位图有已删 docid 时按位图物理丢弃（全量合并路径）。
+        let cf_count = usize::from(do_p) + usize::from(do_c) + usize::from(do_d);
+        let threads = parallel.min(cf_count.max(1));
+        // Ex-5.6/5.8：位图不可变借用（与列族共享借用互不冲突）。
         let bm = self.deletion_bitmap.as_ref();
         let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
         let filter = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
         if threads <= 1 {
-            // 串行（含 cidx/delta 无输入时 no-op，行为与旧版一致）
-            let mut rep = if needs_filter {
-                self.primary.compact_filtered(&filter)?
-            } else {
-                self.primary.compact()?
-            };
-            if let Some(c) = self.cidx.as_ref() {
-                let r = c.compact()?;
+            // 串行：仅最高紧迫度档列族
+            let mut rep = empty;
+            if do_p {
+                let r = if needs_filter {
+                    self.primary.compact_filtered(&filter)?
+                } else {
+                    self.primary.compact()?
+                };
                 merge_report(&mut rep, &r);
             }
-            let r = self.delta.compact()?;
-            merge_report(&mut rep, &r);
+            if do_c {
+                let r = self.cidx.as_ref().unwrap().compact()?;
+                merge_report(&mut rep, &r);
+            }
+            if do_d {
+                let r = self.delta.compact()?;
+                merge_report(&mut rep, &r);
+            }
             return Ok(rep);
         }
-        // 并行：三列族独立共享借用（字段拆分）→ thread::scope 并发压实，聚合返回
+        // 并行：仅最高紧迫度档（并列）列族
         let compute_cores = self.affinity.compute.clone(); // Ex-7.2：Compaction 并行线程绑 compute 核
         let (p, c, d) = (&self.primary, self.cidx.as_ref(), &self.delta);
         let merged = std::thread::scope(|s| -> Result<crate::column_family::CompactReport> {
-            let h1 = if needs_filter {
+            let h1 = if do_p {
                 let cc = compute_cores.clone();
-                s.spawn(move || {
+                let f = filter;
+                Some(s.spawn(move || {
                     crate::affinity::bind_current(&cc);
-                    p.compact_filtered(&filter)
-                })
+                    if needs_filter {
+                        p.compact_filtered(&f)
+                    } else {
+                        p.compact()
+                    }
+                }))
             } else {
-                let cc = compute_cores.clone();
-                s.spawn(move || {
-                    crate::affinity::bind_current(&cc);
-                    p.compact()
-                })
+                None
             };
-            let cc = compute_cores.clone();
-            let h3 = s.spawn(move || {
-                crate::affinity::bind_current(&cc);
-                d.compact()
-            });
-            let h2 = c.map(|cf| {
+            let h2 = if do_c {
                 let cc = compute_cores.clone();
-                s.spawn(move || {
+                let cf = c.unwrap();
+                Some(s.spawn(move || {
                     crate::affinity::bind_current(&cc);
                     cf.compact()
-                })
-            });
-            let r1 = h1.join().unwrap()?;
-            let r2 = match h2 {
-                Some(h) => Some(h.join().unwrap()?),
-                None => None,
+                }))
+            } else {
+                None
             };
-            let r3 = h3.join().unwrap()?;
-            let mut merged = crate::column_family::CompactReport {
-                merged_ssts: 0,
-                kept_keys: 0,
-                freed_bytes: 0,
-                out_level: r1.out_level, // out_level 取 primary
+            let h3 = if do_d {
+                let cc = compute_cores.clone();
+                Some(s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    d.compact()
+                }))
+            } else {
+                None
             };
-            for r in std::iter::once(&r1)
-                .chain(r2.as_ref())
-                .chain(std::iter::once(&r3))
-            {
-                merged.merged_ssts += r.merged_ssts;
-                merged.kept_keys += r.kept_keys;
-                merged.freed_bytes += r.freed_bytes;
+            let mut merged = empty;
+            for h in [h1, h2, h3].into_iter().flatten() {
+                let r = h.join().unwrap()?;
+                merge_report(&mut merged, &r);
             }
             Ok(merged)
         })?;

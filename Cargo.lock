@@ -827,6 +827,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "io-uring-file"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1556,6 +1574,7 @@ dependencies = [
  "dashmap",
  "disk-space",
  "fst",
+ "io-uring-file",
  "jieba-rs",
  "lru",
  "memmap2",

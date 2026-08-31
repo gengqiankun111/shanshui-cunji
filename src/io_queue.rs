@@ -50,6 +50,60 @@ pub fn io_uring_enabled(cfg: &RuntimeConfig) -> bool {
     cfg.io_uring_enabled && cfg!(target_os = "linux")
 }
 
+/// V 项：io_uring 后端池（Linux 专属）——按 IoClass 三队列（WAL/SST/倒排）SQPOLL 实例，
+/// read_at/write_at/fsync 转发。主库零 unsafe（unsafe 在 io-uring-file crate 白名单内）。
+/// 非 Linux 目标编译为空类型（io-uring-file crate 在非 Linux 为空）。
+#[cfg(target_os = "linux")]
+pub mod backend {
+    use super::IoClass;
+    use io_uring_file::queue::{IoUringFile, QueueParams};
+    use std::fs::File;
+    use std::io;
+
+    /// 三队列池（每 IoClass 一个 SQPOLL 实例；`queue_id()` 路由）。
+    pub struct IoUringPool {
+        queues: [IoUringFile; 3],
+    }
+
+    impl IoUringPool {
+        /// 初始化三队列。`sqpoll_idle_us`：SQPOLL 空闲退出（µs）；`sqpoll_cpu`：内核
+        /// 轮询线程绑核（V 项：affinity 三池外预留核，防与用户线程抢核）。
+        pub fn open(
+            entries: u32,
+            sqpoll_idle_us: u32,
+            sqpoll_cpu: Option<u32>,
+        ) -> io::Result<Self> {
+            let params = QueueParams {
+                entries,
+                sqpoll_idle_us,
+                sqpoll_cpu,
+            };
+            let queues = [
+                IoUringFile::open(params)?,
+                IoUringFile::open(params)?,
+                IoUringFile::open(params)?,
+            ];
+            Ok(Self { queues })
+        }
+
+        fn q(&self, class: IoClass) -> &IoUringFile {
+            &self.queues[class.queue_id()]
+        }
+
+        pub fn read_at(&self, class: IoClass, file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.q(class).read_at(file, buf, offset)
+        }
+
+        pub fn write_at(&self, class: IoClass, file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+            self.q(class).write_at(file, buf, offset)
+        }
+
+        pub fn fsync(&self, class: IoClass, file: &File) -> io::Result<()> {
+            self.q(class).fsync(file)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

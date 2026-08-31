@@ -1296,6 +1296,18 @@ impl ColumnFamily {
         self.ssts.load().levels.iter().filter(|l| **l == 0).count()
     }
 
+    /// W 项：合并紧迫度（跨列族调度优先级，越高越优先）——
+    /// L0 段数压力 ×10（主因子）+ 大小软阈值超限 ×8。热段选段已由
+    /// `select_compaction_inputs`（Ex-5.9）在列族内承担，此处为跨列族调度主因子。
+    pub fn compaction_urgency(&self) -> u32 {
+        let l0 = self.l0_count() as u32;
+        let mut u = l0.saturating_mul(10);
+        if self.l0_max_size_bytes > 0 && self.l0_bytes() > self.l0_max_size_bytes {
+            u += 8;
+        }
+        u
+    }
+
     /// 当前 L0 段文件总字节（按层号过滤后取磁盘元数据）。
     pub fn l0_bytes(&self) -> u64 {
         let snap = self.ssts.load();
@@ -2546,6 +2558,39 @@ mod tests {
                 "get_at miss {miss}"
             );
         }
+    }
+
+    #[test]
+    fn compaction_urgency_grows_with_l0_pressure() {
+        // W 项：紧迫度 = L0 段数 ×10 + 大小超限 +8——多段 flush 后递增（跨列族调度主因子）
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf.compaction_urgency(), 0, "空库无压力");
+        for seg in 0..3u64 {
+            for i in seg * 50..seg * 50 + 50 {
+                cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+            let u = cf.compaction_urgency();
+            let expect = (seg + 1) as u32 * 10;
+            assert_eq!(u, expect, "L0 段数 {} → urgency {u}", seg + 1);
+        }
+        // 大小软阈值：l0_max_size_bytes 配小 → 超限追加 +8
+        let dir2 = tmp();
+        let mut cfg2 = small_cfg(64);
+        cfg2.storage.l0_max_size_mb = 1; // 1MB 大小软阈值
+        let mut cf2 = ColumnFamily::open("primary", &dir2, &cfg2).unwrap();
+        // 单段 ~3.2MB（50×64KB）→ 超 1MB 软阈值
+        for i in 0..50u64 {
+            cf2.put(i, vec![0x55u8; 64 * 1024]).unwrap();
+        }
+        cf2.switch_and_flush().unwrap();
+        assert!(
+            cf2.compaction_urgency() >= 18,
+            "大小超限应追加 +8（l0=1 → 10+8，实际 {}）",
+            cf2.compaction_urgency()
+        );
     }
 
     #[test]

@@ -227,7 +227,9 @@ impl MySqlServer {
     /// - 信号驱动（100ms 轮询）：写后即时收敛 L0（替代 P 项写路径同步合并）；
     /// - 10 分钟兜底：覆盖 flush 未触发 / 信号丢失等异常路径（原 guard 线程语义）。
     /// - `try_read` 非阻塞：引擎正忙（写语句持写锁）时跳过本轮，不干扰前台写。
-    /// - 单后台线程 + compact 内部并行度：多列族压实由 Engine::compact 内部 thread::scope 承担。
+    /// - W 项：`while needs_compact` 多轮压实——Engine::compact 每轮仅压最高紧迫度档
+    ///   （跨列族调度），循环直至全部收敛（防止多列族压力下只压一轮导致低紧迫度列族滞留）。
+    /// - 单后台线程 + compact 内部并行度：同档多列族压实由 Engine::compact 内部 thread::scope 承担。
     fn spawn_compaction_worker(&self) {
         let engine = self.engine.clone();
         let pending = self.engine.read().unwrap().compact_pending.clone();
@@ -240,9 +242,12 @@ impl MySqlServer {
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
                 if signaled || backstop {
-                    if engine.read().unwrap().needs_compact() {
-                        if let Ok(g) = engine.try_read() {
+                    if let Ok(g) = engine.try_read() {
+                        // W 项：多轮直至收敛（紧迫度调度下每轮可能只压一部分列族）
+                        let mut guard = 0;
+                        while g.needs_compact() && guard < 8 {
                             let _ = g.compact();
+                            guard += 1;
                         }
                     }
                     if backstop {

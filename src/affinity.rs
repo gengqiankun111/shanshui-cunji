@@ -16,6 +16,9 @@ pub struct CpuPartition {
     pub network: Vec<usize>,
     pub compute: Vec<usize>,
     pub io: Vec<usize>,
+    /// V 项：SQPOLL 内核轮询线程预留核（io_uring 启用时从三池外空闲核取 1 个；
+    /// 防与用户线程抢核——SQPOLL 高 IOPS 场景独占核，避免轮询抢占业务线程）。
+    pub sqpoll: Vec<usize>,
 }
 
 /// 逻辑核总数（当前可用并行度，至少 1）。
@@ -60,6 +63,8 @@ pub fn plan_partition(cfg: &AffinityConfig) -> CpuPartition {
         network,
         compute,
         io,
+        // V 项：SQPOLL 预留核由 reserve_sqpoll_core 单独计算（io_uring 启用时），此处为空
+        sqpoll: Vec::new(),
     }
 }
 
@@ -80,6 +85,17 @@ pub fn bind_current(cores: &[usize]) -> bool {
         }
     }
     false
+}
+
+/// V 项：SQPOLL 内核轮询线程预留核——从三池（network/compute/io）之外的空闲逻辑核取 1 个；
+/// 无空闲核则返回空（调用方不绑核，SQPOLL 随内核调度）。供 io_uring 启用时调用。
+pub fn reserve_sqpoll_core(part: &CpuPartition) -> Option<usize> {
+    let n = logical_cores();
+    let mut used = std::collections::HashSet::new();
+    for c in part.network.iter().chain(&part.compute).chain(&part.io) {
+        used.insert(*c);
+    }
+    (0..n).find(|c| !used.contains(c))
 }
 
 #[cfg(test)]
