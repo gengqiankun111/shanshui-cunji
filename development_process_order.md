@@ -28,8 +28,9 @@
 | J | 倒排段 GC 后台化 | P2 | ⏳ | 当前 gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，工程化） |
 | K | fulltext 大 posting 反序列化优化 | P2 | ⏳ | 5000 万库 content 词 posting ~1600 万，首次反序列化 ~100ms+；候选：段内 posting 分块延迟加载 |
 | L | Compaction 智能调度（合并冷却 + 动态窗口 + 倒排阈值） | P1 | ✅ 完成 | 28eae9d：①合并冷却（compaction_cooldown=2，软约束防收敛死循环）②动态窗口（l0_stall_min/max=8/16，写压力驱动）③倒排刷盘阈值参数化（flush_threshold，二分收敛推荐 500 万：段数 -80%、吞吐仅 -6%）；+demo 13 项单条 avg/max 统计 |
-| M | 事务类查询优化（范围查询改一次扫描） | P0 | ✅ 开发完成（待 1 亿库复测） | 1 亿库 sysbench 实测：oltp_read_only 42 TPS / read_write 29.5 TPS（点查类 5k-7k TPS）。根因：BETWEEN 范围/SUM 聚合被展开为**逐 id 独立 txn_get**（每事务 ~700 次 LSM 点查）。方案：范围查询走 `scan_range_at`（MemTable+SSTable 合并扫描 + 快照 seq 过滤），SUM/ORDER BY/DISTINCT 在扫描结果上处理；预期事务类 TPS 提升 ~50× |
+| M | 事务类查询优化（范围查询改一次扫描） | P0 | ✅ 完成 | 1 亿库 sysbench 实测：oltp_read_only 42 TPS / read_write 29.5 TPS（点查类 5k-7k TPS）。根因：BETWEEN 范围/SUM 聚合被展开为**逐 id 独立 txn_get**（每事务 ~700 次 LSM 点查）。方案：范围查询走 `scan_range_at`（MemTable+SSTable 合并扫描 + 快照 seq 过滤），SUM/ORDER BY/DISTINCT 在扫描结果上处理；复测（d044b4c）：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%）；未达 50× 预估——真实瓶颈为引擎单 Mutex 每语句串行（~1ms×14 语句），后续 P1 并发模型改造 |
 | N | 倒排回表批量读（batch_get） | P0 | ✅ 完成 | 借鉴 batch_get 架构建议：倒排/全文 posting 回表从**逐 docid 点查**改为**批量读**——SST 层按块分组（同块多 key 只读/解压一次）+ 整文件/分区布隆批量粗筛 + Delta 单次范围扫描分组覆盖；万级 posting 回表从万次随机读降为块级顺序读 |
+| O | MySQL 服务并发模型改造（引擎单 Mutex → 读读并行） | P1 | ⏳ 待排期 | 1 亿库复测定位：事务类 TPS 天花板 = 引擎全局单 Mutex 每语句串行（~1ms×14 语句/事务 → ~1000 stmt/s）。方案：读路径 `RwLock` 化 / 多引擎分片 / 事务内语句批处理；预期事务类 TPS 数倍提升 |
 
 ## 3. 大项详情
 
