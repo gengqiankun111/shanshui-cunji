@@ -8,11 +8,11 @@
 ## 1. 导出增强剩余（开发进行中项）
 
 - **来源**：feature E 模块 🔄 / design 20.5 / export.rs
-- **已完成**：CSV 全量、Parquet 全量（`--parquet`，70c3b30）
+- **已完成**：CSV 全量、Parquet 全量（`--parquet`，70c3b30）、**增量导出**（`--incremental --checkpoint`
+  docid 游标断点续传，2174531——首轮全量记 max、后续只导新增、断档自动全量重建，468 全绿）
 - **待做**：
-  - **增量导出**：`--incremental --checkpoint`——docid/updated_at 游标断点续传（对称 P3-4 增量导入 5085db8）
   - **JDBC 直连导出**（阶段 3）：批量插入目标库
-  - 流式管道 Filter/Projection + `--rate-limit` 资源控制
+  - 流式管道 Filter/Projection + `--rate-limit` 资源控制（在线业务影响 <5% 目标）
 
 ## 2. 合并阻塞根治：无锁合并（O 项规模，阶段一已落地）
 

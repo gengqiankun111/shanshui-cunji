@@ -7,7 +7,7 @@
 
 | 功能 | 模块 | 已落地 | 剩余 |
 |---|---|---|---|
-| 导出增强（增量 / Parquet / JDBC） | E | Parquet 导出（`--parquet`，70c3b30） | **增量导出**（`--incremental --checkpoint`，docid/updated_at 游标断点续传）；**JDBC 直连**（阶段 3）；Filter/Projection + rate-limit |
+| 导出增强（增量 / Parquet / JDBC） | E | Parquet 导出（`--parquet`，70c3b30）；增量导出（`--incremental --checkpoint` docid 游标断点续传，2174531） | **JDBC 直连**（阶段 3）；流式管道 Filter/Projection + rate-limit |
 
 ## ⏳ 待办
 

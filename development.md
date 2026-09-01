@@ -1982,6 +1982,24 @@ impl RuntimePools {
 5. **预期**：写路径 fsync 批处理与读路径异步提交减少 syscall 上下文切换；收益在核多 / 高
    IOPS 场景显著，2 核小机器可能不显著。
 
+### 7.64 导出增强：export --incremental --checkpoint 增量导出（E 模块，docid 游标断点续传）
+
+> 2026-09-01。E 模块"导出增强（增量 / Parquet / JDBC）"的增量部分落地（`2174531`）。
+> 对称 P3-4 增量导入（`5085db8`）；JDBC 直连（阶段 3）与流式管道 Filter/Projection 留后续。
+
+- `shanshui-cunji-export --csv out.csv --incremental [--checkpoint cp]`：DocId 游标断点续传——
+  首次全量导出并记录最大 docid 到 checkpoint（默认 `out.checkpoint`）；后续只导
+  `docid > checkpoint` 的新数据并推进游标（CSV / Parquet 双路径，`export_csv`/`export_parquet`
+  增加 `base: u64` 参数，返回 `(rows, max_docid)`）；
+- **checkpoint 缺失语义**：对齐 import.rs `load_checkpoint().unwrap_or(0)`——首次运行 / 断档
+  按全量导出处理并重建 checkpoint（修正原实现：checkpoint 缺失直接报错退出）；
+- **不变量**（`migrate.rs incremental_export_cursor_progresses` 固化）：只导 `docid > base` 的新行、
+  `max_docid` 单调推进、无新数据时 `max_docid == base` 不写 checkpoint（游标不前进）；
+- **原子写**：复用 `save_checkpoint` tmp+rename（`checkpoint_atomic_persist` 已覆盖）；
+- 端到端验证（D:/shanshui-tmp/exp-a）：首轮 3 行全量 + cp=3 → 追加 2 行二次增量只导 4/5 + cp=5 →
+  无新数据 0 行不推进 → 删 cp 断档自动全量 5 行重建；
+- 全量测试 466 → **468 全绿**。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
