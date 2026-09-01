@@ -75,6 +75,10 @@ path = "src/bin/mysql_server.rs"
 name = "shanshui-cunji-gen-dataset"
 path = "src/bin/gen_dataset.rs"
 
+[[bin]]
+name = "shanshui-cunji-shard-build"
+path = "src/bin/shard_build.rs"
+
 [features]
 # 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；
 # `alloc-jemalloc` 切 tikv-jemallocator（mallctl purge/stats，Linux/musl 推荐）；

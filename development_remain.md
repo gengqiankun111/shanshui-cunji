@@ -99,7 +99,9 @@
 - **阶段 A（P0）— ✅ 已完成**：全局 docid 分配器 `src/docid_alloc.rs`（分片前缀
   `docid = shard_id<<40 | local_id`，路由 O(1)、分片内 AtomicU64 自增无集中瓶颈、扩容归属不变、
   40 位溢出保护）；demo `demo/docid-alloc` 5 测试 + kernel 7 单测，507 全绿（development.md 7.81）
-- **后续**：分片构建工具 → 10 分片 10 亿构建
+- **后续**：分片构建工具 `src/shard_build.rs` + `shanshui-cunji-shard-build`（✅ development.md 7.82）：
+  行号取模均匀分配/显式主键前缀路由/--shard-id 多进程并行/BOM 修复，513 全绿
+- **待验证**：10 分片 10 亿构建（验收：构建 ≤60 分钟、点查 10 万+ QPS）
 - **阶段 B/C/D**：倒排分片化验证、scale_out+raft_meta 接 RPC（raft 阶段二）、分片级可观测
 - **触发**：阶段 A 立即（10 亿库前提）；B/C/D 随节点规模/硬件推进
 

@@ -45,7 +45,7 @@
 | AA | 导出增强：流式管道 + JDBC 直连（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 阶段 3（c6b5417）：流式管道（--filter/--project/--mask Filter+Projection+Sink 分叉，内存 O(批)）+ JDBC 直连（MysqlWireClient MySQL wire 客户端建表+批量 INSERT 无文件落盘）+ --rate-limit；端到端验证 CSV/Parquet/JDBC；476 全绿；详见 development.md 7.66 |
 | AB | 导出增强：MySQL 兼容 CSV 配套 + 建表 DDL（2026-09-01） | 延伸 | ✅ 完成 | design 20.5（313bd81）：--mysql-compatible 自动生成 CREATE TABLE + LOAD DATA INFILE 配套 SQL（比逐条 INSERT 快 ~20 倍）+ --mysql-max-varchar 控制 VARCHAR/TEXT + --dry-run-schema --target clickhouse\|mysql 建表 DDL（MergeTree / InnoDB）；+4 测试 476 全绿；详见 development.md 7.67 |
 | AC | 导出增强：与 Compaction 共享后台 IO 优先级（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 收尾（40e8abb）：CF scan_limiter Token Bucket（扫描路径专用，前台点查不受影响）+ export --io-rate-limit-mb（默认 storage.io_rate_limit_mb 同 Compaction 后台预算语义）；+1 测试 477 全绿；**导出功能全部完成**；详见 development.md 7.68 |
-| AD | 10 亿库扩展阶段 A：全局 docid 分配器（分片前缀 `shard_id<<40\|local_id`） | P0 | ✅ 完成 | `src/docid_alloc.rs`：DocIdAllocator/ShardLocalAllocator（AtomicU64 无锁分配 + 水位恢复续跑 + 扩容归属不变 + 40 位溢出保护）；demo/docid-alloc 5 测试 + kernel 7 单测，507 全绿；详见 development.md 7.81 / design-10b-extension.md §5.1 |
+| AD | 10 亿库扩展阶段 A：全局 docid 分配器 + 分片构建工具（分片前缀 `shard_id<<40\|local_id`） | P0 | ✅ 完成 | `src/docid_alloc.rs`：DocIdAllocator/ShardLocalAllocator（AtomicU64 无锁分配 + 水位恢复续跑 + 扩容归属不变 + 40 位溢出保护）；`src/shard_build.rs` + `shanshui-cunji-shard-build`：行号取模均匀/显式主键前缀路由/--shard-id 多进程并行/BOM 修复，端到端验证通过；demo 11 测试 + kernel 13 单测，513 全绿；详见 development.md 7.81/7.82 / design-10b-extension.md §5.1/§5.3 |
 
 ## 3. 大项详情
 

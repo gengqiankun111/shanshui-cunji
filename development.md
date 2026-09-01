@@ -2376,6 +2376,29 @@ impl RuntimePools {
 5. **后续（阶段 B/C/D）**：分片构建工具 → 10 分片 10 亿构建；倒排分片化验证；scale_out+
    raft_meta 接 RPC；分片级可观测。
 
+### 7.82 AD 10 亿库阶段 A（续）：分片构建工具
+
+> 2026-09-02。用户排期 AD 后续：把大源文件构建为 N 个分片数据目录（design-10b-extension.md
+> §5.3 / §7.2），docid 用 7.81 的分片前缀分配器——每分片独立 Engine，支持多进程并行。
+
+1. **kernel**（`src/shard_build.rs`，`ShardBuildPlanner` 纯逻辑不碰 IO，6 单测）：
+   - 行分配：无显式主键 `row_idx % n_shards` 均匀分布（各分片行数差 ≤1）；
+   - docid 前缀：`alloc_on(sid)` → `shard_id<<40 | local_id`（复用 `DocIdAllocator`）；
+   - 显式主键路由：`route(docid)` 高 N 位 O(1) 直取 + `validate_routed` 构建期拒绝错路由；
+   - 崩溃续跑：`with_watermarks` 恢复各分片水位续跑不重复；`resize` 扩容归属不变。
+2. **bin**（`shanshui-cunji-shard-build`）：`--csv|--json --shards N --data-dir-prefix <dir>|
+   --data-dirs d0,d1,... [--shard-id N]`——每分片独立 Engine 目录（`shard-XX`），复用
+   `import` 的 CSV/JSONL 逐行解析 + term 提取；`--shard-id` 单分片构建 = 多进程并行入口
+   （各进程独立读源，10 分片并行导入）；
+3. **端到端验证**（临时数据已清理）：
+   - CSV 无主键 1000 行 → 4 分片各 250，docid 前缀 0/1<<40/2<<40/3<<40 正确，export 回读
+     各 250 行总计 1000 完整；
+   - CSV 显式主键（docid 带前缀）→ 按前缀正确路由到各分片；
+   - `--shard-id 3` 只构建分片 3（并行模式）；
+   - JSONL 200 行 → 4×50；发现并修复 **UTF-8 BOM 首行解析失败**（strip `\u{feff}`）；
+4. **回归**：513 全绿（+6 shard_build 单测）。
+5. **后续**：10 分片 10 亿构建验证（验收：构建 ≤60 分钟、点查 10 万+ QPS）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
