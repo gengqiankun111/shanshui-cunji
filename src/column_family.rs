@@ -168,6 +168,37 @@ impl ColumnFamily {
         wal_dir: Option<&Path>,
         cfg: &Config,
     ) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::open_inner(name, dir, wal_dir, cfg, None)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open_inner(name, dir, wal_dir, cfg)
+        }
+    }
+
+    /// V 项：打开列族并注入 io_uring 后端池（Linux + `runtime.io_uring_enabled`）——
+    /// 加载的 SST 块读与 WAL fsync 经 SQPOLL 队列；Windows / 未启用传 None（同步路径）。
+    #[cfg(target_os = "linux")]
+    pub fn open_with_io_uring(
+        name: &str,
+        dir: &Path,
+        wal_dir: Option<&Path>,
+        cfg: &Config,
+        iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
+    ) -> Result<Self> {
+        Self::open_inner(name, dir, wal_dir, cfg, iou)
+    }
+
+    fn open_inner(
+        name: &str,
+        dir: &Path,
+        wal_dir: Option<&Path>,
+        cfg: &Config,
+        #[cfg(target_os = "linux")]
+        iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         if let Some(w) = wal_dir {
             std::fs::create_dir_all(w)?;
@@ -218,7 +249,17 @@ impl ColumnFamily {
                 warn!("Manifest 中的 SST 缺失，跳过: {}", p.display());
                 continue;
             }
-            match SstReader::open_with_granularity(&p, cfg.sstable.index_granularity as usize) {
+            // V 项：Linux + io_uring 启用时经 open_with_io_uring 注入 SQPOLL 池，否则同步打开
+            #[cfg(target_os = "linux")]
+            let open_res = SstReader::open_with_io_uring(
+                &p,
+                cfg.sstable.index_granularity as usize,
+                iou.clone(),
+            );
+            #[cfg(not(target_os = "linux"))]
+            let open_res =
+                SstReader::open_with_granularity(&p, cfg.sstable.index_granularity as usize);
+            match open_res {
                 Ok(r) => {
                     ssts.push(r);
                     sst_levels_loaded.push(sst_levels.get(i).copied().unwrap_or(0));
@@ -254,12 +295,18 @@ impl ColumnFamily {
         let (wal, wal_records) = match WalMode::parse(&cfg.storage.wal_mode) {
             WalMode::Ring => {
                 let size = (cfg.storage.wal_ring_size_mb as usize) * 1024 * 1024;
-                let (ring, recs) = RingWal::open_or_create(&wal_path, size)?;
+                let (mut ring, recs) = RingWal::open_or_create(&wal_path, size)?;
+                // V 项：注入 io_uring 池（Linux + 启用时）——WAL fsync 走 SQPOLL 队列
+                #[cfg(target_os = "linux")]
+                ring.set_io_uring(iou.clone());
                 (WalBackend::Ring(ring), recs)
             }
             WalMode::Append => {
                 // 先创建（open_append 兼容新库空文件），再回放
-                let w = WalWriter::open_append(&wal_path, 1, false)?;
+                let mut w = WalWriter::open_append(&wal_path, 1, false)?;
+                // V 项：注入 io_uring 池（Linux + 启用时）——WAL fsync 走 SQPOLL 队列
+                #[cfg(target_os = "linux")]
+                w.set_io_uring(iou.clone());
                 let recs = WalReader::recover(&wal_path)?;
                 (WalBackend::Append(w), recs)
             }

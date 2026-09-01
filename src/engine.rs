@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
+use tracing::{info, warn};
 
 use crate::bitmap::DeletionBitmap;
 use crate::column_family::ColumnFamily;
@@ -109,9 +110,9 @@ pub struct Engine {
     data_dir: std::path::PathBuf,
     /// V 项：io_uring 后端池（Linux + `runtime.io_uring_enabled` 时初始化；Windows 无此字段）。
     /// 按 IoClass 三队列 SQPOLL，read_at/write_at/fsync 经 `io_uring_*` 方法转发；
-    /// 热路径接入（sstable/wal）随 Linux 部署验证后启用。
+    /// 已接入热路径——CF 打开时注入（SST 块读 + WAL fsync 走 SQPOLL 队列）。
     #[cfg(target_os = "linux")]
-    iou: Option<crate::io_queue::backend::IoUringPool>,
+    iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
     /// X 项：Prometheus 风格指标（读写计数 + 延迟直方图 + Compaction/Flush 次数；
     /// 网络层连接/语句由服务进程写入共享 Metrics）。
     pub metrics: crate::metrics::Metrics,
@@ -298,6 +299,40 @@ impl Engine {
             .as_deref()
             .map(Path::new)
             .unwrap_or(data_dir);
+        // V 项：io_uring 后端池初始化（Linux + `runtime.io_uring_enabled`）——SQPOLL 三队列
+        // （WAL/SST/倒排）+ affinity 三池外预留核；提前到 CF 打开之前创建，注入各 CF
+        // （SST 块读 + WAL fsync 走 io_uring）。Windows 编译为空（cfg 移除变量）。
+        #[cfg(target_os = "linux")]
+        let iou = {
+            let affinity = crate::affinity::plan_partition(&cfg.affinity);
+            if crate::io_queue::io_uring_enabled(&cfg.runtime) {
+                let sqpoll_cpu =
+                    crate::affinity::reserve_sqpoll_core(&affinity).map(|c| c as u32);
+                let pool = crate::io_queue::backend::IoUringPool::open(256, 1000, sqpoll_cpu);
+                match &pool {
+                    Ok(_) => info!(
+                        "io_uring 后端池初始化成功（SQPOLL 三队列，预留核={:?}）",
+                        sqpoll_cpu
+                    ),
+                    Err(e) => warn!(
+                        "io_uring 后端池初始化失败，回退同步 IO: {e}（io_uring_enabled 未生效）"
+                    ),
+                }
+                pool.ok().map(std::sync::Arc::new)
+            } else {
+                info!("io_uring 未启用（runtime.io_uring_enabled=false），走同步 IO");
+                None
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let primary = Arc::new(ColumnFamily::open_with_io_uring(
+            "primary",
+            &sst_root.join("primary"),
+            Some(wal_root),
+            cfg,
+            iou.clone(),
+        )?);
+        #[cfg(not(target_os = "linux"))]
         let primary = Arc::new(ColumnFamily::open_with_wal_dir(
             "primary",
             &sst_root.join("primary"),
@@ -317,14 +352,39 @@ impl Engine {
         )?;
         // 位图索引（design 5.2.4，M7-2）：白名单非空时全量重建内存位图
         inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
-        let cidx = ColumnFamily::open_with_wal_dir(
-            "cidx",
-            &sst_root.join("cidx"),
-            Some(wal_root),
-            cfg,
-        )
+        let cidx = {
+            // V 项：Linux + 启用时注入 io_uring 池（cidx 可选 CF，失败容忍）
+            #[cfg(target_os = "linux")]
+            {
+                ColumnFamily::open_with_io_uring(
+                    "cidx",
+                    &sst_root.join("cidx"),
+                    Some(wal_root),
+                    cfg,
+                    iou.clone(),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                ColumnFamily::open_with_wal_dir(
+                    "cidx",
+                    &sst_root.join("cidx"),
+                    Some(wal_root),
+                    cfg,
+                )
+            }
+        }
         .ok()
         .map(Arc::new);
+        #[cfg(target_os = "linux")]
+        let delta = Arc::new(ColumnFamily::open_with_io_uring(
+            "delta",
+            &sst_root.join("delta"),
+            Some(wal_root),
+            cfg,
+            iou.clone(),
+        )?);
+        #[cfg(not(target_os = "linux"))]
         let delta = Arc::new(ColumnFamily::open_with_wal_dir(
             "delta",
             &sst_root.join("delta"),
@@ -362,19 +422,6 @@ impl Engine {
             .set_external_seq(Arc::clone(&global_seq));
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
-        // V 项：io_uring 后端池初始化（Linux + `runtime.io_uring_enabled`）——SQPOLL 三队列
-        // （WAL/SST/倒排）+ affinity 三池外预留核；Windows 编译为空（cfg 移除变量）。
-        #[cfg(target_os = "linux")]
-        let iou = {
-            let affinity = crate::affinity::plan_partition(&cfg.affinity);
-            if crate::io_queue::io_uring_enabled(&cfg.runtime) {
-                let sqpoll_cpu =
-                    crate::affinity::reserve_sqpoll_core(&affinity).map(|c| c as u32);
-                crate::io_queue::backend::IoUringPool::open(256, 1000, sqpoll_cpu).ok()
-            } else {
-                None
-            }
-        };
         let mut engine = Self {
             primary,
             cidx,

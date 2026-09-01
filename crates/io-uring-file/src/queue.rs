@@ -134,6 +134,9 @@ impl IoUringFile {
 // SAFETY: 所有操作经 Mutex 串行化，无并发裸指针进入内核；`&IoUringFile` 跨线程共享 =
 // 串行进入队列，语义安全（论证见模块头）。
 unsafe impl Sync for IoUringFile {}
+// SAFETY: 同 Sync 论证——内部唯一状态 `Mutex<IoUring>` 为自包含，跨线程 move（Arc 派发）
+// 不会引入悬垂引用或数据竞争（io-uring crate 的 IoUring 标记 !Send，Mutex 包裹后语义安全）。
+unsafe impl Send for IoUringFile {}
 
 #[cfg(test)]
 mod tests {

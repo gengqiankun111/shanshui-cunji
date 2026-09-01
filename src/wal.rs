@@ -40,6 +40,10 @@ pub struct WalWriter {
     pending_bytes: usize,
     /// 上次 fsync 时刻（组提交窗口判定，M8）。
     last_sync: std::time::Instant,
+    /// V 项：io_uring 后端池引用（Linux + `runtime.io_uring_enabled` 时 Some）——
+    /// fsync 提交到 WAL 队列（SQPOLL 免 syscall）。非 Linux 编译为空字段。
+    #[cfg(target_os = "linux")]
+    iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
 }
 
 const GROUP_COMMIT_FSYNC_BYTES: usize = 4 * 1024 * 1024; // perf 模式攒满 4MB 才 fsync
@@ -70,6 +74,8 @@ impl WalWriter {
             perf_mode,
             pending_bytes: 0,
             last_sync: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            iou: None,
         })
     }
 
@@ -101,7 +107,40 @@ impl WalWriter {
             perf_mode,
             pending_bytes: 0,
             last_sync: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            iou: None,
         })
+    }
+
+    /// V 项：注入 io_uring 后端池（Linux + `runtime.io_uring_enabled`）——此后 fsync
+    /// 提交到 WAL 队列（SQPOLL 免 syscall）。CF 打开 WAL 后调用；未启用保持 None。
+    #[cfg(target_os = "linux")]
+    pub fn set_io_uring(&mut self, iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>) {
+        self.iou = iou;
+    }
+
+    /// V 项：fsync 转发——io_uring 启用（`self.iou` 有值）时经 WAL 队列提交，
+    /// 否则回退 `sync_all`。非 Linux 编译恒走同步路径。
+    #[cfg(target_os = "linux")]
+    fn fsync_file(&mut self) -> Result<()> {
+        let iou = self.iou.clone();
+        if let Some(f) = self.file.as_ref() {
+            if let Some(iou) = &iou {
+                iou.fsync(crate::io_queue::IoClass::Wal, f).map_err(crate::error::Error::Io)?;
+            } else {
+                f.sync_all().map_err(crate::error::Error::Io)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 非 Linux：直接 `sync_all`（无 io_uring 路径）。
+    #[cfg(not(target_os = "linux"))]
+    fn fsync_file(&mut self) -> Result<()> {
+        if let Some(f) = self.file.as_ref() {
+            f.sync_all().map_err(crate::error::Error::Io)?;
+        }
+        Ok(())
     }
 
     /// 截断重建 WAL（M8-P5）：flush 后所有记录已刷盘，清空文件并写头（magic + next_seq），
@@ -113,7 +152,7 @@ impl WalWriter {
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(WAL_HEADER)?;
         file.write_all(&next.to_le_bytes())?;
-        file.sync_all()?; // 头 + next_seq 落盘（崩溃恢复 seq 接续依据）
+        self.fsync_file()?; // 头 + next_seq 落盘（崩溃恢复 seq 接续依据）
         self.buf.clear();
         self.pending_bytes = 0;
         self.last_sync = std::time::Instant::now();
@@ -169,7 +208,7 @@ impl WalWriter {
         self.buf.clear();
         self.pending_bytes = 0;
         if !self.perf_mode {
-            file.sync_all()?;
+            self.fsync_file()?;
         }
         self.last_sync = std::time::Instant::now();
         Ok(())
@@ -205,9 +244,7 @@ impl WalWriter {
     /// 显式 fsync（紧急 / 关闭前）。
     pub fn flush_sync(&mut self) -> Result<()> {
         self.sync()?;
-        if let Some(f) = self.file.as_mut() {
-            f.sync_all()?;
-        }
+        self.fsync_file()?;
         Ok(())
     }
 
@@ -330,6 +367,10 @@ pub struct RingWal {
     max_written_seq: u64,
     /// 上次 fsync 时刻（组提交窗口判定，M8）。
     last_sync: std::time::Instant,
+    /// V 项：io_uring 后端池引用（Linux + `runtime.io_uring_enabled` 时 Some）——
+    /// fsync 提交到 WAL 队列（SQPOLL 免 syscall）。非 Linux 编译为空字段。
+    #[cfg(target_os = "linux")]
+    iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
 }
 
 /// 环形 WAL 头长度（魔数 4 + 保留 8 + tail 8）。
@@ -367,6 +408,8 @@ impl RingWal {
                 index: Vec::new(),
                 max_written_seq: 0,
                 last_sync: std::time::Instant::now(),
+                #[cfg(target_os = "linux")]
+                iou: None,
             };
             write_ring_header(ring.file.as_mut().unwrap(), ring.tail)?;
             ring.fsync_file()?;
@@ -389,6 +432,8 @@ impl RingWal {
             index: Vec::new(),
             max_written_seq: 0,
             last_sync: std::time::Instant::now(),
+            #[cfg(target_os = "linux")]
+            iou: None,
         };
         ring.tail = ring.read_tail()?;
         let (recs, index) = ring.scan_ring()?;
@@ -511,7 +556,9 @@ impl RingWal {
             file.seek(std::io::SeekFrom::Start(*off as u64))?;
             file.write_all(bytes)?;
         }
-        file.sync_all()?; // 单次 fsync：头部 tail + 记录区原子提交（消除冗余第二次 fsync）
+        // 单次 fsync：头部 tail + 记录区原子提交（消除冗余第二次 fsync）——
+        // io_uring 启用时经 WAL 队列（SQPOLL），否则 sync_all。
+        self.fsync_file()?;
         for (off, rec) in &plan {
             let seq = u64::from_le_bytes(rec[8..16].try_into().unwrap());
             self.index.push((*off, seq));
@@ -575,9 +622,33 @@ impl RingWal {
         Ok(recs)
     }
 
+    /// V 项：注入 io_uring 后端池（Linux + `runtime.io_uring_enabled`）——此后 fsync
+    /// 提交到 WAL 队列（SQPOLL 免 syscall）。CF 打开 WAL 后调用；未启用保持 None。
+    #[cfg(target_os = "linux")]
+    pub fn set_io_uring(&mut self, iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>) {
+        self.iou = iou;
+    }
+
+    /// V 项：fsync 转发——io_uring 启用（`self.iou` 有值）时经 WAL 队列提交，
+    /// 否则回退 `sync_all`。非 Linux 编译恒走同步路径。
+    #[cfg(target_os = "linux")]
     fn fsync_file(&self) -> Result<()> {
         if let Some(f) = self.file.as_ref() {
-            f.sync_all()?;
+            if let Some(iou) = &self.iou {
+                iou.fsync(crate::io_queue::IoClass::Wal, f)
+                    .map_err(crate::error::Error::Io)?;
+            } else {
+                f.sync_all().map_err(crate::error::Error::Io)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 非 Linux：直接 `sync_all`（无 io_uring 路径）。
+    #[cfg(not(target_os = "linux"))]
+    fn fsync_file(&self) -> Result<()> {
+        if let Some(f) = self.file.as_ref() {
+            f.sync_all().map_err(crate::error::Error::Io)?;
         }
         Ok(())
     }

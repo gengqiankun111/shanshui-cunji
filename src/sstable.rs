@@ -697,6 +697,11 @@ pub struct SstReader {
     /// Ex-5.9/Ex-7.1：读热度计数（点查/范围扫描命中递增，冷热 Compaction 选段依据；
     /// PerCpuCounter 按核拆分——并发读多核 touch 无伪共享）。
     heat: PerCpuCounter,
+    /// V 项：io_uring 后端池引用（Linux + `runtime.io_uring_enabled` 时 Some）——块读走
+    /// SQPOLL 队列异步提交（免 syscall），WAL fsync 同池（IoClass::Sst 路由）。
+    /// 非 Linux 编译为空字段（io-uring-file crate 为空）。
+    #[cfg(target_os = "linux")]
+    iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
 }
 
 /// Level 1 摘要条目：每 `index_granularity` 个块一条（design 4.4.2）。
@@ -717,10 +722,34 @@ impl SstReader {
     /// 打开 SST 并指定两级索引粒度（`sstable.index_granularity`）。
     pub fn open_with_granularity(path: &Path, index_granularity: usize) -> Result<Self> {
         let granularity = index_granularity.max(1);
-        Self::open_inner(path, granularity)
+        #[cfg(target_os = "linux")]
+        {
+            Self::open_inner(path, granularity, None)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open_inner(path, granularity)
+        }
     }
 
-    fn open_inner(path: &Path, index_granularity: usize) -> Result<Self> {
+    /// V 项：打开 SST 并注入 io_uring 后端池（Linux + `runtime.io_uring_enabled`）——
+    /// 块读经 SQPOLL 队列提交；Windows / 未启用传 None（走同步 read_at）。
+    #[cfg(target_os = "linux")]
+    pub fn open_with_io_uring(
+        path: &Path,
+        index_granularity: usize,
+        iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
+    ) -> Result<Self> {
+        let granularity = index_granularity.max(1);
+        Self::open_inner(path, granularity, iou)
+    }
+
+    fn open_inner(
+        path: &Path,
+        index_granularity: usize,
+        #[cfg(target_os = "linux")]
+        iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
+    ) -> Result<Self> {
         let mut file = std::fs::File::open(path).map_err(Error::Io)?;
         let fsize = file.metadata().map_err(Error::Io)?.len();
         if fsize < 8 + 54 {
@@ -858,6 +887,8 @@ impl SstReader {
             compression,
             format: version,
             heat: PerCpuCounter::new(),
+            #[cfg(target_os = "linux")]
+            iou,
         })
     }
 
@@ -1101,11 +1132,11 @@ impl SstReader {
     /// 读取并解压数据块，校验 CRC（位置读：`&self` 可并发，读写分离读路径基础）。
     pub fn read_block(&self, e: &IndexEntry) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; e.comp_len as usize];
-        read_at(&self.file, &mut comp, e.offset)?;
+        self.read_at_io(&mut comp, e.offset)?;
 
         // 读 Trailer 校验
         let mut trailer = vec![0u8; TRAILER_LEN];
-        read_at(&self.file, &mut trailer, e.offset + e.comp_len as u64)?;
+        self.read_at_io(&mut trailer, e.offset + e.comp_len as u64)?;
         let raw_len = u32::from_le_bytes(trailer[0..4].try_into().unwrap()) as usize;
         let comp_len = u32::from_le_bytes(trailer[4..8].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(trailer[8..12].try_into().unwrap());
@@ -1128,6 +1159,25 @@ impl SstReader {
         }
     }
 
+    /// V 项：位置读转发——Linux + io_uring 启用（`self.iou` 有值）时经 SQPOLL 队列提交
+    /// （`IoClass::Sst` 队列，免 syscall 异步完成），否则回退同步 `read_at`。
+    /// 非 Linux 编译恒走同步路径（`iou` 字段不存在）。
+    #[cfg(target_os = "linux")]
+    fn read_at_io(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        if let Some(iou) = &self.iou {
+            iou.read_at(crate::io_queue::IoClass::Sst, &self.file, buf, offset)
+                .map_err(Error::Io)?;
+            return Ok(());
+        }
+        read_at(&self.file, buf, offset)
+    }
+
+    /// 非 Linux：直接同步读（无 io_uring 路径）。
+    #[cfg(not(target_os = "linux"))]
+    fn read_at_io(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        read_at(&self.file, buf, offset)
+    }
+
     /// U 项：合并读连续数据块（冷扫预读）——一次 `read_at` 覆盖整组
     /// （4×4KB → 1×16KB，减少顺序扫描 syscall/IO 次数），逐块切片 + CRC 校验 + 解压。
     /// 布局假设：块紧凑连续（`compressed + TRAILER_LEN` 紧邻）；校验失败回退逐块读（安全）。
@@ -1143,7 +1193,7 @@ impl SstReader {
         let last = &entries[n - 1];
         let end = last.offset + last.comp_len as u64 + TRAILER_LEN as u64;
         let mut buf = vec![0u8; (end - start) as usize];
-        read_at(&self.file, &mut buf, start)?;
+        self.read_at_io(&mut buf, start)?;
         let mut out = Vec::with_capacity(n);
         for e in entries {
             let rel = (e.offset - start) as usize;
@@ -1166,7 +1216,7 @@ impl SstReader {
     /// O 项第③步：`&self`——compact 经 `Arc<SstReader>` 并发读输入段（内部 `read_at` 无状态 seek）。
     pub fn block_raw(&self, e: &IndexEntry) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut comp = vec![0u8; e.comp_len as usize];
-        read_at(&self.file, &mut comp, e.offset)?;
+        self.read_at_io(&mut comp, e.offset)?;
         let raw = self.decompress(&comp, e.raw_len as usize)?;
         Ok((comp, raw))
     }
