@@ -96,8 +96,10 @@
 ## 10. 10 亿库扩展（设计 `design-10b-extension.md`，阶段 A P0）
 
 - **来源**：2026-09-02 规划（10 亿库分片扩展方案）
-- **阶段 A（P0，可独立先行）**：全局 docid 分配器（分片前缀 `docid = shard_id<<40 | local_id`，
-  路由 O(1)、分片内自增无集中瓶颈、扩容 docid 归属不变）→ 分片构建工具 → 10 分片 10 亿构建
+- **阶段 A（P0）— ✅ 已完成**：全局 docid 分配器 `src/docid_alloc.rs`（分片前缀
+  `docid = shard_id<<40 | local_id`，路由 O(1)、分片内 AtomicU64 自增无集中瓶颈、扩容归属不变、
+  40 位溢出保护）；demo `demo/docid-alloc` 5 测试 + kernel 7 单测，507 全绿（development.md 7.81）
+- **后续**：分片构建工具 → 10 分片 10 亿构建
 - **阶段 B/C/D**：倒排分片化验证、scale_out+raft_meta 接 RPC（raft 阶段二）、分片级可观测
 - **触发**：阶段 A 立即（10 亿库前提）；B/C/D 随节点规模/硬件推进
 

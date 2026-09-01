@@ -2355,6 +2355,27 @@ impl RuntimePools {
 3. **收尾**：P0/P1/P2 全排期执行完毕（P0-1 扩容编排 / P0-2 元数据 Raft / P1 Tiered 评估不引入 /
    P1 Indexer 代理层 / P2 两级索引不引入 / P2 Calvin 硬件卸载不引入）——**500 全绿**。
 
+### 7.81 AD 10 亿库阶段 A：全局 docid 分配器（分片前缀）
+
+> 2026-09-02。用户排期 AD（10 亿库扩展阶段 A，P0）：全局 docid 分配器，为分片扩展提供
+> O(1) 路由 + 无集中瓶颈 + 扩容归属不变的 docid 空间。design-10b-extension.md §5.1。
+
+1. **方案**：`docid = shard_id<<40 | local_id`——高 N 位 = 分片号（u16，最多 65535 分片），
+   低 40 位 = 分片内自增（每分片 1 万亿）；
+   - **路由 O(1)**：`shard_of(docid)` 高位直取分片，无需 hash64 重映射（旧 hash 路由保留兼容）；
+   - **跨分片唯一**：不同 shard_id 前缀天然不重叠 → 无集中分配器、无锁；
+   - **无集中瓶颈**：每分片 `AtomicU64` fetch_add（gseq-hw 实测单线程 2 亿/s，余量 2+ 数量级）；
+   - **扩容归属不变**：`resize` 只新增分片号段，已有 docid 高 N 位不变；
+   - **边界保护**：local_id 达 1<<40 拒绝分配（防分片号污染）。
+2. **demo**（`demo/docid-alloc`，5 测试）：编码/解码往返 + 路由 O(1)、并发分配唯一性
+   （8 线程×100k/分片）、扩容归属不变（4→10）、40 位溢出拒绝、全局唯一。
+3. **kernel**（`src/docid_alloc.rs`）：`ShardLocalAllocator`（无锁原子分配 + watermark 水位，
+   崩溃恢复 `with_start` 续跑不重复）+ `DocIdAllocator`（`new`/`from_watermarks`/`alloc`/
+   `resize`/`watermarks`，超限与越界分片拒绝）；7 个单元测试。
+4. **回归**：507 全绿（+7 docid_alloc 单测）。
+5. **后续（阶段 B/C/D）**：分片构建工具 → 10 分片 10 亿构建；倒排分片化验证；scale_out+
+   raft_meta 接 RPC；分片级可观测。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

@@ -24,6 +24,7 @@ pub mod bloom;
 pub mod column_family;
 pub mod config;
 pub mod demo;
+pub mod docid_alloc;
 pub mod engine;
 pub mod error;
 pub mod explain;
