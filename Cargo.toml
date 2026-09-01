@@ -43,6 +43,9 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 parquet = "59.2.0"
 arrow = "59.2.0"
 jieba-rs = { version = "0.10", optional = true }
+# I 项异步协程运行时（design 9.5：10k 连接目标——网络层协程化，连接 idle 不占 OS 线程；
+# 查询执行经 spawn_blocking 复用现有同步引擎）
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 
 [[bin]]
 name = "shanshui-cunji-migrate"

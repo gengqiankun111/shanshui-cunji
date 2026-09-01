@@ -56,6 +56,8 @@ fn main() {
     let bind = opt_arg(&args, "--bind", "0.0.0.0:3307");
     let user = opt_arg(&args, "--user", "root");
     let password = opt_arg(&args, "--password", "");
+    // I 项异步协程运行时（design 9.5 10k 连接目标）：--async 切换 tokio 网络层
+    let async_mode = args.iter().any(|a| a == "--async");
 
     let cfg = if config_path.is_empty() {
         Config::default()
@@ -73,10 +75,21 @@ fn main() {
     };
     let engine = Engine::open(&data_dir, &cfg).expect("打开引擎失败");
     println!(
-        "[mysql-server] 数据目录 {} 打开完成，启动 MySQL 协议服务: {bind}",
-        data_dir.display()
+        "[mysql-server] 数据目录 {} 打开完成，启动 MySQL 协议服务{}: {bind}",
+        data_dir.display(),
+        if async_mode { "（异步协程）" } else { "" }
     );
-    MySqlServer::new(engine, user, password)
-        .serve(&bind)
-        .expect("MySQL 服务失败");
+    let server = MySqlServer::new(engine, user, password);
+    if async_mode {
+        // 异步网络层：连接 idle 不占 OS 线程；查询经 spawn_blocking 复用同步引擎
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime 构建失败");
+        rt.block_on(async move {
+            server.serve_async(&bind).await.expect("MySQL 异步服务失败");
+        });
+    } else {
+        server.serve(&bind).expect("MySQL 服务失败");
+    }
 }

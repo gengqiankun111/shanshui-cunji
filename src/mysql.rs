@@ -479,6 +479,54 @@ impl MySqlServer {
         Ok(local)
     }
 
+    /// 异步服务（design 9.5 10k 连接目标）：tokio accept 循环，每连接一个 **task**——
+    /// 连接 idle 不占 OS 线程；查询经 `spawn_blocking` 复用同步引擎（活跃查询才占阻塞线程）。
+    /// 需在 tokio runtime 内调用（`#[tokio::main]` / `tokio::runtime`）。返回实际绑定地址。
+    pub async fn serve_async(self, addr: &str) -> Result<std::net::SocketAddr> {
+        self.spawn_compaction_worker();
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local = listener.local_addr()?;
+        tracing::info!(
+            "MySQL 协议服务已启动（异步协程）: mysql://{addr}（库 {DEFAULT_DB}，表 {DEFAULT_TABLE}）"
+        );
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("异步 accept 错误: {e}");
+                    continue;
+                }
+            };
+            let engine = self.engine.clone();
+            let user = self.user.clone();
+            let password = self.password.clone();
+            let auto_id = self.auto_id.clone();
+            let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                // X 项：连接计数（活跃/累计，/metrics 指标）
+                if let Ok(g) = engine.read() {
+                    g.metrics.active_conns.fetch_add(1, Ordering::Relaxed);
+                    g.metrics.total_conns.fetch_add(1, Ordering::Relaxed);
+                }
+                let r = handle_connection_async(
+                    &mut stream,
+                    engine.clone(),
+                    &user,
+                    &password,
+                    conn_id,
+                    auto_id,
+                )
+                .await;
+                if let Ok(g) = engine.read() {
+                    g.metrics.active_conns.fetch_add(-1, Ordering::Relaxed);
+                }
+                if let Err(e) = r {
+                    tracing::warn!("MySQL 会话结束（异步）: {e}");
+                }
+            });
+        }
+    }
+
     /// 测试用：绑定到随机端口并返回地址（单连接阻塞处理，供协议级测试）。
     pub fn serve_once(self, addr: &str) -> Result<std::net::SocketAddr> {
         let listener = TcpListener::bind(addr)?;
@@ -497,16 +545,9 @@ impl MySqlServer {
     }
 }
 
-/// 单连接处理：握手 → 认证 → 命令循环。
-fn handle_connection(
-    stream: &mut TcpStream,
-    engine: Arc<RwLock<Engine>>,
-    user: &str,
-    password: &str,
-    conn_id: u64,
-    auto_id: Arc<AtomicU64>,
-) -> Result<()> {
-    let mut session = Session {
+/// 新建会话（同步/异步连接共用）。
+fn new_session(auto_id: Arc<AtomicU64>) -> Session {
+    Session {
         user: String::new(),
         authenticated: false,
         txn: None,
@@ -514,9 +555,11 @@ fn handle_connection(
         statements: std::collections::HashMap::new(),
         next_stmt_id: 1,
         auto_id,
-    };
-    // ① 握手（HandshakeV10）
-    let scramble = gen_scramble(conn_id);
+    }
+}
+
+/// 构造 HandshakeV10 握手包（同步/异步共用）。
+fn build_handshake_packet(conn_id: u64, scramble: &[u8; 20]) -> Vec<u8> {
     let mut hb = Vec::new();
     hb.push(PROTOCOL_VERSION);
     // 协议字符串均为 NUL 结尾 C 串（无 lenenc 长度前缀）
@@ -535,25 +578,27 @@ fn handle_connection(
     hb.push(0); // auth plugin data part2 终止 NUL（auth_len=21 = 8+12+NUL）
     hb.extend_from_slice(b"mysql_native_password");
     hb.push(0);
-    write_packet(stream, 0, &hb)?;
+    hb
+}
 
-    // ② 读握手响应
-    let (_, resp) = read_packet(stream)?;
-    tracing::debug!(
-        "握手响应 {} 字节: {:02x?}",
-        resp.len(),
-        &resp[..resp.len().min(96)]
-    );
+/// 解析握手响应并校验 native_password 认证（同步/异步共用）。返回是否认证通过。
+fn parse_handshake_response(
+    resp: &[u8],
+    session: &mut Session,
+    user: &str,
+    password: &str,
+    scramble: &[u8; 20],
+) -> Result<bool> {
     if resp.is_empty() {
         return Err(Error::Cluster("客户端握手响应为空".into()));
     }
     let mut pos = 0usize;
-    let cap = read_u32_le(&resp, &mut pos);
-    let _max_packet = read_u32_le(&resp, &mut pos);
+    let cap = read_u32_le(resp, &mut pos);
+    let _max_packet = read_u32_le(resp, &mut pos);
     let _charset = resp.get(pos).copied().unwrap_or(0);
     pos += 1;
     pos += 23; // filler（协议 41：charset 后 23 字节零填充）
-    session.user = read_nul_string(&resp, &mut pos)?;
+    session.user = read_nul_string(resp, &mut pos)?;
     // 协议 41 握手响应顺序：username → auth_response → [CONNECT_WITH_DB] db →
     // [PLUGIN_AUTH] auth_plugin_name → [CONNECT_ATTRS] attrs。
     // 各字段由「服务器声明」决定客户端是否发送：服务器 CAPABILITIES 未声明
@@ -562,23 +607,46 @@ fn handle_connection(
     if cap & CLIENT_PLUGIN_AUTH != 0 {
         // auth_response：服务器未声明 CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA → 1 字节长度前缀
         // （小值下 lenenc 与 1 字节一致，read_lenenc_raw 兼容两者）
-        let auth_len = read_lenenc_raw(&resp, &mut pos)? as usize;
+        let auth_len = read_lenenc_raw(resp, &mut pos)? as usize;
         if pos + auth_len > resp.len() {
             return Err(Error::Cluster("auth_response 越界".into()));
         }
         auth_response = resp[pos..pos + auth_len].to_vec();
         pos += auth_len;
-        tracing::debug!("认证: user={} auth_len={} resp_len={}", session.user, auth_len, resp.len());
     }
     if cap & CLIENT_CONNECT_WITH_DB != 0 && CAPABILITIES & CLIENT_CONNECT_WITH_DB != 0 {
-        let _db = read_nul_string(&resp, &mut pos)?;
+        let _db = read_nul_string(resp, &mut pos)?;
     }
     if cap & CLIENT_PLUGIN_AUTH != 0 {
-        let _plugin = read_nul_string(&resp, &mut pos)?;
+        let _plugin = read_nul_string(resp, &mut pos)?;
     }
-    let ok = session.user == user && check_native_password(&auth_response, &scramble, password);
+    Ok(session.user == user && check_native_password(&auth_response, scramble, password))
+}
+
+/// 单连接处理：握手 → 认证 → 命令循环。
+fn handle_connection(
+    stream: &mut TcpStream,
+    engine: Arc<RwLock<Engine>>,
+    user: &str,
+    password: &str,
+    conn_id: u64,
+    auto_id: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut session = new_session(auto_id);
+    // ① 握手（HandshakeV10）
+    let scramble = gen_scramble(conn_id);
+    write_packet(stream, 0, &build_handshake_packet(conn_id, &scramble))?;
+
+    // ② 读握手响应
+    let (_, resp) = read_packet(stream)?;
+    tracing::debug!(
+        "握手响应 {} 字节: {:02x?}",
+        resp.len(),
+        &resp[..resp.len().min(96)]
+    );
+    let ok = parse_handshake_response(&resp, &mut session, &user, &password, &scramble)?;
     if !ok {
-        tracing::debug!("认证失败: user={} auth_len={}", session.user, auth_response.len());
+        tracing::debug!("认证失败: user={} auth_len={}", session.user, resp.len());
         let _ = write_packet(stream, 2, &err_payload(1045, "Access denied for user"))?;
         return Err(Error::Cluster("认证失败".into()));
     }
@@ -599,71 +667,185 @@ fn handle_connection(
         if cmd.is_empty() {
             continue;
         }
-        // 客户端命令包 seq=0，响应包从 seq=1 起递增
-        let seq0 = 1u8;
-        match cmd[0] {
-            COM_QUIT => return Ok(()),
-            COM_PING => write_packet(stream, seq0, &ok_payload(0, 0))?,
-            COM_INIT_DB => {
-                // 单库模式：任意库名均接受（MySQL 客户端默认带 sbtest 等库名）
-                let _db = String::from_utf8_lossy(&cmd[1..]).to_string();
-                write_packet(stream, seq0, &ok_payload(0, 0))?;
+        // 命令分发（无 IO 逻辑——同步/异步连接共用，异步路径经 spawn_blocking）
+        let (seq0, packets) = handle_command(&engine, &mut session, &cmd);
+        let Some(packets) = packets else {
+            return Ok(()); // COM_QUIT / EOF
+        };
+        let mut seq = seq0;
+        for p in packets {
+            write_packet(stream, seq, &p)?;
+            seq = seq.wrapping_add(1);
+        }
+    }
+}
+
+/// 处理单个命令包（无 IO）——同步 / 异步连接共用（异步路径经 `spawn_blocking` 执行，
+/// 连接 idle 不占 OS 线程，design 9.5 10k 连接目标）。
+/// 返回 `(起始 seq, 响应包列表)`；`None` = 连接应终止（COM_QUIT / EOF 由调用方处理）。
+fn handle_command(
+    engine: &Arc<RwLock<Engine>>,
+    session: &mut Session,
+    cmd: &[u8],
+) -> (u8, Option<Vec<Vec<u8>>>) {
+    // 客户端命令包 seq=0，响应包从 seq=1 起递增
+    let seq0 = 1u8;
+    match cmd[0] {
+        COM_QUIT => (seq0, None),
+        COM_PING => (seq0, Some(vec![ok_payload(0, 0)])),
+        COM_INIT_DB => {
+            // 单库模式：任意库名均接受（MySQL 客户端默认带 sbtest 等库名）
+            let _db = String::from_utf8_lossy(&cmd[1..]).to_string();
+            (seq0, Some(vec![ok_payload(0, 0)]))
+        }
+        COM_QUERY => {
+            // X 项：语句计数（/metrics 指标）
+            if let Ok(g) = engine.read() {
+                g.metrics.statements.fetch_add(1, Ordering::Relaxed);
             }
-            COM_QUERY => {
-                // X 项：语句计数（/metrics 指标）
-                if let Ok(g) = engine.read() {
-                    g.metrics.statements.fetch_add(1, Ordering::Relaxed);
+            let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
+            // O 项第②步：读语句走 RwLock 读锁（多连接 SELECT 并行）；写语句走写锁互斥
+            let resp = if is_read_statement(&sql) {
+                let guard = engine.read().unwrap();
+                dispatch_query_read(&guard, &sql, session)
+            } else {
+                let mut guard = engine.write().unwrap();
+                dispatch_query(&mut guard, &sql, session)
+            };
+            (seq0, Some(query_response_packets(seq0, &resp)))
+        }
+        COM_STMT_PREPARE => {
+            // H-5：预处理语句（JDBC 依赖）。请求 = 0x16 + SQL
+            let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
+            (seq0, Some(stmt_prepare(session, &sql)))
+        }
+        COM_STMT_EXECUTE => {
+            // I 项高并发：预处理读语句（SELECT/SHOW 等）走 RwLock 读锁——sysbench
+            // point_select 等 PREPARE/EXECUTE 负载多连接并行；写语句保持写锁互斥
+            match stmt_execute_sql(session, cmd) {
+                Ok(sql) => {
+                    let resp = if is_read_statement(&sql) {
+                        let guard = engine.read().unwrap();
+                        dispatch_query_read(&guard, &sql, session)
+                    } else {
+                        let mut guard = engine.write().unwrap();
+                        dispatch_query(&mut guard, &sql, session)
+                    };
+                    (seq0, Some(query_response_packets(seq0, &resp)))
                 }
-                let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
-                // O 项第②步：读语句走 RwLock 读锁（多连接 SELECT 并行）；写语句走写锁互斥
-                let resp = if is_read_statement(&sql) {
-                    let guard = engine.read().unwrap();
-                    dispatch_query_read(&guard, &sql, &mut session)
-                } else {
-                    let mut guard = engine.write().unwrap();
-                    dispatch_query(&mut guard, &sql, &mut session)
-                };
-                write_query_response(stream, seq0, resp)?;
+                Err(resp) => (seq0, Some(query_response_packets(seq0, &resp))),
             }
-            COM_STMT_PREPARE => {
-                // H-5：预处理语句（JDBC 依赖）。请求 = 0x16 + SQL
-                let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
-                let packets = stmt_prepare(&mut session, &sql);
-                let mut seq = seq0;
-                for p in packets {
-                    write_packet(stream, seq, &p)?;
-                    seq = seq.wrapping_add(1);
-                }
+        }
+        COM_STMT_CLOSE => {
+            // H-5：释放 statement（无响应包）
+            if cmd.len() >= 5 {
+                let stmt_id = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
+                session.statements.remove(&stmt_id);
             }
-            COM_STMT_EXECUTE => {
-                // I 项高并发：预处理读语句（SELECT/SHOW 等）走 RwLock 读锁——sysbench
-                // point_select 等 PREPARE/EXECUTE 负载多连接并行（旧实现全走写锁串行）；
-                // 写语句（INSERT/UPDATE/DELETE）保持写锁互斥
-                match stmt_execute_sql(&session, &cmd) {
-                    Ok(sql) => {
-                        let resp = if is_read_statement(&sql) {
-                            let guard = engine.read().unwrap();
-                            dispatch_query_read(&guard, &sql, &mut session)
-                        } else {
-                            let mut guard = engine.write().unwrap();
-                            dispatch_query(&mut guard, &sql, &mut session)
-                        };
-                        write_query_response(stream, seq0, resp)?;
-                    }
-                    Err(resp) => write_query_response(stream, seq0, resp)?,
-                }
-            }
-            COM_STMT_CLOSE => {
-                // H-5：释放 statement（无响应包）
-                if cmd.len() >= 5 {
-                    let stmt_id = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
-                    session.statements.remove(&stmt_id);
-                }
-            }
-            other => {
-                let msg = format!("command {other:#x} not supported");
-                write_packet(stream, seq0, &err_payload(1047, &msg))?;
-            }
+            (seq0, Some(Vec::new()))
+        }
+        other => {
+            let msg = format!("command {other:#x} not supported");
+            (seq0, Some(vec![err_payload(1047, &msg)]))
+        }
+    }
+}
+
+// ============ 异步协程运行时（design 9.5：10k 连接目标）============
+
+/// 异步读 MySQL 包（4 字节头 + payload）。
+async fn read_packet_async(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<(u8, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 4];
+    stream.read_exact(&mut hdr).await?;
+    let len = (hdr[0] as usize) | ((hdr[1] as usize) << 8) | ((hdr[2] as usize) << 16);
+    let seq = hdr[3];
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    Ok((seq, payload))
+}
+
+/// 异步写 MySQL 包。
+async fn write_packet_async(
+    stream: &mut tokio::net::TcpStream,
+    seq: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let len = payload.len() as u32;
+    stream
+        .write_all(&[
+            (len & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            ((len >> 16) & 0xff) as u8,
+            seq,
+        ])
+        .await?;
+    stream.write_all(payload).await
+}
+
+/// 异步单连接处理：握手 → 认证 → 命令循环。
+/// **连接 idle 不占 OS 线程**（tokio task）；查询经 `spawn_blocking` 复用同步引擎
+/// （引擎 RwLock + session 独占在阻塞线程执行）——10k 长连接仅活跃查询占线程。
+async fn handle_connection_async(
+    stream: &mut tokio::net::TcpStream,
+    engine: Arc<RwLock<Engine>>,
+    user: &str,
+    password: &str,
+    conn_id: u64,
+    auto_id: Arc<AtomicU64>,
+) -> Result<()> {
+    // session 用 Option 包装：spawn_blocking 独占期间 take，处理完归还
+    let mut session: Option<Session> = Some(new_session(auto_id));
+    // ① 握手（HandshakeV10）
+    let scramble = gen_scramble(conn_id);
+    write_packet_async(stream, 0, &build_handshake_packet(conn_id, &scramble)).await?;
+    // ② 读握手响应 + 认证（native_password）
+    let (_, resp) = read_packet_async(stream).await?;
+    let ok = parse_handshake_response(
+        &resp,
+        session.as_mut().unwrap(),
+        &user,
+        &password,
+        &scramble,
+    )?;
+    if !ok {
+        let _ =
+            write_packet_async(stream, 2, &err_payload(1045, "Access denied for user")).await?;
+        return Err(Error::Cluster("认证失败".into()));
+    }
+    session.as_mut().unwrap().authenticated = true;
+    write_packet_async(stream, 2, &ok_payload(0, 0)).await?;
+    // ③ 命令循环：异步读包（idle 不占线程）→ spawn_blocking 执行查询 → 异步写响应
+    loop {
+        let (_, cmd) = match read_packet_async(stream).await {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        if cmd.is_empty() {
+            continue;
+        }
+        let engine2 = engine.clone();
+        let mut sess = session.take().expect("session 应存在");
+        let r = tokio::task::spawn_blocking(move || {
+            let (seq0, pkts) = handle_command(&engine2, &mut sess, &cmd);
+            (sess, seq0, pkts)
+        })
+        .await
+        .map_err(|e| {
+            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("blocking task: {e}")))
+        })?;
+        session = Some(r.0);
+        let Some(pkts) = r.2 else {
+            return Ok(()); // COM_QUIT
+        };
+        let mut seq = r.1;
+        for p in pkts {
+            write_packet_async(stream, seq, &p).await?;
+            seq = seq.wrapping_add(1);
         }
     }
 }
@@ -1249,34 +1431,44 @@ fn replace_params(sql: &str, values: &[String]) -> String {
     out
 }
 
-/// 写 COM_QUERY 响应（ResultSet 多包 / OK / ERR）。
-fn write_query_response(stream: &mut TcpStream, seq0: u8, resp: QueryResponse) -> Result<()> {
+/// 编码 COM_QUERY 响应为包序列（ResultSet 多包 / OK / ERR）——与 IO 解耦，
+/// 同步/异步连接共用（异步路径逐包 `write_packet_async`）。
+fn query_response_packets(seq0: u8, resp: &QueryResponse) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
     let mut seq = seq0;
     match resp {
-        QueryResponse::Ok(affected, lid) => write_packet(stream, seq, &ok_payload(affected, lid))?,
-        QueryResponse::Err(code, msg) => write_packet(stream, seq, &err_payload(code, &msg))?,
+        QueryResponse::Ok(affected, lid) => out.push(ok_payload(*affected, *lid)),
+        QueryResponse::Err(code, msg) => out.push(err_payload(*code, msg)),
         QueryResponse::Set { columns, rows } => {
             let mut cnt = Vec::new();
             write_lenenc(&mut cnt, columns.len() as u64);
-            write_packet(stream, seq, &cnt)?;
-            seq = seq.wrapping_add(1);
-            for c in &columns {
-                write_packet(stream, seq, c)?;
-                seq = seq.wrapping_add(1);
+            out.push(cnt);
+            for c in columns {
+                out.push(c.clone());
             }
-            write_packet(stream, seq, &eof_payload())?;
-            seq = seq.wrapping_add(1);
-            for row in &rows {
+            out.push(eof_payload());
+            for row in rows {
                 let mut rp = Vec::new();
                 for cell in row {
                     write_lenenc(&mut rp, cell.len() as u64);
                     rp.extend_from_slice(cell);
                 }
-                write_packet(stream, seq, &rp)?;
-                seq = seq.wrapping_add(1);
+                out.push(rp);
             }
-            write_packet(stream, seq, &eof_payload())?;
+            out.push(eof_payload());
         }
+    }
+    // seq 仅用于包序号（协议要求递增；此处响应包连续）
+    let _ = seq;
+    out
+}
+
+/// 写 COM_QUERY 响应（ResultSet 多包 / OK / ERR）。
+fn write_query_response(stream: &mut TcpStream, seq0: u8, resp: QueryResponse) -> Result<()> {
+    let mut seq = seq0;
+    for p in query_response_packets(seq0, &resp) {
+        write_packet(stream, seq, &p)?;
+        seq = seq.wrapping_add(1);
     }
     Ok(())
 }
@@ -2526,5 +2718,97 @@ mod tests {
             total += ok;
         }
         assert_eq!(total, n_threads * 30, "并发预处理读全部成功（无死锁）");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_server_protocol_roundtrip() {
+        // I 项异步协程运行时：serve_async 协议往返（握手 + 认证 + SELECT + PREPARE/EXECUTE）
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = tokio::spawn(async move {
+            server
+                .serve_async(&addr.to_string())
+                .await
+                .expect("async serve 失败");
+        });
+        // 等待 accept 就绪（探测连接成功即就绪，连接随即被关闭）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "async server 未就绪");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // 同步 TestClient 连异步 server：握手 + 认证 + SELECT 往返
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+        let packets = c.query("SELECT * FROM documents WHERE id=1");
+        assert!(packets.len() >= 3, "结果集多包（列定义+EOF+行尾）");
+        // 预处理往返（异步路径 spawn_blocking 执行查询）
+        let prep = c.stmt_prepare("SELECT * FROM documents WHERE id=?");
+        let stmt_id = u32::from_le_bytes(prep[0][1..5].try_into().unwrap());
+        let pk = c.stmt_execute(stmt_id, 7u64);
+        assert_ne!(pk[0][0], ERR_PACKET, "异步路径预处理 EXECUTE 成功");
+        // 写语句（走写锁）
+        let ins = c.query("INSERT INTO documents (id, doc) VALUES (42, '{\"a\":1}')");
+        assert_eq!(ins[0][0], OK_PACKET);
+        let sel = c.query("SELECT * FROM documents WHERE id=42");
+        let row = &sel[sel.len() - 2];
+        let mut p = 0usize;
+        let _ = read_lenenc(&row, &mut p).unwrap();
+        assert_eq!(&row[p..p + 2], b"42", "异步路径写入可见");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_server_concurrent_clients_all_succeed() {
+        // I 项异步协程：serve_async + 8 并发客户端查询全成功（连接 task 不占 OS 线程）
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = tokio::spawn(async move {
+            server
+                .serve_async(&addr.to_string())
+                .await
+                .expect("async serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "async server 未就绪");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let n_threads = 8;
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            handles.push(std::thread::spawn(move || {
+                let mut c = TestClient::connect(addr);
+                let (scramble, _) = c.handshake();
+                c.authenticate("root", "secret", &scramble);
+                let mut ok = 0u32;
+                for i in 1..=20u64 {
+                    let pk = c.query(&format!("SELECT * FROM documents WHERE id={i}"));
+                    if pk[0][0] != ERR_PACKET {
+                        ok += 1;
+                    }
+                }
+                (t, ok)
+            }));
+        }
+        let mut total = 0u32;
+        for h in handles {
+            let (t, ok) = h.join().expect("并发线程应正常结束");
+            assert!(ok > 0, "线程 {t} 查询全部失败");
+            total += ok;
+        }
+        assert_eq!(total, n_threads * 20, "异步服务并发查询全部成功");
     }
 }
