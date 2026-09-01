@@ -2103,6 +2103,25 @@ impl RuntimePools {
   P73 前旧 release 合并残留的 manifest 缺失引用（99/98/89 数据已并入 sst-100，重建 manifest
   后干净启动）；全量 **478 全绿**。
 
+### 7.70 异步协程运行时（I 项 P3，design 9.5 10k 连接目标）
+
+> 2026-09-01。tokio 异步网络层落地（`2802885`）——连接 idle 不占 OS 线程，10k 长连接可行；
+> 查询经 spawn_blocking 复用同步引擎（活跃查询才占阻塞线程）。480 全绿。
+
+- **协议逻辑抽取（同步/异步共用）**：`handle_command`（命令分发无 IO）、`query_response_packets`
+  （响应编码）、`build_handshake_packet` / `parse_handshake_response`（握手）、`new_session`；
+  同步 `handle_connection` 重构复用（16 mysql 测试回归全过）；
+- **异步路径**：`read/write_packet_async`（tokio AsyncRead/Write）+ `handle_connection_async`——
+  连接 task 异步读包（idle 不占线程），查询 `spawn_blocking` 执行（引擎 RwLock + session
+  take/归还独占）；`MySqlServer::serve_async`（tokio accept 循环 + 每连接 task）；
+- **接入**：mysql-server bin `--async` 切换 tokio runtime（默认同步不变）；
+- **1 亿库实测**：
+  - 并发点查（8 线程 pymysql）：966 QPS 3999/4000 命中（与同步 1100 同量级，pymysql 开销主导）；
+  - **idle 连接不占线程（核心验证）**：500 个 idle 连接 → **server 仅 15 线程**（同步模式
+    500 连接 = 500+ 线程）；线程数不随连接数线性增长 → 10k 长连接可行；
+- 测试 `async_server_protocol_roundtrip`（握手/认证/SELECT/PREPARE/INSERT 往返）+
+  `async_server_concurrent_clients_all_succeed`（8 并发客户端全成功）；全量 **480 全绿**。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
