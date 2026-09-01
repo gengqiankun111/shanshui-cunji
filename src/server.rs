@@ -1797,4 +1797,134 @@ mod tests {
         assert_eq!(st, 400, "未知依赖应 400: {resp}");
         assert!(resp.contains("未知步骤"), "{resp}");
     }
+
+    /// 跨分片真实业务节点（design_extension 13.2）：分片 = 独立 Engine（本地事务），
+    /// HTTP 端点执行真实余额变更——`/debit/action` 扣 100、`/debit/compensate` 加 100 回滚、
+    /// `/credit/action` 加 100（`fail_credit=true` 注入业务失败）、`/credit/compensate` 减 100 冲销、
+    /// `/balance` 返回两账户余额（docid 1=debit、2=credit）。补偿幂等：值型回退，重复调用余额不变。
+    fn spawn_shard_node(dir: &std::path::Path, fail_credit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::net::SocketAddr {
+        let mut engine = Engine::open(dir, &cfg()).unwrap();
+        engine.put(1, b"1000".to_vec(), &[]).unwrap(); // debit 账户初始 1000
+        engine.put(2, b"0".to_vec(), &[]).unwrap(); // credit 账户初始 0
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match s.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let bal = |id: u64| -> i64 {
+                    engine
+                        .get(id)
+                        .unwrap()
+                        .map(|v| String::from_utf8_lossy(&v).parse().unwrap_or(0))
+                        .unwrap_or(0)
+                };
+                let (status, body) = if path.starts_with("/balance") {
+                    (200, format!("{{\"debit\":{},\"credit\":{}}}", bal(1), bal(2)))
+                } else if path.contains("/action") {
+                    if path.contains("debit") {
+                        engine.put(1, format!("{}", bal(1) - 100).into_bytes(), &[]).unwrap();
+                        (200, "ok".into())
+                    } else if fail_credit.load(Ordering::SeqCst) {
+                        (500, "credit business fail".into()) // 注入：credit 节点业务失败
+                    } else {
+                        engine.put(2, format!("{}", bal(2) + 100).into_bytes(), &[]).unwrap();
+                        (200, "ok".into())
+                    }
+                } else if path.contains("/compensate") {
+                    if path.contains("debit") {
+                        engine.put(1, format!("{}", bal(1) + 100).into_bytes(), &[]).unwrap();
+                    } else {
+                        engine.put(2, format!("{}", bal(2) - 100).into_bytes(), &[]).unwrap();
+                    }
+                    (200, "compensated".into())
+                } else {
+                    (404, "not found".into())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// 查询分片节点当前余额（debit/credit）。
+    fn shard_balance(addr: std::net::SocketAddr) -> (i64, i64) {
+        let (st, resp) = http_req(addr, "GET", "/balance", b"");
+        assert_eq!(st, 200, "{resp}");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        (
+            v["debit"].as_i64().unwrap(),
+            v["credit"].as_i64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn saga_cross_shard_transfer_end_to_end() {
+        // 跨分片 2 节点真实联调（design_extension 13.2）：分片 A（debit）+ 分片 B（credit）
+        // + 网关编排转账；验证正向 / 中段失败逆序补偿 / 补偿幂等重试。
+        let gw_dir = tmp();
+        let (sa_dir, sb_dir) = (tmp(), tmp());
+        let fail_credit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let n1 = spawn_shard_node(&sa_dir, fail_credit.clone());
+        let n2 = spawn_shard_node(&sb_dir, fail_credit.clone());
+        let engine = Engine::open(&gw_dir, &cfg()).unwrap();
+        let coord = crate::saga::SagaCoordinator::open(&gw_dir.join("saga")).unwrap();
+        let addr = spawn_server(engine, Some(Arc::new(Mutex::new(coord))), None);
+
+        // ---- 场景 1：正向转账（debit 扣 100 → credit 加 100）→ Succeeded ----
+        let body = format!(
+            r#"{{"tx_id":"tfr","steps":[
+                {{"name":"debit","action_url":"http://{n1}/debit/action","compensate_url":"http://{n1}/debit/compensate"}},
+                {{"name":"credit","action_url":"http://{n2}/credit/action","compensate_url":"http://{n2}/credit/compensate"}}
+            ]}}"#
+        );
+        let (st, resp) = http_req(addr, "POST", "/saga/start", body.as_bytes());
+        assert_eq!(st, 200, "{resp}");
+        assert!(resp.contains("Succeeded"), "{resp}");
+        assert_eq!(shard_balance(n1), (900, 0), "正向：debit 节点扣 100（credit 不归它管）");
+        assert_eq!(shard_balance(n2), (1000, 100), "正向：credit 节点加 100（debit 不归它管）");
+
+        // ---- 场景 2：中段失败（credit 业务失败）→ 逆序补偿 debit ----
+        fail_credit.store(true, Ordering::SeqCst);
+        let body2 = format!(
+            r#"{{"tx_id":"tfail","steps":[
+                {{"name":"debit","action_url":"http://{n1}/debit/action","compensate_url":"http://{n1}/debit/compensate"}},
+                {{"name":"credit","action_url":"http://{n2}/credit/action","compensate_url":"http://{n2}/credit/compensate"}}
+            ]}}"#
+        );
+        let (st, resp) = http_req(addr, "POST", "/saga/start", body2.as_bytes());
+        assert_eq!(st, 200, "{resp}");
+        assert!(resp.contains("Compensated"), "{resp}");
+        assert_eq!(shard_balance(n1), (900, 0), "debit 已补偿回滚（tfail 扣 100 后又加回）");
+        assert_eq!(shard_balance(n2), (1000, 100), "credit 节点未写入（action 失败未登记）");
+
+        // ---- 场景 3：补偿幂等（对已补偿终态重复 compensate → no-op，余额不变）----
+        let (st, resp) = http_req(
+            addr,
+            "POST",
+            "/saga/compensate",
+            format!(r#"{{"tx_id":"tfail","steps":[]}}"#).as_bytes(),
+        );
+        assert_eq!(st, 200, "{resp}");
+        assert_eq!(shard_balance(n1), (900, 0), "补偿幂等：余额不重复回退");
+    }
 }
