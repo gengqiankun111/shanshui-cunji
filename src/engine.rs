@@ -1765,6 +1765,48 @@ mod tests {
         assert_eq!(e1.primary.sst_count(), e2.primary.sst_count());
     }
 
+    #[test]
+    fn persist_manifest_reflects_memory_snapshot_only() {
+        // P73：persist_manifest 基于内存快照（ssts ArcSwap）重建清单——磁盘上存在但不在
+        // 内存快照中的文件（如无锁合并并发时"正在写入的半写段"）不得写入 manifest，
+        // 否则重启加载失败。确定性验证：放置幽灵段后 flush，manifest 不含它。
+        let mut cfg = Config::default();
+        cfg.memtable.max_size_mb = 1; // 小 MemTable → flush 触发 manifest 重写
+        let data_dir = tmp();
+        let mut engine = Engine::open(&data_dir, &cfg).unwrap();
+        for i in 0..2000u64 {
+            engine.put(i, format!("v{i}").into_bytes(), &[]).unwrap();
+        }
+        engine.flush_primary().unwrap();
+        // 磁盘放"幽灵"段（模拟并发写入中的半写段 / 残留文件）
+        let ghost = data_dir.join("primary").join("sst-99999999.sst");
+        std::fs::write(&ghost, b"partial-written-not-in-snapshot").unwrap();
+        // 再写并 flush → persist 重写 manifest
+        for i in 2000..3000u64 {
+            engine.put(i, format!("v{i}").into_bytes(), &[]).unwrap();
+        }
+        engine.flush_primary().unwrap();
+        let m: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(data_dir.join("primary").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let files = m["sst_files"].as_array().expect("manifest sst_files");
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.as_str().unwrap().contains("99999999")),
+            "manifest 不得引用非内存快照段（幽灵段）"
+        );
+        assert!(files.len() >= 2, "flush 段应在 manifest 中");
+        // 重开：数据完整（manifest 与磁盘一致可加载）
+        drop(engine);
+        let engine = Engine::open(&data_dir, &cfg).unwrap();
+        for i in (0..3000u64).step_by(997) {
+            let v = engine.get(i).unwrap();
+            assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()), "docid={i}");
+        }
+    }
+
     fn cfg() -> Config {
         let mut c = Config::default();
         c.sstable.compression = "none".into();
