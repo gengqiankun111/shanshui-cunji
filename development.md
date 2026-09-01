@@ -2086,6 +2086,23 @@ impl RuntimePools {
 - 测试 `scan_rate_limit_slows_stream`：限速 1MB/s 扫描 2MB 显著变慢（≥300ms）、关闭恢复快速、
   前台读不受影响；全量 **477 全绿**。
 
+### 7.69 高并发查询优化（I 项 P3，同步模型内可落地部分）
+
+> 2026-09-01。design 9.5 目标（10k 连接 / 85 万 QPS 依赖异步协程运行时，`97e3586` 落地**同步模型
+> 内可做的高并发优化**）。478 全绿。
+
+- **COM_STMT_EXECUTE 读语句走读锁**：`stmt_execute_sql` 拆分（参数解析 + 占位符替换，与 Engine
+  锁解耦）→ 预处理读语句（SELECT/SHOW 等）走 RwLock 读锁——sysbench point_select 等
+  PREPARE/EXECUTE 负载多连接**并行**（旧实现全走写锁串行）；写语句保持写锁互斥；
+- **连接线程小栈**：`thread::Builder` 512KB + 命名（默认 2MB/8MB）——10k 连接内存 5GB vs 20GB+，
+  支撑更多并发连接；
+- **MySqlServer::serve 返回实际绑定地址**（`127.0.0.1:0` 随机端口——并发测试/动态端口）；
+- 测试 `stmt_execute_concurrent_selects_all_succeed`：8 线程并发 PREPARE/EXECUTE SELECT
+  全部成功无死锁（读锁并行正确性）；
+- **1 亿库实测**（8 线程 pymysql 并发点查）：1100 QPS 4000/4000 全命中无回归；附带清理
+  P73 前旧 release 合并残留的 manifest 缺失引用（99/98/89 数据已并入 sst-100，重建 manifest
+  后干净启动）；全量 **478 全绿**。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
