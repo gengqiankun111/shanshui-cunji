@@ -1886,6 +1886,46 @@ mod tests {
         assert_eq!(unquote(&parts[1]), r#"{"a":1,"b":2}"#);
     }
 
+    #[test]
+    fn compaction_worker_converges_l0_with_single_round_per_wake() {
+        // 9e77872（P71 阶段一）：worker 锁内**单轮**合并 + 100ms 循环——写触发信号后，
+        // worker 多轮单轮合并收敛 L0（旧实现锁内 while 8 轮连续合并阻塞写）。
+        // 覆盖空白：engine 级测试只手动调 compact()，此处验证 worker 线程真实运行收敛。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.memtable.max_size_mb = 1; // 小 MemTable → 写入过程快速 flush 多段
+        cfg.storage.l0_stall_threshold = 2; // 低 L0 阈值 → 2 段 L0 即触发合并
+        let engine = Engine::open(dir.path(), &cfg).unwrap();
+        let server = MySqlServer::new(engine, "root", "");
+        server.spawn_compaction_worker();
+        // 写 5 段（各 ~2MB）→ L0 超阈值 → auto_compact 置信号（worker 挂载：写不阻塞）
+        let val = vec![b'x'; 2048];
+        for seg in 0..5u64 {
+            for i in seg * 1000..seg * 1000 + 1000 {
+                server.engine.write().unwrap().put(i, val.clone(), &[]).unwrap();
+            }
+        }
+        // 等待 worker 多轮单轮合并收敛（100ms 轮询 + 单轮合并；10s 上限）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !server.engine.read().unwrap().needs_compact()
+                || std::time::Instant::now() > deadline
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !server.engine.read().unwrap().needs_compact(),
+            "worker 多轮单轮合并后 L0 应收敛（10s 内）"
+        );
+        // 数据完整
+        for i in (0..5_000u64).step_by(997) {
+            let v = server.engine.read().unwrap().get(i).unwrap();
+            assert_eq!(v.as_deref(), Some(val.as_slice()), "docid={i}");
+        }
+    }
+
     // ---------- 集成：协议往返 ----------
 
     /// 测试客户端：连接 → 握手 → 认证 → 查询。
