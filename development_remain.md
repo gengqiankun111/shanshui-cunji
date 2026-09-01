@@ -101,8 +101,12 @@
   40 位溢出保护）；demo `demo/docid-alloc` 5 测试 + kernel 7 单测，507 全绿（development.md 7.81）
 - **后续**：分片构建工具 `src/shard_build.rs` + `shanshui-cunji-shard-build`（✅ development.md 7.82）：
   行号取模均匀分配/显式主键前缀路由/--shard-id 多进程并行/BOM 修复，513 全绿
-- **待验证**：10 分片 10 亿构建（验收：构建 ≤60 分钟、点查 10 万+ QPS）
-- **阶段 B/C/D**：倒排分片化验证、scale_out+raft_meta 接 RPC（raft 阶段二）、分片级可观测
+- **阶段 B（倒排分片化验证）— ✅ 已完成**（development.md 7.83）：
+  分片内倒排存 local_id（Roaring 32-bit，存储格式零改动），跨分片前缀组合全局 docid
+  （`src/shard_inverted.rs`：ShardedInvertedSearch 广播合并唯一 + 跨分片惰性分页窗口 +
+  真实 Engine 集成验证），520 全绿
+- **待验证**：10 分片 10 亿构建（验收：构建 ≤60 分钟、点查 10 万+ QPS）+ 亿级 posting 规模回归
+- **阶段 C/D**：scale_out+raft_meta 接 RPC（raft 阶段二）、分片级可观测
 - **触发**：阶段 A 立即（10 亿库前提）；B/C/D 随节点规模/硬件推进
 
 ## 已完成基线（勿重复）

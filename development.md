@@ -2399,6 +2399,31 @@ impl RuntimePools {
 4. **回归**：513 全绿（+6 shard_build 单测）。
 5. **后续**：10 分片 10 亿构建验证（验收：构建 ≤60 分钟、点查 10 万+ QPS）。
 
+### 7.83 AD 10 亿库阶段 B：分片化倒排检索验证
+
+> 2026-09-02。用户排期阶段 B（design-10b-extension.md §6）：倒排分片化验证——广播检索 +
+> Chunk 拼接 + 分块解码在分片场景的正确性。
+
+1. **设计决策**（分片前缀 docid 与 Roaring 32-bit 倒排的适配）：
+   - 分片前缀 docid（u64，`shard<<40|local`）超出 Roaring u32 上限 → 倒排**存分片内
+     local_id**（每分片 1 亿 << 42.9 亿上限，余量 42×）；
+   - 跨分片广播时 `encode(shard, local)` 前缀组合成全局 docid（O(1)）——存储格式零改动
+     （K 项 v3 分块 / G 项 LRU+mmap / J 项后台 GC 全保留）；
+   - 分片间 local 不重叠 → 全局天然唯一（合并无需去重）；前缀保序 → 全局 docid 有序。
+2. **kernel**（`src/shard_inverted.rs`，`ShardedInvertedSearch` + `LocalInvertedSource` trait）：
+   - `search_global`：广播合并（各分片 local 位图 → 前缀组合 → 按序拼接）；
+   - `search_paged`：**跨分片惰性分页窗口**——不整段合并全量，按各分片命中数定位窗口
+     所在分片，`iter.skip/take` 只取窗口（亿级 posting 分页 O(窗口)）；
+   - `doc_count_global`：跨分片精确 COUNT。
+3. **验证**（demo `shard-inverted` 5 测试 + kernel 7 单测）：
+   - local→全局前缀组合正确 + 全局有序 + 广播合并唯一（无重复）；
+   - 分页窗口跨分片边界（offset 落在分片中部 → 窗口跨两分片）、跨多分片、边界
+     （offset≥total / limit=0 / 末尾窗口 / 空 term）；
+   - **真实 Engine 集成**：4 分片 × 真实 Engine 倒排存 local_id + 适配 `LocalInvertedSource`
+     → 广播 4000 条唯一 + 分页跨分片正确（全链路验证）。
+4. **回归**：520 全绿（+7 shard_inverted 单测）。
+5. **待验证（硬件）**：10 分片 10 亿构建 + 亿级 posting 规模回归（分页 sub-ms、COUNT 精确）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

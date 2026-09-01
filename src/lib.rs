@@ -60,6 +60,7 @@ pub mod sdk_cache;
 pub mod seqlock;
 pub mod server;
 pub mod shard_build;
+pub mod shard_inverted;
 pub mod sharding;
 pub mod sstable;
 pub mod sqlish;
