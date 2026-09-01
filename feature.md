@@ -79,7 +79,7 @@
 | 增量导入（docid 游标断点续传） | ✅ | P3-4 `5085db8` |
 | Parquet 数据集生成器 + 批量导入（5000 万 × 20 字段） | ✅ | M8-P3 `30b1639` |
 | mysqldump 导入（MySQL 迁移） | ✅ | M1（migrate 工具） |
-| 导出增强（增量 / Parquet / JDBC） | 🔄 | Parquet 导出 ✅（`--parquet` docid+json 两列 SNAPPY 分块，环回实测 3 行往返）；增量导出 ✅（`--incremental --checkpoint` docid 游标断点续传 `2174531`）；JDBC 直连（阶段 3）+ 流式管道 Filter/Projection 留待 |
+| 导出增强（增量 / Parquet / JDBC / 流式管道） | 🔄 | Parquet ✅（`--parquet` 70c3b30）；增量 ✅（`--incremental --checkpoint` 2174531）；流式管道 ✅（`--filter/--project/--mask` Filter+Projection+Sink 分叉，c6b5417）；JDBC 直连 ✅（`--jdbc mysql://...` 无文件落盘建表+批量 INSERT，c6b5417）；MySQL 兼容 CSV 配套（LOAD DATA INFILE SQL）留后续 |
 
 ## F. 备份 / 一致性 / 外部缓存
 

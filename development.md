@@ -2028,6 +2028,31 @@ impl RuntimePools {
   `sst_mutate` 锁内（store→persist→remove 原子）。回归测试 `persist_manifest_reflects_memory_snapshot_only`
   （幽灵段不入 manifest）；1 亿库原数据（79/88/89/97/98/99 六段）完整恢复，点查全命中。
 
+### 7.66 导出增强：流式管道（Filter/Projection/Sink 分叉）+ JDBC 直连（E 模块，design 20.5）
+
+> 2026-09-01。E 模块"导出增强（增量 / Parquet / JDBC）"的**流式管道**与 **JDBC 直连**落地
+> （`c6b5417`）。增量导出（7.64）+ Parquet（7.62）已完成；剩余 MySQL 兼容 CSV 配套留后续。
+
+- **流式管道**（`src/export_pipeline.rs`）：SST 流式扫描 → Filter → Projection → **Sink Adapter
+  分叉**（CSV / Parquet / JDBC），每批 `batch_size` 刷一次，内存恒定（批 × 单行）：
+  - `--filter 'field op value AND ...'`：op ∈ `=` `!=` `>` `>=` `<` `<=` `CONTAINS`；
+    值支持数字 / '字符串'（含 `\'` 转义）/ true / false / null；AND 组合，字段缺失不通过
+    （Eq 语义）；
+  - `--project 'a,b,c'`：字段子集输出；`--mask 'field=pattern'`：字段值脱敏替换；
+  - 无 Filter/Projection 时**零 JSON 解析**（原样透传），全量导出零额外开销；
+- **JDBC 直连**（`--jdbc 'mysql://user[:pass]@host[:port]/db'`，无文件落盘）：
+  - `mysql.rs` 新增 `MysqlWireClient`——MySQL wire 客户端（握手 + mysql_native_password 认证
+    + COM_QUERY 建表/批量 INSERT），复用 H 项协议编解码与 `check_native_password`；
+  - 自动 `CREATE TABLE IF NOT EXISTS`（docid BIGINT UNSIGNED 主键 + doc TEXT）；
+    批量 `INSERT INTO t (docid, doc) VALUES (...)`（`escape_sql` 转义单引号/反斜杠/换行）；
+- **资源控制**：`--rate-limit <rows/s>` 每批按目标速率 sleep 节流；
+- **Engine::scan_stream**（&self）：流式主键范围扫描（回调式，`false` 提前终止）——
+  导出管道内存 O(批)，不再全量收集；
+- 端到端验证（exp-a 5 行库）：CSV 过滤 `amount>=200 AND name CONTAINS 'a'` + 投影 name,amount
+  + 脱敏 → carol/dave 两行 `{"name":"***","amount":...}`；Parquet 过滤 amount>=300 → 3 行；
+  JDBC 导出 5 行到本机 MySQL（3308）→ 点查数据完整；增量回归 cp 推进正常；
+- 全量测试 469 → **476 全绿**（export_pipeline 6 + 相关）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

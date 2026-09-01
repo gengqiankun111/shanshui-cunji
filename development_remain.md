@@ -9,10 +9,12 @@
 
 - **来源**：feature E 模块 🔄 / design 20.5 / export.rs
 - **已完成**：CSV 全量、Parquet 全量（`--parquet`，70c3b30）、**增量导出**（`--incremental --checkpoint`
-  docid 游标断点续传，2174531——首轮全量记 max、后续只导新增、断档自动全量重建，468 全绿）
+  docid 游标断点续传，2174531——首轮全量记 max、后续只导新增、断档自动全量重建）、**流式管道**
+  （`--filter/--project/--mask` Filter+Projection+Sink 分叉 + `--rate-limit`，c6b5417）、
+  **JDBC 直连**（`--jdbc mysql://...` MySQL wire 客户端建表+批量 INSERT 无文件落盘，c6b5417）
 - **待做**：
-  - **JDBC 直连导出**（阶段 3）：批量插入目标库
-  - 流式管道 Filter/Projection + `--rate-limit` 资源控制（在线业务影响 <5% 目标）
+  - **MySQL 兼容配套**：`--mysql-compatible` CSV 转义 + LOAD DATA INFILE 配套 SQL、`--mysql-max-varchar`
+  - **ClickHouse** `--dry-run-schema` 建表 DDL
 
 ## 2. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + 3d58137）
 

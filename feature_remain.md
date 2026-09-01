@@ -7,7 +7,7 @@
 
 | 功能 | 模块 | 已落地 | 剩余 |
 |---|---|---|---|
-| 导出增强（增量 / Parquet / JDBC） | E | Parquet 导出（`--parquet`，70c3b30）；增量导出（`--incremental --checkpoint` docid 游标断点续传，2174531） | **JDBC 直连**（阶段 3）；流式管道 Filter/Projection + rate-limit |
+| 导出增强（增量 / Parquet / JDBC / 流式管道） | E | Parquet（70c3b30）；增量（2174531）；流式管道 Filter/Projection/Sink（c6b5417）；JDBC 直连（c6b5417） | MySQL 兼容 CSV 配套（LOAD DATA INFILE SQL / --mysql-max-varchar）；ClickHouse --dry-run-schema |
 
 ## ⏳ 待办
 
