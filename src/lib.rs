@@ -62,6 +62,7 @@ pub mod seqlock;
 pub mod server;
 pub mod shard_build;
 pub mod shard_inverted;
+pub mod shard_metrics;
 pub mod sharding;
 pub mod sstable;
 pub mod sqlish;

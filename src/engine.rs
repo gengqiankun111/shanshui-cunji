@@ -121,6 +121,9 @@ pub struct Engine {
     /// X 项：Prometheus 风格指标（读写计数 + 延迟直方图 + Compaction/Flush 次数；
     /// 网络层连接/语句由服务进程写入共享 Metrics）。
     pub metrics: crate::metrics::Metrics,
+    /// 10 亿库阶段 D：分片级指标（docid 水位 + 读写计数 + 上限预警）；默认 None，
+    /// 分片部署时 `attach_shard_metrics(n)` 挂载。
+    pub shard_metrics: std::sync::Mutex<Option<crate::shard_metrics::ShardMetricsRegistry>>,
 }
 
 /// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
@@ -476,6 +479,7 @@ impl Engine {
             #[cfg(target_os = "linux")]
             iou,
             metrics: crate::metrics::Metrics::default(),
+            shard_metrics: std::sync::Mutex::new(None),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -1398,6 +1402,55 @@ impl Engine {
         self.inverted.mem_docids() + self.pending_inverted.lock().unwrap().len() as u64
     }
 
+    // ============ 10 亿库阶段 D：分片级可观测 ============
+
+    /// 挂载分片级指标（n 分片；分片部署时调用一次）。
+    pub fn attach_shard_metrics(&self, n_shards: u16) {
+        *self.shard_metrics.lock().unwrap() =
+            Some(crate::shard_metrics::ShardMetricsRegistry::new(n_shards));
+    }
+
+    /// 上报分片 docid 水位（构建/写入推进时）。
+    pub fn update_shard_watermark(&self, shard_id: u16, wm: u64) {
+        if let Some(r) = self.shard_metrics.lock().unwrap().as_ref() {
+            r.update_watermark(shard_id, wm);
+        }
+    }
+
+    pub fn record_shard_write(&self, shard_id: u16) {
+        if let Some(r) = self.shard_metrics.lock().unwrap().as_ref() {
+            r.record_write(shard_id);
+        }
+    }
+
+    pub fn record_shard_read(&self, shard_id: u16) {
+        if let Some(r) = self.shard_metrics.lock().unwrap().as_ref() {
+            r.record_read(shard_id);
+        }
+    }
+
+    /// 分片级指标 Prometheus 渲染（未挂载返回空串）。
+    pub fn shard_metrics_render(&self) -> String {
+        self.shard_metrics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.render())
+            .unwrap_or_default()
+    }
+
+    /// 分片 docid 水位预警列表（Warn/Critical）。
+    pub fn shard_watermark_alerts(
+        &self,
+    ) -> Vec<(u16, crate::shard_metrics::WatermarkLevel, f64)> {
+        self.shard_metrics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.alerts())
+            .unwrap_or_default()
+    }
+
     /// 将倒排攒批缓冲一次性刷入内存字典（Ex-5.3 批处理）。
     /// 低基数 term 跨行聚合：一组 (term, docid) 按 term 分组合并，每 term 一次锁操作。
     /// 崩溃安全：WAL 回放重新走 put 重建倒排，缓冲丢失不丢数据。
@@ -1796,6 +1849,28 @@ mod tests {
         DIR.get_or_init(|| tempfile::tempdir().unwrap())
             .path()
             .join(name)
+    }
+
+    #[test]
+    fn shard_metrics_attach_and_render() {
+        // 10 亿库阶段 D：挂载分片指标 → 水位上报 → /metrics 渲染 + 预警
+        let cfg = Config::default();
+        let e = Engine::open(&tmp(), &cfg).unwrap();
+        assert!(e.shard_metrics_render().is_empty(), "未挂载渲染为空");
+        e.attach_shard_metrics(10);
+        e.update_shard_watermark(0, 100_000_000); // 每分片 1 亿（10 亿库）
+        e.record_shard_write(0);
+        e.record_shard_read(0);
+        let out = e.shard_metrics_render();
+        assert!(out.contains("shanshui_shard_docid_watermark{shard=\"0\"} 100000000"));
+        assert!(out.contains("shanshui_shard_writes_total{shard=\"0\"} 1"));
+        assert!(e.shard_watermark_alerts().is_empty(), "10 亿库水位无预警");
+        // 高水位（≈82%）→ Warn 预警
+        e.update_shard_watermark(1, 900_000_000_000);
+        let alerts = e.shard_watermark_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].0, 1);
+        assert_eq!(alerts[0].1, crate::shard_metrics::WatermarkLevel::Warn);
     }
 
     #[test]

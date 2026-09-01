@@ -765,12 +765,26 @@ fn handle_metrics(engine: &mut Engine) -> (u16, String) {
     let s = engine.stats();
     let l0 = engine.primary_l0_count() as u64;
     let flush = engine.total_flush_count();
-    (
-        200,
-        engine
-            .metrics
-            .render(s.sst_file_count as u64, l0, s.mem_ratio, s.disk_ratio, flush),
-    )
+    let mut out = engine
+        .metrics
+        .render(s.sst_file_count as u64, l0, s.mem_ratio, s.disk_ratio, flush);
+    // 10 亿库阶段 D：分片级指标（docid 水位 + 读写计数 + 预警）
+    out.push_str(&engine.shard_metrics_render());
+    if !engine.shard_watermark_alerts().is_empty() {
+        out.push_str("# HELP shanshui_shard_docid_alert 分片 docid 水位预警（1=Warn 2=Critical）\n");
+        out.push_str("# TYPE shanshui_shard_docid_alert gauge\n");
+        for (sid, lvl, ratio) in engine.shard_watermark_alerts() {
+            let v = match lvl {
+                crate::shard_metrics::WatermarkLevel::Normal => 0u64,
+                crate::shard_metrics::WatermarkLevel::Warn => 1,
+                crate::shard_metrics::WatermarkLevel::Critical => 2,
+            };
+            out.push_str(&format!(
+                "shanshui_shard_docid_alert{{shard=\"{sid}\",level=\"{lvl:?}\"}} {v} # ratio={ratio:.4}\n"
+            ));
+        }
+    }
+    (200, out)
 }
 
 /// 执行计划推演（development 5.26）：`GET /explain?filter=status%3Dactive` → ExplainPlan JSON。

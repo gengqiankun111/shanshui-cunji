@@ -2468,6 +2468,26 @@ impl RuntimePools {
 4. **后续**：TCP 传输实现 + scale_out 编排与 raft 联动（真实 10 节点扩容/故障切换联调，
    随部署推进）。
 
+### 7.86 AD 10 亿库阶段 D：分片级可观测（Metrics + docid 水位预警）
+
+> 2026-09-02。用户排期阶段 D（design-10b-extension.md §6）：分片级 Metrics + docid
+> 上限预警——分片部署的运维观测与分配器失控提前发现。
+
+1. **kernel**（`src/shard_metrics.rs`，`ShardMetricsRegistry`）：
+   - 每分片：docid watermark（gauge）+ 写入/读取计数（counter，分片负载分布）；
+   - 水位预警：watermark / 1<<40 ≥ 80% → Warn、≥ 90% → Critical（`alerts()` 列表）；
+   - Prometheus 渲染：`shard="N"` label 输出（水位/比率/读写计数）。
+2. **Engine 集成**：`attach_shard_metrics(n)` 挂载 + `update_shard_watermark`/
+   `record_shard_write/read` + `shard_metrics_render`/`shard_watermark_alerts`；
+   server `/metrics` 追加分片指标 + 预警 gauge（`shanshui_shard_docid_alert`）。
+3. **验证**（demo `shard-metrics` 4 测试 + kernel 5 单测含 Engine 集成）：
+   - 水位/负载计数、预警阈值（Warn/Critical 边界）、Prometheus label 渲染、
+     **10 分片 10 亿构建监控**（每分片 1 亿 = 0.009% 全 Normal，余量充足）；
+   - Engine 挂载 → 水位上报 → render 输出 → 高水位预警全链路。
+4. **回归**：530 全绿（+5 shard_metrics/Engine 集成）。
+5. **阶段 A~D 全部完成**：docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片可观测；
+   剩余为 10 分片 10 亿构建验收（硬件）与 raft TCP 传输/扩容编排联动（部署推进）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

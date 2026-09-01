@@ -110,7 +110,10 @@
   `src/raft_rpc.rs`——RaftMsg serde + RaftTransport trait（LocalRaftTransport 进程内/
   TCP 接线点）+ RaftNodeRuntime（选举/日志复制/自动 failover/多数派，MetaOp 复制到
   MetaCenter 状态机），525 全绿
-- **阶段 D（分片级可观测）**：分片 Metrics + docid 水位预警（接 /metrics）
+- **阶段 D（分片级可观测）— ✅ 已完成**（development.md 7.86）：
+  `src/shard_metrics.rs`——分片 docid 水位 gauge + 读写计数 + 80%/90% 上限预警 +
+  /metrics 集成（`shanshui_shard_docid_alert`），Engine 挂载全链路，530 全绿
+- **阶段 A~D 全部完成**；剩余：10 分片 10 亿构建验收（硬件）+ raft TCP 传输/扩容编排联动（部署推进）
 - **触发**：阶段 A 立即（10 亿库前提）；B/C/D 随节点规模/硬件推进
 
 ## 已完成基线（勿重复）
