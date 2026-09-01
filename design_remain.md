@@ -26,16 +26,16 @@
   - **资源控制**：`--rate-limit` 限流、与 Compaction 共享后台 IO 优先级（对在线业务影响 <5%）
   - **MySQL 兼容**：`--mysql-compatible` CSV 转义 + LOAD DATA INFILE 配套 SQL、`--mysql-max-varchar`
 
-## 3. 合并阻塞根治：无锁合并（P72 方案）
+## 3. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + P73 3d58137）
 
-- **来源**：problem_solving P72 / 构建记录（2026-09-01）
-- **状态**：分批缓解已落地（compact_input_max_mb，-55%）；根治未做
-- **方案**（O 项规模改造）：
-  1. CF 增 `sst_mutate: Mutex<()>`（flush/compact 的 ssts store 互斥，防无 Engine 锁后并发丢失）
-  2. CF `switch_and_flush` 改 `&self`（memtable 冻结内部 Mutex）
-  3. Engine primary/delta/cidx 字段 `Arc<ColumnFamily>`
-  4. mysql worker：read() 内 clone CF Arc → drop 锁 → 无锁 CF.compact（复刻紧迫度调度）
-- **风险**：compact 与 put 并发安全（CF compact 不碰 memtable）；需全量 + 并发测试
+- **来源**：problem_solving P72/P73 / development 7.65
+- **已落地**：分批缓解（compact_input_max_mb）→ **根治**（2026-09-01）：
+  1. CF 增 `sst_mutate: Mutex<()>`（flush/compact 的 ssts store 互斥）✓
+  2. CF `switch_and_flush` 改 `&self`（MemTableBuffer 内部 RwLock 冻结）✓
+  3. Engine primary/delta/cidx 字段 `Arc<ColumnFamily>` ✓
+  4. mysql worker 无锁合并（clone CF Arc → drop 锁 → CompactTargets::run）✓
+  - 附带修复 P73：persist_manifest 内存快照（不扫描磁盘，防引用半写段）+ store→persist→remove
+    原子；1 亿库实测合并期写不塌陷（25-43k rows/s），469 全绿
 
 ## 4. 读写分离（COW 快照读）
 

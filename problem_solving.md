@@ -663,6 +663,31 @@
   （需 Engine 读锁，RwLock 写者优先）全部卡死（pymysql 超时，server CPU 满核），分钟级恢复。
   分批缓解不覆盖该场景；测试规避用 l0_max_size_mb=0（仅段数阈值）使 backstop 不触发；
   根治仍需无锁合并。详见 images/perf-0.7.0/sysbench-100m/构建记录.md「复现并诊断」段。
+- **根治落地（af24dbd，2026-09-01）**：按上述完整方案实施——
+  - MemTableBuffer 内部 `RwLock`（switch/take_immutable `&self`，iter_range 改 HRTB 闭包式）；
+  - CF `switch_and_flush`/flush `&self` 化 + `sst_mutate: Mutex<()>`（ssts 变更互斥）；
+  - Engine primary/cidx/delta `Arc<ColumnFamily>` + deletion_bitmap `Arc<DeletionBitmap>`
+    （DeletionBitmap 内部 RwLock &self 化）；
+  - mysql worker：读锁内 `Engine::compaction_targets()` clone CF Arc → drop 锁 → 无锁合并
+    （写与合并并发，写不再被合并阻塞）；469 全绿 + 无锁/读锁合并收敛等价测试；
+  - **1 亿库实测**：原配置下持续写入 36-43k rows/s 稳定（合并触发时速率不塌陷，
+    修复前合并期 8.2k-18.2k 塌陷 + 分钟级阻塞）；flush 正常、数据完整。
+
+### P73. 无锁合并的 manifest 竞态（persist 引用半写段 → 重启损坏）
+- **问题**：P72 无锁合并落地后，1 亿库实测出现 `SST 加载失败: seek 越界 (os error 131)`、
+  连续多段损坏、重启失败。根因：`persist_manifest` 以**磁盘扫描**重建清单——无锁合并后
+  flush（Engine 写锁内写段文件）与合并（worker 无锁 persist）并发，磁盘扫描会引用
+  **正在写入、尚未写完的半写段文件** → manifest 悬空引用半写段 → 重启 seek 越界。
+  （旧代码 flush 全程写锁内 + 合并读锁，RwLock 互斥，无此竞态；无锁合并打破互斥暴露。）
+- **修复（3d58137）**：
+  1. `persist_manifest` 改**内存快照**（ssts ArcSwap + levels）重建清单，不扫描磁盘——
+     与 ssts store 原子一致（sst_mutate 锁内调用）；
+  2. `finalize_compact` 删旧段移入 `sst_mutate` 锁内（store→persist→remove 原子）；
+  3. `flush_single` 全程持 `sst_mutate`（id 分配 + 写文件 + store + persist 原子，防 id/persist 竞态）。
+- **回归测试（5de5ab0）**：`persist_manifest_reflects_memory_snapshot_only`——放置幽灵段后
+  flush，manifest 不含它，重开数据完整；469 全绿。
+- **1 亿库恢复**：损坏段均为测试数据段（8.7MB L0），删除后原 1 亿库（79/88/89/97/98/99
+  六段）完整保留，点查 id 1 / 5000万 / 1亿 全命中。
 
 ---
 

@@ -14,12 +14,13 @@
   - **JDBC 直连导出**（阶段 3）：批量插入目标库
   - 流式管道 Filter/Projection + `--rate-limit` 资源控制（在线业务影响 <5% 目标）
 
-## 2. 合并阻塞根治：无锁合并（O 项规模，阶段一已落地）
+## 2. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + 3d58137）
 
-- **来源**：P72 / development 7.60
-- **已落地**：syscall 风暴修复（96ac6bc）、分批合并（1763554）、worker 单轮合并阶段一（9e77872）
-- **待做（根治）**：CF `sst_mutate` + `switch_and_flush` 改 `&self` + Engine 字段 `Arc<ColumnFamily>` +
-  mysql worker 无锁合并路径（方案见 design_remain §3 / P72）
+- **来源**：P72 / P73 / development 7.65
+- **已落地**：syscall 风暴修复（96ac6bc）、分批合并（1763554）、worker 单轮（9e77872）、
+  **无锁合并根治**（af24dbd：MemTableBuffer RwLock &self 化 + CF sst_mutate + Engine Arc 化 +
+  worker clone CF Arc 无锁合并）+ **P73 manifest 竞态修复**（3d58137：persist 内存快照 +
+  store→persist→remove 原子）+ 回归测试（5de5ab0）；1 亿库实测合并期写不塌陷；469 全绿
 
 ## 3. Ex-1.5 与 M5 双写扩容协议衔接
 

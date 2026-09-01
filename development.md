@@ -2000,6 +2000,34 @@ impl RuntimePools {
   无新数据 0 行不推进 → 删 cp 断档自动全量 5 行重建；
 - 全量测试 466 → **468 全绿**。
 
+### 7.65 合并阻塞写根治：无锁合并（P72 完整方案 + P73 manifest 竞态修复）
+
+> 2026-09-01。P72 根治落地（`af24dbd`）——worker 合并不再持 Engine 读锁，写与合并并发；
+> 1 亿库实测暴露 P73 manifest 竞态并修复（`3d58137` + `5de5ab0`）。469 全绿。
+
+- **背景**：P72 阶段一（分批 + worker 单轮）只缓解合并阻塞写（-55%）；backstop 大段合并
+  仍分钟级阻塞写（2026-09-01 复测复现，见 P72 复现补充）。根治 = 合并不持 Engine 锁。
+- **方案（P72 完整版）**：
+  1. `MemTableBuffer` 内部 `RwLock`——`switch`/`take_immutable` `&self` 化（Engine 字段
+     `Arc<ColumnFamily>` 后 flush 无法取 `&mut`）；`iter_range` 改 HRTB 闭包式
+     `with_iter_range`（scan_stream_at 的 k-way merge 主体入闭包，锁作用域内消费借用）；
+  2. CF `switch_and_flush`/`flush_single`/`flush_buckets` `&self` + `sst_mutate: Mutex<()>`
+     （flush 与 compact 无 Engine 锁并发的 ssts store/manifest 变更互斥）；写方法
+     （put/delete/sync_wal/wal_append 等）`&self` 化；`write_pressure` 原子化（f64 bits）；
+  3. Engine `primary`/`cidx`/`delta` 改 `Arc<ColumnFamily>` + `deletion_bitmap`
+     `Arc<DeletionBitmap>`（DeletionBitmap 内部 RwLock/Mutex `&self` 化）；
+  4. mysql worker：读锁内 `Engine::compaction_targets()`（clone 三 CF Arc + 位图 Arc +
+     紧迫度判定，快速）→ **drop 锁** → `CompactTargets::run()` 无锁合并——写语句持 Engine
+     写锁与合并**并发执行**（ssts 变更经 CF `sst_mutate` 与 flush 互斥，无丢失更新）；
+- **1 亿库实测**（原配置 l0_max_size_mb=1024）：持续写入 36-43k rows/s 全程稳定；
+  tmp 配置（l0_max_size_mb=256）强制触发合并：日志 `→L1 合并 2 段 → 1` 正常执行，
+  合并期间写速率 25-31k 无塌陷（修复前 8.2k-18.2k + 分钟级阻塞）；flush 正常、数据点查完整。
+- **P73（实测暴露）**：无锁合并后 `persist_manifest` 磁盘扫描会引用"正在写入的半写段" →
+  manifest 悬空引用 → 重启 `SST seek 越界` 损坏。修复：`persist_manifest` 改**内存快照**
+  （ssts ArcSwap + levels）重建；`finalize_compact` 删旧段 + `flush_single` 全程移入
+  `sst_mutate` 锁内（store→persist→remove 原子）。回归测试 `persist_manifest_reflects_memory_snapshot_only`
+  （幽灵段不入 manifest）；1 亿库原数据（79/88/89/97/98/99 六段）完整恢复，点查全命中。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

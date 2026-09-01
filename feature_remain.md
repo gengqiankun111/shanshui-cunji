@@ -14,7 +14,6 @@
 | 功能 | 模块 | 说明 |
 |---|---|---|
 | 高并发查询优化（design 9.5 目标） | I（P3） | M6 后留待；10k 连接类需异步运行时；H 模块并发查询未启动 |
-| 合并阻塞根治（无锁合并） | D（P72） | CF sst_mutate + flush &self 化 + Engine Arc 化 + worker 无锁路径（O 项规模，方案已记录） |
 | io_uring Linux 部署实测 | io_queue（V） | 代码 + 指引就绪（7.63），实测需 Linux ≥4GB 环境 |
 | 导出管道资源控制 | E | rate-limit / 后台 IO 优先级（在线业务影响 <5% 目标） |
 

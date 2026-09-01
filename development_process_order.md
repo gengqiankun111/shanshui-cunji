@@ -41,6 +41,7 @@
 | W | Compaction 优先级队列 | P2 | ✅ 完成 | f09e9fb：跨列族**紧迫度调度**——column_family::compaction_urgency（L0 段数×10 + 大小超限 +8），Engine::compact 每轮仅压最高紧迫度档列族（并列并行保留 SSD 并发），其余由后台 worker 后续轮次压实（while needs_compact 多轮）；压力最大列族（primary 主数据）优先收敛，读路径最快受益；433 测试全绿 |
 | X | Metrics（Prometheus 风格 /metrics） | P2 | ✅ 完成 | 0257835：新增 src/metrics.rs（原子计数器 + 延迟对数直方图 + Prometheus 文本渲染）分层埋点——引擎层（读写 ops/延迟/compact 次数）+ 列族层（flush_counter）+ 网络层（mysql 连接/语句计数）；server.rs `GET /metrics`（counter/histogram/gauge）；436 测试全绿 |
 | Y | 分布式延伸 + 写路径收尾（2026-09-01） | 延伸 | ✅ 完成 | SAGA 网关 HTTP API（Ex-2.5，781199e）+ 13.5 补偿协议（170bf21）+ 13.6 拓扑并行 + 13.7 后台对账（71aa712）；1 亿库写路径 syscall 风暴修复（96ac6bc，oltp_insert +795%）+ 合并阻塞分批缓解（1763554）；465 测试全绿；详见 development.md 7.57~7.61 / P71 |
+| Z | 合并阻塞写根治：无锁合并（2026-09-01） | 延伸 | ✅ 完成 | P72 完整方案（af24dbd：MemTableBuffer RwLock &self 化 + CF sst_mutate + Engine Arc 化 + worker clone CF Arc 无锁合并——写与合并并发）+ P73 manifest 竞态修复（3d58137：persist 内存快照 + store→persist→remove 原子）+ 回归测试（5de5ab0）；1 亿库实测合并期写 25-43k rows/s 不塌陷（修复前 8.2k-18.2k 分钟级阻塞）；469 全绿；详见 development.md 7.65 / P72 / P73 |
 
 ## 3. 大项详情
 
