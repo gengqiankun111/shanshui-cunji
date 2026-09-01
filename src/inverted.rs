@@ -41,8 +41,9 @@ use mmap_file::MmapFile;
 
 /// 段文件魔数。
 const SEG_MAGIC: &[u8; 8] = b"NVINV001";
-/// 段文件版本：v2 = term 带字段前缀（`field=value`，供 COUNT/GROUP BY 聚合）。
-const SEG_VERSION: u16 = 2;
+/// 段文件版本：v2 = term 带字段前缀 + Roaring 紧凑 posting；v3 = posting 分块布局
+/// （容器头索引 + 独立容器字节，K 项：分页/COUNT 按需延迟加载，全量解码与 v2 持平）。
+const SEG_VERSION: u16 = 3;
 /// 段文件前缀。
 const SEG_PREFIX: &str = "inverted-";
 const MANIFEST_FILE: &str = "inverted-manifest.json";
@@ -384,11 +385,9 @@ impl InvertedIndex {
         for (term, docids) in terms {
             let file_offset = (SEG_MAGIC.len() + std::mem::size_of::<u16>() + body.len()) as u64;
             term_offsets.push((term.clone().into_bytes(), file_offset));
+            // K 项（7.74）：v3 分块布局（分页/COUNT 按容器延迟加载）
             let bitmap: RoaringBitmap = docids.iter().map(|d| *d as u32).collect();
-            let mut bytes = Vec::new();
-            bitmap
-                .serialize_into(&mut bytes)
-                .map_err(|e| Error::Serialize(format!("posting 序列化失败: {e}")))?;
+            let bytes = encode_posting_v3(&bitmap);
             encode_varlen(&mut body, term.as_bytes());
             encode_varlen(&mut body, &bytes);
         }
@@ -564,11 +563,13 @@ impl InvertedIndex {
         if data.len() < 10 || &data[0..8] != SEG_MAGIC {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
+        // K 项（7.74）：段版本 → v3 分块 / v2 紧凑（旧段兼容）
+        let v3 = u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3;
         // FST 精确查找：term → 段内条目字节偏移
         let dicts = self.dicts.load(); // Ex-6.3：Arc 快照零拷贝
         if let Some(map) = dicts.get(seg) {
             return match map.get(term.as_bytes()) {
-                Some(offset) => parse_posting_at(&data, offset as usize),
+                Some(offset) => parse_posting_at(&data, offset as usize, v3),
                 None => Ok(RoaringBitmap::new()),
             };
         }
@@ -579,11 +580,61 @@ impl InvertedIndex {
             let t = decode_varlen(&data, &mut cur)?.to_vec();
             let p = decode_varlen(&data, &mut cur)?.to_vec();
             if t.as_slice() == term.as_bytes() {
-                return RoaringBitmap::deserialize_from(&p[..])
-                    .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")));
+                return if v3 {
+                    decode_posting_v3(&p)
+                } else {
+                    RoaringBitmap::deserialize_from(&p[..])
+                        .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))
+                };
             }
         }
         Ok(RoaringBitmap::new())
+    }
+
+    /// 定位某 term 在某段内的条目起点（FST offset / 线性扫描），并返回段数据映射。
+    /// 段文件不存在（后台 GC 已删，J 项）→ None。供 doc_count / search_paged 快速路径用。
+    fn segment_posting_entry(
+        &self,
+        seg: &str,
+        term: &str,
+    ) -> Result<Option<(Arc<MmapFile>, usize)>> {
+        let files = self.data_files.load();
+        let data = if let Some(m) = files.get(seg) {
+            m.clone()
+        } else {
+            drop(files);
+            let mm = match MmapFile::open(&self.dir.join(seg)) {
+                Ok(m) => Arc::new(m),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(Error::from(e)),
+            };
+            self.data_files.rcu(|m| {
+                let mut n = (**m).clone();
+                n.insert(seg.to_string(), mm.clone());
+                n
+            });
+            mm
+        };
+        if data.len() < 10 || &data[0..8] != SEG_MAGIC {
+            return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
+        }
+        // FST 精确查找：term → 段内条目字节偏移
+        let dicts = self.dicts.load();
+        if let Some(map) = dicts.get(seg) {
+            return Ok(map.get(term.as_bytes()).map(|o| (data, o as usize)));
+        }
+        // 回退线性扫描（无 FST 的旧段 / hash 引擎）
+        let mut cur = 10usize;
+        let count = decode_varint(&data, &mut cur)?;
+        for _ in 0..count {
+            let entry = cur; // 条目起点（term varlen 前）
+            let t = decode_varlen(&data, &mut cur)?.to_vec();
+            let _p = decode_varlen(&data, &mut cur)?;
+            if t.as_slice() == term.as_bytes() {
+                return Ok(Some((data, entry)));
+            }
+        }
+        Ok(None)
     }
 
     /// 当前磁盘段数。
@@ -596,9 +647,83 @@ impl InvertedIndex {
         self.dicts.load().len()
     }
 
-    /// 某 term 命中的文档数（COUNT 原子操作，<0.1ms，design 5.17）。
+    /// 某 term 命中的文档数（COUNT 原子操作，design 5.17）。
+    /// K 项（7.74）：惰性游标归并**精确去重**计数（跨段/内存重复 docid 合并）——
+    /// 容器级按需解码，不收集 docid 列表。
     pub fn doc_count(&self, term: &str) -> Result<u64> {
-        Ok(self.search(term)?.len())
+        let mem_vals: Vec<u32> = self
+            .mem
+            .get(term)
+            .map(|e| e.value().iter().map(|&d| d as u32).collect())
+            .unwrap_or_default();
+        let mut cursors: Vec<PostingCursor> = Vec::new();
+        let segs = self.segments.load();
+        for seg in segs.iter() {
+            if let Some((data, entry)) = self.segment_posting_entry(seg, term)? {
+                if data.len() >= 10
+                    && u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3
+                {
+                    cursors.push(PostingCursor::new(&data, entry)?);
+                } else {
+                    let bm = parse_posting_at(&data, entry, false)?;
+                    cursors.push(PostingCursor::from_bitmap(bm));
+                }
+            }
+        }
+        let mut count = 0u64;
+        merge_distinct(&mem_vals, &mut cursors, |_| {
+            count += 1;
+            false
+        })?;
+        Ok(count)
+    }
+
+    /// 分页快速路径（K 项）：跨内存 + 各段 k-way merge，只解码 [offset, offset+limit)
+    /// 覆盖的容器——大 posting（1600 万 docid）近页从全量反序列化（~3ms）降至窗口解码
+    /// （~10µs，demo posting-chunk x211）。返回 (total, 窗口 docid 升序列表，已去重)。
+    /// total 为各源头部基数之和（跨段重复 docid 未去重时为上界；后台 GC 收敛后精确）。
+    pub fn search_paged(&self, term: &str, offset: u64, limit: u64) -> Result<(u64, Vec<u32>)> {
+        // 内存 posting（小，升序）
+        let mem_vals: Vec<u32> = self
+            .mem
+            .get(term)
+            .map(|e| e.value().iter().map(|&d| d as u32).collect())
+            .unwrap_or_default();
+        let mut total = mem_vals.len() as u64;
+        // 各段：v3 → 惰性游标；v2 旧段 → 全量解码包游标（兼容）
+        let segs = self.segments.load();
+        let mut cursors: Vec<PostingCursor> = Vec::new();
+        for seg in segs.iter() {
+            if let Some((data, entry)) = self.segment_posting_entry(seg, term)? {
+                if data.len() >= 10
+                    && u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3
+                {
+                    let c = PostingCursor::new(&data, entry)?;
+                    total += c.total();
+                    cursors.push(c);
+                } else {
+                    let bm = parse_posting_at(&data, entry, false)?;
+                    total += bm.len();
+                    cursors.push(PostingCursor::from_bitmap(bm));
+                }
+            }
+        }
+        if limit == 0 {
+            return Ok((total, Vec::new()));
+        }
+        // 归并取窗口（去重后流，与 search 的 bitmap 语义一致）
+        let mut out: Vec<u32> = Vec::new();
+        let mut skipped = 0u64;
+        merge_distinct(&mem_vals, &mut cursors, |docid| {
+            if skipped < offset {
+                skipped += 1;
+                false
+            } else {
+                out.push(docid);
+                out.len() as u64 >= limit
+            }
+        })?;
+        Ok((total, out))
     }
 
     /// 遍历全部 term（内存 + 各段），合并出每个 term 的完整 posting 位图。
@@ -630,14 +755,20 @@ impl InvertedIndex {
         if data.len() < 10 || &data[0..8] != SEG_MAGIC {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
+        // K 项（7.74）：段版本 → v3 分块 / v2 紧凑（旧段兼容）
+        let v3 = u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3;
         let mut cur = 10usize;
         let count = decode_varint(&data, &mut cur)?;
         let mut out = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let t = decode_varlen(&data, &mut cur)?.to_vec();
             let p = decode_varlen(&data, &mut cur)?.to_vec();
-            let bitmap = RoaringBitmap::deserialize_from(&p[..])
-                .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))?;
+            let bitmap = if v3 {
+                decode_posting_v3(&p)?
+            } else {
+                RoaringBitmap::deserialize_from(&p[..])
+                    .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))?
+            };
             out.push((String::from_utf8_lossy(&t).into_owned(), bitmap));
         }
         Ok(out)
@@ -745,10 +876,8 @@ impl InvertedIndex {
         for (term, bitmap) in &map {
             let file_offset = (SEG_MAGIC.len() + std::mem::size_of::<u16>() + body.len()) as u64;
             term_offsets.push((term.clone().into_bytes(), file_offset));
-            let mut bytes = Vec::new();
-            bitmap
-                .serialize_into(&mut bytes)
-                .map_err(|e| Error::Serialize(format!("posting 序列化失败: {e}")))?;
+            // K 项（7.74）：v3 分块布局
+            let bytes = encode_posting_v3(bitmap);
             encode_varlen(&mut body, term.as_bytes());
             encode_varlen(&mut body, &bytes);
         }
@@ -821,12 +950,225 @@ pub struct GcReport {
 }
 
 /// 从段数据指定偏移解析 (term, posting) 条目（FST 字典指向的条目）。
-fn parse_posting_at(data: &[u8], offset: usize) -> Result<RoaringBitmap> {
+/// v3 = posting 分块布局（K 项）；v2 = Roaring 紧凑字节（旧段兼容）。
+fn parse_posting_at(data: &[u8], offset: usize, v3: bool) -> Result<RoaringBitmap> {
     let mut cur = offset;
     let _t = decode_varlen(data, &mut cur)?; // 跳过 term
     let p = decode_varlen(data, &mut cur)?.to_vec();
-    RoaringBitmap::deserialize_from(&p[..])
-        .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))
+    if v3 {
+        decode_posting_v3(&p)
+    } else {
+        RoaringBitmap::deserialize_from(&p[..])
+            .map_err(|e| Error::Corrupted(format!("posting 反序列化失败: {e}")))
+    }
+}
+
+// ---------- K 项（7.74）：v3 posting 分块布局（按容器延迟加载） ----------
+//
+// v3 条目 payload：`[u32 容器数][每容器 14B 头：high u16 + card u32 + off u32 + len u32][容器数据区]`。
+// 每个容器 = Roaring 单容器 bitmap（值 = **完整 docid**，容器级对齐 → OR 合并零额外成本）。
+// 分页 / COUNT 只反序列化窗口覆盖的容器（近页 x211、COUNT x4491；全量解码与 v2 紧凑持平，demo posting-chunk）。
+
+/// v3 容器头。
+#[derive(Clone, Copy)]
+struct ChunkHeader {
+    high: u16,
+    card: u64,
+    off: usize,
+    len: usize,
+}
+
+/// 解析 v3 容器头（不复制数据区）。返回（头数组, 头区总字节数）。
+fn v3_headers(payload: &[u8]) -> Result<(Vec<ChunkHeader>, usize)> {
+    if payload.len() < 4 {
+        return Err(Error::Corrupted("v3 posting 头过短".into()));
+    }
+    let nc = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let hdr_bytes = 4 + 14 * nc;
+    if payload.len() < hdr_bytes {
+        return Err(Error::Corrupted("v3 posting 容器头截断".into()));
+    }
+    let mut hs = Vec::with_capacity(nc);
+    for i in 0..nc {
+        let b = 4 + i * 14;
+        hs.push(ChunkHeader {
+            high: u16::from_le_bytes(payload[b..b + 2].try_into().unwrap()),
+            card: u32::from_le_bytes(payload[b + 2..b + 6].try_into().unwrap()) as u64,
+            off: u32::from_le_bytes(payload[b + 6..b + 10].try_into().unwrap()) as usize,
+            len: u32::from_le_bytes(payload[b + 10..b + 14].try_into().unwrap()) as usize,
+        });
+    }
+    Ok((hs, hdr_bytes))
+}
+
+/// v3 编码：RoaringBitmap → 分块 payload（flush / gc 写路径用）。
+fn encode_posting_v3(bm: &RoaringBitmap) -> Vec<u8> {
+    // 按高 16 位分容器（bitmap 升序迭代 → 容器天然按 high 升序）
+    let mut by_high: Vec<(u16, Vec<u32>)> = Vec::new();
+    for d in bm.iter() {
+        let high = (d >> 16) as u16;
+        match by_high.last_mut() {
+            Some((h, v)) if *h == high => v.push(d),
+            _ => by_high.push((high, vec![d])),
+        }
+    }
+    // 各容器序列化为 Roaring 单容器字节（值 = 完整 docid → 容器级对齐）
+    let mut bodies: Vec<(u16, u64, Vec<u8>)> = Vec::new();
+    for (high, vals) in by_high {
+        let c: RoaringBitmap = vals.into_iter().collect();
+        let mut bytes = Vec::new();
+        c.serialize_into(&mut bytes).unwrap();
+        bodies.push((high, c.len(), bytes));
+    }
+    let mut out = Vec::new();
+    out.extend((bodies.len() as u32).to_le_bytes());
+    let mut data_off = 4 + 14 * bodies.len();
+    for (high, card, bytes) in &bodies {
+        out.extend(high.to_le_bytes());
+        out.extend((*card as u32).to_le_bytes());
+        out.extend((data_off as u32).to_le_bytes());
+        out.extend((bytes.len() as u32).to_le_bytes());
+        data_off += bytes.len();
+    }
+    for (_, _, bytes) in &bodies {
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+/// v3 全量解码（search / 合并场景；容器级 OR 与 v2 紧凑反序列化持平）。
+fn decode_posting_v3(payload: &[u8]) -> Result<RoaringBitmap> {
+    let (hs, _) = v3_headers(payload)?;
+    let mut result = RoaringBitmap::new();
+    for h in hs {
+        let end = h.off + h.len;
+        if payload.len() < end {
+            return Err(Error::Corrupted("v3 posting 容器数据截断".into()));
+        }
+        let c = RoaringBitmap::deserialize_from(&payload[h.off..end])
+            .map_err(|e| Error::Corrupted(format!("v3 容器反序列化失败: {e}")))?;
+        result |= c;
+    }
+    Ok(result)
+}
+
+/// v3 惰性游标（分页 k-way merge 用）：容器级按需解码，逐 docid 产出。
+/// 持有段数据 `Arc<MmapFile>`（零拷贝）——容器数据在**数据区**按需反序列化。
+struct PostingCursor {
+    /// 段数据映射；`None` = v2 旧段全量解码后的内存游标（from_bitmap）。
+    data: Option<Arc<MmapFile>>,
+    /// 条目 payload 起点（相对段文件头）。
+    payload_off: usize,
+    headers: Vec<ChunkHeader>,
+    idx: usize,
+    cur: Option<(Vec<u32>, usize)>, // (当前容器值列表, 位置)
+}
+
+impl PostingCursor {
+    /// 从条目 offset（FST 指向）构造：跳过 varlen term + varlen payload → 解析容器头。
+    fn new(data: &Arc<MmapFile>, entry: usize) -> Result<Self> {
+        let mut cur = entry;
+        let _t = decode_varlen(data, &mut cur)?; // 跳过 term（pos → term 末尾）
+        let payload = decode_varlen(data, &mut cur)?; // payload 切片（pos → payload 末尾）
+        let (headers, _) = v3_headers(payload)?;
+        Ok(Self {
+            data: Some(data.clone()),
+            payload_off: cur - payload.len(),
+            headers,
+            idx: 0,
+            cur: None,
+        })
+    }
+
+    /// 从已解码 bitmap 构造（v2 旧段兼容）：全部 docid 作为单个"容器"，无段数据。
+    fn from_bitmap(bm: RoaringBitmap) -> Self {
+        let vals: Vec<u32> = bm.iter().collect();
+        Self {
+            data: None,
+            payload_off: 0,
+            headers: Vec::new(),
+            idx: 0,
+            cur: Some((vals, 0)),
+        }
+    }
+
+    /// 该段内该 term 的 posting 总数（头部基数求和）。
+    fn total(&self) -> u64 {
+        self.headers.iter().map(|h| h.card).sum()
+    }
+
+    /// 下一个 docid（跨容器推进时解码）。None = 耗尽。
+    fn next_docid(&mut self) -> Result<Option<u32>> {
+        loop {
+            if let Some((vals, pos)) = &mut self.cur {
+                if *pos < vals.len() {
+                    let v = vals[*pos];
+                    *pos += 1;
+                    return Ok(Some(v));
+                }
+            }
+            if self.idx >= self.headers.len() {
+                return Ok(None);
+            }
+            let h = self.headers[self.idx];
+            self.idx += 1;
+            let data = self.data.as_ref().expect("段游标必有数据");
+            let start = self.payload_off + h.off;
+            let end = start + h.len;
+            if data.len() < end {
+                return Err(Error::Corrupted("v3 posting 容器数据截断".into()));
+            }
+            let c = RoaringBitmap::deserialize_from(&data[start..end])
+                .map_err(|e| Error::Corrupted(format!("v3 容器反序列化失败: {e}")))?;
+            self.cur = Some((c.iter().collect(), 0));
+        }
+    }
+}
+
+/// 多源升序归并（K 项，分页/COUNT 共用）：内存 vals + 各段惰性游标，对每个**去重后**的
+/// docid 调 `f(docid)`；`f` 返回 true 时停止（提前退出）。各源 docid 均升序。
+fn merge_distinct(
+    mem_vals: &[u32],
+    cursors: &mut [PostingCursor],
+    mut f: impl FnMut(u32) -> bool,
+) -> Result<()> {
+    let mut mem_next = mem_vals.first().copied();
+    let mut mem_pos = 0usize;
+    let mut nxt: Vec<Option<u32>> = Vec::with_capacity(cursors.len());
+    for c in cursors.iter_mut() {
+        nxt.push(c.next_docid()?);
+    }
+    let mut last = u32::MAX;
+    loop {
+        let mut best: Option<(u32, usize)> = None; // (值, 源；usize::MAX = 内存)
+        if let Some(v) = mem_next {
+            if best.map_or(true, |(b, _)| v < b) {
+                best = Some((v, usize::MAX));
+            }
+        }
+        for (i, v) in nxt.iter().enumerate() {
+            if let Some(x) = v {
+                if best.map_or(true, |(b, _)| *x < b) {
+                    best = Some((*x, i));
+                }
+            }
+        }
+        let Some((val, src)) = best else { break };
+        if val != last {
+            last = val;
+            if f(val) {
+                return Ok(());
+            }
+        }
+        // 推进源（重复 docid 也推进）
+        if src == usize::MAX {
+            mem_pos += 1;
+            mem_next = mem_vals.get(mem_pos).copied();
+        } else {
+            nxt[src] = cursors[src].next_docid()?;
+        }
+    }
+    Ok(())
 }
 
 /// 解码段文件计数 / term 条目数（LEB128）。
@@ -1606,5 +1948,71 @@ mod tests {
         // 合并后仍可检索
         assert!(idx.search("a=1").unwrap().contains(1));
         assert!(idx.search("b=2").unwrap().contains(2));
+    }
+
+    // ---------- K 项（7.74）：v3 posting 分块布局（分页/COUNT 按容器延迟加载） ----------
+
+    #[test]
+    fn v3_paged_matches_full_search_across_segments() {
+        // 大 posting 分页快速路径与全量 search 窗口一致（多段、hash 引擎线性扫描定位）
+        let dir = tmp();
+        let idx = InvertedIndex::open_with_gc(&dir, 10, "hash", 0).unwrap();
+        for seg in 0..3u64 {
+            for i in seg * 2000..seg * 2000 + 2000 {
+                idx.add("hot", i);
+            }
+            idx.flush_segment().unwrap();
+        }
+        let full = idx.search("hot").unwrap();
+        assert_eq!(full.len(), 6000);
+        for (off, lim) in [
+            (0u64, 10u64),
+            (5, 10),
+            (1000, 100),
+            (5990, 20),
+            (0, 100_000),
+        ] {
+            let (total, ids) = idx.search_paged("hot", off, lim).unwrap();
+            assert_eq!(total, 6000, "total 应一致");
+            let expect: Vec<u32> = full.iter().skip(off as usize).take(lim as usize).collect();
+            assert_eq!(ids, expect, "窗口 ({off},{lim}) 应与全量 search 一致");
+        }
+        // COUNT 快速路径精确
+        assert_eq!(idx.doc_count("hot").unwrap(), 6000);
+    }
+
+    #[test]
+    fn v3_paged_dedups_docids_across_segments() {
+        // 跨段重复 docid（同主键更新未 GC）：窗口去重、doc_count 精确
+        let dir = tmp();
+        let idx = InvertedIndex::open_with_gc(&dir, 10, "hash", 0).unwrap();
+        idx.add("dup", 1);
+        idx.add("dup", 2);
+        idx.flush_segment().unwrap();
+        idx.add("dup", 2); // 跨段重复
+        idx.add("dup", 3);
+        idx.flush_segment().unwrap();
+        assert_eq!(idx.doc_count("dup").unwrap(), 3, "COUNT 必须跨段去重");
+        let (_, ids) = idx.search_paged("dup", 0, 100).unwrap();
+        assert_eq!(ids, vec![1, 2, 3], "分页窗口必须去重");
+        // 深页 offset 基于去重后流
+        let (_, ids2) = idx.search_paged("dup", 1, 100).unwrap();
+        assert_eq!(ids2, vec![2, 3], "offset 应基于去重后流");
+    }
+
+    #[test]
+    fn v3_full_decode_equals_compact_roundtrip() {
+        // v3 编码 → 全量解码与原始 bitmap 一致（search 全量路径正确性）
+        let dir = tmp();
+        let idx = InvertedIndex::open_with_gc(&dir, 10, "hash", 0).unwrap();
+        for i in (0..100_000u64).step_by(3) {
+            idx.add("sparse", i);
+        }
+        idx.flush_segment().unwrap();
+        let bm = idx.search("sparse").unwrap();
+        assert_eq!(bm.len(), 33_334);
+        // 命中集合抽查（稀疏跨多容器）
+        assert!(bm.contains(0) && bm.contains(99_999) && bm.contains(50_001));
+        assert!(!bm.contains(1));
     }
 }

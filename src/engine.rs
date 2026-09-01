@@ -1154,30 +1154,17 @@ impl Engine {
     ) -> Result<PagedRows> {
         // Ex-5.3：查询前刷入攒批缓冲，保证 put 后未达阈值的数据立即可查（一致性）
         self.flush_inverted_pending();
-        let bitmap = self.inverted.search(term)?;
-        let total = bitmap.len() as u64;
+        // K 项（7.74）：v3 分块快速路径——只解码 [offset, offset+limit) 覆盖的容器
+        // （大 posting 近页从全量反序列化降至窗口解码，x211）；total 来自容器头基数。
+        let (total, ids) = self
+            .inverted
+            .search_paged(term, offset, limit.unwrap_or(u64::MAX))?;
         let mut rows = Vec::new();
-        let cap = limit.unwrap_or(u64::MAX);
         // N 项：收集可见窗口 docid（bitmap 升序）→ 一次 `batch_get` 批量回表。
-        // 旧实现逐 docid `get`：每 key 独立走完整 LSM 点查（78 SST 布隆/二分/读块 +
-        // Delta 扫描 + JSON 合并），万级 posting 退化为万次随机读；批量化后按块分组、
-        // 每数据块只读/解压一次，Delta 单次范围扫描分组覆盖。
-        let mut ids: Vec<u64> = Vec::new();
-        let mut skipped = 0u64;
-        for docid in bitmap {
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            if ids.len() as u64 >= cap {
-                break;
-            }
-            ids.push(docid as u64);
-        }
-        let vals = self.batch_get(&ids)?;
+        let vals = self.batch_get(&ids.iter().map(|&d| d as u64).collect::<Vec<_>>())?;
         for (d, v) in ids.into_iter().zip(vals) {
             if let Some(v) = v {
-                rows.push((d, v));
+                rows.push((d as u64, v));
             }
         }
         Ok(PagedRows { total, rows })
