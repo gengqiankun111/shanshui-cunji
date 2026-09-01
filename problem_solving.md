@@ -689,6 +689,19 @@
 - **1 亿库恢复**：损坏段均为测试数据段（8.7MB L0），删除后原 1 亿库（79/88/89/97/98/99
   六段）完整保留，点查 id 1 / 5000万 / 1亿 全命中。
 
+### P74. MySQL 参数化 INSERT 转义缺陷：`unquote` 不反转义 SQL 转义序列
+- **问题**：高并发 CRUD 稳定性测试（tmp_crud_stress.py，pymysql 参数化 `%s`）实测
+  `INSERT INTO documents (id, doc) VALUES (%s, %s)` 报
+  `insert error: serialization error: key must be a string at line 1 column 2`；直接
+  拼接 SQL 却成功。根因：pymysql 参数化把 JSON 文档里的 `"` `\` 转义为 `\"` `\\`，
+  server 侧 `unquote` 只剥首尾引号不反转义 → `doc_terms` 用 serde 解析 `{\"v\":1}`
+  （反斜杠成为 key 首字符）→ 报 key 非法。H 项（MySQL 协议）遗留缺陷，常规 mysql cli
+  （客户端本地转义后传输）未暴露。
+- **修复**：`unquote` 增加 SQL 反转义——`\'`→`'`、`\"`→`"`、`\\`→`\`、`\n`/`\r`/`\t`/`\0`
+  还原，未知序列保留原样；INSERT doc、UPDATE expr、字段值统一受益。
+- **回归测试**：`unquote_reverses_sql_escape_sequences`（`\"` `\\` `\'` 换行/未加引号原样）；
+  pymysql 参数化 INSERT 实测通过；520 全绿。
+
 ---
 
 ## 环境备忘（不入库）

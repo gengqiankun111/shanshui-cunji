@@ -1985,11 +1985,38 @@ fn split_values(s: &str) -> Vec<String> {
 /// 去掉字符串包裹引号。
 fn unquote(s: &str) -> String {
     let t = s.trim();
-    if t.len() >= 2 && ((t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"'))) {
-        t[1..t.len() - 1].to_string()
+    let body = if t.len() >= 2
+        && ((t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')))
+    {
+        &t[1..t.len() - 1]
     } else {
-        t.to_string()
+        t
+    };
+    // SQL 反转义（H 项遗留缺陷修复）：客户端参数化/转义把 `"` `\` 等写成 `\"` `\\`，
+    // 不还原则 JSON 文档解析失败（pymysql 参数化实测 `{\"v\":1}` → serde 报 key 非法）。
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('0') => out.push('\0'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
     }
+    out
 }
 
 /// 找配对右括号（含引号感知）。
@@ -2260,6 +2287,17 @@ mod tests {
     }
 
     #[test]
+    fn unquote_reverses_sql_escape_sequences() {
+        // H 项遗留缺陷修复：pymysql 参数化把 `"` `\` 转义为 `\"` `\\`，须反转义回原值
+        assert_eq!(unquote(r#"'{\"v\":1}'"#), r#"{"v":1}"#);
+        assert_eq!(unquote(r"'a\\b'"), r"a\b");
+        assert_eq!(unquote(r"'it\'s'"), "it's");
+        assert_eq!(unquote(r#""hello""#), "hello");
+        assert_eq!(unquote("'a\\nb'"), "a\nb");
+        // 未加引号原样（去除首尾空白）
+        assert_eq!(unquote("plain"), "plain");
+    }
+
     fn extract_between_range_variants() {
         // 标准 BETWEEN
         assert_eq!(
