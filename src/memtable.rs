@@ -7,6 +7,7 @@
 //!   事务活跃期 + 未刷盘时也能读到快照点版本（旧实现仅保最新，快照语义不严格）。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 use crossbeam_skiplist::SkipMap;
 
@@ -229,7 +230,16 @@ impl<'a> Iterator for MemRangeIter<'a> {
 }
 
 /// 双缓冲：Mutable 接收写入，Immutable 冻结待刷盘。
+/// P72（无锁合并）：内部 `RwLock<BufferInner>`——`switch_and_flush` `&self` 化（Engine 字段
+/// `Arc<ColumnFamily>` 化后 flush 无法取 `&mut`）的支撑：冻结切换经**写锁**，读/写经**读锁**
+/// （SkipMap 本身并发安全，锁仅护"双缓冲结构不变性"）。put/delete 只取读锁（写路径在 Engine
+/// 写锁内与 switch 互斥，双保险）；scan 期间持有读锁与 switch（Engine 写锁）天然互斥。
 pub struct MemTableBuffer {
+    inner: RwLock<BufferInner>,
+}
+
+/// 双缓冲内部态：mutable 接收写入，immutable 冻结待刷盘。
+struct BufferInner {
     mutable: MemTable,
     immutable: Option<MemTable>,
 }
@@ -237,35 +247,36 @@ pub struct MemTableBuffer {
 impl MemTableBuffer {
     pub fn new() -> Self {
         Self {
-            mutable: MemTable::new(),
-            immutable: None,
+            inner: RwLock::new(BufferInner {
+                mutable: MemTable::new(),
+                immutable: None,
+            }),
         }
     }
 
     /// 写入当前 Mutable 表。
     pub fn put(&self, key: Vec<u8>, seq: u64, value: Vec<u8>) {
-        self.mutable.put(key, seq, value);
+        self.inner.read().unwrap().mutable.put(key, seq, value);
     }
 
     pub fn delete(&self, key: Vec<u8>, seq: u64) {
-        self.mutable.delete(key, seq);
+        self.inner.read().unwrap().mutable.delete(key, seq);
     }
 
     /// 读路径：先查 Mutable，再查 Immutable（Immutable 冻结期间仍可读，保证内存一致性）。
     pub fn get(&self, key: &[u8]) -> Option<MemTableEntry> {
-        self.mutable
+        let g = self.inner.read().unwrap();
+        g.mutable
             .get(key)
-            .or_else(|| self.immutable.as_ref().and_then(|m| m.get(key)))
+            .or_else(|| g.immutable.as_ref().and_then(|m| m.get(key)))
     }
 
     /// 快照读（S 项）：Mutable/Immutable 各取 **seq ≤ snapshot** 的最新版本，
     /// 再取两者中 seq 更大者（跨表版本合并，语义与 `get` 一致 + 快照过滤）。
     pub fn get_at(&self, key: &[u8], snapshot_seq: u64) -> Option<MemTableEntry> {
-        let mut best: Option<MemTableEntry> = None;
-        if let Some(e) = self.mutable.get_at(key, snapshot_seq) {
-            best = Some(e);
-        }
-        if let Some(imm) = &self.immutable {
+        let g = self.inner.read().unwrap();
+        let mut best: Option<MemTableEntry> = g.mutable.get_at(key, snapshot_seq);
+        if let Some(imm) = &g.immutable {
             if let Some(e) = imm.get_at(key, snapshot_seq) {
                 if best.as_ref().map_or(true, |b| e.seq > b.seq) {
                     best = Some(e);
@@ -277,34 +288,35 @@ impl MemTableBuffer {
 
     /// 冻结切换：当前 Mutable 变为 Immutable，新建空 Mutable 承接写入。
     /// 前提：上一轮 Immutable 已被取走（刷盘完成），否则 debug 断言失败。
-    pub fn switch(&mut self) {
-        debug_assert!(self.immutable.is_none(), "上一轮 Immutable 尚未刷盘完成");
-        self.immutable = Some(std::mem::take(&mut self.mutable));
+    /// P72：`&self`（写锁内交换，Engine 写锁下与写路径互斥）。
+    pub fn switch(&self) {
+        let mut g = self.inner.write().unwrap();
+        debug_assert!(g.immutable.is_none(), "上一轮 Immutable 尚未刷盘完成");
+        g.immutable = Some(std::mem::take(&mut g.mutable));
     }
 
     /// 取走 Immutable（刷盘完成后调用），释放内存。
-    pub fn take_immutable(&mut self) -> Option<MemTable> {
-        self.immutable.take()
+    pub fn take_immutable(&self) -> Option<MemTable> {
+        self.inner.write().unwrap().immutable.take()
     }
 
-    /// 当前 Immutable（冻结中待刷盘）引用；无则返回 None。
-    pub fn immutable(&self) -> Option<&MemTable> {
-        self.immutable.as_ref()
-    }
-
-    /// 双缓冲范围流式迭代器（M8-P10）：immutable + mutable 各一个 `MemRangeIter`
+    /// 双缓冲范围流式迭代（M8-P10）：immutable + mutable 各一个 `MemRangeIter`
     /// （同 key 以 seq 去重由 k-way merge 调用方负责）。
-    pub fn iter_range<'a>(
-        &'a self,
+    /// P72：迭代器借用 RwLock 读锁内数据——改为 HRTB 闭包式（`f` 在锁作用域内消费迭代器，
+    /// 调用方把 k-way merge 主体放入闭包），避免返回锁外悬垂借用。
+    pub fn with_iter_range<R>(
+        &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-    ) -> Vec<MemRangeIter<'a>> {
+        f: impl for<'a> FnOnce(Vec<MemRangeIter<'a>>) -> R,
+    ) -> R {
+        let g = self.inner.read().unwrap();
         let mut out = Vec::new();
-        if let Some(imm) = &self.immutable {
+        if let Some(imm) = &g.immutable {
             out.push(MemRangeIter::new(imm, start, end));
         }
-        out.push(MemRangeIter::new(&self.mutable, start, end));
-        out
+        out.push(MemRangeIter::new(&g.mutable, start, end));
+        f(out)
     }
 
     /// 范围扫描：遍历 Immutable 与 Mutable 两表（同 key 以 seq 去重由调用方负责）。
@@ -314,18 +326,20 @@ impl MemTableBuffer {
         end: Option<&[u8]>,
         mut f: F,
     ) {
-        if let Some(imm) = &self.immutable {
+        let g = self.inner.read().unwrap();
+        if let Some(imm) = &g.immutable {
             imm.scan_range(start, end, &mut f);
         }
-        self.mutable.scan_range(start, end, &mut f);
+        g.mutable.scan_range(start, end, &mut f);
     }
 
     pub fn mutable_bytes(&self) -> usize {
-        self.mutable.approx_bytes()
+        self.inner.read().unwrap().mutable.approx_bytes()
     }
 
     pub fn immutable_bytes(&self) -> usize {
-        self.immutable.as_ref().map_or(0, |m| m.approx_bytes())
+        let g = self.inner.read().unwrap();
+        g.immutable.as_ref().map_or(0, |m| m.approx_bytes())
     }
 }
 
@@ -442,11 +456,11 @@ mod tests {
 
     #[test]
     fn buffer_switch_freezes_and_writes_continue() {
-        let mut buf = MemTableBuffer::new();
+        let buf = MemTableBuffer::new();
         buf.put(b"x".to_vec(), 1, b"1".to_vec());
         buf.switch(); // Mutable 冻结，新写入进新表
 
-        assert_eq!(buf.immutable().unwrap().len(), 1);
+        assert!(buf.immutable_bytes() >= 1, "Immutable 冻结了 x");
         buf.put(b"y".to_vec(), 2, b"2".to_vec());
         // 新写入只进 Mutable，不可见 frozen
         assert_eq!(buf.get(b"x").unwrap().value.unwrap(), b"1"); // Immutable 仍可读
@@ -462,7 +476,7 @@ mod tests {
     #[test]
     fn switch_preserves_data_for_flush() {
         // 模拟刷盘流程：写入 → switch → 取走 Immutable 刷盘 → 数据完整
-        let mut buf = MemTableBuffer::new();
+        let buf = MemTableBuffer::new();
         for i in 0..100u64 {
             buf.put(format!("k{i}").as_bytes().to_vec(), i, b"v".to_vec());
         }

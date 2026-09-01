@@ -27,11 +27,13 @@ use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 /// 引擎：组合主数据 + 组合索引 + Delta 增量 + 倒排 + HotCache。
 pub struct Engine {
     /// 主数据列族（value = 序列化文档字节）。
-    primary: ColumnFamily,
+    /// P72（无锁合并）：`Arc<ColumnFamily>`——mysql 后台 worker clone 三 CF Arc 后无锁合并，
+    /// flush/compact 的 ssts 变更经 CF 内部 `sst_mutate` 互斥（不再依赖 Engine RwLock 串行）。
+    primary: Arc<ColumnFamily>,
     /// 组合索引列族（key = encode_composite_key）。
-    cidx: Option<ColumnFamily>,
+    cidx: Option<Arc<ColumnFamily>>,
     /// Delta 增量列族（阶段 1.5，key = encode_docid ++ VarLen(field)，Merge-on-Read 覆盖 Base）。
-    delta: ColumnFamily,
+    delta: Arc<ColumnFamily>,
     /// 倒排索引。
     inverted: InvertedIndex,
     /// 文档热缓存（O 项第②步：内部 `Mutex`——读路径 `&self` 并发回填/命中）。
@@ -88,7 +90,8 @@ pub struct Engine {
     pub compact_worker: Arc<AtomicBool>,
     /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
     /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
-    deletion_bitmap: Option<DeletionBitmap>,
+    /// P72：`Arc`——worker 无锁合并 clone 后并发读位图过滤（写路径在 Engine 写锁内）。
+    deletion_bitmap: Option<Arc<DeletionBitmap>>,
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     affinity: crate::affinity::CpuPartition,
@@ -125,6 +128,59 @@ fn merge_report(base: &mut crate::column_family::CompactReport, other: &crate::c
     base.merged_ssts += other.merged_ssts;
     base.kept_keys += other.kept_keys;
     base.freed_bytes += other.freed_bytes;
+}
+
+/// P72（无锁合并）：`Engine::compaction_targets` 的产物——已 clone 的三 CF Arc + 删除位图 Arc
+/// 与最高紧迫度档判定。mysql worker drop Engine 读锁后调 `run()` 无锁合并。
+pub struct CompactTargets {
+    /// 删除位图（Some 且 deleted_count>0 → 合并过滤已删键；None = 传统 Tombstone 路径）。
+    pub deletion_bitmap: Option<Arc<DeletionBitmap>>,
+    /// 主数据列族 Arc（clone 共享）。
+    pub primary: Arc<ColumnFamily>,
+    /// 组合索引列族（可能未启用 / 非最高紧迫度档）。
+    pub cidx: Option<Arc<ColumnFamily>>,
+    /// Delta 增量列族 Arc。
+    pub delta: Arc<ColumnFamily>,
+    /// 各列族是否为本轮最高紧迫度档（紧凑调度，与 `Engine::compact` 一致）。
+    pub do_primary: bool,
+    pub do_cidx: bool,
+    pub do_delta: bool,
+}
+
+impl CompactTargets {
+    /// 无锁合并执行：仅压最高紧迫度档列族（串行；并列场景由 worker 下一轮收敛）。
+    /// 与写并发安全：compact 不碰 memtable；ssts 变更经 CF `sst_mutate` 与 flush 互斥。
+    pub fn run(&self) -> Result<crate::column_family::CompactReport> {
+        let empty = crate::column_family::CompactReport {
+            merged_ssts: 0,
+            kept_keys: 0,
+            freed_bytes: 0,
+            out_level: 0,
+        };
+        let mut rep = empty;
+        let bm = self.deletion_bitmap.as_ref();
+        let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
+        if self.do_primary {
+            let r = if needs_filter {
+                let f = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
+                self.primary.compact_filtered(&f)?
+            } else {
+                self.primary.compact()?
+            };
+            merge_report(&mut rep, &r);
+        }
+        if self.do_cidx {
+            if let Some(c) = &self.cidx {
+                let r = c.compact()?;
+                merge_report(&mut rep, &r);
+            }
+        }
+        if self.do_delta {
+            let r = self.delta.compact()?;
+            merge_report(&mut rep, &r);
+        }
+        Ok(rep)
+    }
 }
 
 /// N 项：Delta 批量覆盖收集——单次范围扫描 `[min..max]`（docid 编码 + 字段变长前缀），
@@ -242,12 +298,12 @@ impl Engine {
             .as_deref()
             .map(Path::new)
             .unwrap_or(data_dir);
-        let primary = ColumnFamily::open_with_wal_dir(
+        let primary = Arc::new(ColumnFamily::open_with_wal_dir(
             "primary",
             &sst_root.join("primary"),
             Some(wal_root),
             cfg,
-        )?;
+        )?);
         let mut inverted = InvertedIndex::open_with_gc(
             &inverted_root.join("inverted"),
             // L 项：倒排刷盘阈值可配（config.inverted.flush_threshold；0 = 默认 100 万 term 对）
@@ -267,16 +323,17 @@ impl Engine {
             Some(wal_root),
             cfg,
         )
-        .ok();
-        let delta = ColumnFamily::open_with_wal_dir(
+        .ok()
+        .map(Arc::new);
+        let delta = Arc::new(ColumnFamily::open_with_wal_dir(
             "delta",
             &sst_root.join("delta"),
             Some(wal_root),
             cfg,
-        )?;
+        )?);
         // 删除位图（Ex-5.6）：开启时加载/创建独立位图文件（4KB 页对齐，见 bitmap.rs）
         let deletion_bitmap = if cfg.storage.deletion_bitmap_enabled {
-            Some(DeletionBitmap::open(&data_dir.join("deletion.bitmap"))?)
+            Some(Arc::new(DeletionBitmap::open(&data_dir.join("deletion.bitmap"))?))
         } else {
             None
         };
@@ -294,10 +351,15 @@ impl Engine {
                 .max(delta.wal_next_seq())
                 .max(outbox.as_ref().map_or(0, |o| o.wal_next_seq())),
         ));
+        // P72：open 阶段 worker 尚未 clone Arc → get_mut 唯一引用可行（此后 CF 内部 &self 维护）
         let mut primary = primary;
-        primary.set_external_seq(Arc::clone(&global_seq));
+        Arc::get_mut(&mut primary)
+            .unwrap()
+            .set_external_seq(Arc::clone(&global_seq));
         let mut delta = delta;
-        delta.set_external_seq(Arc::clone(&global_seq));
+        Arc::get_mut(&mut delta)
+            .unwrap()
+            .set_external_seq(Arc::clone(&global_seq));
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
         // V 项：io_uring 后端池初始化（Linux + `runtime.io_uring_enabled`）——SQPOLL 三队列
@@ -464,7 +526,7 @@ impl Engine {
         // L 项：写压力 → 各列族动态 L0 阈值（高峰收窄提前收敛）
         self.primary.set_write_pressure(pressure);
         self.delta.set_write_pressure(pressure);
-        if let Some(c) = &mut self.cidx {
+        if let Some(c) = &self.cidx {
             c.set_write_pressure(pressure);
         }
         if self.io_rate_base_bytes == 0 {
@@ -473,7 +535,7 @@ impl Engine {
         let rate = (self.io_rate_base_bytes as f64 * (1.0 - 0.5 * pressure)) as u64;
         self.primary.set_io_rate_bytes(rate);
         self.delta.set_io_rate_bytes(rate);
-        if let Some(c) = &mut self.cidx {
+        if let Some(c) = &self.cidx {
             c.set_io_rate_bytes(rate);
         }
     }
@@ -490,7 +552,7 @@ impl Engine {
         self.delta.delete_prefix(&encode_docid(docid))?;
         // ②.5 删除位图复活（Ex-5.6）：put 覆盖 delete → 清位（O(1) 内存，位未置时零 IO）；
         //     持久性与 WAL 同步（flush_wal 先刷位图后刷 WAL）
-        if let Some(bm) = &mut self.deletion_bitmap {
+        if let Some(bm) = &self.deletion_bitmap {
             bm.clear(docid);
         }
         // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
@@ -706,7 +768,7 @@ impl Engine {
     /// Ex-5.6：删除位图脏页**先于** WAL fsync 落盘——若崩溃发生在 WAL fsync 之后、
     /// 环形 WAL 截断推进之前，位图已持久（删除不丢）；反之位图先持久、WAL 回放重删幂等。
     pub fn flush_wal(&mut self) -> Result<()> {
-        if let Some(bm) = &mut self.deletion_bitmap {
+        if let Some(bm) = &self.deletion_bitmap {
             bm.flush()?;
         }
         self.primary.sync_wal()?;
@@ -799,7 +861,7 @@ impl Engine {
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.hotcache.lock().unwrap().invalidate(docid);
-        match &mut self.deletion_bitmap {
+        match &self.deletion_bitmap {
             Some(bm) => {
                 bm.mark_deleted(docid);
                 self.primary
@@ -1200,7 +1262,7 @@ impl Engine {
 
     /// 组合索引前缀查询：编码前缀键范围扫描 → 回表主数据。
     pub fn query_by_composite_prefix(&mut self, fields: &[&[u8]]) -> Result<Vec<QueryRow>> {
-        let Some(cidx) = &mut self.cidx else {
+        let Some(cidx) = self.cidx.clone() else {
             return Ok(Vec::new());
         };
         let start = crate::keys::encode_composite_key(fields, 0);
@@ -1462,6 +1524,29 @@ impl Engine {
             || self.cidx.as_ref().map_or(false, |c| c.needs_compact())
     }
 
+    /// P72（无锁合并）：读取三 CF Arc + 删除位图 Arc + 紧迫度判定（紧凑调度复刻 `compact`）——
+    /// mysql worker 在 Engine 读锁内**快速**调用本方法（clone 廉价），drop 锁后对返回的
+    /// `CompactTargets::run()` 执行**无锁合并**（与写并发；ssts 变更经 CF `sst_mutate` 互斥，
+    /// flush 同锁 → 无丢失更新）。返回 None = 无紧迫度（不需要合并）。
+    pub fn compaction_targets(&self) -> Option<CompactTargets> {
+        let pu = self.primary.compaction_urgency();
+        let du = self.delta.compaction_urgency();
+        let cu = self.cidx.as_ref().map_or(0, |c| c.compaction_urgency());
+        let max = pu.max(du).max(cu);
+        if max == 0 {
+            return None;
+        }
+        Some(CompactTargets {
+            deletion_bitmap: self.deletion_bitmap.clone(),
+            primary: self.primary.clone(),
+            cidx: self.cidx.clone(),
+            delta: self.delta.clone(),
+            do_primary: pu == max,
+            do_cidx: self.cidx.is_some() && cu == max,
+            do_delta: du == max,
+        })
+    }
+
     /// 主数据列族当前 L0 段数（P 项自动 Compaction 收敛性观测 / 测试）。
     pub fn primary_l0_count(&self) -> usize {
         self.primary.l0_count()
@@ -1590,7 +1675,7 @@ impl Engine {
         if self.primary.memtable_bytes() > 0 {
             self.primary.switch_and_flush()?;
         }
-        if let Some(cidx) = &mut self.cidx {
+        if let Some(cidx) = &self.cidx {
             if cidx.memtable_bytes() > 0 {
                 cidx.switch_and_flush()?;
             }
@@ -1613,7 +1698,7 @@ impl Drop for Engine {
             let _ = self.flush_wal();
         }
         // Ex-5.6：正常退出兜底落盘删除位图脏页（组提交关闭时 flush_wal 不执行，位图独立 flush）
-        if let Some(bm) = &mut self.deletion_bitmap {
+        if let Some(bm) = &self.deletion_bitmap {
             let _ = bm.flush();
         }
     }
@@ -1633,6 +1718,51 @@ mod tests {
         DIR.get_or_init(|| tempfile::tempdir().unwrap())
             .path()
             .join(name)
+    }
+
+    #[test]
+    fn compact_targets_run_matches_engine_compact() {
+        // P72（无锁合并）：`Engine::compaction_targets` + `CompactTargets::run`（worker 无锁路径）
+        // 与 `Engine::compact`（读锁内串行）收敛结果一致——多列族压力 + 删除位图过滤双路径。
+        let mut cfg = Config::default();
+        cfg.memtable.max_size_mb = 1; // 小 MemTable → 写入快速 flush 多段
+        cfg.storage.l0_stall_threshold = 2; // 低 L0 阈值 → 2 段即触发合并
+        let mut e1 = Engine::open(&tmp(), &cfg).unwrap();
+        let mut e2 = Engine::open(&tmp(), &cfg).unwrap();
+        let val = vec![b'x'; 1024];
+        for seg in 0..4u64 {
+            for i in seg * 500..seg * 500 + 500 {
+                let t: &[&str] = &["tag_a"];
+                e1.put(i, val.clone(), t).unwrap();
+                e2.put(i, val.clone(), t).unwrap();
+            }
+        }
+        // 删除一部分（删除位图开启）→ 合并需物理丢弃
+        for i in (0..2_000u64).step_by(3) {
+            e1.delete(i).unwrap();
+            e2.delete(i).unwrap();
+        }
+        e1.flush_wal().unwrap();
+        e2.flush_wal().unwrap();
+        // e1：Engine::compact 读锁路径收敛；e2：无锁路径（compaction_targets 循环 run）收敛
+        while e1.needs_compact() {
+            let _ = e1.compact().unwrap();
+        }
+        while e2.needs_compact() {
+            let Some(t) = e2.compaction_targets() else { break };
+            t.run().unwrap();
+        }
+        assert!(!e1.needs_compact());
+        assert!(!e2.needs_compact());
+        // 收敛后数据一致（存活 docid 全部命中；已删不可见）
+        for i in 0..2_000u64 {
+            let v1 = e1.get(i).unwrap();
+            let v2 = e2.get(i).unwrap();
+            assert_eq!(v1, v2, "docid={i}");
+        }
+        // 段数收敛一致（同输入 → 同压实结果）
+        assert_eq!(e1.primary_l0_count(), e2.primary_l0_count());
+        assert_eq!(e1.primary.sst_count(), e2.primary.sst_count());
     }
 
     fn cfg() -> Config {

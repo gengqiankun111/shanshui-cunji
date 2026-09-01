@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
 
 use crate::error::Result;
 
@@ -28,12 +29,14 @@ pub const PAGE_BYTES: usize = 4096;
 pub const BITS_PER_PAGE: u64 = (PAGE_BYTES * 8) as u64;
 
 /// 删除位图：稠密内存位图 + 4KB 页对齐持久化文件。
+/// P72（无锁合并）：内部 `RwLock`（bits）+ `Mutex`（dirty）——Engine 字段 `Arc<DeletionBitmap>`
+/// 共享（worker 无锁合并克隆 Arc 后读位图过滤；写路径在 Engine 写锁内，锁仅护结构内部一致性）。
 #[derive(Debug, Default)]
 pub struct DeletionBitmap {
     /// 稠密位图：docid 的 bit 位（LSB-first，byte = docid/8，bit = docid%8）。
-    bits: Vec<u64>,
+    bits: RwLock<Vec<u64>>,
     /// 脏页索引（docid/BITS_PER_PAGE）：`flush` 时只写这些页。
-    dirty: HashSet<u64>,
+    dirty: Mutex<HashSet<u64>>,
     /// 位图文件路径（`<data_dir>/deletion.bitmap`）。
     path: PathBuf,
 }
@@ -53,42 +56,45 @@ impl DeletionBitmap {
             }
         }
         Ok(Self {
-            bits,
-            dirty: HashSet::new(),
+            bits: RwLock::new(bits),
+            dirty: Mutex::new(HashSet::new()),
             path: path.to_path_buf(),
         })
     }
 
     /// 删除：置位（O(1) 内存）+ 标记脏页；仅当位确实翻转才写页（重复删除零 IO）。
-    pub fn mark_deleted(&mut self, docid: u64) {
+    pub fn mark_deleted(&self, docid: u64) {
         if !self.is_deleted(docid) {
-            self.ensure_capacity(docid);
+            let mut bits = self.bits.write().unwrap();
+            Self::ensure_capacity_bits(&mut bits, docid);
             let byte = (docid / 8) as usize;
             let bit = docid % 8;
-            self.bits[byte] |= 1 << bit;
-            self.dirty.insert(docid / BITS_PER_PAGE);
+            bits[byte] |= 1 << bit;
+            self.dirty.lock().unwrap().insert(docid / BITS_PER_PAGE);
         }
     }
 
     /// 复活（put 重新写入）：清位（O(1)）+ 标记脏页；位本就未置时零 IO。
-    pub fn clear(&mut self, docid: u64) {
+    pub fn clear(&self, docid: u64) {
         if self.is_deleted(docid) {
-            self.ensure_capacity(docid);
+            let mut bits = self.bits.write().unwrap();
+            Self::ensure_capacity_bits(&mut bits, docid);
             let byte = (docid / 8) as usize;
             let bit = docid % 8;
-            self.bits[byte] &= !(1 << bit);
-            self.dirty.insert(docid / BITS_PER_PAGE);
+            bits[byte] &= !(1 << bit);
+            self.dirty.lock().unwrap().insert(docid / BITS_PER_PAGE);
         }
     }
 
     /// 查询（O(1)）：已删返回 true；越界（从未删除）返回 false。
     pub fn is_deleted(&self, docid: u64) -> bool {
         let byte = docid / 8;
-        if byte >= self.bits.len() as u64 {
+        let bits = self.bits.read().unwrap();
+        if byte >= bits.len() as u64 {
             return false;
         }
         let bit = docid % 8;
-        (self.bits[byte as usize] >> bit) & 1 == 1
+        (bits[byte as usize] >> bit) & 1 == 1
     }
 
     /// 主数据键（8 字节大端 docid）的已删判定（compaction 过滤用）。
@@ -101,17 +107,23 @@ impl DeletionBitmap {
 
     /// 当前已删 docid 总数。
     pub fn deleted_count(&self) -> u64 {
-        self.bits.iter().map(|w| w.count_ones() as u64).sum()
+        self.bits
+            .read()
+            .unwrap()
+            .iter()
+            .map(|w| w.count_ones() as u64)
+            .sum()
     }
 
     /// 是否有待落盘脏页。
     pub fn has_pending(&self) -> bool {
-        !self.dirty.is_empty()
+        !self.dirty.lock().unwrap().is_empty()
     }
 
     /// 脏页全部落盘：每页 4KB 对齐写一次 + 一次 fsync（同页 N 次删除 = 1 页写 + 1 fsync）。
-    pub fn flush(&mut self) -> Result<()> {
-        if self.dirty.is_empty() {
+    pub fn flush(&self) -> Result<()> {
+        let dirty_pages: Vec<u64> = self.dirty.lock().unwrap().iter().copied().collect();
+        if dirty_pages.is_empty() {
             return Ok(());
         }
         let mut f = File::options()
@@ -119,8 +131,9 @@ impl DeletionBitmap {
             .truncate(false) // 覆盖写：不截断（保留既有页）
             .write(true)
             .open(&self.path)?;
-        let mut pages: Vec<u64> = self.dirty.iter().copied().collect();
+        let mut pages = dirty_pages;
         pages.sort_unstable();
+        let bits = self.bits.read().unwrap();
         for p in pages {
             let start = (p * BITS_PER_PAGE) as usize;
             let mut buf = vec![0u8; PAGE_BYTES];
@@ -128,8 +141,8 @@ impl DeletionBitmap {
                 let global = start + cell * 8;
                 let mut byte = 0u8;
                 for b in 0..8 {
-                    if global + b < self.bits.len() * 8
-                        && (self.bits[(global + b) / 8] >> ((global + b) % 8)) & 1 == 1
+                    if global + b < bits.len() * 8
+                        && (bits[(global + b) / 8] >> ((global + b) % 8)) & 1 == 1
                     {
                         byte |= 1 << b;
                     }
@@ -141,14 +154,14 @@ impl DeletionBitmap {
             f.write_all(&buf)?; // 越界页写入自动扩展文件（4KB 页粒度）
         }
         f.sync_all()?;
-        self.dirty.clear();
+        self.dirty.lock().unwrap().clear();
         Ok(())
     }
 
-    fn ensure_capacity(&mut self, docid: u64) {
+    fn ensure_capacity_bits(bits: &mut Vec<u64>, docid: u64) {
         let need = (docid / 8) as usize + 1;
-        if self.bits.len() < need {
-            self.bits.resize(need, 0);
+        if bits.len() < need {
+            bits.resize(need, 0);
         }
     }
 }
@@ -212,12 +225,12 @@ mod tests {
     fn redundant_ops_do_not_dirty_pages() {
         // 重复删除 / 从未删除的 put 清位 → 零页写出（put 路径不产生额外 IO）
         let dir = tempfile::tempdir().unwrap();
-        let mut bm = DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap();
+        let bm = DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap();
         bm.mark_deleted(5);
         bm.mark_deleted(5); // 重复删除：位已置 → 不新增脏页
-        assert_eq!(bm.dirty.len(), 1);
+        assert_eq!(bm.dirty.lock().unwrap().len(), 1);
         bm.clear(99); // 从未删除 → 清位是 no-op → 不新增脏页
-        assert_eq!(bm.dirty.len(), 1);
+        assert_eq!(bm.dirty.lock().unwrap().len(), 1);
         bm.flush().unwrap();
         assert_eq!(std::fs::metadata(dir.path().join("del.bitmap")).unwrap().len(), PAGE_BYTES as u64);
     }

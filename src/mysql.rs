@@ -227,9 +227,11 @@ impl MySqlServer {
     /// - 信号驱动（100ms 轮询）：写后即时收敛 L0（替代 P 项写路径同步合并）；
     /// - 10 分钟兜底：覆盖 flush 未触发 / 信号丢失等异常路径（原 guard 线程语义）。
     /// - `try_read` 非阻塞：引擎正忙（写语句持写锁）时跳过本轮，不干扰前台写。
-    /// - W 项：`while needs_compact` 多轮压实——Engine::compact 每轮仅压最高紧迫度档
-    ///   （跨列族调度），循环直至全部收敛（防止多列族压力下只压一轮导致低紧迫度列族滞留）。
-    /// - 单后台线程 + compact 内部并行度：同档多列族压实由 Engine::compact 内部 thread::scope 承担。
+    /// - P72（无锁合并根治）：worker 在 Engine 读锁内**快速** clone 三 CF Arc + 删除位图 Arc +
+    ///   紧迫度判定（`Engine::compaction_targets`）→ **drop 锁** → 对 `CompactTargets::run()` 执行
+    ///   **无锁合并**——写语句持 Engine 写锁与合并**并发执行**（不再写锁排队等读锁）；
+    ///   ssts 变更经 CF `sst_mutate` 与 flush 互斥（无丢失更新）。紧凑度调度由 targets 判定，
+    ///   每轮压最高紧迫度档（同 Engine::compact 串行分支），多轮循环收敛。
     fn spawn_compaction_worker(&self) {
         let engine = self.engine.clone();
         let pending = self.engine.read().unwrap().compact_pending.clone();
@@ -242,13 +244,10 @@ impl MySqlServer {
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
                 if signaled || backstop {
-                    // 合并阻塞写缓解（P71 阶段一）：锁内**单轮**合并（紧迫度调度每轮压最高档
-                    // 列族，配合 compact_input_max_mb 分批单轮快）→ 释放锁 → 下个 100ms 循环
-                    // 再试——写每轮之间可插入（旧实现锁内 while 8 轮连续合并，写长时间排队）。
-                    if let Ok(g) = engine.try_read() {
-                        if g.needs_compact() {
-                            let _ = g.compact();
-                        }
+                    // 读锁内 clone 目标（Arc clone 廉价）→ drop 锁 → 无锁合并
+                    let targets = engine.read().map(|g| g.compaction_targets()).unwrap_or(None);
+                    if let Some(t) = targets {
+                        let _ = t.run();
                     }
                     if backstop {
                         last_backstop = std::time::Instant::now();

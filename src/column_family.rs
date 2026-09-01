@@ -100,7 +100,7 @@ pub struct ColumnFamily {
     l0_stall_min: usize,
     l0_stall_max: usize,
     /// L 项：前台写压力（0~1，Ex-7.4 同源信号：MemTable 水位代理）——动态窗口反馈依据。
-    write_pressure: f64,
+    write_pressure: AtomicU64,
     /// P 项：L0 大小软阈值（字节；`storage.l0_max_size_mb`；0 = 禁用，仅用段数阈值）。
     l0_max_size_bytes: u64,
     /// 单次合并输入大小上限（字节；`storage.compact_input_max_mb`；0 = 不限）——
@@ -120,6 +120,10 @@ pub struct ColumnFamily {
     memtable: MemTableBuffer,
     /// SST 快照（O 项第③步：ArcSwap 原子发布——读路径 load 无锁，写路径 store 切换）。
     ssts: ArcSwap<SstSnapshot>,
+    /// P72（无锁合并）：SST 快照**变更互斥**——flush（snapshot_insert）与 compact
+    /// （finalize_compact）无 Engine 锁并发时，ssts 的 load→build→store + manifest 持久化
+    /// 需互斥（防两者基于旧快照 store，后写覆盖前写的并发丢失）。
+    sst_mutate: Mutex<()>,
     /// 共享块缓存（跨 CF 共享）。
     block_cache: Arc<BlockCache>,
     /// 单调 seq 分配器（跨重启由 WAL 恢复推进）。
@@ -278,7 +282,7 @@ impl ColumnFamily {
             l0_stall_threshold: cfg.storage.l0_stall_threshold,
             l0_stall_min: cfg.storage.l0_stall_min.max(2),
             l0_stall_max: cfg.storage.l0_stall_max.max(cfg.storage.l0_stall_min.max(2)),
-            write_pressure: 0.0,
+            write_pressure: AtomicU64::new(0.0f64.to_bits()),
             l0_max_size_bytes: cfg.storage.l0_max_size_mb * 1024 * 1024,
             compact_input_max_bytes: cfg.storage.compact_input_max_mb * 1024 * 1024,
             compaction_cooldown: cfg.storage.compaction_cooldown,
@@ -299,6 +303,7 @@ impl ColumnFamily {
                     sizes,
                 }))
             },
+            sst_mutate: Mutex::new(()),
             block_cache,
             seq: AtomicU64::new(1),
             next_sst_id: AtomicU64::new(next_sst_id),
@@ -366,7 +371,7 @@ impl ColumnFamily {
     }
 
     /// 写入原始字节键（组合索引等任意 key 使用）。
-    pub fn put_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
+    pub fn put_bytes(&self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
         let seq = self.put_bytes_nosync(key, value)?;
         self.sync_wal()?;
         Ok(seq)
@@ -374,7 +379,7 @@ impl ColumnFamily {
 
     /// 批量写入（不逐条 fsync，由调用方最终 `sync_wal` 统一提交）。
     /// 供亿级数据压测/导入使用；强安全模式逐条写请用 `put_bytes`。
-    pub fn put_bytes_nosync(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
+    pub fn put_bytes_nosync(&self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
         let seq = match self.wal_append(OP_PUT, &key, Some(&value)) {
             Ok(s) => s,
             // 环形 WAL 缓冲满：先落盘腾空（必要时强制 Flush）再重试
@@ -394,7 +399,7 @@ impl ColumnFamily {
 
     /// 统一提交 WAL 缓冲（批量写入结束时调用）。
     /// 环形 WAL 落盘若需回绕覆盖未刷盘记录 → 强制 Flush 后重试。
-    pub fn sync_wal(&mut self) -> Result<()> {
+    pub fn sync_wal(&self) -> Result<()> {
         let r = self.wal.lock().unwrap().sync();
         match r {
             Ok(()) => Ok(()),
@@ -407,14 +412,14 @@ impl ColumnFamily {
     }
 
     /// 删除（Tombstone，跨 flush/重启一致，见步骤 9）。
-    pub fn delete(&mut self, docid: u64) -> Result<u64> {
+    pub fn delete(&self, docid: u64) -> Result<u64> {
         self.delete_bytes(encode_docid(docid).to_vec())
     }
 
     /// 仅写 WAL 删除记录（Ex-5.6 删除位图路径）：不写 memtable Tombstone、不逐条 fsync
     /// （由 `sync_wal`/组提交统一提交）——墓碑不进入 LSM 层级；
     /// 记录保留用于增量备份导出与崩溃回放（Engine 层回放转 `Engine::delete` 重新置位，幂等）。
-    pub fn delete_record_wal(&mut self, key: Vec<u8>) -> Result<u64> {
+    pub fn delete_record_wal(&self, key: Vec<u8>) -> Result<u64> {
         match self.wal_append(OP_DELETE, &key, None) {
             Ok(s) => Ok(s),
             Err(Error::WalFull(_)) => {
@@ -426,7 +431,7 @@ impl ColumnFamily {
     }
 
     /// 删除原始字节键。
-    pub fn delete_bytes(&mut self, key: Vec<u8>) -> Result<u64> {
+    pub fn delete_bytes(&self, key: Vec<u8>) -> Result<u64> {
         let seq = match self.wal_append(OP_DELETE, &key, None) {
             Ok(s) => s,
             Err(Error::WalFull(_)) => {
@@ -441,7 +446,7 @@ impl ColumnFamily {
     }
 
     /// 环形 WAL 满处理：先落盘缓冲；仍满（回绕需覆盖未刷盘记录）则强制 Flush 后重试。
-    fn ensure_wal_room(&mut self) -> Result<()> {
+    fn ensure_wal_room(&self) -> Result<()> {
         let r = self.wal.lock().unwrap().sync();
         match r {
             Ok(()) => Ok(()),
@@ -455,7 +460,7 @@ impl ColumnFamily {
 
     /// 删除指定前缀的全部记录（阶段 1.5 Delta CF：全量 put 覆盖后清空该 docid 的增量）。
     /// 前缀上界 = prefix ++ [0xFF;4]（字段名长度前缀上限），闭区间扫描后逐条墓碑。
-    pub fn delete_prefix(&mut self, prefix: &[u8]) -> Result<u64> {
+    pub fn delete_prefix(&self, prefix: &[u8]) -> Result<u64> {
         let mut end = prefix.to_vec();
         end.extend_from_slice(&[0xFF; 4]);
         let rows = self.scan_raw_range(Some(prefix), Some(&end))?;
@@ -701,75 +706,78 @@ impl ColumnFamily {
         end: Option<&[u8]>,
         mut f: F,
     ) -> Result<()> {
-        // 源：memtable（immutable + mutable）借用 &self.memtable；SST 借用 &self.ssts
-        let mut mem_iters = self.memtable.iter_range(start, end);
-        let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
-        let snap = self.ssts.load();
-        for sst in snap.ssts.iter() {
-            sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
-        }
-        let mem_count = mem_iters.len();
-        let total = mem_count + sst_iters.len();
-        if total == 0 {
-            return Ok(());
-        }
-        // 各源当前条目 (key, value, seq)
-        let mut cur: Vec<Option<(Vec<u8>, Option<Vec<u8>>, u64)>> = Vec::with_capacity(total);
-        for it in mem_iters.iter_mut() {
-            cur.push(it.next().transpose()?);
-        }
-        for it in sst_iters.iter_mut() {
-            cur.push(it.next().transpose()?);
-        }
-        // k-way merge 用最小堆（O(N log K)，避免每轮线性扫全部源 O(N·K)——K 大时不可接受）
-        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
-            std::collections::BinaryHeap::new();
-        for (i, c) in cur.iter().enumerate() {
-            if let Some((k, _, _)) = c {
-                heap.push(std::cmp::Reverse((k.clone(), i)));
+        // 源：memtable（immutable + mutable）+ SST。P72：memtable 迭代器借用内部 RwLock 读锁
+        // 数据 → HRTB 闭包式（merge 主体在锁作用域内执行）；SST 借用 &self.ssts。
+        self.memtable.with_iter_range(start, end, |mut mem_iters| {
+            let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
+            let snap = self.ssts.load();
+            for sst in snap.ssts.iter() {
+                sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
             }
-        }
-        loop {
-            let Some(std::cmp::Reverse((min_key, i0))) = heap.pop() else {
-                break; // 全部耗尽
-            };
-            // 收集所有 key == min_key 的源（同 key 候选），取快照点前最大 seq（最新可见版本）
-            let mut to_advance: Vec<usize> = vec![i0];
-            while let Some(std::cmp::Reverse((k, i))) = heap.peek() {
-                if *k == min_key {
-                    to_advance.push(*i);
-                    heap.pop();
-                } else {
-                    break;
+            let mem_count = mem_iters.len();
+            let total = mem_count + sst_iters.len();
+            if total == 0 {
+                return Ok(());
+            }
+            // 各源当前条目 (key, value, seq)
+            let mut cur: Vec<Option<(Vec<u8>, Option<Vec<u8>>, u64)>> =
+                Vec::with_capacity(total);
+            for it in mem_iters.iter_mut() {
+                cur.push(it.next().transpose()?);
+            }
+            for it in sst_iters.iter_mut() {
+                cur.push(it.next().transpose()?);
+            }
+            // k-way merge 用最小堆（O(N log K)，避免每轮线性扫全部源 O(N·K)——K 大时不可接受）
+            let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
+                std::collections::BinaryHeap::new();
+            for (i, c) in cur.iter().enumerate() {
+                if let Some((k, _, _)) = c {
+                    heap.push(std::cmp::Reverse((k.clone(), i)));
                 }
             }
-            let mut best_seq = 0u64;
-            let mut best_val: Option<Vec<u8>> = None;
-            for i in to_advance {
-                let (k, v, seq) = cur[i].take().unwrap();
-                debug_assert!(k == min_key, "同 key 归并");
-                if seq <= snapshot_seq && seq >= best_seq {
-                    best_seq = seq;
-                    best_val = v;
-                }
-                // 推进该源到下一跳，重新入堆
-                cur[i] = if i < mem_count {
-                    mem_iters[i].next().transpose()?
-                } else {
-                    sst_iters[i - mem_count].next().transpose()?
+            loop {
+                let Some(std::cmp::Reverse((min_key, i0))) = heap.pop() else {
+                    break; // 全部耗尽
                 };
-                if let Some((nk, _, _)) = &cur[i] {
-                    heap.push(std::cmp::Reverse((nk.clone(), i)));
+                // 收集所有 key == min_key 的源（同 key 候选），取快照点前最大 seq（最新可见版本）
+                let mut to_advance: Vec<usize> = vec![i0];
+                while let Some(std::cmp::Reverse((k, i))) = heap.peek() {
+                    if *k == min_key {
+                        to_advance.push(*i);
+                        heap.pop();
+                    } else {
+                        break;
+                    }
+                }
+                let mut best_seq = 0u64;
+                let mut best_val: Option<Vec<u8>> = None;
+                for i in to_advance {
+                    let (k, v, seq) = cur[i].take().unwrap();
+                    debug_assert!(k == min_key, "同 key 归并");
+                    if seq <= snapshot_seq && seq >= best_seq {
+                        best_seq = seq;
+                        best_val = v;
+                    }
+                    // 推进该源到下一跳，重新入堆
+                    cur[i] = if i < mem_count {
+                        mem_iters[i].next().transpose()?
+                    } else {
+                        sst_iters[i - mem_count].next().transpose()?
+                    };
+                    if let Some((nk, _, _)) = &cur[i] {
+                        heap.push(std::cmp::Reverse((nk.clone(), i)));
+                    }
+                }
+                // 快照点前最新版本为 Tombstone → 该 key 在快照点已删除，不输出
+                if let Some(v) = best_val {
+                    if !f(min_key.as_slice(), &v)? {
+                        break; // 提前终止（游标续扫取满页）
+                    }
                 }
             }
-            // 快照点前最新版本为 Tombstone → 该 key 在快照点已删除，不输出
-            if let Some(v) = best_val {
-                if !f(min_key.as_slice(), &v)? {
-                    break; // 提前终止（游标续扫取满页）
-                }
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// 范围扫描并保留 seq 与 Tombstone（MVCC 快照 Delta 隔离用，M7-1）：
@@ -798,7 +806,8 @@ impl ColumnFamily {
     }
 
     /// MemTable 超阈值 → 冻结并刷盘（MVP 同步刷盘）。
-    fn maybe_flush(&mut self) -> Result<()> {
+    /// P72：`&self`（Engine 字段 Arc<ColumnFamily> 化后 flush 无法取 &mut）。
+    fn maybe_flush(&self) -> Result<()> {
         if self.memtable.mutable_bytes() < self.cfg.max_size_mb * 1024 * 1024 {
             return Ok(());
         }
@@ -806,7 +815,8 @@ impl ColumnFamily {
     }
 
     /// 冻结 Mutable → 刷盘为 SST → 更新 Manifest → 释放 Immutable。
-    pub fn switch_and_flush(&mut self) -> Result<()> {
+    /// P72：`&self`——memtable 冻结经内部 RwLock 写锁；ssts 发布经 `sst_mutate` 互斥。
+    pub fn switch_and_flush(&self) -> Result<()> {
         self.memtable.switch();
         let Some(imm) = self.memtable.take_immutable() else {
             return Ok(());
@@ -885,7 +895,8 @@ impl ColumnFamily {
     }
 
     /// 原逻辑：整个 Immutable 落盘为单个 SST。
-    fn flush_single(&mut self, imm: &MemTable) -> Result<()> {
+    /// P72：`&self` + `sst_mutate` 锁（store + manifest 原子发布，与无锁 compact 并发安全）。
+    fn flush_single(&self, imm: &MemTable) -> Result<()> {
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
         self.write_sst(&path, imm)?;
@@ -894,8 +905,10 @@ impl ColumnFamily {
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
         self.io_acquire(&path)?;
         let reader = SstReader::open_with_granularity(&path, self.index_granularity)?;
+        let _g = self.sst_mutate.lock().unwrap();
         self.snapshot_insert(reader);
         self.persist_manifest()?;
+        drop(_g);
         info!(
             "列族 [{}] 刷盘完成: {} ({} 条)",
             self.name,
@@ -907,7 +920,7 @@ impl ColumnFamily {
 
     /// TTL 分桶 flush：按文档 ttl_field 提取的 UTC 天分桶，每个桶一个 SST 文件；
     /// 无时间字段 / 非 JSON 值落入默认桶（无日期前缀，永不过期）。桶内 key 保持升序。
-    fn flush_buckets(&mut self, imm: &MemTable) -> Result<()> {
+    fn flush_buckets(&self, imm: &MemTable) -> Result<()> {
         let mut buckets: std::collections::BTreeMap<Option<i64>, Vec<BucketRow>> =
             std::collections::BTreeMap::new();
         imm.scan(|k, e| {
@@ -926,6 +939,7 @@ impl ColumnFamily {
                 .push((k.to_vec(), e.value.clone(), flag, e.seq));
         });
         let bucket_count = buckets.len();
+        let _g = self.sst_mutate.lock().unwrap();
         for (days, rows) in buckets {
             let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
             let fname = match days {
@@ -939,6 +953,7 @@ impl ColumnFamily {
             self.snapshot_insert(reader);
         }
         self.persist_manifest()?;
+        drop(_g);
         info!(
             "列族 [{}] TTL 分桶刷盘完成: {} 个桶",
             self.name, bucket_count
@@ -973,15 +988,17 @@ impl ColumnFamily {
 
     /// L 项：设置前台写压力（0~1，Ex-7.4 同源信号：MemTable 水位代理）——动态窗口反馈依据。
     /// 写压力高 → 有效 L0 阈值收窄（提前收敛防堆积 + 写 Stall）；低 → 放宽（降合并次数/写放大）。
-    pub fn set_write_pressure(&mut self, p: f64) {
-        self.write_pressure = p.clamp(0.0, 1.0);
+    pub fn set_write_pressure(&self, p: f64) {
+        self.write_pressure
+            .store(p.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// L 项：有效 L0 阈值 = 基础阈值 ± 压力调整（clamp 在 [min, max]）。
     /// 滞回由压力平滑（Ex-7.4 每次写后按水位重算）保证，防窗口振荡。
     fn effective_l0_threshold(&self) -> usize {
+        let pressure = f64::from_bits(self.write_pressure.load(Ordering::Relaxed));
         let range = self.l0_stall_max.saturating_sub(self.l0_stall_min);
-        let shrink = (range as f64 * self.write_pressure) as usize;
+        let shrink = (range as f64 * pressure) as usize;
         self.l0_stall_threshold
             .saturating_sub(shrink)
             .clamp(self.l0_stall_min, self.l0_stall_max)
@@ -1224,6 +1241,8 @@ impl ColumnFamily {
         dropped: usize,
     ) -> Result<CompactReport> {
         // ④ 原子发布新快照（先 store 后删旧文件；读线程持旧快照 Arc 期间句柄有效）
+        // P72：sst_mutate 互斥——与 flush（snapshot_insert）无 Engine 锁并发时防快照丢失更新
+        let _g = self.sst_mutate.lock().unwrap();
         let cur = self.ssts.load();
         let old_bytes: u64 = sel
             .iter()
@@ -1263,6 +1282,7 @@ impl ColumnFamily {
             sizes,
         }));
         self.persist_manifest()?;
+        drop(_g);
 
         // ⑤ 删除旧段（换快照后再删；并发读仍持 Arc → 句柄有效，引用归零后实际释放）
         for r in &old_ssts {
@@ -1459,7 +1479,7 @@ impl ColumnFamily {
     }
 
     /// 分配 seq 并追加 WAL 记录：外部全局 seq 优先（engine MVCC），否则内部自增。
-    fn wal_append(&mut self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
+    fn wal_append(&self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
         match &self.external_seq {
             Some(ext) => {
                 let seq = ext.fetch_add(1, Ordering::Relaxed);
@@ -1474,7 +1494,7 @@ impl ColumnFamily {
     /// 返回 `(最旧可用 seq, 过滤记录)`：`since_seq != 0` 且最旧可用 seq > since_seq+1 表示
     /// WAL 已被截断（环形覆盖 / 压缩），存在缺口 → 上层应改做全量备份。
     pub fn wal_records_since(
-        &mut self,
+        &self,
         since_seq: u64,
     ) -> Result<(u64, Vec<crate::wal::WalRecord>)> {
         let recs = self.wal.lock().unwrap().recover_records()?;
