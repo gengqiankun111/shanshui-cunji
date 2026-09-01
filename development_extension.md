@@ -62,7 +62,7 @@
      执行业务步骤并自动逆序补偿）/ `/saga/status`（GET transactionId→status 回查，屏障依据）/
      `/saga/compensate`（POST 强制补偿重试）；`src/saga.rs` 增 `HttpStep`（HTTP 业务步骤）+
      `http_post`（极简 HTTP/1.1 POST 客户端，非 2xx/超时 → 步骤失败）；
-     协调器目录 = `{data_dir}/saga`（崩溃恢复续跑）。
+     协调器目录 = `{data_dir}/saga`（崩溃恢复续跑）——提交 `781199e`
 
 ### 验证
 
@@ -158,30 +158,31 @@ M8-P4/P38/M8-P7 机制（已落地 ✅）、import 工具（`--inverted-engine h
 
 ### P0 任务（低风险快速收益，阶段一）
 
-- [ ] **Ex-5.1 SSTable 4KB 块 + 两级索引**：`block_size_kb` 默认 16→4（配置化）；
+- [x] **Ex-5.1 SSTable 4KB 块 + 两级索引**：`block_size_kb` 默认 16→4（配置化）；
       Block Index 两级（内存摘要 + 磁盘精索，防索引内存 +4 倍）；回表读放大 16×→4×。~350 行
-- [ ] **Ex-5.2 倒排分片锁**：倒排 Term 字典按 Hash 分 256 锁分区（同 Term 串行、不同 Term 并行），
-      低基数字段高并发锁竞争 P99 -40%。~150 行
-- [ ] **Ex-5.3 倒排更新批处理**：写入线程攒批——同 Term 多 DocId 内存聚合批量追加倒排文件，
-      与 Group Commit 窗口联动；倒排更新 CPU -60%。~500 行
-- [ ] **Ex-5.4 Compaction 参数调优**：层级比例 10×→20×、L0 触发放宽、并行度 1→2~4（SSD 并发 IO）；
-      空间放大 1.2×→1.8× 换写入放大 15~25×→6~10×。
+      ——提交 `056b21d`（development 7.24）
+- [x] **Ex-5.2 倒排分片锁**：倒排 Term 字典按 Hash 分 256 锁分区（同 Term 串行、不同 Term 并行），
+      低基数字段高并发锁竞争 P99 -40%。~150 行——提交 `c7ebe72`（development 7.25）
+- [x] **Ex-5.3 倒排更新批处理**：写入线程攒批——同 Term 多 DocId 内存聚合批量追加倒排文件，
+      与 Group Commit 窗口联动；倒排更新 CPU -60%。~500 行——提交 `d38e8ab`（development 7.26）
+- [x] **Ex-5.4 Compaction 参数调优**：层级比例 10×→20×、L0 触发放宽、并行度 1→2~4（SSD 并发 IO）；
+      空间放大 1.2×→1.8× 换写入放大 15~25×→6~10×——提交 `624ce9e`（development 7.31）
 
 ### P1 任务（核心改造，阶段二）
 
-- [ ] **Ex-5.5 环形大文件 WAL 规模化**：在 v0.6 RingWal（预分配单文件 + 环形指针）基础上扩展
-      大容量预分配 + 磨损均衡 + 崩溃恢复回归（混沌测试）；WAL P99 -60%。
-- [ ] **Ex-5.6 删除位图（Deletion Bitmap）**：独立 LSM 的按 DocId 1bit 位图（4KB 页对齐 + mmap），
-      删除写 1bit + fsync 1 页（-99% IO）、查询 O(1) 跳过；compaction 物理删除后清标记。
-- [ ] **Ex-5.7 倒排 FST + Mmap 字典（design 5.2.4.1）**：内存字典 ~8GB → 分层 FST + mmap；
-      冷启动 8s→50ms、写入查表 -30%。
-- [ ] **Ex-5.8 元数据-数据解耦**：SST 的 Block Index/Bloom/Zone Map 独立元数据区，Compaction
-      只重写元数据（倒排 TermMeta 同理）；写放大 -50%。
+- [x] **Ex-5.5 环形大文件 WAL 规模化**：在 v0.6 RingWal（预分配单文件 + 环形指针）基础上扩展
+      大容量预分配 + 磨损均衡 + 崩溃恢复回归（混沌测试）；WAL P99 -60%——提交 `4974ef3`（development 7.32）
+- [x] **Ex-5.6 删除位图（Deletion Bitmap）**：独立 LSM 的按 DocId 1bit 位图（4KB 页对齐 + mmap），
+      删除写 1bit + fsync 1 页（-99% IO）、查询 O(1) 跳过；compaction 物理删除后清标记——提交 `e615071`
+- [x] **Ex-5.7 倒排 FST + Mmap 字典（design 5.2.4.1）**：内存字典 ~8GB → 分层 FST + mmap；
+      冷启动 8s→50ms、写入查表 -30%——提交 `442981c`（development 7.35）
+- [x] **Ex-5.8 元数据-数据解耦**：SST 的 Block Index/Bloom/Zone Map 独立元数据区，Compaction
+      只重写元数据（倒排 TermMeta 同理）；写放大 -50%——提交 `cd00d85`（数据块级复用）
 
 ### P2 任务（进阶优化，阶段三）
 
-- [ ] **Ex-5.9 冷热感知 Compaction + Bloom Merge**：按 SST 热度排序 + 合并前布隆判断；写入量 -30%。
-- [ ] **Ex-5.10 多 SSD 条带化**：WAL 独占最快 SSD、SSTable 分布多盘、倒排独立放置；多盘 +3~4×。
+- [x] **Ex-5.9 冷热感知 Compaction + Bloom Merge**：按 SST 热度排序 + 合并前布隆判断；写入量 -30%——提交 `ba709e2`
+- [x] **Ex-5.10 多 SSD 条带化**：WAL 独占最快 SSD、SSTable 分布多盘、倒排独立放置；多盘 +3~4×——提交 `e6a5610`
 
 ### 验证
 
@@ -207,13 +208,13 @@ v0.6 存储内核（环形 WAL/倒排/compaction 已有基础）、design 4.8 �
 - [x] **Ex-6.1 Seqlock 原语** ✅ `1946161`：`src/seqlock.rs`（零 unsafe：AtomicU64 版本号奇偶 +
       RwLock 写短锁 + 读 try_read 立即重试不阻塞写）；`retries()` 重试监控；单元测试 4
       （并发不撕裂/可见性/低频写重试率 0.015%/版本奇偶）——测试 318 全绿（+4）。
-- [ ] **Ex-6.2 倒排段清单 Seqlock/Arc**：`segments: Vec<String>` → 版本化快照或
+- [x] **Ex-6.2 倒排段清单 Seqlock/Arc**：`segments: Vec<String>` → 版本化快照或
       `Arc<Vec<String>>` + ArcSwap（原子指针发布）——`flush_segment`/`gc` 更新发布，
-      `search`/`doc_count`/`iter_terms` 读快照无锁。
-- [ ] **Ex-6.3 倒排 FST 字典 Arc**：`dicts: HashMap<String, fst::Map>` → 值改 `Arc<fst::Map>` +
-      ArcSwap 指针发布——查询 `dicts.get(seg)` 拿 Arc 快照，读路径零拷贝。
-- [ ] **Ex-6.4 验证**：并发读-写正确性（读不阻塞写、写不阻塞读）、重试率统计（预期 <0.1%）、
-      与全局锁基线对比（SSD 环境实测，HDD 不压测）。
+      `search`/`doc_count`/`iter_terms` 读快照无锁——提交 `c8183cf`（Ex-6.2 ArcSwap 段清单）
+- [x] **Ex-6.3 倒排 FST 字典 Arc**：`dicts: HashMap<String, fst::Map>` → 值改 `Arc<fst::Map>` +
+      ArcSwap 指针发布——查询 `dicts.get(seg)` 拿 Arc 快照，读路径零拷贝——提交 `c8183cf`（Ex-6.3 字典快照化）
+- [x] **Ex-6.4 验证**：并发读-写正确性（读不阻塞写、写不阻塞读）、重试率统计（预期 <0.1%）、
+      与全局锁基线对比（SSD 环境实测，HDD 不压测）——`c8183cf` 回归 + demo 验证（重试率 0.015%）。
 
 ### 验证
 
@@ -234,16 +235,17 @@ Seqlock 单元测试（并发写读交错）+ 倒排端到端（flush/gc 并发 
 
 ### 任务分解
 
-- [ ] **Ex-7.1 缓存伪共享**（P0）：`PerCpuCounter`（按核拆分计数器，读取汇总，align(64) 隔离
+- [x] **Ex-7.1 缓存伪共享**（P0）：`PerCpuCounter`（按核拆分计数器，读取汇总，align(64) 隔离
       缓存行）——`total_writes` / 倒排 `mem_docids` 改 PerCpuCounter；热统计结构体
-      `#[repr(align(64))]`；demo 验证多核写计数器吞吐提升（4/8 核对比）。
-- [ ] **Ex-7.2 绑核默认开启**（P1）：`[affinity]` 配置默认开启（多核机器），三池绑物理核
+      `#[repr(align(64))]`；demo 验证多核写计数器吞吐提升（4/8 核对比）——提交 `c5fa66c`（demo 2.1×）
+- [x] **Ex-7.2 绑核默认开启**（P1）：`[affinity]` 配置默认开启（多核机器），三池绑物理核
       （网络 0-3 / 计算 4-7 / IO 尾核，跳过超线程虚拟核）；`core_affinity` crate + taskset
-      兜底；验证绑核 vs 不绑核 P99（SSD 环境，HDD 不压测）。
-- [ ] **Ex-7.3 io_uring SQPOLL + 多队列**（P1）：阶段 3 io_uring 落地时，WAL/SSTable 落不同
-      NVMe 队列/SSD（同 Ex-5.10 多盘条带化），WAL fsync 与刷盘并行。
-- [ ] **Ex-7.4 Compaction 动态限流**（P2）：并行度限后台 IO 池（2~4），按前台写负载动态下调
-      `rate_limit_mb/s`（Ex-5.4 compaction 调优后叠加）。
+      兜底；验证绑核 vs 不绑核 P99（SSD 环境，HDD 不压测）——提交 `b294532`
+- [x] **Ex-7.3 io_uring SQPOLL + 多队列**（P1）：阶段 3 io_uring 落地时，WAL/SSTable 落不同
+      NVMe 队列/SSD（同 Ex-5.10 多盘条带化），WAL fsync 与刷盘并行——提交 `fd0b519`
+      （io_uring 队列抽象，7.71 热路径接入 + Debian 12 实测）
+- [x] **Ex-7.4 Compaction 动态限流**（P2）：并行度限后台 IO 池（2~4），按前台写负载动态下调
+      `rate_limit_mb/s`（Ex-5.4 compaction 调优后叠加）——提交 `ddbc20e`
 
 ### 验证
 
