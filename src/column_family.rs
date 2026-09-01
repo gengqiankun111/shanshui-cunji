@@ -895,8 +895,10 @@ impl ColumnFamily {
     }
 
     /// 原逻辑：整个 Immutable 落盘为单个 SST。
-    /// P72：`&self` + `sst_mutate` 锁（store + manifest 原子发布，与无锁 compact 并发安全）。
+    /// P72/P73：`&self` + `sst_mutate` 锁全程持锁——id 分配、文件写入、store、manifest 原子
+    /// （无锁合并并发时：id 无重复、persist 不引用半写段）。
     fn flush_single(&self, imm: &MemTable) -> Result<()> {
+        let _g = self.sst_mutate.lock().unwrap();
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
         self.write_sst(&path, imm)?;
@@ -905,7 +907,6 @@ impl ColumnFamily {
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
         self.io_acquire(&path)?;
         let reader = SstReader::open_with_granularity(&path, self.index_granularity)?;
-        let _g = self.sst_mutate.lock().unwrap();
         self.snapshot_insert(reader);
         self.persist_manifest()?;
         drop(_g);
@@ -1282,12 +1283,15 @@ impl ColumnFamily {
             sizes,
         }));
         self.persist_manifest()?;
-        drop(_g);
 
-        // ⑤ 删除旧段（换快照后再删；并发读仍持 Arc → 句柄有效，引用归零后实际释放）
+        // ⑤ 删除旧段（P73 修复：在 sst_mutate 锁内完成——persist_manifest 以磁盘扫描重建清单，
+        // 若删旧段在锁外，flush 持锁 persist 时可能扫到未删旧段写入 manifest，随后旧段被删 →
+        // manifest 悬空引用已删文件 → 重启加载失败。store→persist→remove 原子一致）。
+        // 并发读仍持旧快照 Arc → 句柄有效，引用归零后实际释放。
         for r in &old_ssts {
             let _ = std::fs::remove_file(r.path());
         }
+        drop(_g);
         let freed_bytes = old_bytes.saturating_sub(self.sst_bytes());
         if dropped > 0 {
             info!(
@@ -1417,22 +1421,20 @@ impl ColumnFamily {
     }
 
     fn persist_manifest(&self) -> Result<()> {
-        // 以磁盘扫描维护清单（新→旧：id 降序），避免依赖 SstReader 内部状态；
-        // 层号按文件名从内存快照映射（缺省 0 = L0，兼容旧格式）
+        // P73 修复：用**内存快照**（ssts ArcSwap + levels）重建清单，**不扫描磁盘**——
+        // 无锁合并（P72）后 flush（Engine 写锁内写段文件）与合并（worker 无锁 persist）
+        // 并发，磁盘扫描会引用"正在写入、尚未写完"的半写段文件 → manifest 悬空引用
+        // 半写段 → 重启加载失败（SST seek 越界）。内存快照与 ssts store 原子一致
+        // （本函数在 sst_mutate 锁内调用：store→persist 原子）。
         let snap = self.ssts.load();
+        let mut files: Vec<String> = Vec::with_capacity(snap.ssts.len());
         let mut level_by_file: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
         for (sst, lv) in snap.ssts.iter().zip(&snap.levels) {
             if let Some(name) = sst.path().file_name() {
-                level_by_file.insert(name.to_string_lossy().to_string(), *lv);
-            }
-        }
-        let mut files: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if fname.starts_with(SST_PREFIX) {
-                files.push(fname);
+                let name = name.to_string_lossy().to_string();
+                files.push(name.clone());
+                level_by_file.insert(name, *lv);
             }
         }
         files.sort_by(|a, b| b.cmp(a));
