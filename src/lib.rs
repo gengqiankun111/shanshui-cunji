@@ -32,6 +32,7 @@ pub mod external_cache;
 pub mod gateway;
 pub mod hotcache;
 pub mod import_schema;
+pub mod indexer_proxy;
 pub mod inverted;
 pub mod io_queue;
 pub mod io_scheduler;
