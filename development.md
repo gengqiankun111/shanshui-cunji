@@ -1952,6 +1952,36 @@ impl RuntimePools {
 > 18× / auto_compact 检查 syscall 风暴）、事务类复测；problem_solving P69（缺定义补偿）
 > / P70（13.6/13.7 落地）闭环。
 
+### 7.62 导出增强：export --parquet（E 模块，Parquet 导出落地）
+
+> 2026-09-01。E 模块"导出增强（增量 / Parquet / JDBC）"的 Parquet 部分落地（`70c3b30`）。
+
+- `shanshui-cunji-export --parquet <out.parquet>`：两列 docid(Int64) + json(Utf8)，SNAPPY 压缩，
+  10 万行分块 ArrowWriter（复用 M8-P3 arrow/parquet 依赖）；与 `--csv` 并存（模式互斥）；
+- CLI 环回实测（`tmp_export_test.jsonl` 3 行）：JSONL 导入库 A → Parquet 导出 → Parquet 导入
+  库 B → CSV 导出，3 行往返一致；
+- 增量（docid 游标，对称 P3-4 增量导入）/ JDBC 留阶段 2+。
+
+### 7.63 io_uring Linux 部署验证指引（V 项收尾）
+
+> 2026-09-01。V 项代码已落地（crates/io-uring-file + IoUringPool 三队列 + SQPOLL 预留核 +
+> `[runtime] io_uring_enabled` 接入，Linux 门控）；本机（Windows，WSL 异常 / 无 Docker）无法
+> 实测，交付以下部署验证指引（阿里云 2 核/1.6GB 编译大依赖有 OOM 风险，建议 ≥4GB 环境）。
+
+1. **前置**：Linux 内核 ≥ 5.1（io_uring）；`crates/io-uring-file` 依赖 `io-uring 0.7` crate
+   （纯 Rust，无 liburing C 依赖——无需 gcc 交叉编译）；
+2. **编译**：Linux 上 `cargo build --release`（zstd-sys 需系统 gcc + 开发头，如
+   `apt install build-essential`）；
+3. **配置**：`[runtime] io_uring_enabled = true`（默认关，Windows 编译无此字段）+ 预留 SQPOLL
+   核（`[runtime] sqpoll_cpu`，需与绑定核池无重叠，见 affinity `reserve_sqpoll_core`）；
+4. **验证**：
+   - 启动 mysql-server 连小库 → 日志确认 io_uring 池初始化成功（无回退到同步 IO 的告警）；
+   - A/B 对比（io_uring 开 / 关）：YCSB 写重负载（WAL fsync 走 SQPOLL 队列）与读负载
+     （块 read_at 走 io_uring）的吞吐 / P50 / P95 延迟；
+   - 核隔离：`reserve_sqpoll_core` 预留核期间无业务线程落在该核（Ex-7.2 绑核验证方法）；
+5. **预期**：写路径 fsync 批处理与读路径异步提交减少 syscall 上下文切换；收益在核多 / 高
+   IOPS 场景显著，2 核小机器可能不显著。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

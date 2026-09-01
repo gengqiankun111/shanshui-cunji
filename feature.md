@@ -231,7 +231,7 @@
 | 倒排并发读 | ✅ ArcSwap 无锁快照（Ex-6.2/6.3）；引擎级仍经全局 Mutex | I 模块 🔄→✅ + 读写分离行澄清 |
 | **层/段两级 Zone Map 范围粗筛（R 项）** | ✅ `388a916`：层布隆 OR 合并数学不可行（P62：num_bits 冲突/L0=全集/meta-only 无 key）→ 层范围/层索引 + 点查层遍历整层跳过 + 段级越界跳过（精确零假阴性） | I 模块点查路径 |
 | **事务点查快照缓存（T 项）** | ✅ `0eca7a5`：Transaction 256 项 snap_cache（RR/SERIALIZABLE 同 key 二次读直达，提交/回滚即弃；RC 不缓存） | E/F 事务读 |
-| **io_uring 后端（V 项）** | ✅ `f09e9fb`（Linux 部署验证）：crates/io-uring-file（unsafe 白名单，io-uring 0.7 同步提交-等待 + SQPOLL/绑核）+ 主库 IoUringPool 三队列 + affinity SQPOLL 预留核 | io_queue 模块落地 |
+| **io_uring 后端（V 项）** | ✅ `f09e9fb`（代码）+ 部署验证指引 `7.63`（本机 Windows 无 Linux 环境：WSL 异常/无 Docker，交付 A/B 验证步骤供 Linux ≥4GB 环境执行） | io_queue 模块落地 |
 | **Compaction 紧迫度调度（W 项）** | ✅ `f09e9fb`：compaction_urgency（L0 段数×10+大小超限+8）跨列族调度——每轮压最高紧迫度档（并列并行），worker 多轮收敛 | D 模块调度 |
 | **Metrics /metrics（X 项）** | ✅ `0257835`：计数器 + 延迟对数直方图分层埋点（引擎/列族/网络）+ server.rs `GET /metrics`（Prometheus 文本） | 运维可观测 |
 | **4KB 块冷扫预读合并（U 项）** | ✅ `85b9a62`：SstRangeIter 组读 ≤4 块（合并 read_at + 预解码缓存，布局校验失败回退逐块） | I 模块扫描路径 |
