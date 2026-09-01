@@ -430,12 +430,14 @@ impl MySqlServer {
         });
     }
 
-    /// 绑定并接受连接（阻塞）。每连接 spawn 线程处理。
-    pub fn serve(self, addr: &str) -> Result<()> {
+    /// 绑定并接受连接（阻塞）。每连接 spawn 线程处理。返回**实际绑定地址**
+    /// （addr 为 `127.0.0.1:0` 时返回 OS 分配的随机端口——并发测试/动态端口场景）。
+    pub fn serve(self, addr: &str) -> Result<std::net::SocketAddr> {
         // O 项第③步：后台合并 worker（信号驱动 + 10 分钟兜底）——写路径只发信号，
         // 合并读锁下执行，读写均不被合并阻塞（替代 P 项写路径同步合并 + guard 定时器）。
         self.spawn_compaction_worker();
         let listener = TcpListener::bind(addr)?;
+        let local = listener.local_addr()?;
         tracing::info!("MySQL 协议服务已启动: mysql://{addr}（库 {DEFAULT_DB}，表 {DEFAULT_TABLE}）");
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
@@ -446,29 +448,35 @@ impl MySqlServer {
             let password = self.password.clone();
             let auto_id = self.auto_id.clone();
             let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-            std::thread::spawn(move || {
-                // X 项：连接计数（活跃/累计，/metrics 指标）
-                if let Ok(g) = engine.read() {
-                    g.metrics.active_conns.fetch_add(1, Ordering::Relaxed);
-                    g.metrics.total_conns.fetch_add(1, Ordering::Relaxed);
-                }
-                let r = handle_connection(
-                    &mut stream,
-                    engine.clone(),
-                    &user,
-                    &password,
-                    conn_id,
-                    auto_id,
-                );
-                if let Ok(g) = engine.read() {
-                    g.metrics.active_conns.fetch_add(-1, Ordering::Relaxed);
-                }
-                if let Err(e) = r {
-                    tracing::warn!("MySQL 会话结束: {e}");
-                }
-            });
+            // I 项高并发：连接线程小栈（512KB，默认 2MB/8MB）——高连接数下大幅降虚拟内存
+            // 占用（10k 连接 × 栈 = 5GB vs 20GB+），支撑更多并发查询连接
+            std::thread::Builder::new()
+                .name(format!("mysql-conn-{conn_id}"))
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    // X 项：连接计数（活跃/累计，/metrics 指标）
+                    if let Ok(g) = engine.read() {
+                        g.metrics.active_conns.fetch_add(1, Ordering::Relaxed);
+                        g.metrics.total_conns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let r = handle_connection(
+                        &mut stream,
+                        engine.clone(),
+                        &user,
+                        &password,
+                        conn_id,
+                        auto_id,
+                    );
+                    if let Ok(g) = engine.read() {
+                        g.metrics.active_conns.fetch_add(-1, Ordering::Relaxed);
+                    }
+                    if let Err(e) = r {
+                        tracing::warn!("MySQL 会话结束: {e}");
+                    }
+                })
+                .expect("连接线程 spawn 失败");
         }
-        Ok(())
+        Ok(local)
     }
 
     /// 测试用：绑定到随机端口并返回地址（单连接阻塞处理，供协议级测试）。
@@ -628,10 +636,22 @@ fn handle_connection(
                 }
             }
             COM_STMT_EXECUTE => {
-                // O 项第②步：预处理执行暂走写锁（sysbench 用 COM_QUERY 为主；预读优化留后）
-                let mut guard = engine.write().unwrap();
-                let resp = stmt_execute(&mut guard, &mut session, &cmd);
-                write_query_response(stream, seq0, resp)?;
+                // I 项高并发：预处理读语句（SELECT/SHOW 等）走 RwLock 读锁——sysbench
+                // point_select 等 PREPARE/EXECUTE 负载多连接并行（旧实现全走写锁串行）；
+                // 写语句（INSERT/UPDATE/DELETE）保持写锁互斥
+                match stmt_execute_sql(&session, &cmd) {
+                    Ok(sql) => {
+                        let resp = if is_read_statement(&sql) {
+                            let guard = engine.read().unwrap();
+                            dispatch_query_read(&guard, &sql, &mut session)
+                        } else {
+                            let mut guard = engine.write().unwrap();
+                            dispatch_query(&mut guard, &sql, &mut session)
+                        };
+                        write_query_response(stream, seq0, resp)?;
+                    }
+                    Err(resp) => write_query_response(stream, seq0, resp)?,
+                }
             }
             COM_STMT_CLOSE => {
                 // H-5：释放 statement（无响应包）
@@ -1118,19 +1138,21 @@ fn stmt_prepare(session: &mut Session, sql: &str) -> Vec<Vec<u8>> {
 
 /// H-5：COM_STMT_EXECUTE。解析参数（null bitmap + 类型 + 二进制值）→ 占位符替换 →
 /// 复用 COM_QUERY 分发逻辑。
-fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> QueryResponse {
+/// 解析 EXECUTE 包：取 SQL + 参数 → 占位符替换，返回最终可执行 SQL。
+/// （I 项高并发拆分：与 Engine 锁解耦，供读锁 / 写锁两条分发路径共用。）
+fn stmt_execute_sql(session: &Session, cmd: &[u8]) -> std::result::Result<String, QueryResponse> {
     if cmd.len() < 10 {
-        return QueryResponse::Err(1094, "EXECUTE 包过短".to_string());
+        return Err(QueryResponse::Err(1094, "EXECUTE 包过短".to_string()));
     }
     let stmt_id = u32::from_le_bytes(cmd[1..5].try_into().unwrap());
     let Some(sql) = session.statements.get(&stmt_id).cloned() else {
-        return QueryResponse::Err(1094, format!("未知 statement id {stmt_id}"));
+        return Err(QueryResponse::Err(1094, format!("未知 statement id {stmt_id}")));
     };
     let num_params = sql.bytes().filter(|b| *b == b'?').count();
     let null_len = (num_params + 7) / 8;
     let mut pos = 10usize;
     if pos + null_len > cmd.len() {
-        return QueryResponse::Err(1094, "EXECUTE 参数位图越界".to_string());
+        return Err(QueryResponse::Err(1094, "EXECUTE 参数位图越界".to_string()));
     }
     let null_bitmap = &cmd[pos..pos + null_len];
     pos += null_len;
@@ -1139,7 +1161,7 @@ fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> Query
     if cmd.get(pos).copied() == Some(1) {
         pos += 1;
         if pos + num_params * 2 > cmd.len() {
-            return QueryResponse::Err(1094, "EXECUTE 类型表越界".to_string());
+            return Err(QueryResponse::Err(1094, "EXECUTE 类型表越界".to_string()));
         }
         for _ in 0..num_params {
             types.push(cmd[pos]);
@@ -1157,7 +1179,7 @@ fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> Query
         match t {
             MYSQL_TYPE_LONGLONG => {
                 if pos + 8 > cmd.len() {
-                    return QueryResponse::Err(1094, "EXECUTE LONGLONG 越界".to_string());
+                    return Err(QueryResponse::Err(1094, "EXECUTE LONGLONG 越界".to_string()));
                 }
                 let v = u64::from_le_bytes(cmd[pos..pos + 8].try_into().unwrap());
                 pos += 8;
@@ -1165,7 +1187,7 @@ fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> Query
             }
             MYSQL_TYPE_LONG => {
                 if pos + 4 > cmd.len() {
-                    return QueryResponse::Err(1094, "EXECUTE LONG 越界".to_string());
+                    return Err(QueryResponse::Err(1094, "EXECUTE LONG 越界".to_string()));
                 }
                 let v = u32::from_le_bytes(cmd[pos..pos + 4].try_into().unwrap());
                 pos += 4;
@@ -1173,7 +1195,7 @@ fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> Query
             }
             MYSQL_TYPE_DOUBLE => {
                 if pos + 8 > cmd.len() {
-                    return QueryResponse::Err(1094, "EXECUTE DOUBLE 越界".to_string());
+                    return Err(QueryResponse::Err(1094, "EXECUTE DOUBLE 越界".to_string()));
                 }
                 let bits = u64::from_le_bytes(cmd[pos..pos + 8].try_into().unwrap());
                 pos += 8;
@@ -1183,10 +1205,10 @@ fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> Query
             _ => {
                 let len = match read_lenenc_raw(cmd, &mut pos) {
                     Ok(l) => l as usize,
-                    Err(e) => return QueryResponse::Err(1094, format!("参数长度越界: {e}")),
+                    Err(e) => return Err(QueryResponse::Err(1094, format!("参数长度越界: {e}"))),
                 };
                 if pos + len > cmd.len() {
-                    return QueryResponse::Err(1094, "EXECUTE 字符串越界".to_string());
+                    return Err(QueryResponse::Err(1094, "EXECUTE 字符串越界".to_string()));
                 }
                 let s = String::from_utf8_lossy(&cmd[pos..pos + len]).to_string();
                 pos += len;
@@ -1195,9 +1217,8 @@ fn stmt_execute(engine: &mut Engine, session: &mut Session, cmd: &[u8]) -> Query
             }
         }
     }
-    // 占位符替换 → 走 COM_QUERY 分发
-    let exec_sql = replace_params(&sql, &values);
-    dispatch_query(engine, &exec_sql, session)
+    // 占位符替换 → 返回最终 SQL（由调用方按读写分发）
+    Ok(replace_params(&sql, &values))
 }
 
 /// 按顺序把 SQL 中的 `?` 替换为参数值（values 已是 SQL 字面量形式）。
@@ -2452,5 +2473,58 @@ mod tests {
         c.authenticate("root", "secret", &scramble);
         let r = c.stmt_execute(999, 1u64);
         assert_eq!(r[0][0], ERR_PACKET, "未知 stmt_id → 错误");
+    }
+
+    #[test]
+    fn stmt_execute_concurrent_selects_all_succeed() {
+        // I 项高并发：预处理 SELECT 走 RwLock 读锁（旧实现全走写锁串行）——多连接并发
+        // PREPARE/EXECUTE point_select 全部成功、无死锁（读读并行路径正确性）
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        // serve 后台阻塞 accept（I 项小栈连接线程）；预取随机端口（bind-drop 竞态概率极低）
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        // 等待 accept 就绪（探测连接成功即就绪，连接随即被关闭）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server 5s 内未就绪"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let n_threads = 8;
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            handles.push(std::thread::spawn(move || {
+                let mut c = TestClient::connect(addr);
+                let (scramble, _) = c.handshake();
+                c.authenticate("root", "secret", &scramble);
+                let prep = c.stmt_prepare("SELECT * FROM documents WHERE id=?");
+                let stmt_id = u32::from_le_bytes(prep[0][1..5].try_into().unwrap());
+                let mut ok = 0u32;
+                for i in 1..=30u64 {
+                    let pk = c.stmt_execute(stmt_id, i);
+                    if pk[0][0] != ERR_PACKET {
+                        ok += 1;
+                    }
+                }
+                (t, ok)
+            }));
+        }
+        let mut total = 0u32;
+        for h in handles {
+            let (t, ok) = h.join().expect("并发 EXECUTE 线程应正常结束");
+            assert!(ok > 0, "线程 {t} 的 EXECUTE 全部失败");
+            total += ok;
+        }
+        assert_eq!(total, n_threads * 30, "并发预处理读全部成功（无死锁）");
     }
 }
