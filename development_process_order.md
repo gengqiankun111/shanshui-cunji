@@ -40,6 +40,7 @@
 | V | io_uring 后端落地 + SQPOLL 预留核 | P2 | ✅ 完成（Linux 部署验证） | f09e9fb：crates/io-uring-file（unsafe 白名单独立 crate，Linux 门控非 Linux 空编译）——io-uring 0.7 封装 read_at/write_at/fsync 同步提交-等待 + 可选 SQPOLL/绑核，4 个运行测试经 --target x86_64-unknown-linux-gnu 交叉 check 通过；主库 IoUringPool 三队列（WAL/SST/倒排按 IoClass 路由）+ Engine 持池（Linux + `runtime.io_uring_enabled` 初始化）+ affinity SQPOLL 预留核；热路径接入（sstable/wal）留 Linux 部署验证（主库 Linux 交叉编译受 zstd-sys 原生依赖阻塞） |
 | W | Compaction 优先级队列 | P2 | ✅ 完成 | f09e9fb：跨列族**紧迫度调度**——column_family::compaction_urgency（L0 段数×10 + 大小超限 +8），Engine::compact 每轮仅压最高紧迫度档列族（并列并行保留 SSD 并发），其余由后台 worker 后续轮次压实（while needs_compact 多轮）；压力最大列族（primary 主数据）优先收敛，读路径最快受益；433 测试全绿 |
 | X | Metrics（Prometheus 风格 /metrics） | P2 | ✅ 完成 | 0257835：新增 src/metrics.rs（原子计数器 + 延迟对数直方图 + Prometheus 文本渲染）分层埋点——引擎层（读写 ops/延迟/compact 次数）+ 列族层（flush_counter）+ 网络层（mysql 连接/语句计数）；server.rs `GET /metrics`（counter/histogram/gauge）；436 测试全绿 |
+| Y | 分布式延伸 + 写路径收尾（2026-09-01） | 延伸 | ✅ 完成 | SAGA 网关 HTTP API（Ex-2.5，781199e）+ 13.5 补偿协议（170bf21）+ 13.6 拓扑并行 + 13.7 后台对账（71aa712）；1 亿库写路径 syscall 风暴修复（96ac6bc，oltp_insert +795%）+ 合并阻塞分批缓解（1763554）；465 测试全绿；详见 development.md 7.57~7.61 / P71 |
 
 ## 3. 大项详情
 

@@ -628,6 +628,20 @@
   无定义跳过；网关 depends_on 成功 + 环 400 + 未知依赖 400。
 - **结果**：saga 28 全绿（+9），全量 459；提交 `71aa712`。
 
+### P71. 1 亿库写路径 syscall 风暴（l0_bytes 每次 put 调 fs::metadata）+ 合并阻塞写缓解
+- **问题**：1 亿库复测写类吞吐异常（oltp_insert 2.7k vs 基线 12.9k TPS）。A/B 逐步隔离：
+  组提交有效（关组提交 1,008 vs 2ms 18,404）、排除 auto_compact 合并（l0_max_size_mb=0 → 25,103）→
+  锁定 `needs_compact` 大小条件：`l0_max_size_mb>0` 且 L0≥2 时**每次 put**（engine `auto_compact`）
+  调 `l0_bytes()` 对每 L0 段 `fs::metadata`（3 stat/写 → syscall 风暴）。
+- **修复（96ac6bc）**：`SstReader::file_len`（open 一次 metadata）+ `SstSnapshot::sizes` 缓存
+  （open/flush/compact 三构建点填）→ `l0_bytes()`/`sst_bytes()` 读缓存求和，写路径零 syscall。
+- **验证**（8 线程 15s）：oltp_insert 2,676→23,964（+795%）、bulk_insert 4,630→210,895（+45×）、
+  oltp_update_non_index 3,145→8,896（+183%）；读类不受影响；+3 测试（file_len/sizes 磁盘一致/重开一致）。
+- **延伸（1763554）**：写路径观测另发现 worker 持读锁合并阻塞写（合并时写 39k→8.2k，-80%）——
+  `[storage] compact_input_max_mb`（默认 1024MB）分批 L0 输入（`cap_by_size` 保底 2 段），
+  单次合并快 → 写阻塞短（复测 -55%）；L1→L2 不受限；根治（无锁合并）留待后续。
+- **结果**：全量 465 绿；提交 `96ac6bc` + `1763554` + `b9a9eb3` + `0e4e40c`。
+
 ---
 
 ## 环境备忘（不入库）

@@ -235,7 +235,9 @@
 | **Compaction 紧迫度调度（W 项）** | ✅ `f09e9fb`：compaction_urgency（L0 段数×10+大小超限+8）跨列族调度——每轮压最高紧迫度档（并列并行），worker 多轮收敛 | D 模块调度 |
 | **Metrics /metrics（X 项）** | ✅ `0257835`：计数器 + 延迟对数直方图分层埋点（引擎/列族/网络）+ server.rs `GET /metrics`（Prometheus 文本） | 运维可观测 |
 | **4KB 块冷扫预读合并（U 项）** | ✅ `85b9a62`：SstRangeIter 组读 ≤4 块（合并 read_at + 预解码缓存，布局校验失败回退逐块） | I 模块扫描路径 |
-| problem_solving 范围 | P1~P67 | H 模块更新 |
+| **写路径 syscall 风暴（l0_bytes 快照缓存化）** | ✅ `96ac6bc`：`needs_compact` 大小条件每次 put 调 `fs::metadata`（L0≥2 段 N stat/写）→ 写吞吐崩塌（oltp_insert 2.7k）；`SstReader::file_len` + `SstSnapshot::sizes` 缓存（三构建点填）→ `l0_bytes()`/`sst_bytes()` 零 syscall；oltp_insert 2,676→23,964（+795%）、bulk_insert +45× | P 项写路径 + D 模块调度 |
+| **合并阻塞写缓解（分批合并）** | ✅ `1763554`：worker 持读锁合并阻塞写（-80%）→ `[storage] compact_input_max_mb`（默认 1024MB）`cap_by_size` 分批 L0 输入（保底 2 段，多轮收敛）；L1→L2 不受限；复测阻塞 -55%；根治（无锁合并）留待 | D 模块调度 |
+| problem_solving 范围 | P1~P71 | H 模块更新 |
 
 ### 2. 架构缺陷（已知，按优先级与排期映射）
 

@@ -1893,6 +1893,65 @@ impl RuntimePools {
   BEGIN/SELECT/COMMIT 事务点查 1744 txn/s（服务器单引擎串行下合理量级）；sysbench 本体需
   Linux/WSL 安装（Windows 无预编译）；
 
+### 7.57 SAGA 网关 HTTP API + 补偿协议（design_extension 13.1/13.5，Ex-2.5 + 13.5 落地）
+
+> 2026-08-31~09-01。SAGA 分布式事务从内核（Ex-2，7.44）接出 HTTP 网关并补全补偿协议；
+> 445 → 450 测试全绿。
+
+- **Ex-2.5 网关**（`781199e`）：`HttpStep`（HTTP 业务步骤，非 2xx/超时→失败）+ `http_post`
+  （极简 HTTP/1.1 POST 客户端）+ `server.rs` 三端点 `POST /saga/start`（`{tx_id, steps[]}`，
+  终态幂等）/ `GET /saga/status` / `POST /saga/compensate`；协调器持久化 `{data_dir}/saga`
+  崩溃恢复续跑；`Engine::data_dir()` 访问器；+3 网关 e2e；
+- **13.5 补偿协议**（`170bf21` + `136882f`）：修复"缺步骤定义被静默跳过并误标终态"——
+  未补偿分支保持 `Compensating` + `last_error`；+10 测试（13.5.3 半途恢复续跑正向/失败
+  续补偿/部分补偿不重复 + 缺定义保持待补偿/重试续补/跨重开持久化/终态 no-op + 超时屏障空转）；
+- 文档：design_extension 13.5 补偿协议形式化（状态机 + 不变量 I1~I4 + 崩溃恢复时序表）。
+
+### 7.58 SAGA 13.6/13.7 拓扑并行执行 + 后台对账重试（design_extension 13.6/13.7）
+
+> 2026-09-01。SAGA 长事务正向并行化 + 未终态自动收敛；450 → 459 测试全绿（提交 `71aa712`）。
+
+- **13.6 拓扑并行**：`topo_layers`（Kahn 分层 + 环/自依赖/越界检测 → 网关 400）+ `run_parallel`
+  （scoped 线程按拓扑层并行正向、层间屏障、失败转补偿；executed_steps 按层序登记 → 逆序补偿
+  = 反拓扑序）；`/saga/start` 解析 `depends_on`（未知/环 → 400）；`SagaStep` 加 `Send + Sync`；
+- **13.7 后台对账**：`SagaState` 增 `retry_count`/`last_retry_at_ms`/`updated_at_ms`
+  （serde default 兼容旧状态文件）+ `retry_pending`（Failed/Compensating 指数退避续补偿、
+  Executing 挂起检测、无步骤定义跳过）；`server.rs` 协调器 `Arc<Mutex>` 共享 + 步骤定义缓存
+  + 60s 对账线程；+9 测试（分层/环/依赖序/并行提速/反拓扑补偿/退避/挂起/网关环拒绝）。
+
+### 7.59 1 亿库复测 + 写路径 syscall 风暴修复（l0_bytes/sst_bytes 快照缓存化）
+
+> 2026-09-01。1 亿库（db-100m-v070）全套测试 + 定位并修复写路径性能崩塌；459 → 462 全绿。
+
+- **结构检查**：SST（NVSSTL01/V5）与 manifest 格式自构建以来零变化——兼容、无需重建；
+- **读类大幅提升**（R 项层/段 Zone Map 粗筛 + M 项范围一次扫描 + O 项 RwLock 无锁化）：
+  oltp_point_select 12,816（基线 5,087，+152%）、select_random_points 27,897（+342%）、
+  select_random_ranges 30,410（+330%）；
+- **写路径修复**（`96ac6bc`）：根因 = `needs_compact` 大小条件每次 put 调 `l0_bytes()` 的
+  `fs::metadata`（L0≥2 段时每次写 N 次 stat 的 syscall 风暴）→ 写吞吐崩塌（oltp_insert 2.7k TPS）。
+  修复：`SstReader::file_len`（open 一次 metadata）+ `SstSnapshot::sizes` 缓存
+  （open/flush/compact 构建时填）→ `l0_bytes()`/`sst_bytes()` 零 syscall；
+- **实测**（8 线程 15s）：oltp_insert 2,676→23,964（+795%）、bulk_insert 4,630→210,895（+45×）、
+  oltp_update_non_index 3,145→8,896（+183%）；+3 测试（file_len/sizes 与磁盘一致/重开一致）。
+
+### 7.60 写路径收尾：合并阻塞观测 + 分批合并（compact_input_max_mb）
+
+> 2026-09-01。后台 worker 持读锁合并阻塞写（RwLock 语义）的缓解；462 → 465 全绿（`1763554` + `0e4e40c`）。
+
+- **观测**（1 亿库写 ~1.5GB 触发合并）：合并期间写吞吐 39k → 8.2k rows/s（-80%），阻塞 ~60s；
+- **修复**：`[storage] compact_input_max_mb`（默认 1024MB）——`select_compaction_inputs` 对
+  L0→L1 输入按大小分批（`cap_by_size` 保底 2 段，剩余段 worker 多轮收敛）；L1→L2 不受限
+  （层内不重叠需全选）；复测合并期间写吞吐 8.2k → 18.2k（-55%）；
+- **说明**：分批缓解未根治——根治需无锁合并（CF Arc 化 + 合并与写并发），留待后续；
+- 事务类复测（写修复后与 O③ 持平）：read_only 523/561、read_write 243/215 TPS。
+
+### 7.61 1 亿库构建记录与问题闭环汇总
+
+> 2026-09-01。构建记录（images/perf-0.7.0/sysbench-100m/构建记录.md）追加：插入性能复测
+> （pymysql 单条 ~2k、批量 ~4k rows/s）、sysbench 全套对比基线、写路径 A/B 定位（组提交有效
+> 18× / auto_compact 检查 syscall 风暴）、事务类复测；problem_solving P69（缺定义补偿）
+> / P70（13.6/13.7 落地）闭环。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
