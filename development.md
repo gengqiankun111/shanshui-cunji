@@ -2053,6 +2053,24 @@ impl RuntimePools {
   JDBC 导出 5 行到本机 MySQL（3308）→ 点查数据完整；增量回归 cp 推进正常；
 - 全量测试 469 → **476 全绿**（export_pipeline 6 + 相关）。
 
+### 7.67 导出增强：MySQL 兼容 CSV 配套 + ClickHouse/MySQL 建表 DDL（E 模块，design 20.5）
+
+> 2026-09-01。E 模块"导出增强"的 **MySQL 兼容 CSV 配套**与 **建表 DDL** 落地（`313bd81`）。
+> 至此 design 20.5 导出功能基本完整：CSV/Parquet/JDBC/增量/流式管道/MySQL 兼容/DDL。
+
+- **`--mysql-compatible`**：CSV 导出后自动生成同名 `.sql` 配套文件（`CREATE TABLE IF NOT EXISTS` +
+  `LOAD DATA INFILE`——比逐条 INSERT 快 ~20 倍）；LOAD DATA 的 `FIELDS TERMINATED BY ',' ENCLOSED BY '"'`
+  与 RFC 4180 CSV 输出逐字段对齐；
+- **`--mysql-max-varchar <n>`**：doc 列 `VARCHAR(n)`（n>0）或 `TEXT`（默认）——处理 MySQL 65KB
+  行大小限制，超长字段降级 TEXT；
+- **`--dry-run-schema <out.sql> [--target clickhouse|mysql]`**：只生成目标库建表 DDL 不导出数据：
+  - ClickHouse：`docid UInt64 + doc String`，`ENGINE = MergeTree ORDER BY docid`（Parquet 导出后
+    `INSERT ... SELECT FROM file('*.parquet')` 直读）；
+  - MySQL：`docid BIGINT UNSIGNED PRIMARY KEY + doc VARCHAR(n)/TEXT`，`InnoDB utf8mb4`；
+- 端到端验证：ClickHouse/MySQL DDL 输出正确；CSV + 配套 SQL（建表 + LOAD DATA）生成正确；
+  +4 DDL 单元测试（TEXT/VARCHAR 切换、MergeTree、LOAD DATA FIELDS 对齐、DDL+LOAD 组装）；
+- 全量 **476 全绿**。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

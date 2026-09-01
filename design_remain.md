@@ -20,11 +20,12 @@
 - **已落地**：CSV 全量、Parquet 全量（`--parquet`，70c3b30）、增量导出（`--incremental --checkpoint`
   docid 游标断点续传，2174531）、流式管道（`--filter/--project/--mask` Filter+Projection+Sink 分叉，
   c6b5417）、JDBC 直连（`--jdbc mysql://...` MySQL wire 客户端建表+批量 INSERT，c6b5417）、
-  `--rate-limit` 限流（c6b5417）
+  `--rate-limit` 限流（c6b5417）、MySQL 兼容 CSV 配套（`--mysql-compatible` 自动生成 CREATE TABLE +
+  LOAD DATA INFILE SQL + `--mysql-max-varchar`，313bd81）、建表 DDL（`--dry-run-schema --target
+  clickhouse|mysql` MergeTree / InnoDB，313bd81）
 - **未落地**：
-  - **MySQL 兼容配套**：`--mysql-compatible` CSV 转义 + LOAD DATA INFILE 配套 SQL、`--mysql-max-varchar`
-  - **ClickHouse**：`--dry-run-schema` 建表 DDL（MergeTree 分区）
-  - **与 Compaction 共享后台 IO 优先级**（当前仅 --rate-limit 客户端节流）
+  - **与 Compaction 共享后台 IO 优先级**（当前仅 --rate-limit 客户端节流；导出侧服务器级
+    IO 优先级共享需 Engine IO 限速器接入，对在线业务影响 <5% 目标）
 
 ## 3. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + P73 3d58137）
 

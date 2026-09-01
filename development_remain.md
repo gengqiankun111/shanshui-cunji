@@ -11,10 +11,11 @@
 - **已完成**：CSV 全量、Parquet 全量（`--parquet`，70c3b30）、**增量导出**（`--incremental --checkpoint`
   docid 游标断点续传，2174531——首轮全量记 max、后续只导新增、断档自动全量重建）、**流式管道**
   （`--filter/--project/--mask` Filter+Projection+Sink 分叉 + `--rate-limit`，c6b5417）、
-  **JDBC 直连**（`--jdbc mysql://...` MySQL wire 客户端建表+批量 INSERT 无文件落盘，c6b5417）
+  **JDBC 直连**（`--jdbc mysql://...` MySQL wire 客户端建表+批量 INSERT 无文件落盘，c6b5417）、
+  **MySQL 兼容 CSV 配套**（`--mysql-compatible` CREATE TABLE + LOAD DATA INFILE SQL +
+  `--mysql-max-varchar`，313bd81）、**建表 DDL**（`--dry-run-schema` ClickHouse/MySQL，313bd81）
 - **待做**：
-  - **MySQL 兼容配套**：`--mysql-compatible` CSV 转义 + LOAD DATA INFILE 配套 SQL、`--mysql-max-varchar`
-  - **ClickHouse** `--dry-run-schema` 建表 DDL
+  - **与 Compaction 共享后台 IO 优先级**（导出侧服务器级限速，在线业务影响 <5% 目标）
 
 ## 2. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + 3d58137）
 
