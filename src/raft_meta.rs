@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Result;
 use crate::meta::MetaCenter;
 
@@ -26,14 +28,14 @@ pub enum RaftRole {
 }
 
 /// 元数据操作（日志条目 → 应用到 MetaCenter 状态机）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MetaOp {
     Register { node: String, addr: String, role: String },
     Unregister { node: String },
 }
 
 /// 日志条目。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetaEntry {
     pub term: u64,
     pub op: MetaOp,

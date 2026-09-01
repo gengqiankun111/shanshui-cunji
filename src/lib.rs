@@ -53,6 +53,7 @@ pub mod replication;
 pub mod reshard;
 pub mod rpc;
 pub mod raft_meta;
+pub mod raft_rpc;
 pub mod saga;
 pub mod scale_out;
 pub mod schema;

@@ -2444,6 +2444,30 @@ impl RuntimePools {
      对已删除 id 无效果），数学完全吻合；抽样点查正常。
 4. **回归**：520 全绿（+1 unquote 反转义单测）。
 
+### 7.85 AD 10 亿库阶段 C：raft 元数据 RPC 接线（raft 阶段二）
+
+> 2026-09-02。用户排期阶段 C（design-10b-extension.md §6）：scale_out + raft_meta 接 RPC
+> 通道——把 raft 消息从单进程确定性 `deliver` 解耦为 `RaftTransport` trait（真实节点间
+> 网络传输的抽象接线点）。
+
+1. **设计**（`src/raft_rpc.rs`）：
+   - `RaftMsg`（VoteReq/VoteResp/Append/AppendAck）公开 + serde 序列化（JSON-over-TCP
+     复用 rpc.rs 帧格式）；`MetaOp`/`MetaEntry` 补 serde derive；
+   - `RaftTransport` trait（send/recv）+ `LocalRaftTransport`（进程内队列中枢，
+     测试/单机多节点联调）；真实部署 TCP 实现接 MetaCenter 节点间通道；
+   - `RaftNodeRuntime<T>`：单节点状态机（term/role/log/commit/applied/votes）+ transport
+     驱动——收到消息处理并回发、`tick` 心跳超时自动选举（failover）、leader `propose`
+     日志追加 + Append 广播 → 提交 → 应用到 MetaCenter 状态机；多数派（N/2+1）与
+     脑裂安全语义同 raft_meta.rs 阶段一。
+2. **验证**（demo `raft-rpc` 4 测试 + kernel 5 单测）：
+   - 选举 / 日志复制（3 节点 master 一致）/ 自动 failover（leader 宕机 → follower 超时
+     新选举 → 新 leader 继续提议）/ 多数派存活（单节点宕机仍可提交）；
+   - `RaftMsg` JSON 序列化往返一致（RPC 传输协议）；
+   - 设计取舍：确定性驱动（刷新非目标心跳）模拟 Raft 随机超时，避免多节点同时竞选冲突。
+3. **回归**：525 全绿（+5 raft_rpc 单测）。
+4. **后续**：TCP 传输实现 + scale_out 编排与 raft 联动（真实 10 节点扩容/故障切换联调，
+   随部署推进）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

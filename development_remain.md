@@ -106,7 +106,11 @@
   （`src/shard_inverted.rs`：ShardedInvertedSearch 广播合并唯一 + 跨分片惰性分页窗口 +
   真实 Engine 集成验证），520 全绿
 - **待验证**：10 分片 10 亿构建（验收：构建 ≤60 分钟、点查 10 万+ QPS）+ 亿级 posting 规模回归
-- **阶段 C/D**：scale_out+raft_meta 接 RPC（raft 阶段二）、分片级可观测
+- **阶段 C（raft RPC 接线）— ✅ 已完成**（development.md 7.85）：
+  `src/raft_rpc.rs`——RaftMsg serde + RaftTransport trait（LocalRaftTransport 进程内/
+  TCP 接线点）+ RaftNodeRuntime（选举/日志复制/自动 failover/多数派，MetaOp 复制到
+  MetaCenter 状态机），525 全绿
+- **阶段 D（分片级可观测）**：分片 Metrics + docid 水位预警（接 /metrics）
 - **触发**：阶段 A 立即（10 亿库前提）；B/C/D 随节点规模/硬件推进
 
 ## 已完成基线（勿重复）
