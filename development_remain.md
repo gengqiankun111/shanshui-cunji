@@ -64,6 +64,16 @@
 - 多副本 raft 兜底——Calvin 阶段三 / 元数据切换需求
 - 增量备份已有（M6-5），增量导出待做（见 §1）
 
+## 8. 倒排段 GC 后台化（排期 J 项，✅ 完成 7.73 `b76dd40`）
+
+- **来源**：development_process_order J 项（P2）——原"gc() 需显式调用；后台线程周期触发"
+- **已落地**：InvertedIndex `next_seg_id → AtomicU64`、`flush_segment`/`gc` 改 `&self` +
+  `mutate: Mutex<()>`（与写路径 flush 序列化 Manifest 写/删段文件，防丢失更新）；
+  `read_segment_posting` 读段 NotFound 跳过（后台 GC 与查询并发）；Engine `inverted` Arc 化 +
+  `inverted_gc_pending` 信号（flush_inverted 刷盘后置位）；mysql 后台 GC worker
+  （信号 + 10 分钟兜底，读锁内 clone Arc 无锁执行 gc，不阻塞查询）
+- **回归**：485 全绿（+3：并发 flush/gc 无丢段、gc &self、worker 收敛段数）
+
 ## 已完成基线（勿重复）
 
 - 排期大项 A~Y 全完成（development_process_order.md 第 2 章）

@@ -2190,6 +2190,31 @@ impl RuntimePools {
    剩余"写路径（txn_commit/compaction）仍串行"属引擎写路径范畴（组提交已解决主瓶颈），维持
    M8-P1 暂缓结论，复制型读写分离留分布式阶段。
 
+### 7.73 倒排段 GC 后台化（J 项，P2：后台线程周期触发替代显式调用）
+
+> 2026-09-02。J 项原描述"gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，
+> 工程化）"。GC 后台化引入**两个并发问题**（demo inverted-gc-bg 前置研究）：
+
+1. **flush 与 gc 并发写 Manifest 丢失更新**（demo 确定性复现）：
+   - 竞态：flush 在 persist 前持旧段清单快照 → gc 完成（新清单 + 删旧段文件）→ flush 按旧
+     快照写 Manifest → **引用已删段** + 覆盖 gc 新清单（数据丢失）；
+   - 解法（对齐 CF `sst_mutate`）：`InvertedIndex` 新增 `mutate: Mutex<()>`——`flush_segment`
+     与 `gc` 序列化（Manifest 写 / 删段文件互斥）；有锁零缺失（demo 断言硬保证）；
+2. **后台 GC 与查询并发读旧段**：查询持旧段快照时 gc 已删文件 → `read_segment_posting`
+   open NotFound 时**跳过该段返回空**（数据已合并进新段，快照前后结果一致）；其他 IO 错误
+   （真损坏）照常传播；
+3. **&self 化改造**（后台线程持有 Arc 直接调用）：
+   - `next_seg_id: u64 → AtomicU64`；`flush_segment`/`gc` 改 `&self`（其余字段已是
+     ArcSwap/DashMap/Mutex 天然并发安全）；
+   - `Engine.inverted` → `Arc<InvertedIndex>`；`Engine::inverted_gc`/`flush_inverted` 改 `&self`；
+4. **后台 GC worker**（mysql 服务挂载，serve/serve_async 都 spawn）：
+   - 信号驱动：`Engine::flush_inverted` 刷盘后检测 `should_gc()` → 置 `inverted_gc_pending`；
+   - 100ms 轮询 + 10 分钟兜底；Engine 读锁内 clone inverted Arc → drop 锁 → 无锁执行
+     `gc()`（不阻塞查询；gc 内部 mutate 锁仅与写路径 flush 短暂互斥）；
+   - 段数爆炸不再依赖显式 `inverted_gc`（批量导入/长跑自动收敛）；
+5. **回归**：全量 **485 全绿**（+3：并发 flush/gc 无丢段完整性、gc &self（Arc 共享直接调用）、
+   worker 集成收敛段数 + 合并后数据可检索）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

@@ -39,6 +39,7 @@
 | 位图索引（枚举字段白名单，COUNT/AND/GROUP BY 快速路径） | ✅ | M7-2 `4a19550` |
 | 倒排 posting 缓存（term→bitmap LRU 256 项，Arc 浅拷贝 O(1)，写路径 add/flush/gc 失效） | ✅ | G 项 `c380792` |
 | 倒排段数据 mmap 化（`data_files: ArcSwap<HashMap<seg, Arc<MmapFile>>>`，FST offset 直接切片反序列化，免 fs::read 全量读） | ✅ | G/K 项（P50 `data_files` ArcSwap 化 + P53：gc 先换映射再删旧文件，Windows 已映射不可删） |
+| 倒排段 GC 后台化（后台线程周期触发替代显式调用：flush_segment/gc &self + mutate 互斥防丢失更新；Engine inverted Arc + 信号；mysql 后台 GC worker 信号+10 分钟兜底，不阻塞查询） | ✅ | J 项 `b76dd40`（7.73，485 全绿） |
 | 字段白名单 / 黑名单 / 长文本保护（max_term_len，防字典膨胀） | ✅ | M8-P4 `cde4f18`（字典压缩 45 万倍） |
 | fulltext 分词索引（长文本可检索，`ft:field:token`） | ✅ | M8-P7 `545682f` |
 | 中文 bigram 分词（中英混合文本检索） | ✅ | M8-P9 `72badfe` |
