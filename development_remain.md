@@ -25,12 +25,17 @@
   worker clone CF Arc 无锁合并）+ **P73 manifest 竞态修复**（3d58137：persist 内存快照 +
   store→persist→remove 原子）+ 回归测试（5de5ab0）；1 亿库实测合并期写不塌陷；469 全绿
 
-## 3. Ex-1.5 与 M5 双写扩容协议衔接
+## 3. Ex-1.5 与 M5 双写扩容协议衔接（✅ 完成 7.76 `8f8c1ea`）
 
 - **来源**：development_extension Ex-1 剩余 / development 7.43
-- **状态**：`[ ]` 未完成——outbox 投递器 + 幂等消费已落地（7348acd），"双写→追平→切换"改造为
-  "本地事务写 + outbox 待办 + 排空校验"留待**真实扩容联调**时落地
-- **前置**：需两节点扩容场景（真实分布式构建阶段）
+- **已落地**：扩容编排协调器 `src/scale_out.rs`——ADDING→CATCH_UP→DRAIN→SWITCH→DONE
+  状态机（防跳步/终态拒绝）+ **回滚预案**（路由不切换/新节点摘除/幂等）+ 状态持久化崩溃续跑；
+  "双写→追平→切换"改造为 **"本地事务写 + outbox 待办 + 排空校验"**（业务只写主节点，
+  outbox 消息同 seq/fsync 本地原子；追平 = dispatch_outbox → RPC repl.apply 幂等应用到
+  新节点；排空校验 = outbox_drained + 数据一致性抽样，**未排空禁止切换**）
+- **衔接**：meta.rs 路由（switch 提升新节点 master / rollback 回退）+ replication.rs
+  repl.apply 幂等 + outbox.rs 幂等消费；生产接 RPC，测试进程内双 Engine
+- **回归**：494 全绿（+6：scale_out 状态机 5 + engine e2e 1）
 
 ## 4. io_uring Linux 部署实测
 

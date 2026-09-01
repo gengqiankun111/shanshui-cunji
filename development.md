@@ -2257,6 +2257,29 @@ impl RuntimePools {
 - Ex-2.5 补提交号 `781199e`；development_remain.md §6 标记完成；
 - 至此排期大项 A~AC + 扩展 Ex-1~7 全部闭环，**所有任务 checkbox 均与代码一致**。
 
+### 7.76 Ex-1.5 双写扩容协议衔接（P0-1：扩容编排协调器）
+
+> 2026-09-02。Ex-1 落地 outbox 后（7348acd），Ex-1.5 把原 M5 "双写→追平→切换"改造为
+> **"本地事务写 + outbox 待办 + 排空校验"**（development 7.43 留待真实扩容联调；本会话
+> 落地为可测试的编排协调器，生产 RPC 衔接 repl.apply）。
+
+1. **扩容编排状态机**（新增 `src/scale_out.rs`）：
+   - `ADDING`（新节点注册 slave）→ `CATCH_UP`（outbox 增量追平）→ `DRAIN`（排空校验）→
+     `SWITCH`（路由切换）→ `DONE`（新节点接管）；任意阶段失败 → `ROLLBACK`；
+   - 状态机合法性：禁止跳步（如 ADDING 直接 DRAIN 拒绝）、终态（DONE/ROLLBACK）后推进拒绝、
+     重复回滚幂等 no-op；编排状态**持久化**（`{data_dir}/scale-out.json`，tmp+rename 原子写）
+     ——崩溃恢复 `resume` 续跑；
+2. **职责划分（低耦合）**：协调器只做状态机 + 状态持久化 + 路由更新（MetaCenter）；投递/
+   取数/校验由调用方用 engine outbox API 完成并反馈：
+   - 追平：`engine.dispatch_outbox` → 投递回调（生产 = RPC `repl.apply` 幂等应用；测试 =
+     进程内双 Engine put 覆盖）；
+   - 排空校验：`outbox_drained`（pending=0）+ 数据一致性抽样（主/新节点逐 docid 对比）——
+     **未排空禁止切换**（防切脏数据，demo drain_check_rejects_switch 验证）；
+   - 切换/回滚：`meta.register(target, master)` + `unregister(source)`（回滚反向）；
+3. **回归**：494 全绿（+6：scale_out 状态机 5——正常切换/回滚保持旧节点/防跳步/终态拒绝
+   幂等/崩溃恢复；engine e2e——写主+outbox 本地原子 → 追平 → 排空 → 切换 → 新节点数据一致）；
+   demo `src/demo/scale-out` 4 测试（含漏投一致性检测、排空拒绝）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
