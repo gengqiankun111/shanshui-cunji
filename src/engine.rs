@@ -1224,6 +1224,24 @@ impl Engine {
         self.primary.scan_range(start, end)
     }
 
+    /// 流式主键范围扫描（design 20.5 导出管道）：回调按 docid 升序收到 `(docid, value)`；
+    /// 返回 `false` 提前终止（取满批/游标续扫）。内存 O(批)，不随扫描总量膨胀。
+    pub fn scan_stream<F: FnMut(u64, &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        mut f: F,
+    ) -> Result<()> {
+        let sk = start.map(|s| encode_docid(s).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        self.primary.scan_stream(sk.as_deref(), ek.as_deref(), |key, val| {
+            let docid = decode_docid(key).map_err(|_| {
+                crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+            })?;
+            f(docid, val)
+        })
+    }
+
     /// 事务范围扫描（M 项，事务类查询优化 P0）：RR/SERIALIZABLE 走 `scan_range_at`
     /// 快照版本过滤（一次 k-way merge 扫描，替代逐 id `txn_get`）；同事务未提交写
     /// （`read_own`）覆盖扫描结果；事务内删除的 docid 从结果中排除。

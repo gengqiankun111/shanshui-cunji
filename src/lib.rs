@@ -27,6 +27,7 @@ pub mod demo;
 pub mod engine;
 pub mod error;
 pub mod explain;
+pub mod export_pipeline;
 pub mod external_cache;
 pub mod gateway;
 pub mod hotcache;

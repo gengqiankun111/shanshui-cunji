@@ -2,12 +2,12 @@
 //!
 //! 用法：`shanshui-cunji-export --csv out.csv [--config config.toml]`
 //!       `shanshui-cunji-export --parquet out.parquet [--config config.toml]`
-//!       `shanshui-cunji-export --csv out.csv --incremental --checkpoint cp.txt [--config config.toml]`
-//! CSV：两列 docid, json（RFC 4180 转义，csv crate）。
-//! Parquet：两列 docid(Int64), json(Utf8)，SNAPPY 压缩，分块写入。
+//!       `shanshui-cunji-export --jdbc 'mysql://root@127.0.0.1:3306/db' [--table t] [--config config.toml]`
+//! 导出管道（design 20.5）：流式扫描 → Filter（--filter 'field op value AND ...'）→
+//! Projection（--project 'a,b,c' 字段子集 + --mask 'f=pat' 脱敏）→ Sink 分叉
+//! （CSV / Parquet / JDBC 直连）。--rate-limit <rows/s> 限流；--batch-size 每批行数。
 //! 增量（design 20.5）：`--incremental`（DocId 游标断点续传）——首次全量导出并记录最大 docid
-//! 到 checkpoint；后续只导 `docid > checkpoint` 的新数据并推进游标（对称 P3-4 增量导入；
-//! JDBC / updated_at 时间戳游标留阶段 2+）。
+//! 到 checkpoint；后续只导 `docid > checkpoint` 的新数据并推进游标（对称 P3-4 增量导入）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,15 +19,28 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 use shanshui_cunji::config::Config;
+use shanshui_cunji::error::Result;
+use shanshui_cunji::export_pipeline::{Filter, Projection, Sink};
 use shanshui_cunji::migrate::{load_checkpoint, save_checkpoint};
+use shanshui_cunji::mysql::MysqlWireClient;
+
+/// 默认批大小（design 20.5：内存恒定 = 批 × 单行，如 10k × 1KB ≈ 10MB）。
+const DEFAULT_BATCH: usize = 10_000;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut csv_path: Option<PathBuf> = None;
     let mut parquet_path: Option<PathBuf> = None;
+    let mut jdbc_url: Option<String> = None;
+    let mut table = "export_rows".to_string();
     let mut checkpoint_path: Option<PathBuf> = None;
     let mut incremental = false;
     let mut config_path = PathBuf::from("config.toml");
+    let mut filter_expr: Option<String> = None;
+    let mut project_expr: Option<String> = None;
+    let mut masks: Vec<String> = Vec::new();
+    let mut rate_limit: f64 = 0.0;
+    let mut batch_size = DEFAULT_BATCH;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -43,6 +56,18 @@ fn main() {
                     parquet_path = Some(PathBuf::from(&args[i]));
                 }
             }
+            "--jdbc" => {
+                i += 1;
+                if i < args.len() {
+                    jdbc_url = Some(args[i].clone());
+                }
+            }
+            "--table" => {
+                i += 1;
+                if i < args.len() {
+                    table = args[i].clone();
+                }
+            }
             "--checkpoint" => {
                 i += 1;
                 if i < args.len() {
@@ -50,6 +75,36 @@ fn main() {
                 }
             }
             "--incremental" => incremental = true,
+            "--filter" => {
+                i += 1;
+                if i < args.len() {
+                    filter_expr = Some(args[i].clone());
+                }
+            }
+            "--project" => {
+                i += 1;
+                if i < args.len() {
+                    project_expr = Some(args[i].clone());
+                }
+            }
+            "--mask" => {
+                i += 1;
+                if i < args.len() {
+                    masks.push(args[i].clone());
+                }
+            }
+            "--rate-limit" => {
+                i += 1;
+                if i < args.len() {
+                    rate_limit = args[i].parse().unwrap_or(0.0);
+                }
+            }
+            "--batch-size" => {
+                i += 1;
+                if i < args.len() {
+                    batch_size = args[i].parse().unwrap_or(DEFAULT_BATCH);
+                }
+            }
             "--config" | "-c" => {
                 i += 1;
                 if i < args.len() {
@@ -60,9 +115,33 @@ fn main() {
         }
         i += 1;
     }
-    let Some((out, mode)) = csv_path.map(|p| (p, "csv")).or_else(|| parquet_path.map(|p| (p, "parquet"))) else {
-        eprintln!("❌ 用法: shanshui-cunji-export --csv <out.csv> | --parquet <out.parquet> [--incremental --checkpoint <cp>] [--config config.toml]");
+    // 输出目标：--csv / --parquet / --jdbc 三选一
+    let mode = if csv_path.is_some() {
+        "csv"
+    } else if parquet_path.is_some() {
+        "parquet"
+    } else if jdbc_url.is_some() {
+        "jdbc"
+    } else {
+        eprintln!("❌ 用法: shanshui-cunji-export --csv <out.csv> | --parquet <out.parquet> | --jdbc 'mysql://...'");
+        eprintln!("    [--incremental --checkpoint <cp>] [--filter 'field op value AND ...'] [--project 'a,b']");
+        eprintln!("    [--mask 'field=pat'] [--rate-limit <rows/s>] [--batch-size <n>] [--config config.toml]");
         std::process::exit(1);
+    };
+
+    let filter = match Filter::parse(filter_expr.as_deref()) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    };
+    let projection = match Projection::parse(project_expr.as_deref(), &masks) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
     };
 
     let cfg = match Config::load(&config_path) {
@@ -82,9 +161,14 @@ fn main() {
     };
 
     // 增量模式：checkpoint 默认与输出同路径（.checkpoint 后缀）；读游标
-    let cp_path = checkpoint_path
-        .clone()
-        .unwrap_or_else(|| out.with_extension("checkpoint"));
+    let out: Option<PathBuf> = csv_path.clone().or_else(|| parquet_path.clone());
+    let cp_path = match &checkpoint_path {
+        Some(cp) => cp.clone(),
+        None => out
+            .as_ref()
+            .map(|p| p.with_extension("checkpoint"))
+            .unwrap_or_else(|| PathBuf::from("export.checkpoint")),
+    };
     let base = if incremental {
         match load_checkpoint(&cp_path) {
             Ok(b) => b,
@@ -98,125 +182,250 @@ fn main() {
         0
     };
 
-    let t = std::time::Instant::now();
-    let result = match mode {
-        "csv" => export_csv(&mut engine, &out, base),
-        _ => export_parquet(&mut engine, &out, base),
+    // 构建 Sink（分叉目标）
+    let mut sink: Box<dyn Sink> = match mode {
+        "csv" => Box::new(CsvSink::new(csv_path.as_ref().unwrap()).unwrap_or_else(|e| {
+            eprintln!("❌ CSV 创建失败: {e}");
+            std::process::exit(1);
+        })),
+        "parquet" => Box::new(ParquetSink::new(parquet_path.as_ref().unwrap()).unwrap_or_else(|e| {
+            eprintln!("❌ Parquet 创建失败: {e}");
+            std::process::exit(1);
+        })),
+        _ => Box::new(JdbcSink::new(jdbc_url.as_ref().unwrap(), &table).unwrap_or_else(|e| {
+            eprintln!("❌ JDBC 连接失败: {e}");
+            std::process::exit(1);
+        })),
     };
-    match result {
-        Ok((rows, max_docid)) => {
-            if incremental && max_docid > base {
-                if let Err(e) = save_checkpoint(&cp_path, max_docid) {
-                    eprintln!("❌ checkpoint 写入失败: {e}");
-                    std::process::exit(1);
-                }
-                println!(
-                    "✅ 增量导出完成: {} 行（docid {}..={}）→ {}（{:.0} ms），游标推进至 {}",
-                    rows,
-                    base + 1,
-                    max_docid,
-                    out.display(),
-                    t.elapsed().as_secs_f64() * 1000.0,
-                    max_docid
-                );
-            } else {
-                println!(
-                    "✅ 导出完成: {} 行 → {}（{:.0} ms）",
-                    rows,
-                    out.display(),
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
+
+    let t = std::time::Instant::now();
+    // 流式扫描 → Filter → Projection → 攒批 → Sink（内存恒定 = batch × 单行）
+    let start = if base > 0 { Some(base + 1) } else { None };
+    let mut rows: Vec<(u64, String)> = Vec::with_capacity(batch_size);
+    let mut count = 0u64;
+    let mut max_docid = base;
+    let scan = engine.scan_stream(start, None, |docid, val| {
+        let doc = std::str::from_utf8(val).map_err(|_| {
+            shanshui_cunji::error::Error::Corrupted("导出值非 UTF-8".into())
+        })?;
+        // Filter：无条件时跳过 JSON 解析（原样透传）
+        let text: String = if filter.is_empty() {
+            doc.to_string()
+        } else {
+            let v: serde_json::Value = serde_json::from_str(doc).map_err(|_| {
+                shanshui_cunji::error::Error::Corrupted(format!("docid={docid} JSON 解析失败"))
+            })?;
+            if !filter.matches(&v) {
+                return Ok(true); // 条件不通过：跳过
             }
+            if projection.is_identity() {
+                doc.to_string()
+            } else {
+                projection.apply(&v)?
+            }
+        };
+        count += 1;
+        max_docid = max_docid.max(docid);
+        rows.push((docid, text));
+        if rows.len() >= batch_size {
+            flush_batch(&mut *sink, &mut rows, rate_limit)?;
         }
+        Ok(true)
+    });
+    match scan {
+        Ok(()) => {}
         Err(e) => {
             eprintln!("❌ 导出失败: {e}");
             std::process::exit(1);
         }
     }
-}
+    flush_batch(&mut *sink, &mut rows, rate_limit).unwrap_or_else(|e| {
+        eprintln!("❌ 导出失败: {e}");
+        std::process::exit(1);
+    });
+    sink.finish().unwrap_or_else(|e| {
+        eprintln!("❌ 导出完成失败: {e}");
+        std::process::exit(1);
+    });
 
-/// CSV 导出（两列 docid, json）。`base` = 增量游标（0 = 全量）。
-fn export_csv(
-    engine: &mut shanshui_cunji::engine::Engine,
-    out: &PathBuf,
-    base: u64,
-) -> Result<(u64, u64), String> {
-    let mut wtr = csv::WriterBuilder::new()
-        .from_path(out)
-        .map_err(|e| e.to_string())?;
-    let _ = wtr.write_record(["docid", "json"]);
-    let start = if base > 0 { Some(base + 1) } else { None };
-    let all = engine.scan_range(start, None).map_err(|e| e.to_string())?;
-    let mut rows = 0u64;
-    let mut max_docid = base;
-    for (docid, bytes) in all {
-        let json_str = String::from_utf8_lossy(&bytes);
-        if wtr
-            .write_record([docid.to_string(), json_str.into_owned()])
-            .is_err()
-        {
-            break;
+    // 增量：推进 checkpoint（原子 tmp+rename）
+    if incremental && max_docid > base {
+        if let Err(e) = save_checkpoint(&cp_path, max_docid) {
+            eprintln!("❌ checkpoint 写入失败: {e}");
+            std::process::exit(1);
         }
-        rows += 1;
-        max_docid = max_docid.max(docid);
+        println!(
+            "✅ 增量导出完成: {} 行（docid {}..={}）→ {}（{:.0} ms），游标推进至 {}",
+            count,
+            base + 1,
+            max_docid,
+            out.as_ref().map_or_else(|| jdbc_url.as_ref().unwrap().as_str(), |p| p.to_str().unwrap()),
+            t.elapsed().as_secs_f64() * 1000.0,
+            max_docid
+        );
+    } else {
+        println!(
+            "✅ 导出完成: {} 行 → {}（{:.0} ms）",
+            count,
+            out.as_ref().map_or_else(|| jdbc_url.as_ref().unwrap().as_str(), |p| p.to_str().unwrap()),
+            t.elapsed().as_secs_f64() * 1000.0
+        );
     }
-    let _ = wtr.flush();
-    Ok((rows, max_docid))
 }
 
-/// Parquet 导出（docid Int64 + json Utf8，SNAPPY，分块 10 万行批量写）。`base` = 增量游标。
-fn export_parquet(
-    engine: &mut shanshui_cunji::engine::Engine,
-    out: &PathBuf,
-    base: u64,
-) -> Result<(u64, u64), String> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("docid", DataType::Int64, false),
-        Field::new("json", DataType::Utf8, false),
-    ]));
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| e.to_string())?;
+/// 攒批刷新到 Sink（可选限流：每批按目标速率 sleep）。
+fn flush_batch(
+    sink: &mut dyn Sink,
+    rows: &mut Vec<(u64, String)>,
+    rate_limit: f64,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let batch: Vec<(u64, &str)> = rows.iter().map(|(d, s)| (*d, s.as_str())).collect();
+    sink.write_batch(&batch)?;
+    if rate_limit > 0.0 {
+        // 目标批间隔 = 批行数 / 速率（秒）；保守 sleep 到满批时长
+        let target = rows.len() as f64 / rate_limit;
+        std::thread::sleep(std::time::Duration::from_secs_f64(target));
+    }
+    rows.clear();
+    Ok(())
+}
 
-    let start = if base > 0 { Some(base + 1) } else { None };
-    let all = engine.scan_range(start, None).map_err(|e| e.to_string())?;
-    let mut rows = 0u64;
-    let mut max_docid = base;
-    let mut ids = Vec::with_capacity(100_000);
-    let mut jsons = Vec::with_capacity(100_000);
-    for (docid, bytes) in all {
-        ids.push(docid as i64);
-        jsons.push(String::from_utf8_lossy(&bytes).into_owned());
-        rows += 1;
-        max_docid = max_docid.max(docid);
-        if ids.len() >= 100_000 {
-            write_batch(&mut writer, &schema, &ids, &jsons)?;
-            ids.clear();
-            jsons.clear();
+// ============ Sink 实现 ============
+
+/// CSV Sink：两列 docid, json（RFC 4180 转义，csv crate）。
+struct CsvSink {
+    wtr: csv::Writer<std::fs::File>,
+}
+
+impl CsvSink {
+    fn new(out: &PathBuf) -> Result<Self> {
+        let mut wtr = csv::WriterBuilder::new()
+            .from_path(out)
+            .map_err(|e| shanshui_cunji::error::Error::Unsupported(e.to_string()))?;
+        let _ = wtr.write_record(["docid", "json"]);
+        Ok(Self { wtr })
+    }
+}
+
+impl Sink for CsvSink {
+    fn write_batch(&mut self, rows: &[(u64, &str)]) -> Result<()> {
+        for (docid, doc) in rows {
+            if self
+                .wtr
+                .write_record([docid.to_string(), doc.to_string()])
+                .is_err()
+            {
+                break;
+            }
         }
+        Ok(())
     }
-    if !ids.is_empty() {
-        write_batch(&mut writer, &schema, &ids, &jsons)?;
+    fn finish(&mut self) -> Result<()> {
+        self.wtr.flush().map_err(shanshui_cunji::error::Error::Io)
     }
-    writer.close().map_err(|e| e.to_string())?;
-    Ok((rows, max_docid))
 }
 
-fn write_batch(
-    writer: &mut ArrowWriter<std::fs::File>,
-    schema: &Arc<Schema>,
-    ids: &[i64],
-    jsons: &[String],
-) -> Result<(), String> {
-    let rb = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(ids.to_vec())),
-            Arc::new(StringArray::from(jsons.to_vec())),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    writer.write(&rb).map_err(|e| e.to_string())
+/// Parquet Sink：两列 docid(Int64), json(Utf8)，SNAPPY 压缩，分块批量写。
+struct ParquetSink {
+    writer: Option<ArrowWriter<std::fs::File>>,
+    schema: Arc<Schema>,
+    ids: Vec<i64>,
+    jsons: Vec<String>,
+}
+
+impl ParquetSink {
+    fn new(out: &PathBuf) -> Result<Self> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("docid", DataType::Int64, false),
+            Field::new("json", DataType::Utf8, false),
+        ]));
+        let props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build();
+        let file = std::fs::File::create(out).map_err(shanshui_cunji::error::Error::Io)?;
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .map_err(|e| shanshui_cunji::error::Error::Unsupported(e.to_string()))?;
+        Ok(Self {
+            writer: Some(writer),
+            schema,
+            ids: Vec::with_capacity(100_000),
+            jsons: Vec::with_capacity(100_000),
+        })
+    }
+}
+
+impl Sink for ParquetSink {
+    fn write_batch(&mut self, rows: &[(u64, &str)]) -> Result<()> {
+        for (docid, doc) in rows {
+            self.ids.push(*docid as i64);
+            self.jsons.push(doc.to_string());
+            if self.ids.len() >= 100_000 {
+                self.flush_arrow()?;
+            }
+        }
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        self.flush_arrow()?;
+        if let Some(w) = self.writer.take() {
+            w.close()
+                .map_err(|e| shanshui_cunji::error::Error::Unsupported(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl ParquetSink {
+    fn flush_arrow(&mut self) -> Result<()> {
+        if self.ids.is_empty() {
+            return Ok(());
+        }
+        let rb = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(self.ids.clone())),
+                Arc::new(StringArray::from(self.jsons.clone())),
+            ],
+        )
+        .map_err(|e| shanshui_cunji::error::Error::Unsupported(e.to_string()))?;
+        self.writer
+            .as_mut()
+            .unwrap()
+            .write(&rb)
+            .map_err(|e| shanshui_cunji::error::Error::Unsupported(e.to_string()))?;
+        self.ids.clear();
+        self.jsons.clear();
+        Ok(())
+    }
+}
+
+/// JDBC Sink（design 20.5）：直连目标 MySQL，建表 + 批量 INSERT（无文件落盘）。
+struct JdbcSink {
+    client: MysqlWireClient,
+    table: String,
+}
+
+impl JdbcSink {
+    fn new(url: &str, table: &str) -> Result<Self> {
+        let mut client = MysqlWireClient::from_url(url)?;
+        client.connect()?;
+        // 建表（幂等）：docid BIGINT UNSIGNED 主键 + doc JSON 文本列
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS `{table}` (docid BIGINT UNSIGNED PRIMARY KEY, doc TEXT)"
+        );
+        client.query(&ddl)?;
+        Ok(Self {
+            client,
+            table: table.to_string(),
+        })
+    }
+}
+
+impl Sink for JdbcSink {
+    fn write_batch(&mut self, rows: &[(u64, &str)]) -> Result<()> {
+        self.client.insert_batch(&self.table, rows)
+    }
 }
