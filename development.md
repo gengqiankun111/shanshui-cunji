@@ -2215,6 +2215,37 @@ impl RuntimePools {
 5. **回归**：全量 **485 全绿**（+3：并发 flush/gc 无丢段完整性、gc &self（Arc 共享直接调用）、
    worker 集成收敛段数 + 合并后数据可检索）。
 
+### 7.74 fulltext 大 posting 反序列化优化（K 项，P2：段内 posting 分块延迟加载）
+
+> 2026-09-02。K 项背景（db-50m 实测）：content 高频词 posting ~1600 万 docid，RoaringBitmap
+> 紧凑序列化 ~数 MB，首次反序列化 ~100ms+（mmap 缺页 + 解析）。G 项 LRU 缓存解决重复查询，
+> 首次仍全量。候选方案「段内 posting 分块延迟加载」落地（demo posting-chunk 前置验证）。
+
+1. **段格式 v2 → v3**（SEG_VERSION=3）：
+   - posting 条目 payload 改为**分块布局**：`[u32 容器数][每容器 14B 头：high u16 + card u32 +
+     off u32 + len u32][容器数据区]`；
+   - 每个容器 = Roaring 单容器 bitmap（值 = **完整 docid** → 容器级对齐，`result |= c` 合并
+     零额外成本）；写路径（flush_segment/gc）用 `encode_posting_v3`；
+   - **旧段 v2 兼容**：段文件头带版本，读路径按段版本分发（v2 紧凑 / v3 分块），老库不重建；
+2. **快速路径**（惰性游标 `PostingCursor`：持 `Arc<MmapFile>` 零拷贝，容器级按需反序列化）：
+   - `search_paged(term, offset, limit)`：跨内存 + 各段 k-way merge（`merge_distinct`），只解码
+     窗口覆盖的容器——近页从全量反序列化降至窗口解码；total 为容器头基数之和（跨段重复
+     docid 时为上界，后台 GC 收敛后精确）；
+   - `doc_count(term)`：归并**精确跨段去重**计数（不收集 docid 列表）；
+   - engine `search_term_paged` / fulltext 分页走快速路径；
+3. **A/B 实测**（demo posting-chunk，16,666,667 posting，release）：
+
+   | 场景 | v2 紧凑全量 | v3 分块 | 结论 |
+   |---|---|---|---|
+   | 近页 1000 | 2.69ms | 12.8µs | **x211**（只解码 1 容器） |
+   | COUNT | 2.69ms | 600ns | **x4491**（只读容器头） |
+   | 全量解码（search） | 2.69ms | 2.80ms | 持平（x1.0） |
+   | 数据体积 | 6109KB | 6115KB | +0.1%（头部 10KB） |
+
+4. **决策**：分块布局全量解码与紧凑持平（容器级 OR 零成本）、分页/COUNT 快 2-4 个数量级、
+   数据几乎无膨胀——收益成立，段格式 v3 落地（v2 旧段兼容读取）。
+5. **回归**：全量 **488 全绿**（+3：分页与全量 search 窗口一致、跨段重复去重、v3 往返）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

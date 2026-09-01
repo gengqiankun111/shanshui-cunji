@@ -74,6 +74,17 @@
   （信号 + 10 分钟兜底，读锁内 clone Arc 无锁执行 gc，不阻塞查询）
 - **回归**：485 全绿（+3：并发 flush/gc 无丢段、gc &self、worker 收敛段数）
 
+## 9. fulltext 大 posting 反序列化优化（排期 K 项，✅ 完成 7.74 `ed2588d`）
+
+- **来源**：development_process_order K 项（P2）——原"5000 万库 content 词 posting ~1600 万，
+  首次反序列化 ~100ms+；候选：段内 posting 分块延迟加载"
+- **已落地**：段格式 v2→v3 posting 分块布局（容器头索引 + 独立容器字节，值存完整 docid
+  容器级对齐）；`search_paged`/`doc_count` 惰性游标 k-way merge（分页只解码窗口容器、
+  COUNT 精确跨段去重）；engine search_term_paged/fulltext 分页走快速路径；旧段 v2 兼容读取
+- **实测**（demo posting-chunk，1600 万 posting）：近页 x211、COUNT x4491、全量分块解码
+  与紧凑持平（x1.0）、数据仅 +0.1%
+- **回归**：488 全绿（+3：分页与全量一致、跨段去重、v3 往返）
+
 ## 已完成基线（勿重复）
 
 - 排期大项 A~Y 全完成（development_process_order.md 第 2 章）
