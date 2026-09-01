@@ -1552,6 +1552,18 @@ mod tests {
     }
 
     #[test]
+    fn sst_reader_file_len_matches_disk() {
+        // 修复（96ac6bc）：open 时一次 metadata 缓存 file_len——后续 l0_bytes/sst_bytes
+        // 读快照 sizes 缓存零 syscall；此处验证缓存值与磁盘实际字节数一致。
+        let path = tmp();
+        write_sample(&path, 100);
+        let r = SstReader::open(&path).unwrap();
+        let disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(r.file_len(), disk, "file_len 缓存 = 磁盘实际字节数");
+        assert!(r.file_len() > 0, "非空段 file_len > 0");
+    }
+
+    #[test]
     fn sst_range_iter_matches_scan_range() {
         // M8-P10 流式迭代器：与 scan_range 输出完全一致（全量 + 范围过滤 + 升序）
         let path = tmp();

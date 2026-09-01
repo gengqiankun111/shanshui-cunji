@@ -2648,6 +2648,79 @@ mod tests {
         assert!(!cf2.needs_compact(), "单段超大小阈值不应触发合并");
     }
 
+    #[test]
+    fn l0_bytes_and_sst_bytes_match_disk_sizes() {
+        // 修复（96ac6bc）：l0_bytes/sst_bytes 读快照 sizes 缓存（零 fs::metadata），
+        // 验证缓存值与磁盘实际文件大小一致——open/flush/compact 三个构建点均正确。
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // flush 3 段（L0）
+        for seg in 0..3u64 {
+            for i in seg * 50..seg * 50 + 50 {
+                cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+        }
+        let disk_l0: u64 = {
+            let snap = cf.ssts.load();
+            snap.ssts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| snap.levels[*i] == 0)
+                .map(|(_, s)| std::fs::metadata(s.path()).unwrap().len())
+                .sum()
+        };
+        let disk_all: u64 = {
+            let snap = cf.ssts.load();
+            snap.ssts
+                .iter()
+                .map(|s| std::fs::metadata(s.path()).unwrap().len())
+                .sum()
+        };
+        assert_eq!(cf.l0_bytes(), disk_l0, "L0 字节 = 磁盘实际和（flush 构建点 sizes 缓存）");
+        assert_eq!(cf.sst_bytes(), disk_all, "全部字节 = 磁盘实际和");
+        // sizes 与每段 file_len 一致（修复双缓存同源）
+        let snap = cf.ssts.load();
+        for (i, s) in snap.ssts.iter().enumerate() {
+            assert_eq!(snap.sizes[i], s.file_len(), "sizes[{i}] = file_len");
+        }
+        // compact 发布点：新快照 sizes 随合并更新，仍与磁盘一致
+        cf.compact().unwrap();
+        let disk_all2: u64 = {
+            let snap = cf.ssts.load();
+            snap.ssts
+                .iter()
+                .map(|s| std::fs::metadata(s.path()).unwrap().len())
+                .sum()
+        };
+        assert_eq!(cf.sst_bytes(), disk_all2, "compact 后 sizes 仍与磁盘一致");
+    }
+
+    #[test]
+    fn sizes_cache_survives_reopen() {
+        // 修复：load（重开）构建点 sizes 正确——重开后 l0_bytes/sst_bytes 仍与磁盘一致
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            for i in 0..50u64 {
+                cf.put(i, format!("v-{i}").into_bytes()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+        } // drop = 关闭
+        let cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        let disk_all: u64 = {
+            let snap = cf2.ssts.load();
+            snap.ssts
+                .iter()
+                .map(|s| std::fs::metadata(s.path()).unwrap().len())
+                .sum()
+        };
+        assert_eq!(cf2.sst_bytes(), disk_all, "重开后 sizes 缓存仍正确");
+        assert_eq!(cf2.l0_bytes(), disk_all, "单层全 L0 → l0_bytes = 全部字节");
+    }
+
     // ---------- S 项：MemTable 多版本（严格 MVCC 快照读） ----------
 
     #[test]
