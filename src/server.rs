@@ -14,8 +14,10 @@
 //! filter 语法（MVP 子集）：`field=value`，多条件用 ` AND ` 连接（位图交集）；
 //! `docid=...` 走主键点查。
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -23,9 +25,30 @@ use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::optimizer::QuerySpec;
 
+/// SAGA 网关协调器共享句柄（13.7 对账线程与请求处理串行共享）。
+type SagaShared = Arc<Mutex<crate::saga::SagaCoordinator>>;
+/// SAGA 步骤定义缓存（tx_id → /saga/start 原始 steps JSON；对账重试重建步骤用）。
+type SagaStepsCache = Arc<Mutex<HashMap<String, Value>>>;
+
+/// 对账周期（13.7，秒）。
+const SAGA_RECONCILE_INTERVAL_SECS: u64 = 60;
+/// Executing 挂起阈值（13.7，毫秒）。
+const SAGA_STALL_MS: u64 = 60_000;
+/// 补偿重试指数退避上限（13.7，毫秒）。
+const SAGA_MAX_BACKOFF_MS: u64 = 300_000;
+
+/// 当前纪元毫秒（13.7 对账时间基准，与 saga.rs 同源）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 启动 HTTP 服务（阻塞运行，进程终止即退出）。串行处理连接（MVP）。
 /// `broadcast`：小表广播 JOIN 选项（design 19.3，阶段 3），None 表示关闭广播。
-/// SAGA 网关（Ex-2.5）：协调器持久化目录 = `{data_dir}/saga`，`/saga/*` 端点由此服务。
+/// SAGA 网关（Ex-2.5）：协调器持久化目录 = `{data_dir}/saga`，`/saga/*` 端点由此服务；
+/// 13.7：spawn 后台对账线程（Failed/Compensating 自动续补偿、Executing 挂起检测）。
 pub fn serve(
     engine: &mut Engine,
     addr: &str,
@@ -34,11 +57,63 @@ pub fn serve(
     // Ex-7.2：server 主线程绑网络核（绑定失败忽略——单核/受限环境 no-op）
     crate::affinity::bind_current(&engine.network_cores());
     let saga_dir = engine.data_dir().join("saga");
-    let saga = crate::saga::SagaCoordinator::open(&saga_dir)?;
+    let saga: SagaShared = Arc::new(Mutex::new(crate::saga::SagaCoordinator::open(&saga_dir)?));
+    let steps_cache: SagaStepsCache = Arc::new(Mutex::new(HashMap::new()));
+    spawn_reconciler(saga.clone(), steps_cache.clone());
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     tracing::info!("HTTP-JSON 服务已启动: http://{local}（SAGA 网关目录 {}）", saga_dir.display());
-    serve_listener(engine, listener, broadcast, Some(saga))
+    serve_listener(engine, listener, broadcast, Some(saga), Some(steps_cache))
+}
+
+/// 13.7 后台对账线程：周期扫描未终态事务，按指数退避自动续补偿（无步骤定义则跳过留人工）。
+fn spawn_reconciler(saga: SagaShared, steps_cache: SagaStepsCache) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(SAGA_RECONCILE_INTERVAL_SECS));
+        let now = now_ms();
+        let (mut coord, cache) = match (saga.lock(), steps_cache.lock()) {
+            (Ok(c), Ok(s)) => (c, s),
+            _ => continue, // 中毒/其他：下周期再试
+        };
+        let retried = coord.retry_pending(
+            |tx| {
+                cache
+                    .get(tx)
+                    .map(http_steps_from_json)
+                    .unwrap_or_default()
+            },
+            now,
+            SAGA_STALL_MS,
+            SAGA_MAX_BACKOFF_MS,
+        );
+        if retried > 0 {
+            tracing::info!("SAGA 对账器触发 {retried} 个事务续补偿");
+        }
+    });
+}
+
+/// 从 steps JSON 数组重建 HTTP 步骤（对账重试与 start 解析共用；非法项跳过）。
+fn http_steps_from_json(arr: &Value) -> Vec<Box<dyn crate::saga::SagaStep>> {
+    let mut out: Vec<Box<dyn crate::saga::SagaStep>> = Vec::new();
+    if let Some(items) = arr.as_array() {
+        for st in items {
+            if let (Some(name), Some(compensate_url)) = (
+                st.get("name").and_then(|x| x.as_str()),
+                st.get("compensate_url").and_then(|x| x.as_str()),
+            ) {
+                let action_url = st.get("action_url").and_then(|x| x.as_str()).unwrap_or("");
+                let payload = st
+                    .get("payload")
+                    .map(|p| serde_json::to_string(p).unwrap_or_default())
+                    .unwrap_or_default()
+                    .into_bytes();
+                out.push(Box::new(crate::saga::HttpStep::new(
+                    name, action_url, compensate_url, payload,
+                )));
+            }
+        }
+    }
+    out
 }
 
 /// 接受连接并分发请求（供 `serve` 与测试复用）。
@@ -46,7 +121,8 @@ fn serve_listener(
     engine: &mut Engine,
     listener: TcpListener,
     broadcast: Option<crate::join::JoinBroadcast>,
-    mut saga: Option<crate::saga::SagaCoordinator>,
+    saga: Option<SagaShared>,
+    steps_cache: Option<SagaStepsCache>,
 ) -> Result<()> {
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -56,7 +132,9 @@ fn serve_listener(
                 continue;
             }
         };
-        if let Err(e) = handle_connection(engine, &mut stream, broadcast, &mut saga) {
+        if let Err(e) =
+            handle_connection(engine, &mut stream, broadcast, saga.as_ref(), steps_cache.as_ref())
+        {
             tracing::warn!("请求处理失败: {e}");
         }
     }
@@ -68,10 +146,12 @@ fn handle_connection(
     engine: &mut Engine,
     stream: &mut TcpStream,
     broadcast: Option<crate::join::JoinBroadcast>,
-    saga: &mut Option<crate::saga::SagaCoordinator>,
+    saga: Option<&SagaShared>,
+    steps_cache: Option<&SagaStepsCache>,
 ) -> Result<()> {
     let (method, path, query, body) = read_http_request(stream)?;
-    let (status, payload) = route_request(engine, &method, &path, &query, &body, broadcast, saga);
+    let (status, payload) =
+        route_request(engine, &method, &path, &query, &body, broadcast, saga, steps_cache);
     write_http_response(stream, status, &payload)
 }
 
@@ -457,7 +537,8 @@ fn route_request(
     query: &str,
     body: &[u8],
     broadcast: Option<crate::join::JoinBroadcast>,
-    saga: &mut Option<crate::saga::SagaCoordinator>,
+    saga: Option<&SagaShared>,
+    steps_cache: Option<&SagaStepsCache>,
 ) -> (u16, String) {
     match (method, path) {
         ("POST", "/put") => handle_put(engine, body),
@@ -476,7 +557,7 @@ fn route_request(
         ("POST", "/delete") => handle_delete(engine, body, query),
         ("GET", "/delete") => handle_delete(engine, body, query),
         // Ex-2.5 SAGA 网关（无协调器挂载时 501）
-        ("POST", "/saga/start") => handle_saga_start(saga, body),
+        ("POST", "/saga/start") => handle_saga_start(saga, steps_cache, body),
         ("GET", "/saga/status") => handle_saga_status(saga, query),
         ("POST", "/saga/compensate") => handle_saga_compensate(saga, body),
         _ => (
@@ -493,12 +574,15 @@ fn route_request(
 // ---------------------------------------------------------------------------
 
 /// `POST /saga/start` `{"tx_id":"t1","steps":[{"name":"扣款","action_url":"...",
-/// "compensate_url":"...","payload":"..."}]}` → 执行（失败自动逆序补偿）。
+/// "compensate_url":"...","payload":"...","depends_on":["..."]}]}` → 执行（失败自动逆序补偿）。
+/// 13.6：steps[i] 可选 `depends_on`（依赖步骤名数组）→ 拓扑并行执行；无依赖 → 原串行 `run`。
+/// 13.7：成功后缓存步骤定义（对账重试重建用）。
 fn handle_saga_start(
-    saga: &mut Option<crate::saga::SagaCoordinator>,
+    saga: Option<&SagaShared>,
+    steps_cache: Option<&SagaStepsCache>,
     body: &[u8],
 ) -> (u16, String) {
-    let Some(coord) = saga else {
+    let Some(coord_arc) = saga else {
         return (501, json!({"error": "SAGA 协调器未挂载"}).to_string());
     };
     let v: Value = match serde_json::from_slice(body) {
@@ -511,7 +595,16 @@ fn handle_saga_start(
     let Some(steps_arr) = v.get("steps").and_then(|x| x.as_array()) else {
         return (400, json!({"error": "缺少 steps 数组"}).to_string());
     };
+    // 解析步骤：name → 索引（depends_on 引用解析）
+    let mut name_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, st) in steps_arr.iter().enumerate() {
+        let Some(name) = st.get("name").and_then(|x| x.as_str()) else {
+            return (400, json!({"error": format!("steps[{i}] 缺少 name")}).to_string());
+        };
+        name_idx.insert(name, i);
+    }
     let mut steps: Vec<Box<dyn crate::saga::SagaStep>> = Vec::new();
+    let mut deps: Vec<Vec<usize>> = Vec::new();
     for (i, st) in steps_arr.iter().enumerate() {
         let (Some(name), Some(action_url), Some(compensate_url)) = (
             st.get("name").and_then(|x| x.as_str()),
@@ -528,11 +621,36 @@ fn handle_saga_start(
             .map(|p| serde_json::to_string(p).unwrap_or_default())
             .unwrap_or_default()
             .into_bytes();
-        let step = crate::saga::HttpStep::new(name, action_url, compensate_url, payload);
-        steps.push(Box::new(step));
+        // 13.6 depends_on：依赖步骤名数组 → 索引（未知名/自依赖 → 400）
+        let mut di = Vec::new();
+        if let Some(dep) = st.get("depends_on").and_then(|x| x.as_array()) {
+            for d in dep {
+                let Some(dn) = d.as_str() else {
+                    return (400, json!({"error": format!("steps[{i}].depends_on 项须为字符串")}).to_string());
+                };
+                match name_idx.get(dn) {
+                    Some(&idx) => di.push(idx),
+                    None => {
+                        return (
+                            400,
+                            json!({"error": format!("steps[{i}].depends_on 引用未知步骤: {dn}")}).to_string(),
+                        )
+                    }
+                }
+            }
+        }
+        deps.push(di);
+        steps.push(Box::new(crate::saga::HttpStep::new(name, action_url, compensate_url, payload)));
     }
     let refs: Vec<&dyn crate::saga::SagaStep> = steps.iter().map(|s| s.as_ref()).collect();
+    // 13.7：缓存步骤定义（对账重试重建；失败仅告警不阻断）
+    if let Some(cache) = steps_cache {
+        if let Ok(mut c) = cache.lock() {
+            c.insert(tx_id.to_string(), Value::Array(steps_arr.clone()));
+        }
+    }
     let outcome = (|| -> crate::error::Result<crate::saga::SagaStatus> {
+        let mut coord = coord_arc.lock().unwrap();
         match coord.status(tx_id) {
             Some(st) if st.status.is_terminal() => return Ok(st.status), // 终态幂等
             Some(_) => {} // 已登记：run 续跑（含崩溃恢复）
@@ -540,22 +658,31 @@ fn handle_saga_start(
                 coord.start(tx_id)?;
             }
         }
-        coord.run(tx_id, &refs)
+        // 13.6：有依赖声明 → 拓扑并行；否则原串行 run（兼容旧请求）
+        let has_deps = deps.iter().any(|d| !d.is_empty());
+        if has_deps {
+            // 提前环/非法依赖校验 → 400（run_parallel 内部同样校验，双保险）
+            if let Err(e) = crate::saga::topo_layers(steps.len(), &deps) {
+                return Err(e);
+            }
+        }
+        if has_deps {
+            coord.run_parallel(tx_id, &refs, &deps)
+        } else {
+            coord.run(tx_id, &refs)
+        }
     })();
     match outcome {
         Ok(status) => {
-            let st = coord.status(tx_id).unwrap();
+            let st = coord_arc.lock().unwrap().status(tx_id).unwrap().clone();
             (200, json!({"tx_id": tx_id, "status": status, "executed_steps": st.executed_steps, "last_error": st.last_error}).to_string())
         }
-        Err(e) => (500, json!({"error": e.to_string()}).to_string()),
+        Err(e) => (400, json!({"error": e.to_string()}).to_string()),
     }
 }
 
 /// `GET /saga/status?tx_id=` → transactionId → status 回查（屏障接口依据）。
-fn handle_saga_status(
-    saga: &Option<crate::saga::SagaCoordinator>,
-    query: &str,
-) -> (u16, String) {
+fn handle_saga_status(saga: Option<&SagaShared>, query: &str) -> (u16, String) {
     let Some(coord) = saga else {
         return (501, json!({"error": "SAGA 协调器未挂载"}).to_string());
     };
@@ -563,18 +690,16 @@ fn handle_saga_status(
     let Some(tx_id) = params.iter().find(|(k, _)| k == "tx_id").map(|(_, v)| v.clone()) else {
         return (400, json!({"error": "缺少 tx_id 参数"}).to_string());
     };
-    match coord.status(&tx_id) {
-        Some(st) => (200, json!({"tx_id": tx_id, "status": st.status, "executed_steps": st.executed_steps, "compensated_steps": st.compensated_steps, "last_error": st.last_error}).to_string()),
+    let st = coord.lock().unwrap().status(&tx_id).cloned();
+    match st {
+        Some(st) => (200, json!({"tx_id": tx_id, "status": st.status, "executed_steps": st.executed_steps, "compensated_steps": st.compensated_steps, "last_error": st.last_error, "retry_count": st.retry_count}).to_string()),
         None => (404, json!({"error": format!("SAGA 事务不存在: {tx_id}")}).to_string()),
     }
 }
 
 /// `POST /saga/compensate` `{"tx_id":"t1"}` → 强制对已登记分支逆序补偿（重试/人工干预）。
 /// 步骤定义从持久化状态无从恢复，故请求可带可选 `steps`（缺省按已登记分支续补偿）。
-fn handle_saga_compensate(
-    saga: &mut Option<crate::saga::SagaCoordinator>,
-    body: &[u8],
-) -> (u16, String) {
+fn handle_saga_compensate(saga: Option<&SagaShared>, body: &[u8]) -> (u16, String) {
     let Some(coord) = saga else {
         return (501, json!({"error": "SAGA 协调器未挂载"}).to_string());
     };
@@ -586,25 +711,9 @@ fn handle_saga_compensate(
         return (400, json!({"error": "缺少 tx_id"}).to_string());
     };
     // 可选 steps（缺省空：仅把持久化状态置 Compensating；后续 run 续补偿）
-    let mut steps: Vec<Box<dyn crate::saga::SagaStep>> = Vec::new();
-    if let Some(arr) = v.get("steps").and_then(|x| x.as_array()) {
-        for (i, st) in arr.iter().enumerate() {
-            let (Some(name), Some(compensate_url)) = (
-                st.get("name").and_then(|x| x.as_str()),
-                st.get("compensate_url").and_then(|x| x.as_str()),
-            ) else {
-                return (400, json!({"error": format!("steps[{i}] 缺少 name/compensate_url")}).to_string());
-            };
-            let action_url = st.get("action_url").and_then(|x| x.as_str()).unwrap_or("");
-            let payload = st
-                .get("payload")
-                .map(|p| serde_json::to_string(p).unwrap_or_default())
-                .unwrap_or_default()
-                .into_bytes();
-            steps.push(Box::new(crate::saga::HttpStep::new(name, action_url, compensate_url, payload)));
-        }
-    }
+    let steps = v.get("steps").map(http_steps_from_json).unwrap_or_default();
     let refs: Vec<&dyn crate::saga::SagaStep> = steps.iter().map(|s| s.as_ref()).collect();
+    let mut coord = coord.lock().unwrap();
     if steps.is_empty() {
         // 无步骤定义：无法发起网络补偿，返回当前状态（续跑依赖 /saga/start 带步骤）
         return match coord.status(tx_id) {
@@ -1118,16 +1227,17 @@ mod tests {
         c
     }
 
-    /// 启动服务线程（引擎所有权移入），返回监听地址。`saga` = SAGA 网关协调器（可 None）。
+    /// 启动服务线程（引擎所有权移入），返回监听地址。`saga` = SAGA 网关共享句柄（可 None）。
     fn spawn_server(
         engine: Engine,
-        saga: Option<crate::saga::SagaCoordinator>,
+        saga: Option<SagaShared>,
+        steps_cache: Option<SagaStepsCache>,
     ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let mut engine = engine;
-            serve_listener(&mut engine, listener, None, saga).unwrap();
+            serve_listener(&mut engine, listener, None, saga, steps_cache).unwrap();
         });
         addr
     }
@@ -1347,7 +1457,7 @@ mod tests {
         c.enrich.to_field = "docid".into();
         let engine = Engine::open(&dir, &c).unwrap();
         assert!(engine.enrich_config().is_some(), "enrich 配置生效");
-        let addr = spawn_server(engine, None);
+        let addr = spawn_server(engine, None, None);
 
         // 关联文档（user 档案 docid=7，无 user_id → 降级正常写入）
         let (st, body) = http_req(addr, "POST", "/put", br#"{"docid":7,"name":"alice","city":"beijing"}"#);
@@ -1372,7 +1482,7 @@ mod tests {
     fn http_end_to_end_crud_and_search() {
         let dir = tmp();
         let engine = Engine::open(&dir, &cfg()).unwrap();
-        let addr = spawn_server(engine, None);
+        let addr = spawn_server(engine, None, None);
 
         // PUT
         let (st, body) = http_req(
@@ -1564,7 +1674,7 @@ mod tests {
         let (n2, a2, c2) = mock_biz_node("");
         let engine = Engine::open(&dir, &cfg()).unwrap();
         let coord = crate::saga::SagaCoordinator::open(&dir.join("saga")).unwrap();
-        let addr = spawn_server(engine, Some(coord));
+        let addr = spawn_server(engine, Some(Arc::new(Mutex::new(coord))), None);
 
         let body = format!(
             r#"{{"tx_id":"t1","steps":[{{"name":"debit","action_url":"http://{n1}/debit/action","compensate_url":"http://{n1}/debit/compensate"}},{{"name":"credit","action_url":"http://{n2}/credit/action","compensate_url":"http://{n2}/credit/compensate"}}]}}"#
@@ -1594,7 +1704,7 @@ mod tests {
         let (n2, _a2, _c2) = mock_biz_node("credit/action"); // credit 业务失败
         let engine = Engine::open(&dir, &cfg()).unwrap();
         let coord = crate::saga::SagaCoordinator::open(&dir.join("saga")).unwrap();
-        let addr = spawn_server(engine, Some(coord));
+        let addr = spawn_server(engine, Some(Arc::new(Mutex::new(coord))), None);
 
         let body = format!(
             r#"{{"tx_id":"t2","steps":[{{"name":"debit","action_url":"http://{n1}/debit/action","compensate_url":"http://{n1}/debit/compensate"}},{{"name":"credit","action_url":"http://{n2}/credit/action","compensate_url":"http://{n2}/credit/compensate"}}]}}"#
@@ -1622,7 +1732,7 @@ mod tests {
         {
             let engine = Engine::open(&dir, &cfg()).unwrap();
             let coord = crate::saga::SagaCoordinator::open(&dir.join("saga")).unwrap();
-            let addr = spawn_server(engine, Some(coord));
+            let addr = spawn_server(engine, Some(Arc::new(Mutex::new(coord))), None);
             let body = format!(
                 r#"{{"tx_id":"t3","steps":[{{"name":"a","action_url":"http://{n1}/a/action","compensate_url":"http://{n1}/a/compensate"}},{{"name":"b","action_url":"http://{n2}/b/action","compensate_url":"http://{n2}/b/compensate"}}]}}"#
             );
@@ -1638,5 +1748,53 @@ mod tests {
         assert_eq!(a1.load(Ordering::SeqCst), 1);
         assert_eq!(a2.load(Ordering::SeqCst), 1);
         assert_eq!(c1.load(Ordering::SeqCst), 0, "成功路径无补偿");
+    }
+
+    #[test]
+    fn saga_gateway_depends_on_parallel_and_cycle_rejected() {
+        // 13.6 网关：depends_on 拓扑并行成功；环 → 400；未知依赖 → 400
+        let dir = tmp();
+        let (n1, a1, _c1) = mock_biz_node("");
+        let (n2, a2, _c2) = mock_biz_node("");
+        let (n3, a3, _c3) = mock_biz_node("");
+        let engine = Engine::open(&dir, &cfg()).unwrap();
+        let coord = crate::saga::SagaCoordinator::open(&dir.join("saga")).unwrap();
+        let addr = spawn_server(engine, Some(Arc::new(Mutex::new(coord))), None);
+
+        // b 依赖 a；c 无依赖 → 拓扑层 [a,c] → [b]（c 与 a 并行）
+        let body = format!(
+            r#"{{"tx_id":"d1","steps":[
+                {{"name":"a","action_url":"http://{n1}/a/action","compensate_url":"http://{n1}/a/compensate"}},
+                {{"name":"b","action_url":"http://{n2}/b/action","compensate_url":"http://{n2}/b/compensate","depends_on":["a"]}},
+                {{"name":"c","action_url":"http://{n3}/c/action","compensate_url":"http://{n3}/c/compensate"}}
+            ]}}"#
+        );
+        let (st, resp) = http_req(addr, "POST", "/saga/start", body.as_bytes());
+        assert_eq!(st, 200, "依赖并行 start 失败: {resp}");
+        assert!(resp.contains("Succeeded"), "{resp}");
+        assert_eq!(a1.load(Ordering::SeqCst), 1);
+        assert_eq!(a2.load(Ordering::SeqCst), 1, "依赖者 b 已执行");
+        assert_eq!(a3.load(Ordering::SeqCst), 1);
+
+        // 环 x→y→x → 400
+        let body2 = format!(
+            r#"{{"tx_id":"d2","steps":[
+                {{"name":"x","action_url":"http://{n1}/x/action","compensate_url":"http://{n1}/x/compensate","depends_on":["y"]}},
+                {{"name":"y","action_url":"http://{n2}/y/action","compensate_url":"http://{n2}/y/compensate","depends_on":["x"]}}
+            ]}}"#
+        );
+        let (st, resp) = http_req(addr, "POST", "/saga/start", body2.as_bytes());
+        assert_eq!(st, 400, "环依赖应 400: {resp}");
+        assert!(resp.contains("构成环"), "{resp}");
+
+        // 未知依赖 → 400
+        let body3 = format!(
+            r#"{{"tx_id":"d3","steps":[
+                {{"name":"a","action_url":"http://{n1}/a/action","compensate_url":"http://{n1}/a/compensate","depends_on":["ghost"]}}
+            ]}}"#
+        );
+        let (st, resp) = http_req(addr, "POST", "/saga/start", body3.as_bytes());
+        assert_eq!(st, 400, "未知依赖应 400: {resp}");
+        assert!(resp.contains("未知步骤"), "{resp}");
     }
 }

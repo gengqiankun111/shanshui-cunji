@@ -12,12 +12,20 @@
 //! - **悬挂防护**：终态/已补偿分支拒绝迟到正向执行（防重复应用）；
 //! - **崩溃恢复**：状态持久化，协调器重建后从持久化进度续跑/续补偿。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+
+/// 当前纪元毫秒（13.7 对账退避/挂起检测时间基准）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// SAGA 状态机状态（终态 = Succeeded / Compensated）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +61,15 @@ pub struct SagaState {
     pub compensated_steps: BTreeSet<String>,
     /// 最后错误（诊断/回查展示）。
     pub last_error: Option<String>,
+    /// 13.7 对账诊断：补偿重试计数（指数退避依据）。
+    #[serde(default)]
+    pub retry_count: u32,
+    /// 13.7 对账诊断：最后重试时间戳（自纪元毫秒；None = 未重试过）。
+    #[serde(default)]
+    pub last_retry_at_ms: Option<u64>,
+    /// 13.7 挂起检测：状态最后变更时间（自纪元毫秒，persist 时更新）。
+    #[serde(default)]
+    pub updated_at_ms: u64,
 }
 
 impl SagaState {
@@ -63,12 +80,16 @@ impl SagaState {
             executed_steps: Vec::new(),
             compensated_steps: BTreeSet::new(),
             last_error: None,
+            retry_count: 0,
+            last_retry_at_ms: None,
+            updated_at_ms: now_ms(),
         }
     }
 }
 
 /// SAGA 步骤：正向 + 反向补偿（业务方实现；补偿 = 语义相反的新操作，须幂等）。
-pub trait SagaStep {
+/// `Send + Sync`：13.6 拓扑并行执行在 scoped 线程中共享步骤引用。
+pub trait SagaStep: Send + Sync {
     /// 步骤标识（屏障幂等键 = tx_id + name）。
     fn name(&self) -> &str;
     /// 正向执行（docid 级本地事务）。
@@ -250,10 +271,148 @@ impl SagaCoordinator {
         Ok(st.status)
     }
 
+    /// 13.6 拓扑并行执行：按步骤依赖 DAG 分层，层内并行正向、层间屏障；
+    /// 失败 → 取消本层剩余 → 逆序补偿（executed_steps 按拓扑层序登记，
+    /// 其反序 = 反拓扑序：依赖者先补偿、被依赖者后补偿——13.6.3）。
+    /// `deps[i]` = steps[i] 依赖的步骤索引（DAG 边）；环 → Error::Config。
+    /// 语义与 `run` 对齐（终态幂等 / 续跑 / Failed/Compensating 转补偿）。
+    pub fn run_parallel(
+        &mut self,
+        tx_id: &str,
+        steps: &[&dyn SagaStep],
+        deps: &[Vec<usize>],
+    ) -> Result<SagaStatus> {
+        let status = self.states.get(tx_id).map(|s| s.status).unwrap_or(SagaStatus::Init);
+        match status {
+            SagaStatus::Succeeded | SagaStatus::Compensated => return Ok(status),
+            SagaStatus::Failed | SagaStatus::Compensating => {
+                return self.compensate(tx_id, steps);
+            }
+            _ => {}
+        }
+        // 拓扑分层（Kahn）：层内无依赖可并行；环/非法依赖 → 400
+        let layers = topo_layers(steps.len(), deps)?;
+        let mut st = self.states.get(tx_id).cloned().unwrap_or_else(|| SagaState::new(tx_id));
+        st.status = SagaStatus::Executing;
+        for layer in layers {
+            // 过滤：已登记（续跑）/ 已补偿（悬挂防护）跳过
+            let pending: Vec<usize> = layer
+                .into_iter()
+                .filter(|&idx| {
+                    let n = steps[idx].name();
+                    !st.compensated_steps.contains(n) && !st.executed_steps.iter().any(|x| x == n)
+                })
+                .collect();
+            if pending.is_empty() {
+                continue;
+            }
+            // 层内并行正向（scoped 线程）；注册顺序 = pending 顺序（层序，补偿逆序安全）
+            let outcomes = std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for &idx in &pending {
+                    let step = steps[idx];
+                    handles.push(s.spawn(move || (idx, step.forward())));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+            });
+            for (idx, res) in &outcomes {
+                let step = steps[*idx];
+                match res {
+                    Ok(()) => {
+                        if !st.executed_steps.iter().any(|n| n == step.name()) {
+                            st.executed_steps.push(step.name().to_string()); // 分支登记（I4）
+                            self.persist(&st)?;
+                        }
+                    }
+                    Err(e) => {
+                        st.status = SagaStatus::Failed;
+                        st.last_error = Some(e.to_string());
+                        self.persist(&st)?;
+                        return self.compensate(tx_id, steps); // 剩余本层未执行分支不登记 → 屏障空转
+                    }
+                }
+            }
+        }
+        st.status = SagaStatus::Succeeded;
+        self.persist(&st)?;
+        Ok(st.status)
+    }
+
+    /// 13.7 对账器核心：扫描未终态事务，对可重试错误按指数退避自动续补偿。
+    /// - `steps_for(tx_id)`：提供该事务的步骤定义（网关缓存的原始定义；无定义 → 跳过并告警留人工）；
+    /// - `executing_stall_ms`：Executing 挂起阈值——超过视为执行无进展，标记 Failed 并触发补偿；
+    /// - `max_backoff_ms`：指数退避上限（1s → 2s → 4s … 上限）。
+    /// 返回本次实际触发补偿重试的事务数。
+    pub fn retry_pending(
+        &mut self,
+        mut steps_for: impl FnMut(&str) -> Vec<Box<dyn SagaStep>>,
+        now_ms: u64,
+        executing_stall_ms: u64,
+        max_backoff_ms: u64,
+    ) -> usize {
+        let txs: Vec<String> = self
+            .states
+            .iter()
+            .filter(|(_, st)| !st.status.is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut retried = 0;
+        for tx in txs {
+            let stall = match self.states.get(&tx) {
+                Some(st) if st.status == SagaStatus::Executing => {
+                    now_ms.saturating_sub(st.updated_at_ms) >= executing_stall_ms
+                }
+                _ => false,
+            };
+            if stall {
+                // Executing 挂起 → 标记 Failed（last_error 注明）→ 走补偿
+                let mut st = self.states.get(&tx).cloned().unwrap();
+                st.status = SagaStatus::Failed;
+                st.last_error = Some("对账器：正向执行挂起超阈值".into());
+                if let Err(e) = self.persist(&st) {
+                    tracing::warn!("对账器持久化失败 {tx}: {e}");
+                    continue;
+                }
+            }
+            let st = match self.states.get(&tx) {
+                Some(st) if st.status == SagaStatus::Failed || st.status == SagaStatus::Compensating => st.clone(),
+                _ => continue,
+            };
+            // 指数退避：wait = min(max, 1000 * 2^retry_count)
+            let wait = (1000u64 << st.retry_count.min(31)).min(max_backoff_ms);
+            if let Some(last) = st.last_retry_at_ms {
+                if now_ms.saturating_sub(last) < wait {
+                    continue; // 退避中
+                }
+            }
+            let mut steps = steps_for(&tx);
+            if steps.is_empty() {
+                continue; // 无步骤定义：跳过（13.7：仅告警，人工/补发定义）
+            }
+            let refs: Vec<&dyn SagaStep> = steps.iter().map(|s| s.as_ref()).collect();
+            match self.compensate(&tx, &refs) {
+                Ok(_) => {
+                    if let Some(mut st) = self.states.get(&tx).cloned() {
+                        st.retry_count = st.retry_count.saturating_add(1);
+                        st.last_retry_at_ms = Some(now_ms);
+                        let _ = self.persist(&st);
+                    }
+                    retried += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("对账器补偿失败 {tx}: {e}");
+                }
+            }
+        }
+        retried
+    }
+
     /// 持久化（tmp + rename 原子写）并同步内存态（后续读同一状态来源）。
     fn persist(&mut self, st: &SagaState) -> Result<()> {
+        let mut st = st.clone();
+        st.updated_at_ms = now_ms(); // 13.7 挂起检测：状态最后变更时间
         let path = self.path(&st.tx_id);
-        let text = serde_json::to_string(st)
+        let text = serde_json::to_string(&st)
             .map_err(|e| Error::Serialize(format!("SAGA 状态序列化失败: {e}")))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text)?;
@@ -265,6 +424,54 @@ impl SagaCoordinator {
     fn path(&self, tx_id: &str) -> PathBuf {
         self.dir.join(format!("saga-{tx_id}.json"))
     }
+}
+
+/// 13.6：Kahn 拓扑分层。`deps[i]` = 步骤 i 依赖的步骤索引集合（前置）。
+/// 返回拓扑层序列（层内互相无依赖、可并行）；环 / 非法索引 → Error::Config（网关 400）。
+pub(crate) fn topo_layers(n: usize, deps: &[Vec<usize>]) -> Result<Vec<Vec<usize>>> {
+    if deps.len() != n {
+        return Err(Error::Config(format!(
+            "依赖声明数量 {} ≠ 步骤数 {n}",
+            deps.len()
+        )));
+    }
+    for (i, d) in deps.iter().enumerate() {
+        for &p in d {
+            if p >= n || p == i {
+                return Err(Error::Config(format!("步骤 {i} 依赖索引非法: {p}")));
+            }
+        }
+    }
+    let mut indeg = vec![0usize; n];
+    for (i, d) in deps.iter().enumerate() {
+        indeg[i] = d.len();
+    }
+    let mut adj = vec![Vec::new(); n];
+    for (i, d) in deps.iter().enumerate() {
+        for &p in d {
+            adj[p].push(i);
+        }
+    }
+    let mut queue: VecDeque<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let mut layers = Vec::new();
+    let mut visited = 0;
+    while !queue.is_empty() {
+        let cur: Vec<usize> = queue.drain(..).collect();
+        visited += cur.len();
+        for &i in &cur {
+            for &j in &adj[i] {
+                indeg[j] -= 1;
+                if indeg[j] == 0 {
+                    queue.push_back(j);
+                }
+            }
+        }
+        layers.push(cur);
+    }
+    if visited != n {
+        return Err(Error::Config("SAGA 步骤依赖构成环".into()));
+    }
+    Ok(layers)
 }
 
 /// 极简 HTTP/1.1 POST 客户端（Ex-2.5 网关协调器调用业务步骤端点）。
@@ -776,5 +983,185 @@ mod tests {
         assert_eq!(st.executed_steps, vec!["fast"], "超时未登记分支不在 executed_steps（屏障空转依据）");
         assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1, "只补偿已登记 fast");
         assert!(st.last_error.is_none(), "补偿完成后终态清空错误（终态语义）");
+    }
+
+    // -----------------------------------------------------------------------
+    // 13.6 拓扑并行（topo_layers + run_parallel）+ 13.7 对账器（retry_pending）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn topo_layers_ordering_cycle_and_invalid() {
+        // 依赖：1/2 依赖 0 → 层 [[0],[1,2]]（层内可并行）
+        let layers = topo_layers(3, &[vec![], vec![0], vec![0]]).unwrap();
+        assert_eq!(layers, vec![vec![0], vec![1, 2]]);
+        // 链式 a→b→c → 逐层
+        let layers = topo_layers(3, &[vec![], vec![0], vec![1]]).unwrap();
+        assert_eq!(layers, vec![vec![0], vec![1], vec![2]]);
+        // 环 0↔1
+        assert!(topo_layers(2, &[vec![1], vec![0]]).is_err(), "环应报错");
+        // 自依赖
+        assert!(topo_layers(2, &[vec![0], vec![]]).is_err(), "自依赖应报错");
+        // 非法索引
+        assert!(topo_layers(2, &[vec![5], vec![]]).is_err(), "越界依赖应报错");
+        // 长度不匹配
+        assert!(topo_layers(3, &[vec![], vec![]]).is_err(), "依赖数 ≠ 步骤数应报错");
+    }
+
+    #[test]
+    fn run_parallel_respects_dependency_order() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        c.start("tp1").unwrap();
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let o1 = order.clone();
+        let o2 = order.clone();
+        let steps: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(ClosureStep::new(
+                "a",
+                move || {
+                    o1.lock().unwrap().push("a");
+                    Ok(())
+                },
+                || Ok(()),
+            )),
+            Box::new(ClosureStep::new(
+                "b",
+                move || {
+                    o2.lock().unwrap().push("b");
+                    Ok(())
+                },
+                || Ok(()),
+            )),
+        ];
+        let deps: Vec<Vec<usize>> = vec![vec![], vec![0]]; // b 依赖 a
+        let s = c.run_parallel("tp1", &refs(&steps), &deps).unwrap();
+        assert_eq!(s, SagaStatus::Succeeded);
+        assert_eq!(*order.lock().unwrap(), vec!["a", "b"], "依赖序：a 先于 b");
+        assert_eq!(c.status("tp1").unwrap().executed_steps, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn run_parallel_executes_independent_steps_concurrently() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        c.start("tp2").unwrap();
+        let steps: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(ClosureStep::new("x", || {
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(())
+            }, || Ok(()))),
+            Box::new(ClosureStep::new("y", || {
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(())
+            }, || Ok(()))),
+        ];
+        let deps: Vec<Vec<usize>> = vec![vec![], vec![]]; // 无依赖 → 同层并行
+        let t0 = std::time::Instant::now();
+        let s = c.run_parallel("tp2", &refs(&steps), &deps).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(s, SagaStatus::Succeeded);
+        assert!(elapsed.as_millis() < 150, "并行应远小于串行 160ms: {elapsed:?}");
+    }
+
+    #[test]
+    fn run_parallel_failure_compensates_in_reverse_topo() {
+        // 链 a→b→c；b 失败 → 仅已登记 a 被补偿，c 未执行不补偿
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        c.start("tp3").unwrap();
+        let steps: Vec<Box<dyn SagaStep>> = vec![
+            Box::new(SimpleStep { name: "a", fail_forward: false }),
+            Box::new(SimpleStep { name: "b", fail_forward: true }),
+            Box::new(SimpleStep { name: "c", fail_forward: false }),
+        ];
+        let deps: Vec<Vec<usize>> = vec![vec![], vec![0], vec![1]];
+        FWD_CALLS.store(0, Ordering::SeqCst);
+        CMP_CALLS.store(0, Ordering::SeqCst);
+        let s = c.run_parallel("tp3", &refs(&steps), &deps).unwrap();
+        assert_eq!(s, SagaStatus::Compensated, "链中段失败 → 补偿完成");
+        assert_eq!(c.status("tp3").unwrap().executed_steps, vec!["a"], "仅 a 已登记");
+        assert_eq!(CMP_CALLS.load(Ordering::SeqCst), 1, "只补偿已登记 a");
+    }
+
+    #[test]
+    fn retry_pending_compensates_failed_with_counter() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("rp1");
+        st.status = SagaStatus::Failed;
+        st.executed_steps = vec!["a".to_string()];
+        write_state(dir.path(), &st);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let n = c.retry_pending(
+            |_tx| vec![Box::new(SimpleStep { name: "a", fail_forward: false })],
+            1_000,
+            60_000,
+            300_000,
+        );
+        assert_eq!(n, 1, "Failed 事务被自动续补偿");
+        let st = c.status("rp1").unwrap().clone();
+        assert_eq!(st.status, SagaStatus::Compensated);
+        assert_eq!(st.retry_count, 1, "重试计数 +1");
+        assert!(st.last_retry_at_ms.is_some(), "记录最后重试时间");
+    }
+
+    #[test]
+    fn retry_pending_backoff_skips_recent_retry() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("rp2");
+        st.status = SagaStatus::Compensating;
+        st.executed_steps = vec!["a".to_string()];
+        st.retry_count = 1; // 退避 = 2s
+        st.last_retry_at_ms = Some(900); // 距 now=1000 仅 100ms < 2000ms → 跳过
+        write_state(dir.path(), &st);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let n = c.retry_pending(
+            |_tx| vec![Box::new(SimpleStep { name: "a", fail_forward: false })],
+            1_000,
+            60_000,
+            300_000,
+        );
+        assert_eq!(n, 0, "退避期内跳过");
+        assert_eq!(c.status("rp2").unwrap().status, SagaStatus::Compensating, "状态不变");
+    }
+
+    #[test]
+    fn retry_pending_stalls_executing_then_compensates() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("rp3");
+        st.status = SagaStatus::Executing;
+        st.executed_steps = vec!["a".to_string()];
+        st.updated_at_ms = 100; // 距 now 远超 60s 阈值 → 判定挂起
+        write_state(dir.path(), &st);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let n = c.retry_pending(
+            |_tx| vec![Box::new(SimpleStep { name: "a", fail_forward: false })],
+            10_000_000,
+            60_000,
+            300_000,
+        );
+        assert_eq!(n, 1, "挂起的 Executing 被标记失败并补偿");
+        let st = c.status("rp3").unwrap().clone();
+        assert_eq!(st.status, SagaStatus::Compensated);
+        assert!(st.last_error.is_none(), "补偿完成终态清空（含挂起标记）");
+    }
+
+    #[test]
+    fn retry_pending_skips_without_step_definitions() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = SagaState::new("rp4");
+        st.status = SagaStatus::Failed;
+        st.executed_steps = vec!["a".to_string()];
+        write_state(dir.path(), &st);
+        let mut c = SagaCoordinator::open(dir.path()).unwrap();
+        let n = c.retry_pending(|_tx| Vec::new(), 1_000, 60_000, 300_000);
+        assert_eq!(n, 0, "无步骤定义 → 跳过（留人工/补发定义）");
+        assert_eq!(c.status("rp4").unwrap().status, SagaStatus::Failed, "不推进状态");
     }
 }

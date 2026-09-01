@@ -611,6 +611,23 @@
   补充变体：直接 `compensate()` 调用路径 / 部分缺定义（逆序先补有定义分支、进度不丢）/ 补全定义
   重试续补偿不重复 / 缺定义状态跨重开持久化（对账依据）/ 终态 compensate no-op。
 
+### P70. SAGA 13.6/13.7 落地：拓扑并行执行 + 后台对账自动重试
+- **问题**：13.6（步骤依赖声明与正向并行）与 13.7（后台对账与自动重试）设计留白需实现——
+  SAGA 长事务正向串行吞吐受限；Failed/Compensating 依赖人工 /saga/compensate 重试，无自动收敛。
+- **落地**：
+  - `saga.rs`：`topo_layers`（Kahn 分层 + 环/自依赖/越界检测）+ `run_parallel`（按拓扑层
+    scoped 线程并行正向、层间屏障、失败转补偿；executed_steps 按拓扑层序登记 → 逆序补偿 =
+    反拓扑序，依赖者先补偿）；`SagaState` 增 `retry_count`/`last_retry_at_ms`/`updated_at_ms`
+    （serde default 兼容旧状态文件）+ `retry_pending`（扫描未终态：Failed/Compensating 按
+    指数退避续补偿、Executing 挂起超阈值标记 Failed 触发补偿、无步骤定义跳过留人工）；
+    `SagaStep` 加 `Send + Sync` supertrait（并行共享步骤引用）。
+  - `server.rs`：协调器改 `Arc<Mutex>` 共享 + 步骤定义缓存（对账重建）；`/saga/start` 解析
+    `depends_on`（未知/环 → 400，提前 topo_layers 校验）；spawn 后台对账线程（60s 周期）。
+- **测试（+9）**：topo_layers 分层/环/非法索引；run_parallel 依赖序 / 无依赖并行（80ms×2 < 150ms）/
+  链中段失败反拓扑补偿；retry_pending 自动续补偿 + 计数 / 退避跳过 / Executing 挂起检测 /
+  无定义跳过；网关 depends_on 成功 + 环 400 + 未知依赖 400。
+- **结果**：saga 28 全绿（+9），全量 459；提交 `XXXX`。
+
 ---
 
 ## 环境备忘（不入库）
