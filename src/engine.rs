@@ -35,8 +35,8 @@ pub struct Engine {
     cidx: Option<Arc<ColumnFamily>>,
     /// Delta 增量列族（阶段 1.5，key = encode_docid ++ VarLen(field)，Merge-on-Read 覆盖 Base）。
     delta: Arc<ColumnFamily>,
-    /// 倒排索引。
-    inverted: InvertedIndex,
+    /// 倒排索引。J 项（7.73）：`Arc`（后台 GC worker 无锁 clone 后执行 gc）。
+    pub inverted: Arc<InvertedIndex>,
     /// 文档热缓存（7.72：内部 RwLock+DashMap 粒度化——读路径 `&self` 读读并行、
     /// 写路径（put/invalidate/promote）写锁，不再整包 Mutex 串行热缓存访问）。
     hotcache: HotCache,
@@ -90,6 +90,10 @@ pub struct Engine {
     /// O 项第③步：后台合并 worker 挂载标记（服务进程 spawn 时置 true）——
     /// true 时写路径只发信号（合并不阻塞读写）；false 保持同步合并（写入退避=背压）。
     pub compact_worker: Arc<AtomicBool>,
+    /// J 项（7.73）：倒排段 GC 后台信号——写路径刷盘后检测段超 GC 阈值时置位；mysql 服务
+    /// 的后台 GC worker 读取后检查 `should_gc()` 并执行 `inverted.gc()`（无 worker 场景
+    /// 由 demo/显式 inverted_gc 消费）。
+    pub inverted_gc_pending: Arc<AtomicBool>,
     /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
     /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
     /// P72：`Arc`——worker 无锁合并 clone 后并发读位图过滤（写路径在 Engine 写锁内）。
@@ -426,7 +430,7 @@ impl Engine {
         let mut engine = Self {
             primary,
             cidx,
-            inverted,
+            inverted: Arc::new(inverted),
             delta,
             hotcache,
             watchdog,
@@ -461,6 +465,7 @@ impl Engine {
             auto_compact: cfg.storage.auto_compact,
             compact_pending: Arc::new(AtomicBool::new(false)),
             compact_worker: Arc::new(AtomicBool::new(false)),
+            inverted_gc_pending: Arc::new(AtomicBool::new(false)),
             deletion_bitmap,
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
@@ -1420,16 +1425,24 @@ impl Engine {
     }
 
     /// 强制倒排刷盘（先刷入攒批缓冲，再整段落盘）。
-    pub fn flush_inverted(&mut self) -> Result<()> {
+    /// J 项（7.73）：刷盘后检测段总量超 GC 阈值 → 置后台 GC 信号（mysql worker 消费；
+    /// 无 worker 时由显式 `inverted_gc` / 兜底周期消费）。
+    pub fn flush_inverted(&self) -> Result<()> {
         self.flush_inverted_pending();
-        self.inverted.flush_segment()
+        self.inverted.flush_segment()?;
+        // J 项：段数/大小超阈值 → 后台 GC 信号（避免段数爆炸放大查询延迟）
+        if self.inverted.should_gc() {
+            self.inverted_gc_pending.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// 倒排段 GC 合并（design 5.2.2/5.2.4⑤）：段文件总量超阈值时合并为少量大段。
     /// 大数据量导入后段数可能爆炸（demo 每 100 万 term 对刷一段 → 5000 万库数百段），
-    /// 查询每次遍历全部段（高频 term 每段反序列化 posting）→ 段数直接放大查询延迟，
-    /// 故批量导入后应显式调用一次合并（真实部署由后台 GC 周期触发，当前无自动线程）。
-    pub fn inverted_gc(&mut self) -> Result<crate::inverted::GcReport> {
+    /// 查询每次遍历全部段（高频 term 每段反序列化 posting）→ 段数直接放大查询延迟。
+    /// J 项（7.73）：改 `&self`（inverted 内部 mutate 锁与 flush 互斥）——批量导入后
+    /// 由后台 GC worker 自动周期触发（写路径刷盘置信号），显式调用仍可用。
+    pub fn inverted_gc(&self) -> Result<crate::inverted::GcReport> {
         self.flush_inverted_pending();
         self.inverted.gc()
     }

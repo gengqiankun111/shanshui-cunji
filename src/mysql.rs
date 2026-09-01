@@ -430,12 +430,44 @@ impl MySqlServer {
         });
     }
 
+    /// J 项（7.73）：倒排段 GC 后台 worker。写路径（Engine::flush_inverted）检测段超
+    /// GC 阈值后置 `inverted_gc_pending` 信号；本线程读取信号后检查 `should_gc()` 并执行
+    /// `InvertedIndex::gc()`——Engine 读锁内快速 clone inverted Arc → **drop 锁** → 无锁
+    /// 执行 gc（gc 内部 mutate 锁仅与写路径 flush_segment 互斥，不阻塞查询读）。
+    /// 10 分钟兜底：覆盖刷盘未触发 / 信号丢失等异常路径（段数爆炸不再依赖显式调用）。
+    fn spawn_inverted_gc_worker(&self) {
+        let engine = self.engine.clone();
+        let pending = self.engine.read().unwrap().inverted_gc_pending.clone();
+        std::thread::spawn(move || {
+            let mut last_backstop = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let signaled = pending.swap(false, Ordering::AcqRel);
+                let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
+                if signaled || backstop {
+                    // 读锁内 clone inverted Arc（廉价）→ drop 锁 → 无锁 gc
+                    let inverted = engine.read().ok().map(|g| g.inverted.clone());
+                    if let Some(inv) = inverted {
+                        if inv.should_gc() {
+                            let _ = inv.gc();
+                        }
+                    }
+                    if backstop {
+                        last_backstop = std::time::Instant::now();
+                    }
+                }
+            }
+        });
+    }
+
     /// 绑定并接受连接（阻塞）。每连接 spawn 线程处理。返回**实际绑定地址**
     /// （addr 为 `127.0.0.1:0` 时返回 OS 分配的随机端口——并发测试/动态端口场景）。
     pub fn serve(self, addr: &str) -> Result<std::net::SocketAddr> {
         // O 项第③步：后台合并 worker（信号驱动 + 10 分钟兜底）——写路径只发信号，
         // 合并读锁下执行，读写均不被合并阻塞（替代 P 项写路径同步合并 + guard 定时器）。
         self.spawn_compaction_worker();
+        // J 项（7.73）：倒排段 GC 后台 worker（信号 + 10 分钟兜底）
+        self.spawn_inverted_gc_worker();
         let listener = TcpListener::bind(addr)?;
         let local = listener.local_addr()?;
         tracing::info!("MySQL 协议服务已启动: mysql://{addr}（库 {DEFAULT_DB}，表 {DEFAULT_TABLE}）");
@@ -484,6 +516,8 @@ impl MySqlServer {
     /// 需在 tokio runtime 内调用（`#[tokio::main]` / `tokio::runtime`）。返回实际绑定地址。
     pub async fn serve_async(self, addr: &str) -> Result<std::net::SocketAddr> {
         self.spawn_compaction_worker();
+        // J 项（7.73）：倒排段 GC 后台 worker
+        self.spawn_inverted_gc_worker();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local = listener.local_addr()?;
         tracing::info!(
@@ -2309,6 +2343,50 @@ mod tests {
             let v = server.engine.read().unwrap().get(i).unwrap();
             assert_eq!(v.as_deref(), Some(val.as_slice()), "docid={i}");
         }
+    }
+
+    #[test]
+    fn inverted_gc_worker_converges_segments_after_flush() {
+        // J 项（7.73）：后台倒排段 GC worker——写路径刷盘置 `inverted_gc_pending` 信号 →
+        // worker 检查 `should_gc()` 并执行合并，段数收敛（不再依赖显式 inverted_gc 调用）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.segment_max_size_mb = 1; // GC 阈值 1MB（engine 打开时 ×1MB 换算）
+        let engine = Engine::open(dir.path(), &cfg).unwrap();
+        let server = MySqlServer::new(engine, "root", "");
+        server.spawn_inverted_gc_worker();
+        // 写 12 批（每批 1000 doc × 10 唯一 term 对）+ 刷盘 → 12 段 ≈ 1.8MB > 1MB → 置信号
+        {
+            let mut eng = server.engine.write().unwrap();
+            for batch in 0..12u64 {
+                for i in batch * 1000..batch * 1000 + 1000 {
+                    let terms: Vec<String> = (0..10).map(|j| format!("k{i}-{j}")).collect();
+                    let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                    eng.put(i, format!("{{\"id\":{i}}}").into_bytes(), &refs).unwrap();
+                }
+                eng.flush_inverted().unwrap();
+            }
+            assert!(
+                eng.inverted.should_gc(),
+                "12 段总字节应超 GC 阈值（触发后台信号）"
+            );
+        }
+        // 等待 worker 后台 GC 收敛（100ms 轮询；10s 上限）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let n = server.engine.read().unwrap().inverted.segment_count();
+            if n <= 1 || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let n = server.engine.read().unwrap().inverted.segment_count();
+        assert!(n <= 2, "后台 GC worker 未收敛段数: {n}");
+        // 数据完整可检索（合并后旧段数据不丢）
+        let r = server.engine.read().unwrap().inverted_posting("k0-0").unwrap();
+        assert!(r.contains(0), "k0-0 应含 docid 0");
+        let r2 = server.engine.read().unwrap().inverted_posting("k11999-9").unwrap();
+        assert!(r2.contains(11999), "k11999-9 应含 docid 11999");
     }
 
     // ---------- 集成：协议往返 ----------

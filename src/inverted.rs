@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -74,7 +75,11 @@ pub struct InvertedIndex {
     /// Ex-6.3：值 `Arc<fst::Map>`（MmapFile 不可 Clone，Arc 使 HashMap 可整体 Clone 供
     /// rcu 发布）——查询拿 Arc 快照零拷贝。
     dicts: ArcSwap<HashMap<String, Arc<fst::Map<MmapFile>>>>,
-    next_seg_id: u64,
+    next_seg_id: AtomicU64,
+    /// J 项（7.73）：flush_segment 与 gc 写 Manifest / 删段文件互斥——GC 后台线程化后，
+    /// 写路径 flush 与后台 gc 并发（对齐 CF `sst_mutate` 模式）；无此锁会丢失更新
+    /// （demo inverted-gc-bg 确定性复现：flush 持旧快照期间 gc 删文件 → Manifest 引用已删段）。
+    mutate: std::sync::Mutex<()>,
     /// 刷盘阈值：内存累计 posting 达此值整段落盘。
     flush_threshold: u64,
     /// 段文件 GC 阈值（字节）：磁盘段总量超此值触发 `gc()` 合并（design 5.2.2；0 = 禁用）。
@@ -186,7 +191,8 @@ impl InvertedIndex {
             // Ex-6.2/6.3：ArcSwap 原子发布（读路径 load 拿 Arc 快照无锁）
             segments: ArcSwap::new(Arc::new(segments)),
             dicts: ArcSwap::new(Arc::new(dicts)),
-            next_seg_id,
+            next_seg_id: AtomicU64::new(next_seg_id),
+            mutate: std::sync::Mutex::new(()),
             flush_threshold,
             gc_threshold_bytes,
             bitmap_fields: std::collections::HashSet::new(),
@@ -351,14 +357,17 @@ impl InvertedIndex {
 
     /// 将内存字典整段刷盘为 `inverted-{id}.seg`，并原子更新 Manifest。
     /// engine=fst 时同时编译术语字典 `inverted-{id}.fst`（term → 段内条目偏移）。
-    pub fn flush_segment(&mut self) -> Result<()> {
+    /// J 项（7.73）：改 `&self`（next_seg_id → AtomicU64 + mutate 锁；后台 GC 与写路径
+    /// flush 并发安全）。
+    pub fn flush_segment(&self) -> Result<()> {
+        // J 项：与 gc 互斥（Manifest 写 / 删段文件序列化，防丢失更新）
+        let _mut = self.mutate.lock().unwrap();
         if self.mem.is_empty() {
             return Ok(());
         }
         // G 项：段落盘 → posting 缓存失效
         self.clear_posting_cache();
-        let seg_id = self.next_seg_id;
-        self.next_seg_id += 1;
+        let seg_id = self.next_seg_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg"));
 
         // 序列化段内容（内存快照），并记录每个 term 条目的文件偏移（FST 字典用）
@@ -470,7 +479,7 @@ impl InvertedIndex {
         let segs = self.segments.load(); // Ex-6.2：快照
         let m = SegmentManifest {
             segments: segs.as_ref().clone(),
-            next_seg_id: self.next_seg_id,
+            next_seg_id: self.next_seg_id.load(Ordering::Relaxed),
         };
         let text = serde_json::to_string_pretty(&m)
             .map_err(|e| Error::Serialize(format!("倒排 Manifest 序列化失败: {e}")))?;
@@ -531,8 +540,17 @@ impl InvertedIndex {
                 Some(m) => m.clone(),
                 None => {
                     drop(files);
-                    let mm =
-                        Arc::new(MmapFile::open(&self.dir.join(seg)).map_err(Error::from)?);
+                    // J 项（7.73）：后台 GC 与查询并发——查询持旧段快照时 gc 可能已删该段
+                    // 文件（数据已合并进新段）。文件不存在 = 快照过期 → 跳过该段返回空
+                    // （与 ArcSwap 快照语义一致：读到 gc 前/后快照结果一致），其他 IO 错误
+                    // （真损坏）照常传播。
+                    let mm = match MmapFile::open(&self.dir.join(seg)) {
+                        Ok(m) => Arc::new(m),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(RoaringBitmap::new())
+                        }
+                        Err(e) => return Err(Error::from(e)),
+                    };
                     // rcu 发布（&self 可原子更新）：并发查询下重复注册无害（幂等覆盖）
                     self.data_files.rcu(|m| {
                         let mut n = (**m).clone();
@@ -693,7 +711,11 @@ impl InvertedIndex {
     /// 倒排文件 GC（design 5.2.2）：将全部段读取所有 Term 的最新 Bitmap，
     /// **重写为单个紧凑段**（临时文件 → fsync → 原子更新 Manifest → 删除旧段 + 旧 FST），
     /// 中途崩溃不丢数据（启动只加载 Manifest 中的段，孤儿段被忽略）。
-    pub fn gc(&mut self) -> Result<GcReport> {
+    /// J 项（7.73）：改 `&self` + mutate 锁——后台 GC 线程与写路径 flush 并发安全
+    /// （flush/gc 写 Manifest 与删文件互斥，防丢失更新）。
+    pub fn gc(&self) -> Result<GcReport> {
+        // J 项：与 flush_segment 互斥（Manifest 写 / 删段文件序列化）
+        let _mut = self.mutate.lock().unwrap();
         if !self.should_gc() {
             return Ok(GcReport {
                 merged: 0,
@@ -715,8 +737,7 @@ impl InvertedIndex {
         }
 
         // ② 写新段（临时文件 → fsync → 原子 rename）
-        let seg_id = self.next_seg_id;
-        self.next_seg_id += 1;
+        let seg_id = self.next_seg_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg"));
         let mut body = Vec::new();
         let mut term_offsets: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -1072,7 +1093,7 @@ mod tests {
             let mut idx = InvertedIndex::open(&dir, 1).unwrap();
             idx.add("k", 1);
             idx.flush_segment().unwrap();
-            assert_eq!(idx.next_seg_id, 2);
+            assert_eq!(idx.next_seg_id.load(Ordering::Relaxed), 2);
         }
         let text = std::fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
         assert!(text.contains("inverted-00000001.seg"));
@@ -1512,5 +1533,78 @@ mod tests {
         let report = idx.gc().unwrap();
         assert_eq!(report.merged, 0);
         assert_eq!(idx.segment_count(), 3);
+    }
+
+    // ---------- J 项（7.73）：后台 GC 线程化 —— flush/gc 并发安全（mutate 锁） ----------
+
+    #[test]
+    fn concurrent_flush_and_gc_no_lost_segment() {
+        // 后台 GC 线程化后写路径 flush 与后台 gc **并发**：mutate 锁保证 Manifest 无丢失更新
+        // （demo inverted-gc-bg 确定性复现：无锁时 Manifest 引用已删段 → 数据丢失）。
+        // 写路径为主库真实形态：单写者 flush（Engine 写锁内）+ 后台 gc 线程并发。
+        let dir = tmp();
+        // gc 阈值极小（2 段即合并）；flush_threshold=1（add 即达阈值，写线程持续刷盘）
+        let idx = Arc::new(InvertedIndex::open_with_gc(&dir, 1, "hash", 1).unwrap());
+        // 写线程×1（单写者形态）：add + flush 循环（模拟写路径持续刷盘）
+        let writer = {
+            let idx = Arc::clone(&idx);
+            std::thread::spawn(move || {
+                for batch in 0..60u64 {
+                    for k in 0..5u64 {
+                        idx.add(&format!("w-b{batch}-k{k}"), batch * 5 + k);
+                    }
+                    let _ = idx.flush_segment(); // 刷盘（写路径）
+                }
+            })
+        };
+        // gc 线程×1：周期执行（后台 GC 语义，与写路径并发）
+        let gc_thread = {
+            let idx = Arc::clone(&idx);
+            std::thread::spawn(move || {
+                for _ in 0..120 {
+                    let _ = idx.gc();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        };
+        writer.join().unwrap();
+        gc_thread.join().unwrap();
+        // 完整性：Manifest 引用的段文件全部存在（mutate 锁 → 无丢失更新）
+        let text = std::fs::read_to_string(dir.join(MANIFEST_FILE)).unwrap();
+        let m: SegmentManifest = serde_json::from_str(&text).unwrap();
+        assert!(!m.segments.is_empty(), "Manifest 不应为空");
+        for seg in &m.segments {
+            assert!(dir.join(seg).exists(), "Manifest 引用已删段: {seg}");
+        }
+        // 数据不丢：所有写入 term 均可检索（含被合并进新段的旧段数据）
+        for batch in 0..60u64 {
+            for k in 0..5u64 {
+                let d = batch * 5 + k;
+                assert!(
+                    idx.search(&format!("w-b{batch}-k{k}"))
+                        .unwrap()
+                        .contains(d as u32),
+                    "w-b{batch}-k{k} 数据丢失（docid {d}）"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gc_self_ref_reentrant_safe() {
+        // J 项：gc 改 &self 后——Arc 共享下可直接调用（后台 worker 无锁执行形态），
+        // 且 gc 内部 mutate 锁与 flush_segment 互斥不 panic。
+        let dir = tmp();
+        let idx = Arc::new(InvertedIndex::open_with_gc(&dir, 1, "hash", 1).unwrap());
+        idx.add("a=1", 1);
+        idx.flush_segment().unwrap();
+        idx.add("b=2", 2);
+        idx.flush_segment().unwrap();
+        assert!(idx.should_gc());
+        let report = idx.gc().unwrap();
+        assert_eq!(report.merged, 2);
+        // 合并后仍可检索
+        assert!(idx.search("a=1").unwrap().contains(1));
+        assert!(idx.search("b=2").unwrap().contains(2));
     }
 }
