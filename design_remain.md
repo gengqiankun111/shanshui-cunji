@@ -63,8 +63,9 @@
 | 设计点 | 来源 | 状态 | 条件 |
 |---|---|---|---|
 | 多副本 raft 高可用（序节点/元数据游标） | design_extension 14.x / 710 | ✅ 阶段一落地（7.77 `e2a76a0`：元数据 Raft 自动 failover + 脑裂安全）；剩余阶段二（Calvin gseq raft 联动，RPC 接线） | 元数据切换需求已落地；Calvin 阶段三联动依赖 Calvin 落地 |
+| Calvin 硬件卸载（gseq 接 DSA/PMem） | design_extension 14.9 | 🔍 评估完成（7.80 `demo gseq-hw`：AtomicU64 原子 seq 1-2 亿/s >> 100 万/s 目标 2+ 数量级）→ **无必要性**（远期跨机房+CPU 瓶颈时复评） | 跨机房强一致需求 + 单机 CPU gseq 瓶颈 |
 | 存算分离 / Indexer Node（倒排外置） | design 9.10 / 1130 | 🔍 查询代理层已落地（7.79 `46b2be7`：IndexerProxy 独立倒排 + 回表抽象，500 全绿）；彻底存算分离 | 百亿级规模（50 亿属过度设计，不推荐 MVP；代理层先挂现有节点） |
-| 两级索引（Level 1 内存常驻摘要 + Level 2 精确） | design 4.4.2（阶段 2） | ⏳ 待评估 | 当前 4KB 块 + 段级 Block Index 已覆盖；需评估增量收益 |
+| 两级索引（Level 1 内存常驻摘要 + Level 2 精确） | design 4.4.2（阶段 2） | ✅ 评估完成（7.80 `demo two-level-index`：全局摘要内存为 Zone Map 7812×、过滤收益为 0、点查已 sub-ms）→ **不引入**（现有 Block Index+布隆+Zone Map 已覆盖） | — |
 | Tiered 分层合并（每次只合最小 2 段） | development 7.3 | ✅ 评估完成（7.78 `demo tiered-compaction`：模拟验证写放大不优于 Leveled，当前分批+无锁合并已解决阻塞痛点）→ **暂不引入**（读放大回归风险） | 写放大再优化需求（key 级更新密集场景复评） |
 | io_uring 热路径实测收益 | development 7.71 | ✅ 已实测 | 阿里云 Debian 12 / 内核 6.1：池初始化成功、核隔离生效；2 核小机器写 -13%（SQPOLL 占核）、读持平（块缓存主导）→ 默认关；收益在多核/高 IOPS 场景（7.63 指引） |
 
