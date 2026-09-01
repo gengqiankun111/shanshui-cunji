@@ -62,7 +62,7 @@
 
 | 设计点 | 来源 | 状态 | 条件 |
 |---|---|---|---|
-| 多副本 raft 高可用（序节点/元数据游标） | design_extension 14.x / 710 | 🔍 远期阶段三 | Calvin 落地阶段三；或元数据切换需求 |
+| 多副本 raft 高可用（序节点/元数据游标） | design_extension 14.x / 710 | ✅ 阶段一落地（7.77 `e2a76a0`：元数据 Raft 自动 failover + 脑裂安全）；剩余阶段二（Calvin gseq raft 联动，RPC 接线） | 元数据切换需求已落地；Calvin 阶段三联动依赖 Calvin 落地 |
 | 存算分离 / Indexer Node（倒排外置） | design 9.10 / 1130 | 🔍 远期蓝图 | 百亿级规模（50 亿属过度设计，不推荐 MVP） |
 | 两级索引（Level 1 内存常驻摘要 + Level 2 精确） | design 4.4.2（阶段 2） | ⏳ 待评估 | 当前 4KB 块 + 段级 Block Index 已覆盖；需评估增量收益 |
 | Tiered 分层合并（每次只合最小 2 段） | development 7.3 | ⏳ 后续优化 | 写放大再优化需求 |

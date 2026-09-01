@@ -2280,6 +2280,29 @@ impl RuntimePools {
    幂等/崩溃恢复；engine e2e——写主+outbox 本地原子 → 追平 → 排空 → 切换 → 新节点数据一致）；
    demo `src/demo/scale-out` 4 测试（含漏投一致性检测、排空拒绝）。
 
+### 7.77 多副本元数据 Raft 高可用（P0-2 阶段一：元数据自动切换 + 脑裂安全）
+
+> 2026-09-02。用户排期 P0-2：节点宕机**元数据自动切换**（不人工介入）+ **网络分区（脑裂）
+> 一致性**。落地最小 Raft 管理 MetaCenter 的 master 角色（design_extension 14.x 元数据
+> 切换需求）；Calvin 阶段三 gseq raft 联动依赖 Calvin 落地（阶段二）。
+
+1. **新增 `src/raft_meta.rs`**（确定性核心，消息经 RaftMetaGroup 路由 + reachable 注入分区）：
+   - **选举多数派**：候选获 N/2+1 票成 leader；同 term 已投票不可改投（voted_for 约束）；
+     新 term 换届合法；
+   - **日志复制**：元数据操作（MetaOp::Register/Unregister）作为日志条目，复制到多数派
+     才提交 → 提交后应用 MetaCenter 状态机（follower/leader 均顺序应用，幂等）——
+     **多数派提交保证无脑裂双主**；
+   - **自动 failover**：`tick` 心跳超时（heartbeat_timeout）→ 自动发起选举 → 新 leader
+     接管 master（旧 leader 宕机不人工介入）；
+   - **脑裂安全**：分区后少数派（<多数派）无法选主/提交（无新 master），主分区保持服务，
+     恢复后追平日志；
+2. **测试**：demo `src/demo/raft-meta` 4 测试 + kernel raft_meta 4 单测（选举多数派/元数据
+   复制一致/心跳超时自动 failover master 切换/脑裂少数派不能选主）；
+3. **回归**：498 全绿（+4；含 7.76 scale_out）。注：本机全量测试需 `TMP` 指向 D 盘
+   （C 盘空间不足触发磁盘熔断 `Stalled`，与代码无关）。
+4. **阶段二（Calvin 联动，远期）**：Raft 消息接 RPC 通道（真实节点间）+ Calvin gseq
+   分配器 raft 化（元数据切换时事务序不中断）——依赖 Calvin 落地（13.3.1 触发条件）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
