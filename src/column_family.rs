@@ -103,6 +103,9 @@ pub struct ColumnFamily {
     write_pressure: f64,
     /// P 项：L0 大小软阈值（字节；`storage.l0_max_size_mb`；0 = 禁用，仅用段数阈值）。
     l0_max_size_bytes: u64,
+    /// 单次合并输入大小上限（字节；`storage.compact_input_max_mb`；0 = 不限）——
+    /// L0 分批合并防大输入一次合并长时间阻塞写。
+    compact_input_max_bytes: u64,
     /// L 项：合并冷却轮次（`storage.compaction_cooldown`；0 = 关闭）。
     compaction_cooldown: u32,
     /// L 项：当前合并轮次（每次 compact 成功 +1；冷却到期基准）。
@@ -277,6 +280,7 @@ impl ColumnFamily {
             l0_stall_max: cfg.storage.l0_stall_max.max(cfg.storage.l0_stall_min.max(2)),
             write_pressure: 0.0,
             l0_max_size_bytes: cfg.storage.l0_max_size_mb * 1024 * 1024,
+            compact_input_max_bytes: cfg.storage.compact_input_max_mb * 1024 * 1024,
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
@@ -1021,6 +1025,8 @@ impl ColumnFamily {
             self.effective_l0_threshold(),
             &heat,
             &self.cooling_indices(),
+            &snap.sizes,
+            self.compact_input_max_bytes,
         );
         if sel.len() <= 1 {
             return Ok(CompactReport {
@@ -1057,6 +1063,8 @@ impl ColumnFamily {
             self.effective_l0_threshold(),
             &heat,
             &self.cooling_indices(),
+            &snap.sizes,
+            self.compact_input_max_bytes,
         );
         if sel.len() <= 1 {
             return Ok(CompactReport {
@@ -1770,13 +1778,45 @@ fn select_compaction_inputs(
     level_limit: usize,
     heat: &[u64],
     cooling: &std::collections::HashSet<usize>,
+    sizes: &[u64],
+    max_input_bytes: u64,
 ) -> (Vec<usize>, u32) {
-    let (sel, out) = select_inner(levels, level_limit, heat, cooling);
+    let (mut sel, out) = select_inner(levels, level_limit, heat, cooling);
+    // 单次合并输入大小上限（仅 L0→L1：L0 允许重叠，分批安全；L1→L2 全选保证层内不重叠）
+    if sel.len() >= 2 && out == 1 && max_input_bytes > 0 {
+        sel = cap_by_size(sel, sizes, max_input_bytes);
+    }
     if sel.len() >= 2 {
         return (sel, out);
     }
     // L 项回退：候选不足（冷却挡住收敛）→ 忽略冷却再选（保证收敛 / 防写 Stall）
     select_inner(levels, level_limit, heat, &std::collections::HashSet::new())
+}
+
+/// 分批合并：输入总大小超 `max` 时，从尾部（排序后 = 最冷/最大）移除段直到 ≤ max；
+/// 至少保留 2 段（保证本轮有进展，剩余段由 worker 后续轮次收敛）。
+fn cap_by_size(mut sel: Vec<usize>, sizes: &[u64], max: u64) -> Vec<usize> {
+    if sel.len() <= 2 {
+        return sel;
+    }
+    let total: u64 = sel.iter().map(|&i| sizes.get(i).copied().unwrap_or(0)).sum();
+    if total <= max {
+        return sel;
+    }
+    let mut acc = total;
+    let mut keep = sel.len();
+    for (k, &i) in sel.iter().enumerate().rev() {
+        if keep <= 2 {
+            break;
+        }
+        acc -= sizes.get(i).copied().unwrap_or(0);
+        keep = k;
+        if acc <= max {
+            break;
+        }
+    }
+    sel.truncate(keep.max(2));
+    sel
 }
 
 fn select_inner(
@@ -2338,34 +2378,35 @@ mod tests {
     fn select_compaction_inputs_picks_levels() {
         let no_heat = &[];
         let no_cooling = &std::collections::HashSet::new();
+        let no_sizes = &[0u64; 8];
         // 2 个 L0 + L1 未满 → 仅 L0
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1], 8, no_heat, no_cooling),
+            select_compaction_inputs(&[0, 0, 1], 8, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1], 1)
         );
         // 单个 L0 → 暂不压实
         assert_eq!(
-            select_compaction_inputs(&[0, 1], 8, no_heat, no_cooling),
+            select_compaction_inputs(&[0, 1], 8, no_heat, no_cooling, no_sizes, 0),
             (Vec::new(), 0)
         );
         // L0 ≥ 2 且 L1 已满 → L0 + 全部 L1 收敛
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2, no_heat, no_cooling),
+            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1, 2, 3, 4, 5], 1)
         );
         // L0 空、L1 > 1 → L1 → L2
         assert_eq!(
-            select_compaction_inputs(&[1, 1], 8, no_heat, no_cooling),
+            select_compaction_inputs(&[1, 1], 8, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1], 2)
         );
         // L0 空、L1 单段 → 无压实
         assert_eq!(
-            select_compaction_inputs(&[1], 8, no_heat, no_cooling),
+            select_compaction_inputs(&[1], 8, no_heat, no_cooling, no_sizes, 0),
             (Vec::new(), 0)
         );
         // L0/L1 空、L2 > 1 → 收敛 L2
         assert_eq!(
-            select_compaction_inputs(&[2, 2], 8, no_heat, no_cooling),
+            select_compaction_inputs(&[2, 2], 8, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1], 2)
         );
     }
@@ -2374,18 +2415,19 @@ mod tests {
     fn select_compaction_excludes_cooling_segments() {
         // L 项：冷却段优先不参与合并；候选不足时回退（冷却为软约束，保证收敛）
         let no_heat = &[];
+        let no_sizes = &[0u64; 8];
         let mut cooling = std::collections::HashSet::new();
         cooling.insert(0);
         // L0 段 0 冷却 + 段 1 → 冷却后不足 2 → 回退含冷却段（全量合并，防收敛死循环）
         assert_eq!(
-            select_compaction_inputs(&[0, 0], 8, no_heat, &cooling),
+            select_compaction_inputs(&[0, 0], 8, no_heat, &cooling, no_sizes, 0),
             (vec![0, 1], 1)
         );
         // L0 段 1 冷却 → 段 0 + 段 2 足够 → 冷却生效，排除段 1
         let mut cooling2 = std::collections::HashSet::new();
         cooling2.insert(1);
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 0], 8, no_heat, &cooling2),
+            select_compaction_inputs(&[0, 0, 0], 8, no_heat, &cooling2, no_sizes, 0),
             (vec![0, 2], 1)
         );
     }
@@ -2396,15 +2438,39 @@ mod tests {
         let levels = [0u32, 0, 0, 0, 0]; // 5 个 L0，limit=3
         let heat = [0u64, 0, 100, 50, 10]; // 段 2 最热
         let no_cooling = &std::collections::HashSet::new();
-        let (sel, out) = select_compaction_inputs(&levels, 3, &heat, no_cooling);
+        let (sel, out) = select_compaction_inputs(&levels, 3, &heat, no_cooling, &[0u64; 8], 0);
         assert_eq!(out, 1);
         assert_eq!(sel, vec![2, 3, 4], "应选最热 3 段（100/50/10）");
         // 无热度数据 → 维持全量合并
-        let (sel2, _) = select_compaction_inputs(&levels, 3, &[], no_cooling);
+        let (sel2, _) = select_compaction_inputs(&levels, 3, &[], no_cooling, &[0u64; 8], 0);
         assert_eq!(sel2, vec![0, 1, 2, 3, 4], "无热度全量合并");
         // L0 未超阈值 → 全量（热度不参与）
-        let (sel3, _) = select_compaction_inputs(&[0, 0], 3, &heat, no_cooling);
+        let (sel3, _) = select_compaction_inputs(&[0, 0], 3, &heat, no_cooling, &[0u64; 8], 0);
         assert_eq!(sel3, vec![0, 1]);
+    }
+
+    #[test]
+    fn select_compaction_caps_l0_input_by_size() {
+        // 分批合并（compact_input_max_mb）：L0 总大小超上限 → 只合并 ≤ 上限的部分段
+        //（防大 L0 一次全合并长时间阻塞写）；L1→L2 不受限（层内不重叠需全选）。
+        let no_heat = &[];
+        let no_cooling = &std::collections::HashSet::new();
+        // L0 三段各 600MB（总 1.8GB），上限 1GB → 合并 2 段（600+600=1.2GB 仍超 → 只留 2 段保底）
+        let sizes = [600u64, 600, 600, 100, 100];
+        let (sel, out) = select_compaction_inputs(&[0, 0, 0, 1, 1], 8, no_heat, no_cooling, &sizes, 1024);
+        assert_eq!(out, 1);
+        assert_eq!(sel.len(), 2, "超限应截断到保底 2 段: {sel:?}");
+        // L1→L2（L0 空）：大小上限不生效（全选，保证 L2 无重叠）
+        let (sel2, out2) = select_compaction_inputs(&[1, 1], 8, no_heat, no_cooling, &sizes, 1024);
+        assert_eq!(out2, 2);
+        assert_eq!(sel2, vec![0, 1], "L1→L2 全选不受上限限制");
+        // 总大小未超限 → 全量合并
+        let small = [100u64, 200, 300];
+        let (sel3, _) = select_compaction_inputs(&[0, 0, 0], 8, no_heat, no_cooling, &small, 1024);
+        assert_eq!(sel3, vec![0, 1, 2], "未超限全量合并");
+        // max=0（不限）→ 全量合并（旧行为）
+        let (sel4, _) = select_compaction_inputs(&[0, 0, 0], 8, no_heat, no_cooling, &sizes, 0);
+        assert_eq!(sel4, vec![0, 1, 2], "max=0 不限");
     }
 
     #[test]

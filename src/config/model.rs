@@ -628,6 +628,11 @@ pub struct StorageConfig {
     /// P 项：L0 大小软阈值（MB）——L0 文件总字节超此值触发合并（与段数阈值互补，
     /// 防大段少量堆积；0 = 仅用段数阈值，默认关闭）。
     pub l0_max_size_mb: u64,
+    /// 单次合并输入大小上限（MB，默认 1024）：L0 段多且总大小超限时**分批**合并
+    /// （每轮只合并 ≤ 上限的部分段）——单次合并快 → 后台 worker 持读锁时间短 →
+    /// 写锁等待短（修复大 L0 一次全合并长时间阻塞写）；多轮收敛由 worker 循环兜底。
+    /// 0 = 不限（旧行为，一次合并全部 L0）。
+    pub compact_input_max_mb: u64,
 }
 
 impl Default for StorageConfig {
@@ -666,6 +671,7 @@ impl Default for StorageConfig {
             // 保持既有行为；需按段大小触发时配置 l0_max_size_mb）。
             auto_compact: true,
             l0_max_size_mb: 0,
+            compact_input_max_mb: 1024,
         }
     }
 }
