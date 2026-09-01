@@ -642,6 +642,22 @@
   单次合并快 → 写阻塞短（复测 -55%）；L1→L2 不受限；根治（无锁合并）留待后续。
 - **结果**：全量 465 绿；提交 `96ac6bc` + `1763554` + `b9a9eb3` + `0e4e40c`。
 
+### P72. 合并阻塞写根治方案评估（无锁合并）+ 阶段一落地
+- **问题**：P71 分批只缓解合并阻塞写（-55%）；根治 = 合并与写并发（无锁合并），需动 RwLock 语义。
+- **完整方案（记录供后续实施，O 项规模改造）**：
+  1. CF 增 `sst_mutate: Mutex<()>`——flush/compact 的 ssts store 前置互斥（无 Engine 锁后防
+     "compact 基于旧快照合并、flush 发布新快照，后 store 丢失前 store"的并发丢失）；
+  2. CF `switch_and_flush` 改 `&self`（memtable 冻结内部 Mutex）——Engine 字段 `Arc<ColumnFamily>`
+     化后 flush 无法取 `&mut`（O 项第①步方向延伸）；
+  3. Engine primary/delta/cidx 字段 `Arc<ColumnFamily>`（Engine::compact 已 `&self` 兼容）；
+  4. mysql worker：`read()` 内 clone 三 CF Arc（快速）→ drop 锁 → **无锁** CF.compact
+     （复刻 Engine::compact 紧迫度调度）；写语句持写锁与合并并发执行（ArcSwap 原子发布）。
+  - 风险：compact 与 put 并发安全（CF compact 不碰 memtable）；flush 与 compact 并发由
+    sst_mutate 保证；需全量 + 并发测试验证。
+- **阶段一落地（本项）**：mysql worker 锁内 while 8 轮连续合并 → **单轮合并 + 100ms 循环**
+  （配合 compact_input_max_mb 分批单轮快）——写每轮间可插入，缓解长排队；
+- **结果**：466 全绿；阶段一随提交 `XXXX`；完整无锁方案留待大改造窗口。
+
 ---
 
 ## 环境备忘（不入库）

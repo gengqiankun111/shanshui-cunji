@@ -242,12 +242,12 @@ impl MySqlServer {
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
                 if signaled || backstop {
+                    // 合并阻塞写缓解（P71 阶段一）：锁内**单轮**合并（紧迫度调度每轮压最高档
+                    // 列族，配合 compact_input_max_mb 分批单轮快）→ 释放锁 → 下个 100ms 循环
+                    // 再试——写每轮之间可插入（旧实现锁内 while 8 轮连续合并，写长时间排队）。
                     if let Ok(g) = engine.try_read() {
-                        // W 项：多轮直至收敛（紧迫度调度下每轮可能只压一部分列族）
-                        let mut guard = 0;
-                        while g.needs_compact() && guard < 8 {
+                        if g.needs_compact() {
                             let _ = g.compact();
-                            guard += 1;
                         }
                     }
                     if backstop {
