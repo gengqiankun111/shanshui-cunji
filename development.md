@@ -2071,6 +2071,21 @@ impl RuntimePools {
   +4 DDL 单元测试（TEXT/VARCHAR 切换、MergeTree、LOAD DATA FIELDS 对齐、DDL+LOAD 组装）；
 - 全量 **476 全绿**。
 
+### 7.68 导出增强：与 Compaction 共享后台 IO 优先级（E 模块，design 20.5 收尾）
+
+> 2026-09-01。E 模块"导出增强"最后一项落地（`40e8abb`）——**design 20.5 导出功能全部完成**：
+> CSV/Parquet/JDBC/增量/流式管道/MySQL 兼容/建表 DDL/后台 IO 限速。
+
+- **CF 增 `scan_limiter`**：顺序扫描（scan_stream）路径专用 Token Bucket 限速器——与 Compaction
+  的 `io_limiter` **同策略**（共享后台 IO 预算语义，默认低于前台读写）；前台点查（get）不受影响
+  （限速只作用于 scan_stream，不作用于点查/范围读）；
+- **CF::scan_stream_at 产出按字节 acquire**：扫描节奏受限 → SST 顺序读 IO 随节奏受限
+  （后台 IO 让路前台，对在线业务影响 <5% 目标）；
+- **export `--io-rate-limit-mb <n>`**：导出限速（默认取 `storage.io_rate_limit_mb`，与 Compaction
+  同配置源）；`Engine::set_scan_rate_limit`（0 = 关闭）；
+- 测试 `scan_rate_limit_slows_stream`：限速 1MB/s 扫描 2MB 显著变慢（≥300ms）、关闭恢复快速、
+  前台读不受影响；全量 **477 全绿**。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

@@ -13,9 +13,9 @@
   （`--filter/--project/--mask` Filter+Projection+Sink 分叉 + `--rate-limit`，c6b5417）、
   **JDBC 直连**（`--jdbc mysql://...` MySQL wire 客户端建表+批量 INSERT 无文件落盘，c6b5417）、
   **MySQL 兼容 CSV 配套**（`--mysql-compatible` CREATE TABLE + LOAD DATA INFILE SQL +
-  `--mysql-max-varchar`，313bd81）、**建表 DDL**（`--dry-run-schema` ClickHouse/MySQL，313bd81）
-- **待做**：
-  - **与 Compaction 共享后台 IO 优先级**（导出侧服务器级限速，在线业务影响 <5% 目标）
+  `--mysql-max-varchar`，313bd81）、**建表 DDL**（`--dry-run-schema` ClickHouse/MySQL，313bd81）、
+  **与 Compaction 共享后台 IO 优先级**（`--io-rate-limit-mb` scan_limiter Token Bucket，40e8abb）
+- **待做**：无——**导出增强（design 20.5）全部完成**（✅）
 
 ## 2. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + 3d58137）
 

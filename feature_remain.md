@@ -7,7 +7,7 @@
 
 | 功能 | 模块 | 已落地 | 剩余 |
 |---|---|---|---|
-| 导出增强（增量 / Parquet / JDBC / 流式管道 / MySQL 兼容 / DDL） | E | Parquet（70c3b30）；增量（2174531）；流式管道（c6b5417）；JDBC 直连（c6b5417）；MySQL 兼容 CSV + LOAD DATA SQL + --mysql-max-varchar（313bd81）；--dry-run-schema ClickHouse/MySQL DDL（313bd81） | 与 Compaction 共享后台 IO 优先级（导出侧服务器级限速） |
+| 导出增强（design 20.5 全功能） | E | ✅ 全部完成：Parquet（70c3b30）；增量（2174531）；流式管道（c6b5417）；JDBC 直连（c6b5417）；MySQL 兼容 CSV + LOAD DATA SQL（313bd81）；--dry-run-schema DDL（313bd81）；--io-rate-limit-mb 后台 IO 优先级（40e8abb） | — |
 
 ## ⏳ 待办
 

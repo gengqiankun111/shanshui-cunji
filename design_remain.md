@@ -22,10 +22,9 @@
   c6b5417）、JDBC 直连（`--jdbc mysql://...` MySQL wire 客户端建表+批量 INSERT，c6b5417）、
   `--rate-limit` 限流（c6b5417）、MySQL 兼容 CSV 配套（`--mysql-compatible` 自动生成 CREATE TABLE +
   LOAD DATA INFILE SQL + `--mysql-max-varchar`，313bd81）、建表 DDL（`--dry-run-schema --target
-  clickhouse|mysql` MergeTree / InnoDB，313bd81）
-- **未落地**：
-  - **与 Compaction 共享后台 IO 优先级**（当前仅 --rate-limit 客户端节流；导出侧服务器级
-    IO 优先级共享需 Engine IO 限速器接入，对在线业务影响 <5% 目标）
+  clickhouse|mysql` MergeTree / InnoDB，313bd81）、与 Compaction 共享后台 IO 优先级
+  （`--io-rate-limit-mb` scan_limiter Token Bucket，40e8abb）
+- **未落地**：无——**design 20.5 导出功能全部完成**（✅）
 
 ## 3. 合并阻塞根治：无锁合并（✅ 完成 af24dbd + P73 3d58137）
 

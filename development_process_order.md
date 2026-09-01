@@ -44,6 +44,7 @@
 | Z | 合并阻塞写根治：无锁合并（2026-09-01） | 延伸 | ✅ 完成 | P72 完整方案（af24dbd：MemTableBuffer RwLock &self 化 + CF sst_mutate + Engine Arc 化 + worker clone CF Arc 无锁合并——写与合并并发）+ P73 manifest 竞态修复（3d58137：persist 内存快照 + store→persist→remove 原子）+ 回归测试（5de5ab0）；1 亿库实测合并期写 25-43k rows/s 不塌陷（修复前 8.2k-18.2k 分钟级阻塞）；469 全绿；详见 development.md 7.65 / P72 / P73 |
 | AA | 导出增强：流式管道 + JDBC 直连（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 阶段 3（c6b5417）：流式管道（--filter/--project/--mask Filter+Projection+Sink 分叉，内存 O(批)）+ JDBC 直连（MysqlWireClient MySQL wire 客户端建表+批量 INSERT 无文件落盘）+ --rate-limit；端到端验证 CSV/Parquet/JDBC；476 全绿；详见 development.md 7.66 |
 | AB | 导出增强：MySQL 兼容 CSV 配套 + 建表 DDL（2026-09-01） | 延伸 | ✅ 完成 | design 20.5（313bd81）：--mysql-compatible 自动生成 CREATE TABLE + LOAD DATA INFILE 配套 SQL（比逐条 INSERT 快 ~20 倍）+ --mysql-max-varchar 控制 VARCHAR/TEXT + --dry-run-schema --target clickhouse\|mysql 建表 DDL（MergeTree / InnoDB）；+4 测试 476 全绿；详见 development.md 7.67 |
+| AC | 导出增强：与 Compaction 共享后台 IO 优先级（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 收尾（40e8abb）：CF scan_limiter Token Bucket（扫描路径专用，前台点查不受影响）+ export --io-rate-limit-mb（默认 storage.io_rate_limit_mb 同 Compaction 后台预算语义）；+1 测试 477 全绿；**导出功能全部完成**；详见 development.md 7.68 |
 
 ## 3. 大项详情
 
