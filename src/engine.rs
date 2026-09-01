@@ -3382,6 +3382,67 @@ mod tests {
     }
 
     #[test]
+    fn scale_out_coordinator_e2e_with_outbox() {
+        // Ex-1.5 端到端：扩容协调器（状态机 + 路由切换）衔接 engine outbox——
+        // 写主（业务+outbox 本地原子）→ 追平投递到新节点 → 排空校验 → 切换 → 新节点接管
+        use crate::scale_out::{Phase, ScaleOutCoordinator};
+        use std::sync::Mutex;
+        let da = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.outbox.enabled = true;
+        let a = Mutex::new(Engine::open(da.path(), &c).unwrap());
+        let b = Mutex::new(Engine::open(db.path(), &c).unwrap());
+        // 写主节点 + outbox 入队（本地原子：业务写与消息同 fsync 点）
+        for i in 0..20u64 {
+            let val = format!("doc-{i}").into_bytes();
+            let mut a = a.lock().unwrap();
+            a.put(i, val.clone(), &["status=active"]).unwrap();
+            a.enqueue_outbox(i, &val).unwrap();
+        }
+        // 扩容编排开始（新节点注册为 slave）
+        let mut meta = crate::meta::MetaCenter::new(4);
+        meta.register("node-a", "127.0.0.1:9001", "master").unwrap();
+        let mut coord = ScaleOutCoordinator::begin(
+            &da.path().join("scale-out.json"),
+            meta,
+            "node-a",
+            "node-b",
+            "127.0.0.1:9002",
+        )
+        .unwrap();
+        assert_eq!(coord.phase(), Phase::Adding);
+        coord.begin_catch_up().unwrap();
+        // 追平：dispatch_outbox 投递到新节点（put 覆盖 = 幂等 apply）
+        {
+            let mut a = a.lock().unwrap();
+            let mut b = b.lock().unwrap();
+            let n = a
+                .dispatch_outbox(|key, payload| {
+                    let docid = u64::from_be_bytes(key[..8].try_into().unwrap());
+                    b.put(docid, payload.to_vec(), &[]).unwrap();
+                    true
+                })
+                .unwrap();
+            assert_eq!(n, 20, "20 条 outbox 全部投递");
+            assert!(a.outbox_drained().unwrap(), "排空校验通过");
+        }
+        coord.mark_drained().unwrap();
+        coord.switch().unwrap();
+        assert_eq!(coord.phase(), Phase::Done);
+        assert_eq!(coord.master_node().as_deref(), Some("node-b"), "路由切到新节点");
+        // 新节点数据完整（与主节点一致）
+        let b = b.lock().unwrap();
+        for i in 0..20u64 {
+            assert_eq!(
+                b.get(i).unwrap().as_deref(),
+                Some(format!("doc-{i}").as_bytes()),
+                "docid {i} 追平一致"
+            );
+        }
+    }
+
+    #[test]
     fn deletion_bitmap_persists_across_restart() {
         // 删除 → flush_wal（位图落盘）→ 重启 → 位图文件加载，已删 docid 仍不可见
         let dir = tmp();
