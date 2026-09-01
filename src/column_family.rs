@@ -2474,6 +2474,72 @@ mod tests {
     }
 
     #[test]
+    fn cap_by_size_truncates_and_keeps_min_two() {
+        // cap_by_size 函数级：未超限全保留；超限从尾部移除到 ≤ max；保底 2 段
+        // 未超限 → 全保留
+        assert_eq!(cap_by_size(vec![0, 1, 2], &[100, 200, 300], 1024), vec![0, 1, 2]);
+        // 超限 → 从尾部移除到 ≤ max（保底 2 段：总 800 > 700 但只剩 2 段即停）
+        assert_eq!(cap_by_size(vec![0, 1, 2], &[400, 400, 400], 700), vec![0, 1]);
+        // 超限且移除一段即满足 → 保留前缀
+        assert_eq!(cap_by_size(vec![0, 1, 2], &[300, 300, 500], 600), vec![0, 1]);
+        // 仅 2 段 → 直接返回（保底下限）
+        assert_eq!(cap_by_size(vec![0, 1], &[2000, 2000], 100), vec![0, 1]);
+        // 单段 → 直接返回
+        assert_eq!(cap_by_size(vec![0], &[5000], 100), vec![0]);
+        // 剩余段由后续轮次再选（前缀保留 = 本轮输入；未选段仍在 levels 中可再被选）
+        let no_heat = &[];
+        let no_cooling = &std::collections::HashSet::new();
+        let sizes = [400u64, 400, 400];
+        let (sel, _) = select_compaction_inputs(&[0, 0, 0], 8, no_heat, no_cooling, &sizes, 700);
+        assert_eq!(sel, vec![0, 1], "本轮分批 2 段");
+        // 下一轮（同输入，无冷却）：未选段 2 参与（冷却回退/再次全选后 cap）→ 仍能推进收敛
+        let (sel2, _) = select_compaction_inputs(&[0, 0, 0], 8, no_heat, no_cooling, &sizes, 700);
+        assert_eq!(sel2.len(), 2, "下轮仍可选 2 段（含段 2）");
+    }
+
+    #[test]
+    fn compact_batches_l0_with_small_input_cap() {
+        // 端到端：compact_input_max_mb=1MB，flush 5 段（各 ~4MB）→ 单次 compact 输入被 cap
+        //（保底 2 段 < 全部 5 段）→ 分批合并；多轮收敛后数据完整。
+        let dir = tmp();
+        let mut cfg = small_cfg(64);
+        cfg.storage.compact_input_max_mb = 1; // 1MB 上限
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        let big = vec![b'x'; 2048]; // 2KB/行 → 每段 2000 行 ≈ 4MB > 1MB 上限
+        for seg in 0..5u64 {
+            for i in seg * 2000..seg * 2000 + 2000 {
+                cf.put(i, big.clone()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+        }
+        let before = cf.sst_count();
+        assert!(before >= 5, "应产生 5+ SST: {before}");
+        let rep = cf.compact().unwrap();
+        assert!(
+            rep.merged_ssts >= 2 && rep.merged_ssts < before,
+            "单轮分批：输入被 cap（保底 2 段 < 全部 {before}），实际合并 {} 段",
+            rep.merged_ssts
+        );
+        assert!(cf.sst_count() < before, "本轮合并后段数减少");
+        // 分批合并不丢数据（全部可读）
+        for i in 0..10_000u64 {
+            let v = cf.get(i).unwrap();
+            assert_eq!(v.as_ref().map(|r| r.0.as_slice()), Some(big.as_slice()), "docid={i} 数据完整");
+        }
+        // 多轮收敛（worker while 语义）：最终 needs_compact=false 且数据仍完整
+        let mut rounds = 0;
+        while cf.needs_compact() && rounds < 30 {
+            cf.compact().unwrap();
+            rounds += 1;
+        }
+        assert!(!cf.needs_compact(), "多轮 {rounds} 轮内收敛");
+        for i in (0..10_000u64).step_by(997) {
+            let v = cf.get(i).unwrap();
+            assert_eq!(v.as_ref().map(|r| r.0.as_slice()), Some(big.as_slice()), "收敛后 docid={i}");
+        }
+    }
+
+    #[test]
     fn sst_heat_tracks_point_reads() {
         // Ex-5.9：点查命中递增 SST 热度；跨 flush/compact 保持
         let dir = tmp();
