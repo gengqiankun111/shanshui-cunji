@@ -37,8 +37,9 @@ pub struct Engine {
     delta: Arc<ColumnFamily>,
     /// 倒排索引。
     inverted: InvertedIndex,
-    /// 文档热缓存（O 项第②步：内部 `Mutex`——读路径 `&self` 并发回填/命中）。
-    hotcache: Mutex<HotCache>,
+    /// 文档热缓存（7.72：内部 RwLock+DashMap 粒度化——读路径 `&self` 读读并行、
+    /// 写路径（put/invalidate/promote）写锁，不再整包 Mutex 串行热缓存访问）。
+    hotcache: HotCache,
     /// 看门狗（OOM 限流 + 查询超时熔断）。
     watchdog: Watchdog,
     /// 内存使用率估算（0~1，由上层注入或监控更新）。
@@ -427,7 +428,7 @@ impl Engine {
             cidx,
             inverted,
             delta,
-            hotcache: Mutex::new(hotcache),
+            hotcache,
             watchdog,
             mem_ratio: 0.0,
             max_memory_mb: cfg.hotcache.max_memory_mb + cfg.blockcache.max_memory_mb,
@@ -591,7 +592,7 @@ impl Engine {
     pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // ① 失效 HotCache 该 docid（批量导入模式跳过：只写不读，避免缓存膨胀挤爆内存，P40）
         if !self.skip_hotcache {
-            self.hotcache.lock().unwrap().invalidate(docid);
+            self.hotcache.invalidate(docid);
         }
         // ② 主数据（权威源，WAL 攒批不逐条 fsync）；全量覆盖 → 清空该 docid 的增量（避免旧 patch 覆盖新数据）
         self.primary
@@ -614,7 +615,7 @@ impl Engine {
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中；批量导入模式跳过，P40）
         if !self.skip_hotcache {
-            self.hotcache.lock().unwrap().put(docid, value);
+            self.hotcache.put(docid, value);
         }
         // P 项：事件驱动自动 Compaction——写后检查（Flush 可能刚新增 L0 段），
         // L0 段数/大小超阈值 → 同步合并收敛（写入自然退避 = 背压）。
@@ -907,7 +908,7 @@ impl Engine {
     /// （回放转本函数重新置位，幂等）。关闭时回退传统 Tombstone 路径。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
-        self.hotcache.lock().unwrap().invalidate(docid);
+        self.hotcache.invalidate(docid);
         match &self.deletion_bitmap {
             Some(bm) => {
                 bm.mark_deleted(docid);
@@ -926,7 +927,7 @@ impl Engine {
     /// 部分更新（阶段 1.5，design 4.7）：仅写入变更字段到 Delta CF（几十字节小记录），
     /// 读取时 Merge-on-Read 覆盖 Base；`null` 值表示删除该字段。替代全量 PUT，写入 IO 放大趋近 1。
     pub fn patch(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
-        self.hotcache.lock().unwrap().invalidate(docid);
+        self.hotcache.invalidate(docid);
         for (f, v) in fields {
             let mut key = encode_docid(docid).to_vec();
             encode_varlen(&mut key, f.as_bytes());
@@ -949,7 +950,7 @@ impl Engine {
                 return Ok(None);
             }
         }
-        if let Some(v) = self.hotcache.lock().unwrap().get(docid) {
+        if let Some(v) = self.hotcache.get(docid) {
             return Ok(Some(v));
         }
         let found = self.primary.get(docid)?;
@@ -985,7 +986,7 @@ impl Engine {
         }
         let merged =
             serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-        self.hotcache.lock().unwrap().put(docid, merged.clone());
+        self.hotcache.put(docid, merged.clone());
         self.metrics.record_latency(t.elapsed().as_nanos() as u64);
         Ok(Some(merged))
     }
@@ -997,7 +998,7 @@ impl Engine {
     /// 范围扫描** [min..max] 按 docid 分组，替代逐 docid 扫描。
     /// 输入要求：docids 升序且无重复（倒排 bitmap 迭代天然满足）。
     /// 返回与输入顺序对齐的 `Vec<Option<value>>`。
-    /// O 项第②步：读路径 `&self`（HotCache 内部 Mutex；delta 读已 &self）。
+    /// O 项第②步：读路径 `&self`（HotCache 内部 RwLock 读读并行 + DashMap 无锁计数）。
     pub fn batch_get(&self, docids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
         let n = docids.len();
         let mut out: Vec<Option<Vec<u8>>> = vec![None; n];
@@ -1012,7 +1013,7 @@ impl Engine {
                     continue;
                 }
             }
-            if let Some(v) = self.hotcache.lock().unwrap().get(d) {
+            if let Some(v) = self.hotcache.get(d) {
                 out[i] = Some(v);
             } else {
                 need_primary.push(i);
@@ -1056,7 +1057,7 @@ impl Engine {
             }
             let merged = serde_json::to_vec(&map)
                 .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-            self.hotcache.lock().unwrap().put(d, merged.clone());
+            self.hotcache.put(d, merged.clone());
             out[i] = Some(merged);
         }
         Ok(out)
@@ -2429,19 +2430,19 @@ mod tests {
         let mut e = Engine::open(dir.path(), &cfg()).unwrap();
         // 默认：写后回填 HotCache
         e.put_nosync(1, b"doc-1".to_vec(), &["t"]).unwrap();
-        assert_eq!(e.hotcache.lock().unwrap().len(), 1, "默认写后应回填热缓存");
+        assert_eq!(e.hotcache.len(), 1, "默认写后应回填热缓存");
         // 批量导入模式：只写不读，跳过回填（P40 防缓存膨胀挤爆内存）
         e.set_bulk_import(true);
         e.put_nosync(2, b"doc-2".to_vec(), &["t"]).unwrap();
-        assert_eq!(e.hotcache.lock().unwrap().len(), 1, "批量导入模式不应回填热缓存");
+        assert_eq!(e.hotcache.len(), 1, "批量导入模式不应回填热缓存");
         // 关闭后恢复常规语义
         e.set_bulk_import(false);
         e.put_nosync(3, b"doc-3".to_vec(), &["t"]).unwrap();
-        assert_eq!(e.hotcache.lock().unwrap().len(), 2, "关闭后应恢复回填");
+        assert_eq!(e.hotcache.len(), 2, "关闭后应恢复回填");
         // 主数据不受影响：批量写入的文档仍可正常读取
         e.set_bulk_import(true);
         e.put_nosync(4, b"doc-4".to_vec(), &["t"]).unwrap();
-        assert_eq!(e.hotcache.lock().unwrap().len(), 2);
+        assert_eq!(e.hotcache.len(), 2);
         assert_eq!(e.get(4).unwrap().unwrap(), b"doc-4");
     }
 
