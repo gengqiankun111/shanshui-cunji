@@ -35,9 +35,10 @@
 ## 4. io_uring Linux 部署实测
 
 - **来源**：V 项 / development 7.63 指引
-- **状态**：代码已就绪（Linux 门控）；指引已写；**实测待 Linux ≥4GB 环境**（本机 Windows）
-- **步骤**：内核 ≥5.1 → `[runtime] io_uring_enabled=true` + SQPOLL 核 → A/B（WAL fsync / 块 read_at）
-  吞吐与 P50/P95 → 核隔离验证
+- **状态**：✅ **已完成**（7.71）——热路径接入（SSTable 块读 + WAL fsync 走 SQPOLL）+ 阿里云
+  Debian 12 / 内核 6.1 实测：io_uring 池初始化成功、核隔离生效（SQPOLL 3 线程绑核 0、业务核 1）；
+  2 核小机器写路径 -13%（SQPOLL 占核）、点查/扫描持平（块缓存主导）→ io_uring 保持默认关，
+  多核 NVMe 生产环境按 7.63 指引开启
 
 ## 5. 文档维护（工作流收尾）
 

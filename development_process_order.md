@@ -200,7 +200,7 @@
 | ③ 倒排并发读锁 | 读路径已 ArcSwap 无锁快照（Ex-6.2/6.3 `c8183cf`） | ✅ 已实现（文档澄清；引擎级全局 Mutex 归 O 项） |
 | ④ 环形 WAL 回绕覆盖 vs 崩溃恢复 | 已实现：Flush 后 `set_flushed_seq`，回绕仅覆盖已刷盘记录，未刷盘 → `WalFull` → 强制 Flush（M6-1 + P35） | ✅ 已实现（文档澄清） |
 | ⑤ 4KB 块 IO 放大（预读合并） | 块缓存 LRU 已摊薄重复读；zstd 压缩 + 分区布隆 | ✅ 已修（U 项 85b9a62：SstRangeIter 组读预读 4×4KB → 1×16KB） |
-| ⑥ io_uring SQPOLL 与绑核冲突 | io_uring 后端未落地（io_queue.rs 仅队列抽象，`io_uring_enabled` 默认关，Linux 专属） | 备注：后端落地时需给 SQPOLL 预留独立核（affinity 分区扩展） |
+| ⑥ io_uring SQPOLL 与绑核冲突 | io_uring 后端已落地（7.71：热路径接入 SSTable 块读 + WAL fsync；SQPOLL 预留核 `reserve_sqpoll_core`，实测 3 个 `iou-sqp-*` 线程绑核 0、业务线程核 1） | ✅ 已解决（7.71，`io_uring_enabled` 默认关，多核 NVMe 开启） |
 
 ### 缺陷 → 优化方案路线（与 feature.md「架构评审与补充」对齐）
 | 缺陷（按严重度） | 性质 | 方案要点 | 排期项 |
@@ -208,7 +208,7 @@
 | 引擎全局单 Mutex 串行 + Compaction 同步阻塞 | 性能（吞吐天花板 ~1000 stmt/s） | **读路径无锁化合并**：① 读 API `&self` 化（O/Q/R 共同前置）→ ② RwLock 读读并行（RR 快照读只读）→ ③ ssts ArcSwap + 后台合并 | O（P1，O/Q 合并） |
 | L0/L1 层无全局布隆 | 性能（点查逐 SST 布隆+二分） | 每层 OR 合并布隆，`get_bytes` 整层粗筛一次跳过 | R（P1） |
 | RR 事务点查冷读（get_at 不走 HotCache） | 性能（事务内重复点查放大） | 事务对象内 256 项快照小缓存，提交/回滚即弃 | T（P2） |
-| io_uring 后端未落地 | 平台（Linux 性能上限未兑现） | liburing unsafe 封装 + `io_uring_enabled` 接入 + SQPOLL 预留核 | V（P2） |
+| io_uring 后端未落地 | 平台（Linux 性能上限未兑现） | liburing unsafe 封装 + `io_uring_enabled` 接入 + SQPOLL 预留核 | V（P2）✅ 已完成（7.71：热路径接入 + Debian 12 实测，2 核小机器写 -13% 读持平 → 默认关） |
 | Compaction 优先级队列缺失 | 调度（多列族/层级无序） | 合并任务入优先级队列（热段 > 冷却 > 文件数压力） | W（P2） |
 | Metrics 缺失 | 运维（无观测指标） | admin `/metrics` + 计数器/分位直方图分层埋点 | X（P2） |
 | 4KB 块冷扫 IO 放大 | 性能（低优先） | 相邻块合并 read_at + 预填充块缓存 | U（P3） |

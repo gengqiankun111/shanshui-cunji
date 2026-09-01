@@ -2122,6 +2122,45 @@ impl RuntimePools {
 - 测试 `async_server_protocol_roundtrip`（握手/认证/SELECT/PREPARE/INSERT 往返）+
   `async_server_concurrent_clients_all_succeed`（8 并发客户端全成功）；全量 **480 全绿**。
 
+### 7.71 io_uring Linux 部署实测（V 项收尾：热路径接入 + 阿里云 Debian 12 A/B）
+
+> 2026-09-01。V 项（design_extension v0.5 第 12.3）在 Linux 上完成**部署实测**（7.63 指引执行）。
+> 实测发现 7.63 时代 `iou` 池仅初始化、未接入读写热路径 → 本次**补齐热路径接入**后实测。
+> 环境：阿里云 Debian 12 / 内核 6.1（io_uring 符号 342）/ 2 核 / 1.6GB。
+
+1. **热路径接入（补 7.63 缺口）**：
+   - `SstReader` 增 `iou: Option<Arc<IoUringPool>>` 字段 + `open_with_io_uring` 变体；块读
+     （`read_block`/`read_block_group`/`block_raw`）经 `read_at_io` 转发——Linux + 启用时走
+     SQPOLL（`IoClass::Sst` 队列），否则回退同步 `read_at`；
+   - `WalWriter`/`RingWal` 增 `iou` 字段 + `set_io_uring`；fsync（`sync`/`flush_sync`/
+     `truncate_and_reset`/环形合并 fsync）经 `fsync_file` 转发（`IoClass::Wal` 队列）；
+   - `ColumnFamily::open_with_io_uring`（Linux）把池注入加载的 SST 与 WAL；engine 将 iou
+     池创建**提前到 CF 打开之前**并传入三 CF（primary/cidx/delta）；
+   - `io-uring-file` crate 补 `unsafe impl Send`（Arc 跨线程派发需要，白名单内论证）；
+   - 启动日志：`io_uring 后端池初始化成功（SQPOLL 三队列，预留核=…）` / 未启用回退提示；
+2. **编译验证**：Linux `cargo build --release` 通过（`-C target-cpu=native`；1.6GB 内存需
+   `CARGO_BUILD_JOBS=1` 防 OOM）；本地 Windows 480 测试全绿（cfg 门控双分支）；
+3. **A/B 实测**（MySQL wire，pymysql 本地回环；memtable 8MB 强制 flush 使读走 SSTable；
+   组提交 2ms；WAL append）：
+
+   | 指标（30 万行） | io_uring ON | 同步 OFF | 结论 |
+   |---|---|---|---|
+   | 写吞吐 rows/s | 17,174 | 19,695 | -13% |
+   | 写 P50/P95 ms | 55.1/59.1 | 47.6/55.4 | ON 略慢 |
+   | 点查 5k qps | 23 | 23 | 持平 |
+   | 点查 P50/P95 ms | 44.0/47.9 | 44.0/44.6 | 持平 |
+   | 扫描 30×100k /s | 1.3 | 1.3 | 持平 |
+   | 扫描 P50/P95 ms | 747/766 | 751/761 | 持平 |
+
+   → **符合 7.63 预期**：io_uring 池/热路径正确生效（SST 已落盘、点查扫描走 SQPOLL read_at、
+   WAL fsync 走 SQPOLL 队列），但 **2 核小机器 SQPOLL 内核轮询线程占用 1/2 核资源，写路径
+   反而 -13%**；点查/扫描由块缓存主导、IO 非瓶颈故持平。收益在核多/高 IOPS 场景才显著。
+4. **核隔离验证**：`reserve_sqpoll_core` 生效——3 个 `iou-sqp-*` 内核线程（WAL/SST/倒排
+   三队列）全部绑核 0，业务主线程在核 1（2 核机器 SQPOLL 独占 1 核，其余业务线程自由调度）；
+5. **决策**：io_uring 保持默认关（`io_uring_enabled=false`）——小机器负收益；多核 NVMe
+   生产环境按 7.63 指引开启 + 预留 SQPOLL 核。全量 **480 全绿**（本会话无新增测试，接入
+   由既有 480 回归覆盖）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
