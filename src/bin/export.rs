@@ -6,6 +6,10 @@
 //! 导出管道（design 20.5）：流式扫描 → Filter（--filter 'field op value AND ...'）→
 //! Projection（--project 'a,b,c' 字段子集 + --mask 'f=pat' 脱敏）→ Sink 分叉
 //! （CSV / Parquet / JDBC 直连）。--rate-limit <rows/s> 限流；--batch-size 每批行数。
+//! MySQL 兼容（--mysql-compatible）：CSV 导出后生成配套 SQL（CREATE TABLE + LOAD DATA INFILE，
+//! 比逐条 INSERT 快 ~20 倍）；--mysql-max-varchar <n> 控制 doc 列 VARCHAR(n)/TEXT。
+//! 建表 DDL（--dry-run-schema <out.sql> [--target clickhouse|mysql]）：只生成目标库建表 DDL
+//! （ClickHouse MergeTree 供 Parquet 直读 / MySQL），不导出数据。
 //! 增量（design 20.5）：`--incremental`（DocId 游标断点续传）——首次全量导出并记录最大 docid
 //! 到 checkpoint；后续只导 `docid > checkpoint` 的新数据并推进游标（对称 P3-4 增量导入）。
 
@@ -41,6 +45,10 @@ fn main() {
     let mut masks: Vec<String> = Vec::new();
     let mut rate_limit: f64 = 0.0;
     let mut batch_size = DEFAULT_BATCH;
+    let mut mysql_compatible = false;
+    let mut mysql_max_varchar: usize = 0;
+    let mut dry_run_schema: Option<PathBuf> = None;
+    let mut target = "mysql".to_string();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -105,6 +113,25 @@ fn main() {
                     batch_size = args[i].parse().unwrap_or(DEFAULT_BATCH);
                 }
             }
+            "--mysql-compatible" => mysql_compatible = true,
+            "--mysql-max-varchar" => {
+                i += 1;
+                if i < args.len() {
+                    mysql_max_varchar = args[i].parse().unwrap_or(0);
+                }
+            }
+            "--dry-run-schema" => {
+                i += 1;
+                if i < args.len() {
+                    dry_run_schema = Some(PathBuf::from(&args[i]));
+                }
+            }
+            "--target" => {
+                i += 1;
+                if i < args.len() {
+                    target = args[i].clone();
+                }
+            }
             "--config" | "-c" => {
                 i += 1;
                 if i < args.len() {
@@ -115,6 +142,20 @@ fn main() {
         }
         i += 1;
     }
+    // --dry-run-schema：只生成目标库建表 DDL（不导出数据），供 ClickHouse/MySQL 手动建表
+    if let Some(ddl_path) = &dry_run_schema {
+        let ddl = match target.as_str() {
+            "clickhouse" => clickhouse_ddl(&table),
+            _ => mysql_ddl(&table, mysql_max_varchar),
+        };
+        if let Err(e) = std::fs::write(ddl_path, &ddl) {
+            eprintln!("❌ DDL 写入失败: {e}");
+            std::process::exit(1);
+        }
+        println!("✅ 建表 DDL 已生成（--target {target}）→ {}:\n{ddl}", ddl_path.display());
+        return;
+    }
+
     // 输出目标：--csv / --parquet / --jdbc 三选一
     let mode = if csv_path.is_some() {
         "csv"
@@ -126,6 +167,7 @@ fn main() {
         eprintln!("❌ 用法: shanshui-cunji-export --csv <out.csv> | --parquet <out.parquet> | --jdbc 'mysql://...'");
         eprintln!("    [--incremental --checkpoint <cp>] [--filter 'field op value AND ...'] [--project 'a,b']");
         eprintln!("    [--mask 'field=pat'] [--rate-limit <rows/s>] [--batch-size <n>] [--config config.toml]");
+        eprintln!("    [--mysql-compatible [--mysql-max-varchar <n>]] [--dry-run-schema <out.sql> --target clickhouse|mysql]");
         std::process::exit(1);
     };
 
@@ -152,7 +194,7 @@ fn main() {
         }
     };
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
-    let mut engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
+    let engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("❌ 打开引擎失败: {e}");
@@ -270,6 +312,24 @@ fn main() {
             out.as_ref().map_or_else(|| jdbc_url.as_ref().unwrap().as_str(), |p| p.to_str().unwrap()),
             t.elapsed().as_secs_f64() * 1000.0
         );
+    }
+
+    // --mysql-compatible：CSV 导出后生成 MySQL 配套 SQL（CREATE TABLE + LOAD DATA INFILE，
+    // 比逐条 INSERT 快 ~20 倍；--mysql-max-varchar 控制 doc 列 VARCHAR/TEXT）
+    if mysql_compatible && mode == "csv" {
+        if let Some(csv) = &csv_path {
+            let sql_path = csv.with_extension("sql");
+            let sql = format!(
+                "{}\n\n{}",
+                mysql_ddl(&table, mysql_max_varchar),
+                load_data_sql(&csv.to_string_lossy(), &table)
+            );
+            if let Err(e) = std::fs::write(&sql_path, &sql) {
+                eprintln!("❌ MySQL 配套 SQL 写入失败: {e}");
+                std::process::exit(1);
+            }
+            println!("✅ MySQL 配套 SQL 已生成（LOAD DATA INFILE）→ {}", sql_path.display());
+        }
     }
 }
 
@@ -427,5 +487,79 @@ impl JdbcSink {
 impl Sink for JdbcSink {
     fn write_batch(&mut self, rows: &[(u64, &str)]) -> Result<()> {
         self.client.insert_batch(&self.table, rows)
+    }
+}
+
+// ============ DDL 生成（design 20.5：--dry-run-schema / --mysql-compatible）============
+
+/// MySQL 建表 DDL：docid BIGINT UNSIGNED 主键 + doc（`--mysql-max-varchar > 0` → VARCHAR(n)，
+/// 否则 TEXT——处理 MySQL 65KB 行大小限制，超长字段降级）。
+pub fn mysql_ddl(table: &str, max_varchar: usize) -> String {
+    let doc_type = if max_varchar > 0 {
+        format!("VARCHAR({max_varchar})")
+    } else {
+        "TEXT".to_string()
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS `{table}` (\n  `docid` BIGINT UNSIGNED NOT NULL PRIMARY KEY,\n  `doc` {doc_type}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    )
+}
+
+/// ClickHouse MergeTree 建表 DDL（Parquet 导出后 `INSERT ... SELECT FROM file('*.parquet')` 直读）。
+pub fn clickhouse_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table} (\n  docid UInt64,\n  doc String\n) ENGINE = MergeTree\nORDER BY docid;"
+    )
+}
+
+/// LOAD DATA INFILE 配套 SQL（比逐条 INSERT 快 ~20 倍；FIELDS 对齐 RFC 4180 CSV 输出）。
+pub fn load_data_sql(out_csv: &str, table: &str) -> String {
+    let csv = out_csv.replace('\\', "/"); // MySQL INFILE 路径用正斜杠
+    format!(
+        "LOAD DATA INFILE '{csv}'\nINTO TABLE `{table}`\nFIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\'\nLINES TERMINATED BY '\\n'\nIGNORE 1 LINES\n(`docid`, `doc`);"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mysql_ddl_default_text_and_varchar() {
+        let ddl = mysql_ddl("t", 0);
+        assert!(ddl.contains("BIGINT UNSIGNED NOT NULL PRIMARY KEY"));
+        assert!(ddl.contains("`doc` TEXT"));
+        assert!(!ddl.contains("VARCHAR"));
+        let ddl2 = mysql_ddl("t", 255);
+        assert!(ddl2.contains("`doc` VARCHAR(255)"));
+        assert!(!ddl2.contains("TEXT"));
+    }
+
+    #[test]
+    fn clickhouse_ddl_merge_tree() {
+        let ddl = clickhouse_ddl("sbt_export");
+        assert!(ddl.contains("docid UInt64"));
+        assert!(ddl.contains("doc String"));
+        assert!(ddl.contains("ENGINE = MergeTree"));
+        assert!(ddl.contains("ORDER BY docid"));
+    }
+
+    #[test]
+    fn load_data_sql_aligns_with_csv() {
+        let sql = load_data_sql("D:\\tmp\\out.csv", "sbt_export");
+        assert!(sql.contains("LOAD DATA INFILE 'D:/tmp/out.csv'"), "反斜杠转正斜杠");
+        assert!(sql.contains("FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\'"));
+        assert!(sql.contains("IGNORE 1 LINES"));
+        assert!(sql.contains("(`docid`, `doc`)"));
+    }
+
+    #[test]
+    fn mysql_compatible_sql_composes_ddl_and_load() {
+        // 模拟 --mysql-compatible 的配套 SQL 组装
+        let sql = format!("{}\n\n{}", mysql_ddl("t", 255), load_data_sql("out.csv", "t"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(sql.contains("LOAD DATA INFILE 'out.csv'"));
+        // DDL 与 LOAD 的表名一致（各 1 次反引号表名）
+        assert_eq!(sql.matches("`t`").count(), 2);
     }
 }
