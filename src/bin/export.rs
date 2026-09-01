@@ -10,6 +10,8 @@
 //! 比逐条 INSERT 快 ~20 倍）；--mysql-max-varchar <n> 控制 doc 列 VARCHAR(n)/TEXT。
 //! 建表 DDL（--dry-run-schema <out.sql> [--target clickhouse|mysql]）：只生成目标库建表 DDL
 //! （ClickHouse MergeTree 供 Parquet 直读 / MySQL），不导出数据。
+//! 后台 IO 限速（--io-rate-limit-mb <n>，默认 storage.io_rate_limit_mb）：导出读 SST 与
+//! Compaction 共享后台 IO 预算（Token Bucket，默认低于前台读写），对在线业务影响 <5%。
 //! 增量（design 20.5）：`--incremental`（DocId 游标断点续传）——首次全量导出并记录最大 docid
 //! 到 checkpoint；后续只导 `docid > checkpoint` 的新数据并推进游标（对称 P3-4 增量导入）。
 
@@ -49,6 +51,7 @@ fn main() {
     let mut mysql_max_varchar: usize = 0;
     let mut dry_run_schema: Option<PathBuf> = None;
     let mut target = "mysql".to_string();
+    let mut io_rate_limit_mb: u64 = 0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -132,6 +135,12 @@ fn main() {
                     target = args[i].clone();
                 }
             }
+            "--io-rate-limit-mb" => {
+                i += 1;
+                if i < args.len() {
+                    io_rate_limit_mb = args[i].parse().unwrap_or(0);
+                }
+            }
             "--config" | "-c" => {
                 i += 1;
                 if i < args.len() {
@@ -168,6 +177,7 @@ fn main() {
         eprintln!("    [--incremental --checkpoint <cp>] [--filter 'field op value AND ...'] [--project 'a,b']");
         eprintln!("    [--mask 'field=pat'] [--rate-limit <rows/s>] [--batch-size <n>] [--config config.toml]");
         eprintln!("    [--mysql-compatible [--mysql-max-varchar <n>]] [--dry-run-schema <out.sql> --target clickhouse|mysql]");
+        eprintln!("    [--io-rate-limit-mb <n>] 与 Compaction 共享后台 IO 预算（默认 storage.io_rate_limit_mb）");
         std::process::exit(1);
     };
 
@@ -201,6 +211,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // 导出共享后台 IO 限速（design 20.5）：默认取 storage.io_rate_limit_mb（与 Compaction 同
+    // 后台预算语义），--io-rate-limit-mb 显式覆盖；0 = 关闭
+    if io_rate_limit_mb == 0 {
+        io_rate_limit_mb = cfg.storage.io_rate_limit_mb;
+    }
+    if io_rate_limit_mb > 0 {
+        engine.set_scan_rate_limit(io_rate_limit_mb);
+        println!("⚠️ 导出 IO 限速 {io_rate_limit_mb} MB/s（与 Compaction 共享后台 IO 预算）");
+    }
 
     // 增量模式：checkpoint 默认与输出同路径（.checkpoint 后缀）；读游标
     let out: Option<PathBuf> = csv_path.clone().or_else(|| parquet_path.clone());

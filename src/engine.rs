@@ -1242,6 +1242,18 @@ impl Engine {
         })
     }
 
+    /// 导出共享后台 IO 限速（design 20.5）：启用/关闭顺序扫描路径限速（MB/s；0 = 关闭）。
+    /// 与 Compaction 的 `io_limiter` 同 Token Bucket 策略（默认低于前台读写）——导出读 SST
+    /// 与后台合并共享同一后台 IO 预算语义，对在线业务影响 <5% 目标。
+    pub fn set_scan_rate_limit(&self, mb: u64) {
+        let bytes = mb.saturating_mul(1024 * 1024);
+        self.primary.set_scan_rate_limit(bytes);
+        self.delta.set_scan_rate_limit(bytes);
+        if let Some(c) = &self.cidx {
+            c.set_scan_rate_limit(bytes);
+        }
+    }
+
     /// 事务范围扫描（M 项，事务类查询优化 P0）：RR/SERIALIZABLE 走 `scan_range_at`
     /// 快照版本过滤（一次 k-way merge 扫描，替代逐 id `txn_get`）；同事务未提交写
     /// （`read_own`）覆盖扫描结果；事务内删除的 docid 从结果中排除。
@@ -1823,6 +1835,46 @@ mod tests {
             let v = engine.get(i).unwrap();
             assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()), "docid={i}");
         }
+    }
+
+    #[test]
+    fn scan_rate_limit_slows_stream() {
+        // design 20.5：导出共享后台 IO 限速——启用限速后顺序扫描显著变慢（Token Bucket 生效），
+        // 关闭后恢复；前台点查不受限速影响（scan_limiter 只作用于 scan_stream）。
+        let mut cfg = Config::default();
+        cfg.memtable.max_size_mb = 1;
+        let mut engine = Engine::open(&tmp(), &cfg).unwrap();
+        for i in 0..10u64 {
+            engine.put(i, vec![b'x'; 200_000], &[]).unwrap(); // 200KB × 10 = 2MB
+        }
+        engine.flush_primary().unwrap();
+        // 无限制：扫描快
+        let t0 = std::time::Instant::now();
+        let mut n = 0u64;
+        engine
+            .scan_stream(None, None, |_, v| {
+                n += 1;
+                assert_eq!(v.len(), 200_000);
+                Ok(true)
+            })
+            .unwrap();
+        let fast = t0.elapsed();
+        assert_eq!(n, 10);
+        // 限速 1MB/s：2MB 数据（1s 突发桶 + 1MB 需补桶）→ 显著慢于无限速
+        engine.set_scan_rate_limit(1);
+        let t1 = std::time::Instant::now();
+        engine.scan_stream(None, None, |_, _| Ok(true)).unwrap();
+        let slow = t1.elapsed();
+        assert!(slow > fast, "限速后扫描应更慢（fast={fast:?} slow={slow:?}）");
+        assert!(
+            slow.as_millis() >= 300,
+            "限速 1MB/s 扫描 2MB 应 ≥300ms（实际 {slow:?}）"
+        );
+        // 关闭限速恢复
+        engine.set_scan_rate_limit(0);
+        let t2 = std::time::Instant::now();
+        engine.scan_stream(None, None, |_, _| Ok(true)).unwrap();
+        assert!(t2.elapsed() < slow, "关闭限速后应恢复快速扫描");
     }
 
     fn cfg() -> Config {

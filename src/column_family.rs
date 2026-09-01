@@ -94,6 +94,10 @@ pub struct ColumnFamily {
     /// 后台 IO 限速器（design 4.5 阶段 3；`storage.io_rate_limit_mb`，None = 不限速）。
     /// O 项第③步：内部 `Mutex`——compact `&self` 读路径并发 acquire。
     io_limiter: Option<Mutex<crate::io_scheduler::IoRateLimiter>>,
+    /// 导出共享后台 IO 限速器（design 20.5）：**顺序扫描**（scan_stream）路径专用——
+    /// 与 Compaction 的 `io_limiter` 同 Token Bucket 策略（默认低于前台读写）。导出工具
+    /// 显式启用（`--io-rate-limit-mb` / Engine::set_scan_rate_limit）；前台点查（get）不受影响。
+    scan_limiter: Mutex<Option<crate::io_scheduler::IoRateLimiter>>,
     /// L0 段数阈值（`storage.l0_stall_threshold`，超过判需要 Compaction）。
     l0_stall_threshold: usize,
     /// L 项：动态窗口下限/上限（低峰放宽、高峰收窄；`storage.l0_stall_min/max`）。
@@ -279,6 +283,7 @@ impl ColumnFamily {
             } else {
                 None
             },
+            scan_limiter: Mutex::new(None),
             l0_stall_threshold: cfg.storage.l0_stall_threshold,
             l0_stall_min: cfg.storage.l0_stall_min.max(2),
             l0_stall_max: cfg.storage.l0_stall_max.max(cfg.storage.l0_stall_min.max(2)),
@@ -771,6 +776,11 @@ impl ColumnFamily {
                 }
                 // 快照点前最新版本为 Tombstone → 该 key 在快照点已删除，不输出
                 if let Some(v) = best_val {
+                    // 导出共享后台 IO 限速（design 20.5）：扫描产出按字节 acquire——
+                    // 扫描节奏受限 → SST 顺序读 IO 随节奏受限，与 Compaction 共享后台预算
+                    if let Some(limiter) = self.scan_limiter.lock().unwrap().as_mut() {
+                        limiter.acquire(v.len() as u64)?;
+                    }
                     if !f(min_key.as_slice(), &v)? {
                         break; // 提前终止（游标续扫取满页）
                     }
@@ -985,6 +995,17 @@ impl ColumnFamily {
         if let Some(limiter) = &self.io_limiter {
             limiter.lock().unwrap().set_rate(bytes_per_sec);
         }
+    }
+
+    /// 导出共享后台 IO 限速（design 20.5）：启用/调整顺序扫描路径限速器
+    /// （0 = 关闭，恢复前台读不限速）。与 Compaction `io_limiter` 同 Token Bucket 策略——
+    /// 导出读 SST 与后台合并共享同一后台 IO 预算语义，默认低于前台读写。
+    pub fn set_scan_rate_limit(&self, bytes_per_sec: u64) {
+        *self.scan_limiter.lock().unwrap() = if bytes_per_sec > 0 {
+            Some(crate::io_scheduler::IoRateLimiter::new(bytes_per_sec))
+        } else {
+            None
+        };
     }
 
     /// L 项：设置前台写压力（0~1，Ex-7.4 同源信号：MemTable 水位代理）——动态窗口反馈依据。
