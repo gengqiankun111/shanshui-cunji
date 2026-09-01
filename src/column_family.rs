@@ -68,6 +68,9 @@ pub struct SstSnapshot {
     /// R 项：每层段下标（按层号索引；组内保持快照顺序 = 新→旧，层序 L0→L1→L2 与
     /// "新→旧"一致——flush 只进 L0、compact 下沉，层间版本语义安全）。
     pub layer_indices: Vec<Vec<usize>>,
+    /// 与 `ssts` 平行的文件字节数（open/flush/compact 构建时缓存；写路径 needs_compact
+    /// 的大小条件读此缓存，零 fs::metadata syscall——修复每 put N 次 stat 拖垮写吞吐）。
+    pub sizes: Vec<u64>,
 }
 
 /// 列族：主数据 / 组合索引 / Delta 共用骨架。
@@ -283,11 +286,13 @@ impl ColumnFamily {
                 let loaded: Vec<Arc<SstReader>> = ssts.into_iter().map(Arc::new).collect();
                 let (layer_ranges, layer_indices) =
                     Self::build_layer_meta(&loaded, &sst_levels_loaded);
+                let sizes: Vec<u64> = loaded.iter().map(|r| r.file_len()).collect();
                 ArcSwap::new(Arc::new(SstSnapshot {
                     ssts: loaded,
                     levels: sst_levels_loaded,
                     layer_ranges,
                     layer_indices,
+                    sizes,
                 }))
             },
             block_cache,
@@ -865,11 +870,13 @@ impl ColumnFamily {
         let mut levels = cur.levels.clone();
         levels.insert(0, 0);
         let (layer_ranges, layer_indices) = Self::build_layer_meta(&ssts, &levels);
+        let sizes: Vec<u64> = ssts.iter().map(|r| r.file_len()).collect();
         self.ssts.store(Arc::new(SstSnapshot {
             ssts,
             levels,
             layer_ranges,
             layer_indices,
+            sizes,
         }));
     }
 
@@ -1239,11 +1246,13 @@ impl ColumnFamily {
         );
         kept_levels.insert(0, out_level);
         let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
+        let sizes: Vec<u64> = kept_ssts.iter().map(|r| r.file_len()).collect();
         self.ssts.store(Arc::new(SstSnapshot {
             ssts: kept_ssts,
             levels: kept_levels,
             layer_ranges,
             layer_indices,
+            sizes,
         }));
         self.persist_manifest()?;
 
@@ -1318,26 +1327,25 @@ impl ColumnFamily {
         u
     }
 
-    /// 当前 L0 段文件总字节（按层号过滤后取磁盘元数据）。
+    /// 当前 L0 段文件总字节（快照 sizes 缓存求和，零 syscall——open/flush/compact
+    /// 构建快照时缓存每段大小，写路径 needs_compact 不再逐次 fs::metadata）。
     pub fn l0_bytes(&self) -> u64 {
         let snap = self.ssts.load();
         let mut total = 0u64;
         for (i, s) in snap.ssts.iter().enumerate() {
             if snap.levels.get(i).copied().unwrap_or(0) == 0 {
-                if let Ok(m) = std::fs::metadata(s.path()) {
-                    total += m.len();
-                }
+                total += snap.sizes.get(i).copied().unwrap_or_else(|| s.file_len());
             }
         }
         total
     }
-    /// 全部 SST 文件字节总和。
+    /// 全部 SST 文件字节总和（快照 sizes 缓存，零 syscall）。
     pub fn sst_bytes(&self) -> u64 {
-        self.ssts
-            .load()
-            .ssts
+        let snap = self.ssts.load();
+        snap.ssts
             .iter()
-            .filter_map(|r| std::fs::metadata(r.path()).ok().map(|m| m.len()))
+            .enumerate()
+            .map(|(i, s)| snap.sizes.get(i).copied().unwrap_or_else(|| s.file_len()))
             .sum()
     }
 

@@ -688,6 +688,9 @@ pub struct SstReader {
     /// 空段（无块）为全空 Vec，`key_range()` 返回 None = 无约束。
     min_key: Vec<u8>,
     max_key: Vec<u8>,
+    /// 文件字节数（open 时一次 metadata；快照 sizes 缓存用——写路径 needs_compact
+    /// 不再逐次 fs::metadata，避免每 put 3 次 stat 拖垮写吞吐）。
+    file_len: u64,
     compression: Compression,
     /// 文件格式版本（v3=纯行式，v4=PAX，v5=分区布隆）。
     format: u16,
@@ -851,6 +854,7 @@ impl SstReader {
             // R 项：段 [min, max] 从解码索引首尾取（索引按 key 升序；空段无约束）
             min_key: index.first().map(|e| e.first_key.clone()).unwrap_or_default(),
             max_key: index.last().map(|e| e.max_key.clone()).unwrap_or_default(),
+            file_len: fsize,
             compression,
             format: version,
             heat: PerCpuCounter::new(),
@@ -859,6 +863,11 @@ impl SstReader {
 
     pub fn footer(&self) -> &SstFooter {
         &self.footer
+    }
+
+    /// 文件字节数（open 时缓存；写路径零 syscall 读段大小）。
+    pub fn file_len(&self) -> u64 {
+        self.file_len
     }
 
     /// R 项：段 key 范围 [min, max]（闭区间）。空段（无块/无 key）或单侧缺失返回 None
