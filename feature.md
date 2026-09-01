@@ -128,7 +128,7 @@
 |---|---|---|
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
-| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；**O 项第①②步已落地等价能力**：读路径全量 &self 化（`df16058`）+ 引擎级 RwLock 读读并行（`4585bb9`，读语句读锁并行、写语句写锁互斥），1 亿库 read_only 42→561 TPS；剩余：HotCache 内部 Mutex 粒度 + 写路径（txn_commit/compaction）仍串行；复制型 read_from_replica 属分布式阶段 |
+| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；**O 项第①②步已落地等价能力**：读路径全量 &self 化（`df16058`）+ 引擎级 RwLock 读读并行（`4585bb9`，读语句读锁并行、写语句写锁互斥），1 亿库 read_only 42→561 TPS；**HotCache 内部锁粒度化**（`9071984`，整包 Mutex → 内部 RwLock + DashMap 无锁计数，点查热路径读读并行：demo A/B 4 读线程纯读 x4.16、混合负载 x5.42，482 全绿）；剩余：写路径（txn_commit/compaction）仍串行；复制型 read_from_replica 属分布式阶段 |
 | 倒排并发读（ArcSwap 段清单 + FST 字典指针无锁读） | ✅ | Ex-6（Ex-6.1 原语 `1946161`；Ex-6.2/6.3 ArcSwap 段清单 + FST 字典快照化 `c8183cf`——search/iter 读路径 `segments.load()`/`dicts.load()` 无锁快照，flush/gc rcu 原子发布；剩余引擎级全局 Mutex 见 O 项并发模型） |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 

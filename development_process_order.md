@@ -115,7 +115,8 @@
     BEGIN/SELECT/COMMIT 事务点查 1744 txn/s；sysbench 本体需在 Linux/WSL 安装（Windows 无预编译）；
 - **验收** ✅：mysql cli 连接 + INSERT/SELECT/UPDATE/DELETE 往返 + 事务语句 + sysbench 风格负载全通过；
 - **优先级说明**：P1（生态接入价值高：MySQL 工具链/客户端立即可用），排 B（P0）之后、P2 项之前；
-- 备注：读写分离（原 H）暂缓保留——组提交已解决读被写拖垮，待复制型分布式阶段再启。
+- 备注：读写分离（原 H）暂缓保留——组提交已解决读被写拖垮；**HotCache 内部锁粒度已落地**
+  （7.72 `9071984`：点查热路径读读并行，demo A/B x4.16），复制型分布式阶段再启。
 
 ### D/E/F. LSM 事务三阶段（P1/P2）✅ 完成
 - 阶段一 WriteBatch（src/txn.rs `WriteBatch` + `Engine::write`）：攒批 put/delete → 预校验（失败零副作用 =

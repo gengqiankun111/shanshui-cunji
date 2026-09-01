@@ -40,13 +40,25 @@
   2 核小机器写路径 -13%（SQPOLL 占核）、点查/扫描持平（块缓存主导）→ io_uring 保持默认关，
   多核 NVMe 生产环境按 7.63 指引开启
 
-## 5. 文档维护（工作流收尾）
+## 5. HotCache 内部锁粒度（读写分离收尾，✅ 完成 7.72 `9071984`）
+
+- **来源**：feature I 模块"读写分离"行剩余项（HotCache 内部 Mutex 粒度）
+- **已落地**：整包 `Mutex<HotCache>` → 内部 `RwLock`（cache/protected/used_bytes/promotions）+
+  `DashMap`（stats 无锁计数）；读路径 `peek` 持读锁读读并行、计数无锁；写路径
+  put/invalidate/promote 持写锁；`get` 达热点阈值先释放读锁再写锁 promote（幂等）；engine
+  调用点去外层 lock()（get/batch_get/scan 回填、put 回填、invalidate 直接 &self 调用）
+- **实测**（demo A/B `src/demo/hotcache-rw`，4 读线程热 key 全命中）：纯读 OLD 80.6 万 qps →
+  NEW 335.6 万（**x4.16**）；混合负载（写线程节流 ~3 万写/s put+invalidate）读吞吐 436.9 万
+  （**x5.42**，写不再拖垮读）
+- **回归**：482 全绿（含 hotcache 新增 2 并发测试）
+
+## 6. 文档维护（工作流收尾）
 
 - **来源**：development_extension.md
 - **待做**：Ex-5.x/6.x/7.x 的 checkbox 回填为 ✅（实际已落地，文档过时）；
   Ex-2.5 状态补 `[x]` + 提交号（13.6/13.7 拓扑并行/对账重试已在 development.md 7.58 记录）
 
-## 6. 远期开发（触发后执行，见 design_remain）
+## 7. 远期开发（触发后执行，见 design_remain）
 
 - Calvin 阶段一/二/三（gseq 分配器 → 全局复制日志 → raft 高可用）——触发条件（13.3.1）
 - 多副本 raft 兜底——Calvin 阶段三 / 元数据切换需求

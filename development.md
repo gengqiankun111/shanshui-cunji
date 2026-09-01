@@ -2161,6 +2161,35 @@ impl RuntimePools {
    生产环境按 7.63 指引开启 + 预留 SQPOLL 核。全量 **480 全绿**（本会话无新增测试，接入
    由既有 480 回归覆盖）。
 
+### 7.72 HotCache 内部锁粒度（读写分离收尾，feature I 模块剩余项）
+
+> 2026-09-02。feature.md I 模块"读写分离"行的剩余项：**HotCache 内部 Mutex 粒度**——
+> 原实现整包 `Mutex<HotCache>`，点查热路径 `hotcache.lock()` 与写路径 put/invalidate 互斥，
+> 多个并发读之间也抢同一把锁（读被写拖垮的残留，O 项第①/②步引擎级 RwLock 之后的最后瓶颈）。
+
+1. **内部粒度化**（`src/hotcache.rs`）：
+   - **缓存区**（cache/protected/used_bytes/promotions）改用 `RwLock`：读路径 `peek`（不更新
+     LRU 序）持**读锁**——读读完全并行；写路径（put/invalidate/promote/evict）持**写锁**；
+   - **访问计数**用 `DashMap`（无锁）——读命中计数不碰 RwLock，热点晋升判定无锁读；
+   - `get` 达热点阈值需 promote：先读锁 peek + 无锁计数 → 释放读锁 → 再写锁 promote
+     （幂等：pop+put，多线程同时触发无害）；
+   - 工程权衡：读命中不刷新 LRU 序（`LruCache::get` 需 `&mut`）→ LRU 淘汰近似化——热度由
+     DashMap 计数 + 热点保护区承载，LRU 仅作冷数据兜底序（既有测试全部保持通过）；
+2. **engine.rs 去外层锁**：`hotcache` 字段去掉 `Mutex` 包裹，get/batch_get/scan 回填、put 回填、
+   invalidate（put_nosync/delete/patch）全部直接 `&self` 调用（读路径不再抢整锁）；
+3. **回归**：全量 **482 全绿**（新增 2 并发测试：`concurrent_reads_all_hit_no_data_race` 8 线程
+   并发读值一致 + `concurrent_reads_with_write_invalidate_no_stale` 读写并发无脏读）；
+4. **A/B 实测**（`src/demo/hotcache-rw`，4 读线程热 key 全命中，512 热 key）：
+
+   | 场景 | OLD（Mutex 整包） | NEW（RwLock+DashMap） | 结论 |
+   |---|---|---|---|
+   | 纯读 4×200k ops | 806,147 qps | 3,355,579 qps | **x4.16**（读读并行） |
+   | 混合负载（写线程节流 ~3 万写/s put+invalidate） | 806,147 qps | 4,369,147 qps | **x5.42**（写不再拖垮读） |
+
+5. **决策**：读读并行收益验证成立（x4.16），混合负载下读吞吐不再被写拖垮（x5.42）——I 模块
+   剩余"写路径（txn_commit/compaction）仍串行"属引擎写路径范畴（组提交已解决主瓶颈），维持
+   M8-P1 暂缓结论，复制型读写分离留分布式阶段。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
