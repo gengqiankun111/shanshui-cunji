@@ -2555,6 +2555,25 @@ impl RuntimePools {
    随机点查落后 1.28× → 1.10×，热点近追平；剩余差距在协议往返 + 每语句固定开销
    （spawn_blocking / RwLock / ResultSet 构建），非引擎读路径。
 
+### 7.90 mysql_server 字段级投影（`SELECT status, city` 也裁剪，NULL/大小写/文本化）
+
+> 2026-09-02。7.89 列投影只覆盖 `id`/`doc`/`*`；`SELECT status, city` 之类常用列清单
+> 仍回退 id+doc 双列。扩展：**doc 顶层 JSON 字段名也参与裁剪**（无 schema 文档库按字段提取）。
+
+1. **方案（src/mysql.rs）**：
+   - 投影类型 `ProjCol = Id | Doc | Field(String)`；`parse_projection` 未知简单标识符 →
+     `Field`（函数/别名/DISTINCT 仍回退双列；支持反引号字段名）；
+   - `doc_field_cell`：doc 顶层字段取值，**大小写容错**（精确 → 小写 → 遍历不敏感命中）；
+     `json_value_cell`：字符串原样 / 数字/布尔文本化（true→1/false→0）/ 嵌套对象数组 JSON
+     串化——v1 字段列统一 VAR_STRING 文本化，类型精确化留后续；
+   - **NULL 表达**：文本协议 NULL = 0xfb 单字节（无内容）——结果集行编码增加 0xfb 哨兵
+     判定（合法 utf8 文本值不可能单字节 0xfb，无歧义）；缺失字段 / JSON null / 非对象 doc → NULL；
+   - `select_response`/`txn_select`/`stmt_prepare` 自动生效（列定义列头 = 原列名字符串）。
+2. **回归**：全量 **540 全绿**（+2：doc_field_cell 缺失/NULL/大小写/类型边界、
+   端到端字段列 + 缺失字段 NULL + id/字段混合）。
+3. **实测**（1000 万库 release）：`SELECT id,status,city,amount,ts,title WHERE id=5` 六列按序；
+   `SELECT status,missing_col` → 缺失列 pymysql 返回 `None`；BETWEEN 范围 `SELECT title` 单列流式。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

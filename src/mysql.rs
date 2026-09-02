@@ -1319,7 +1319,7 @@ fn stmt_prepare(session: &mut Session, sql: &str) -> Vec<Vec<u8>> {
     session.statements.insert(stmt_id, sql.to_string());
     let mut packets = Vec::new();
     // PREPARE_OK：0x00 + stmt_id(4) + num_columns(2) + num_params(2) + filler(1) + warnings(2)
-    let proj_cols = parse_projection(sql).unwrap_or_else(|| vec![0, 1]);
+    let proj_cols = parse_projection(sql).unwrap_or_else(|| vec![ProjCol::Id, ProjCol::Doc]);
     let mut ok = vec![0x00];
     ok.extend_from_slice(&stmt_id.to_le_bytes());
     ok.extend_from_slice(&(proj_cols.len() as u16).to_le_bytes()); // 列 = 投影列数（EXECUTE 对齐）
@@ -1472,8 +1472,14 @@ fn query_response_packets(seq0: u8, resp: &QueryResponse) -> Vec<Vec<u8>> {
             for row in rows {
                 let mut rp = Vec::new();
                 for cell in row {
-                    write_lenenc(&mut rp, cell.len() as u64);
-                    rp.extend_from_slice(cell);
+                    if cell.len() == 1 && cell[0] == MYSQL_NULL_CELL {
+                        // 文本协议 NULL：0xfb 单字节长度前缀（无内容）——合法 utf8 文本值
+                        // 不可能出现单字节 0xfb，哨兵无歧义
+                        rp.push(MYSQL_NULL_CELL);
+                    } else {
+                        write_lenenc(&mut rp, cell.len() as u64);
+                        rp.extend_from_slice(cell);
+                    }
                 }
                 out.push(rp);
             }
@@ -1534,12 +1540,22 @@ fn show_response(upper: &str) -> QueryResponse {
     }
 }
 
+/// SELECT 投影列类型：id 主键 / doc 整文档 / doc 顶层 JSON 字段（字段级裁剪）。
+#[derive(Clone, Debug, PartialEq)]
+enum ProjCol {
+    Id,
+    Doc,
+    Field(String),
+}
+
+/// 无投影（* / 解析失败）时的默认双列。
+const DEFAULT_PROJ: &[ProjCol] = &[ProjCol::Id, ProjCol::Doc];
+
 /// SELECT 列投影解析——结果集列裁剪（避免无脑返回整 doc JSON，降低回包字节与序列化开销）。
 ///
-/// 支持简单列清单：`id` / `doc` / `*`（保书写顺序）；编码 `Some(Vec<u8>)`（0=id 列，1=doc 列）。
-/// 含函数 / 别名 / 未知列名（doc 内 JSON 字段等）→ `None`，调用方维持 id+doc 双列现状
-/// （字段级投影需 NULL/类型映射，留后续排期）。
-fn parse_projection(sql: &str) -> Option<Vec<u8>> {
+/// 支持简单列清单：`id` / `doc` / `doc` 顶层 JSON 字段名 / `*`（保书写顺序）。
+/// 含函数 / 别名 / DISTINCT 等 → `None`，调用方维持 id+doc 双列现状。
+fn parse_projection(sql: &str) -> Option<Vec<ProjCol>> {
     let lower = sql.to_lowercase();
     let f = lower.find(" from ")?;
     let list = lower[7..f].trim();
@@ -1549,16 +1565,20 @@ fn parse_projection(sql: &str) -> Option<Vec<u8>> {
     }
     let mut cols = Vec::new();
     for item in list.split(',') {
-        let c = item.trim().trim_matches('`').trim();
+        let raw = item.trim();
+        let c = raw.trim_matches('`'); // 支持反引号包裹（MySQL 兼容）
+        if c.is_empty() || c.contains(' ') || c.contains('(') || c.contains(')') {
+            return None; // 别名/表达式 → 回退双列
+        }
         match c {
-            "" => return None,
             "*" => {
-                cols.push(0);
-                cols.push(1);
+                cols.push(ProjCol::Id);
+                cols.push(ProjCol::Doc);
             }
-            "id" | "docid" => cols.push(0),
-            "doc" | "document" => cols.push(1),
-            _ => return None, // 未知列（JSON 字段等）→ 回退双列
+            "id" | "docid" => cols.push(ProjCol::Id),
+            "doc" | "document" => cols.push(ProjCol::Doc),
+            // 其余视为 doc 顶层 JSON 字段（无 schema 文档库按字段名提取）
+            _ => cols.push(ProjCol::Field(c.to_string())),
         }
     }
     if cols.is_empty() {
@@ -1568,30 +1588,71 @@ fn parse_projection(sql: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// 按投影构建 ResultSet 列定义（None = id + doc 双列，与现状一致）。
-fn proj_columns(proj: Option<&[u8]>) -> Vec<Vec<u8>> {
-    let cols = proj.unwrap_or(&[0, 1]);
-    cols.iter()
-        .map(|&c| {
-            if c == 0 {
-                column_payload("id", MYSQL_TYPE_LONGLONG, 63)
+/// 文本协议 NULL 标记（0xfb 单字节长度前缀，无内容）。
+const MYSQL_NULL_CELL: u8 = 0xfb;
+
+/// doc 顶层字段取值（大小写容错：先精确匹配，再遍历找大小写不敏感命中）。
+/// 缺失 / JSON null → 返回 NULL 哨兵（Vec![0xfb]）。
+fn doc_field_cell(doc: &[u8], field: &str) -> Vec<u8> {
+    let obj = match serde_json::from_slice::<serde_json::Value>(doc) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => return vec![MYSQL_NULL_CELL], // 非对象 doc → 无字段
+    };
+    if let Some(v) = obj.get(field) {
+        return json_value_cell(v);
+    }
+    let lf = field.to_lowercase();
+    if let Some(v) = obj.get(&lf) {
+        return json_value_cell(v);
+    }
+    for (k, v) in obj.iter() {
+        if k.to_lowercase() == lf {
+            return json_value_cell(v);
+        }
+    }
+    vec![MYSQL_NULL_CELL]
+}
+
+/// JSON 值 → 结果集文本 cell（NULL → 0xfb 哨兵；字符串原样；数字/布尔 to_string；
+/// 嵌套对象/数组 JSON 串化——字段级投影 v1 统一文本化，类型精确化留后续）。
+fn json_value_cell(v: &serde_json::Value) -> Vec<u8> {
+    match v {
+        serde_json::Value::Null => vec![MYSQL_NULL_CELL],
+        serde_json::Value::String(s) => s.clone().into_bytes(),
+        serde_json::Value::Bool(b) => {
+            if *b {
+                b"1".to_vec()
             } else {
-                column_payload("doc", MYSQL_TYPE_VAR_STRING, 45)
+                b"0".to_vec()
             }
+        }
+        serde_json::Value::Number(n) => n.to_string().into_bytes(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => v.to_string().into_bytes(),
+    }
+}
+
+/// 按投影构建 ResultSet 列定义（None = id + doc 双列，与现状一致；
+/// id → LONGLONG；doc/字段 → VAR_STRING（字段级 v1 文本化）。
+fn proj_columns(proj: Option<&[ProjCol]>) -> Vec<Vec<u8>> {
+    let cols = proj.unwrap_or(DEFAULT_PROJ);
+    cols.iter()
+        .map(|c| match c {
+            ProjCol::Id => column_payload("id", MYSQL_TYPE_LONGLONG, 63),
+            ProjCol::Doc => column_payload("doc", MYSQL_TYPE_VAR_STRING, 45),
+            ProjCol::Field(f) => column_payload(f, MYSQL_TYPE_VAR_STRING, 45),
         })
         .collect()
 }
 
-/// 按投影构建一行（None = id + doc 双列；id 列 → 数字文本，doc 列 → 原 doc 字节）。
-fn proj_row(proj: Option<&[u8]>, id: u64, doc: &[u8]) -> Vec<Vec<u8>> {
-    let cols = proj.unwrap_or(&[0, 1]);
+/// 按投影构建一行（None = id + doc 双列；id 列 → 数字文本，doc 列 → 原 doc 字节，
+/// 字段列 → doc 顶层字段取值（缺失 NULL）。
+fn proj_row(proj: Option<&[ProjCol]>, id: u64, doc: &[u8]) -> Vec<Vec<u8>> {
+    let cols = proj.unwrap_or(&[ProjCol::Id, ProjCol::Doc]);
     cols.iter()
-        .map(|&c| {
-            if c == 0 {
-                id.to_string().into_bytes()
-            } else {
-                doc.to_vec()
-            }
+        .map(|c| match c {
+            ProjCol::Id => id.to_string().into_bytes(),
+            ProjCol::Doc => doc.to_vec(),
+            ProjCol::Field(f) => doc_field_cell(doc, f),
         })
         .collect()
 }
@@ -2218,62 +2279,88 @@ mod tests {
 
     #[test]
     fn parse_projection_variants() {
+        use ProjCol::{Doc, Field, Id};
         // id 单列 → 主键点查/范围只回 id（响应最小化）
-        assert_eq!(
-            parse_projection("SELECT id FROM orders WHERE id=1"),
-            Some(vec![0])
-        );
+        assert_eq!(parse_projection("SELECT id FROM orders WHERE id=1"), Some(vec![Id]));
         // 反引号 / 大小写 / docid 别名
         assert_eq!(
             parse_projection("select `id` from orders where id=2"),
-            Some(vec![0])
+            Some(vec![Id])
         );
-        assert_eq!(
-            parse_projection("SELECT docid FROM orders WHERE id=3"),
-            Some(vec![0])
-        );
+        assert_eq!(parse_projection("SELECT docid FROM orders WHERE id=3"), Some(vec![Id]));
         // 显式双列 / 保书写顺序
-        assert_eq!(
-            parse_projection("SELECT id, doc FROM orders"),
-            Some(vec![0, 1])
-        );
-        assert_eq!(
-            parse_projection("SELECT doc, id FROM orders"),
-            Some(vec![1, 0])
-        );
+        assert_eq!(parse_projection("SELECT id, doc FROM orders"), Some(vec![Id, Doc]));
+        assert_eq!(parse_projection("SELECT doc, id FROM orders"), Some(vec![Doc, Id]));
         // * → id + doc
+        assert_eq!(parse_projection("SELECT * FROM orders WHERE id=4"), Some(vec![Id, Doc]));
+        // 字段级：doc 顶层 JSON 字段按书写顺序裁剪（不再回退双列）
         assert_eq!(
-            parse_projection("SELECT * FROM orders WHERE id=4"),
-            Some(vec![0, 1])
+            parse_projection("SELECT status, city FROM orders WHERE id=5"),
+            Some(vec![Field("status".into()), Field("city".into())])
         );
-        // 回退场景：JSON 字段列 / 函数 / DISTINCT / 无 FROM
-        assert_eq!(parse_projection("SELECT status FROM orders WHERE id=5"), None);
+        assert_eq!(
+            parse_projection("SELECT id, status FROM orders WHERE id=6"),
+            Some(vec![Id, Field("status".into())])
+        );
+        // 回退场景：函数 / DISTINCT / 别名 / 无 FROM
         assert_eq!(parse_projection("SELECT COUNT(id) FROM orders"), None);
         assert_eq!(
             parse_projection("SELECT DISTINCT c FROM sbtest WHERE id BETWEEN 1 AND 9"),
             None
         );
+        assert_eq!(parse_projection("SELECT c AS x FROM sbtest WHERE id=1"), None);
         assert_eq!(parse_projection("SELECT id"), None);
         // 解析只看 SELECT 与 FROM 之间（带 ORDER BY / LIMIT 不影响）
         assert_eq!(
             parse_projection("SELECT id FROM orders WHERE id BETWEEN 1 AND 9 ORDER BY id LIMIT 5"),
-            Some(vec![0])
+            Some(vec![Id])
         );
     }
 
     #[test]
     fn projection_row_and_columns() {
+        use ProjCol::{Doc, Field, Id};
         let doc = br#"{"status":"active","amount":10}"#;
         // id-only：单列（不携带整 doc）
-        assert_eq!(proj_row(Some(&[0]), 7, doc), vec![b"7".to_vec()]);
+        assert_eq!(proj_row(Some(&[Id]), 7, doc), vec![b"7".to_vec()]);
         // 保序（doc 在前）
-        assert_eq!(proj_row(Some(&[1, 0]), 7, doc), vec![doc.to_vec(), b"7".to_vec()]);
+        assert_eq!(
+            proj_row(Some(&[Doc, Id]), 7, doc),
+            vec![doc.to_vec(), b"7".to_vec()]
+        );
         // None（* / 回退）→ id + doc
         assert_eq!(proj_row(None, 7, doc), vec![b"7".to_vec(), doc.to_vec()]);
-        // 列定义数量与投影一致
-        assert_eq!(proj_columns(Some(&[0])).len(), 1);
-        assert_eq!(proj_columns(Some(&[1, 0])).len(), 2);
+        // 字段级：按 doc 顶层字段取值（字符串原样 / 数字文本化）
+        assert_eq!(
+            proj_row(Some(&[Field("status".into()), Field("amount".into())]), 7, doc),
+            vec![b"active".to_vec(), b"10".to_vec()]
+        );
+        // 列定义数量与投影一致；字段列头 = 列名字符串
+        assert_eq!(proj_columns(Some(&[Id])).len(), 1);
+        assert_eq!(proj_columns(Some(&[Doc, Id])).len(), 2);
         assert_eq!(proj_columns(None).len(), 2);
+        assert_eq!(
+            proj_columns(Some(&[Field("status".into())])).len(),
+            1,
+            "字段级投影列数=1"
+        );
+    }
+
+    #[test]
+    fn doc_field_cell_missing_null_and_case() {
+        // 缺失字段 → NULL 哨兵（0xfb）
+        assert_eq!(doc_field_cell(br#"{"a":1}"#, "b"), vec![MYSQL_NULL_CELL]);
+        // JSON null → NULL
+        assert_eq!(doc_field_cell(br#"{"a":null}"#, "a"), vec![MYSQL_NULL_CELL]);
+        // 大小写容错：doc 存 status，SQL 列名 STATUS（list lower 化后仍可精确命中）
+        assert_eq!(doc_field_cell(br#"{"status":"ok"}"#, "status"), b"ok".to_vec());
+        assert_eq!(doc_field_cell(br#"{"Name":"x"}"#, "name"), b"x".to_vec());
+        // 布尔 → 1/0；数组/对象 → JSON 文本
+        assert_eq!(doc_field_cell(br#"{"on":true,"off":false}"#, "on"), b"1".to_vec());
+        assert_eq!(doc_field_cell(br#"{"on":true,"off":false}"#, "off"), b"0".to_vec());
+        assert_eq!(doc_field_cell(br#"{"tags":["a","b"]}"#, "tags"), b"[\"a\",\"b\"]".to_vec());
+        // 非对象 doc → NULL
+        assert_eq!(doc_field_cell(b"plain", "f"), vec![MYSQL_NULL_CELL]);
     }
 
     #[test]
@@ -2299,6 +2386,36 @@ mod tests {
         assert_eq!(r2[0].len(), 2);
         assert_eq!(r2[0][0], b"42");
         assert_eq!(r2[0][1], doc);
+    }
+
+    #[test]
+    fn projection_end_to_end_field_columns() {
+        // 端到端：字段级投影——`SELECT status, city` 只回两字段列（缺 id/doc）
+        let mut engine = test_engine();
+        engine
+            .put(42, br#"{"status":"active","city":"beijing","amount":88}"#.to_vec(), &[])
+            .unwrap();
+        let resp = select_response(&engine, "SELECT status, city FROM orders WHERE id=42");
+        let QueryResponse::Set { columns, rows } = resp else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![b"active".to_vec(), b"beijing".to_vec()]);
+        // 缺失字段 → NULL（0xfb），不报错
+        let resp2 = select_response(&engine, "SELECT title, city FROM orders WHERE id=42");
+        let QueryResponse::Set { rows: r2, .. } = resp2 else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(r2[0][0], vec![MYSQL_NULL_CELL], "缺失字段应为 NULL");
+        assert_eq!(r2[0][1], b"beijing".to_vec());
+        // 混合：id + 字段
+        let resp3 = select_response(&engine, "SELECT id, amount FROM orders WHERE id=42");
+        let QueryResponse::Set { columns: c3, rows: r3 } = resp3 else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(c3.len(), 2);
+        assert_eq!(r3[0], vec![b"42".to_vec(), b"88".to_vec()]);
     }
 
     #[test]
