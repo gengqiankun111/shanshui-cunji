@@ -131,11 +131,13 @@
   - [x] demo ✅（src/demo/range-window：6 passed + 1 #[ignore] 记录分歧）
   - [x] **50m 验收（2026-09-03，release 3308 复测）**：非事务 id BETWEEN p50 中位
     **86ms → 3.1ms**（位置无关 2.96~3.43ms；MySQL 3306 0.84ms → 差距 **~102× → 3.7×**，目标"个位数×"达成）
-- **Ex-8.2（P0）scan 路径层 + 文件 key 范围剪枝**：
-  - [ ] `scan_stream_at` / `scan_range` 复用 `layer_ranges/layer_indices`（现仅点查路径消费）：
-    窗口 [start,end] 只构造相交 SST 的 SstRangeIter；memtable 按 docid 窗口 with_iter_range 已具备
-  - [ ] 全扫（无窗口）语义不变（全部文件照旧）
-  - [ ] demo + 单测（剪枝 vs 全建迭代器同结果；多段/跨层窗口正确）
+- **Ex-8.2（P0）scan 路径层 + 文件 key 范围剪枝** — ✅ 内核完成（49469f6，554 全绿）
+  - [x] `scan_stream_at` / `count_keys_range_filtered` / `scan_raw_range` 复用段级 `key_range`
+    （sst_intersects_window，闭区间/None 端零假阴性）：窗口 [start,end] 只建相交 SST 的
+    SstRangeIter（免非相交段 L2 定位/索引读与线性走查）；memtable 按窗口 with_iter_range 已具备
+  - [x] 全扫（无窗口）语义不变（全部文件照旧）
+  - [x] demo/单测（scan_prunes_disjoint_ssts_windows：3 不相交文件 × 8 窗口收集==流式 +
+    全扫/跨文件边界/越界空窗口）
 - **Ex-8.3（P1）扫描路径块缓存 + keys-only 投影**：
   - [ ] SstRangeIter/scan_range 读块挂既有 blockcache（当前只点查 get_from_sst 挂载）
   - [ ] 纯 `SELECT id` 窗口扫描走 keys-only 解码（7.100 `decode_data_block_keys` 模式扩展到
