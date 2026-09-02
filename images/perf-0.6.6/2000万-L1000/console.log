@@ -1,0 +1,132 @@
+﻿
+═══ shanshui-cunji 0.6.0 功能冒烟测试（scale=20000000）═══
+
+[2m2026-08-30T05:56:02.694301Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T05:56:02.696255Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T05:56:02.696273Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T05:56:02.696973Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T05:56:02.698240Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T05:56:10.150814Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000001.seg
+[2m2026-08-30T05:56:17.271862Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000002.seg
+[2m2026-08-30T05:56:23.768688Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (1013975 条)
+[2m2026-08-30T05:56:27.731156Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000003.seg
+[2m2026-08-30T05:56:34.626503Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000004.seg
+[2m2026-08-30T05:56:43.955314Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (1001538 条)
+[2m2026-08-30T05:56:44.898263Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000005.seg
+[2m2026-08-30T05:56:52.043259Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000006.seg
+[2m2026-08-30T05:56:58.977054Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000007.seg
+[2m2026-08-30T05:57:04.857965Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1001538 条)
+[2m2026-08-30T05:57:08.952200Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000008.seg
+[2m2026-08-30T05:57:15.858152Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000009.seg
+[2m2026-08-30T05:57:25.712199Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000004.sst (1001538 条)
+[2m2026-08-30T05:57:26.843442Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000010.seg
+[2m2026-08-30T05:57:33.625566Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000011.seg
+[2m2026-08-30T05:57:40.541495Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000012.seg
+[2m2026-08-30T05:57:46.084415Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000005.sst (1001538 条)
+[2m2026-08-30T05:57:50.433951Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000013.seg
+[2m2026-08-30T05:57:57.314881Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000014.seg
+[2m2026-08-30T05:58:05.576572Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000006.sst (1001538 条)
+[2m2026-08-30T05:58:06.828546Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000015.seg
+[2m2026-08-30T05:58:14.236532Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000016.seg
+[2m2026-08-30T05:58:21.364678Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000017.seg
+[2m2026-08-30T05:58:26.621929Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000007.sst (1001538 条)
+[2m2026-08-30T05:58:30.951628Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000018.seg
+[2m2026-08-30T05:58:38.551351Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000019.seg
+[2m2026-08-30T05:58:46.667171Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000008.sst (1001538 条)
+[2m2026-08-30T05:58:48.133427Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000020.seg
+[2m2026-08-30T05:58:55.084081Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000021.seg
+[2m2026-08-30T05:59:02.989867Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000022.seg
+[2m2026-08-30T05:59:07.906643Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000009.sst (1001539 条)
+[2m2026-08-30T05:59:13.619969Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000023.seg
+[2m2026-08-30T05:59:20.652229Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000024.seg
+[2m2026-08-30T05:59:29.266807Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000010.sst (1001230 条)
+[2m2026-08-30T05:59:31.594908Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000025.seg
+[2m2026-08-30T05:59:39.750294Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000026.seg
+[2m2026-08-30T05:59:48.462839Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000027.seg
+[2m2026-08-30T05:59:53.555309Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000011.sst (990452 条)
+[2m2026-08-30T05:59:58.446512Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000028.seg
+[2m2026-08-30T06:00:05.281696Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000029.seg
+[2m2026-08-30T06:00:12.903896Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000012.sst (990452 条)
+[2m2026-08-30T06:00:15.342256Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000030.seg
+[2m2026-08-30T06:00:22.091891Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000031.seg
+[2m2026-08-30T06:00:29.286052Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000032.seg
+[2m2026-08-30T06:00:33.613078Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000013.sst (990452 条)
+[2m2026-08-30T06:00:39.486747Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000033.seg
+[2m2026-08-30T06:00:47.321520Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000034.seg
+[2m2026-08-30T06:00:55.158372Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000014.sst (990452 条)
+[2m2026-08-30T06:00:58.276843Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000035.seg
+[2m2026-08-30T06:01:06.204168Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000036.seg
+[2m2026-08-30T06:01:13.408119Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000037.seg
+[2m2026-08-30T06:01:17.317763Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000015.sst (990452 条)
+[2m2026-08-30T06:01:23.758146Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000038.seg
+[2m2026-08-30T06:01:31.134306Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000039.seg
+[2m2026-08-30T06:01:38.122011Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000016.sst (990452 条)
+[2m2026-08-30T06:01:41.685332Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000040.seg
+[2m2026-08-30T06:01:49.122295Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000041.seg
+[2m2026-08-30T06:01:56.749698Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000042.seg
+[2m2026-08-30T06:02:00.117751Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000017.sst (990452 条)
+[2m2026-08-30T06:02:07.226751Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000043.seg
+[2m2026-08-30T06:02:14.527033Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000044.seg
+[2m2026-08-30T06:02:20.875594Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000018.sst (990452 条)
+[2m2026-08-30T06:02:25.144909Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000045.seg
+[2m2026-08-30T06:02:32.515645Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000046.seg
+[2m2026-08-30T06:02:41.631067Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000019.sst (990452 条)
+[2m2026-08-30T06:02:42.784641Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000047.seg
+[2m2026-08-30T06:02:50.011964Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000048.seg
+[2m2026-08-30T06:02:57.315336Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000049.seg
+[2m2026-08-30T06:03:02.743294Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000020.sst (990452 条)
+[2m2026-08-30T06:03:04.496727Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000050.seg
+[2m2026-08-30T06:03:39.868802Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排 GC 完成: 50 段合并为 1（释放 14467675 字节）
+[2m2026-08-30T06:03:43.847477Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:03:43.849695Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T06:03:43.849713Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T06:03:43.851358Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:03:43.852633Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:06.671990Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (990452 条)
+[2m2026-08-30T06:04:09.688898Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000001.seg
+[2m2026-08-30T06:04:26.828347Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx-demo] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.588587Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.589627Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T06:04:52.589640Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T06:04:52.590287Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.591655Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.593362Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.594379Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T06:04:52.594391Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T06:04:52.595012Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.596403Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.598177Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.599208Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T06:04:52.599220Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T06:04:52.600222Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.602354Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.604460Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.605691Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T06:04:52.605703Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T06:04:52.606338Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:04:52.608193Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:05:14.213097Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000021.sst (67970 条)
+[2m2026-08-30T06:05:30.437023Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 21 个 SST，下一个 id=22
+[2m2026-08-30T06:05:30.438106Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 1 个段，下一个 id=52
+[2m2026-08-30T06:05:30.438266Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 1/1 段
+[2m2026-08-30T06:05:54.158425Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T06:05:54.159813Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+功能               结果       耗时(ms)  说明
+----------------------------------------------------------------------------------------------------
+构造测试数据           ✅     156028.14  生成 20000000 条文档（status/city 倒排 + title/content/remark fulltext 分词；流式生成 100000 条耗时 780 ms）
+批量插入             ✅     461145.21  写入 20000000 / 20000000 条，461145 ms（43370 条/s；WAL 攒批 + 定期倒排刷盘 + 段 GC 合并 50 旧段 → 1 段，释放 13 MB）（单条 avg 9.9 µs / max 3108379.9 µs）
+批量插入             ✅      25874.56  独立引擎 put_batch 批量插入 1000000 条（5000 条/批 × 200 批，每批原子提交），25875 ms（38648 条/s；每批 avg 73.0 ms / max 2871.9 ms）
+查询 · 主键          ✅      16192.71  1000000 次主键点查，命中 1000000，未命中 0（稀疏索引→布隆→Zone Map→块缓存）（单条 avg 16.1 µs / max 33207.6 µs）
+查询 · HotCache    ✅        915.05  1000000 次重复查询，HotCache 命中 1000000 / 1000000（写后回填 + 读后回填）（单条 avg 0.9 µs / max 3411.8 µs）
+查询 · 组合索引        ✅        167.68  status=active 前缀扫描命中 100000 条（写入索引 100000 条）；10000 次前缀点查命中 3333 （单条 avg 0.3 µs / max 28.1 µs）
+查询 · 倒排词条        ✅        580.39  city=beijing 命中 5000000 条（预期 5000000）；抽样回表 200000/200000 条验证；1000 次检索累计命中 6670000000 （单条 avg 317.5 µs / max 8197.5 µs）；10000 次 COUNT（内存位图）累计 66670000000 （单条 avg 0.2 µs / max 1.9 µs）
+查询 · fulltext 分词 ✅       6493.80  1000 次分词检索（content 字段：中文 bigram / 英文整词，每次回表 ≤10），累计命中 6508619364 （单条 avg 6493.7 µs / max 1214997.2 µs）
+查询 · 类 SQL       ✅      18517.26  1000 次等值 `status='active' AND city='beijing'`（倒排 AND 交集）（单条 avg 1159.8 µs / max 134218.4 µs） + 100 次 `AND amount BETWEEN lo AND hi`（后过滤快路径）（单条 avg 1175.8 µs / max 3408.3 µs） + 100 次 `AND ts BETWEEN`（日期时间戳）（单条 avg 172391.4 µs / max 372174.1 µs），累计命中 50000+5000+5000
+分片路由             ✅      19161.24  4 分片抽样 1000000 条分布：shard0=250000, shard1=250000, shard2=250000, shard3=250000（合计 1000000）；分片点查命中 1000000/1000000 （单条 avg 0.5 µs / max 483.8 µs）
+删除               ✅       2191.48  删除 1000000 条并验证不可见（Tombstone 落盘 + HotCache 失效）：1000000/1000000 （单条 avg 2.1 µs / max 8192.3 µs）
+优化器路由            ✅          0.00  静态路由 5 类访问路径自检通过（主键点查/范围/组合索引/倒排/全扫）
+备份 · 还原          ✅      40471.87  备份 20000000 条库 → 还原重开：未删可读 45/45（缺失 0），已删仍不可见 5/5，city=beijing 计数 5000000（预期 5000000，含 tombstone）
+----------------------------------------------------------------------------------------------------
+总计：13/13 通过
+
+📄 HTML 报告已生成: images\perf-0.6.0\2000万-L1000\report.html

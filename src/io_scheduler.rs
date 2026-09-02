@@ -58,6 +58,19 @@ impl IoRateLimiter {
         self.rate_bytes_per_sec > 0
     }
 
+    /// Ex-7.4：动态调速——运行中调整补桶速率（前台写压力高时下调让路，回落时上调追赶）。
+    /// 容量受新突发上限约束（不凭空赠予额度）；0 = 不限速。
+    pub fn set_rate(&mut self, bytes_per_sec: u64) {
+        self.rate_bytes_per_sec = bytes_per_sec;
+        self.burst = bytes_per_sec as f64;
+        self.capacity = self.capacity.min(self.burst);
+    }
+
+    /// 当前补桶速率（字节/秒；0 = 不限速）。
+    pub fn rate(&self) -> u64 {
+        self.rate_bytes_per_sec
+    }
+
     fn refill(&mut self) {
         let elapsed = self.last_refill.elapsed().as_secs_f64();
         if elapsed > 0.0 {
@@ -109,5 +122,28 @@ mod tests {
         let mut l = IoRateLimiter::new(100);
         l.acquire(0).unwrap();
         assert!(l.is_limited());
+    }
+
+    #[test]
+    fn dynamic_rate_adjusts_throttle() {
+        // Ex-7.4：动态调速——低速时 acquire 等待，提速后立即放行；0 恢复不限速
+        let mut l = IoRateLimiter::new(2_000); // 2KB/s
+        assert_eq!(l.rate(), 2_000);
+        l.acquire(2_000).unwrap(); // 消耗整桶
+        let t = Instant::now();
+        l.acquire(1_000).unwrap(); // 2KB/s 下需等 ~0.5s
+        assert!(t.elapsed().as_secs_f64() >= 0.4, "低速限速生效");
+        // 动态提速到 1MB/s：小额度快速放行
+        l.set_rate(1_000_000);
+        assert_eq!(l.rate(), 1_000_000);
+        let t2 = Instant::now();
+        l.acquire(10_000).unwrap();
+        assert!(t2.elapsed().as_millis() < 100, "提速后快速放行");
+        // 降回 0（不限速）：立即放行
+        l.set_rate(0);
+        assert!(!l.is_limited());
+        let t3 = Instant::now();
+        l.acquire(1_000_000).unwrap();
+        assert!(t3.elapsed().as_millis() < 50, "不限速立即放行");
     }
 }

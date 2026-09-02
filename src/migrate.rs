@@ -945,4 +945,46 @@ mod tests {
         // 缺失 → 0
         assert_eq!(load_checkpoint(&dir.path().join("nope")).unwrap(), 0);
     }
+
+    #[test]
+    fn incremental_export_cursor_progresses() {
+        // 复现 export.rs 增量语义（design 20.5）：docid 游标断点续传——
+        // 只导 docid > checkpoint 的新数据，max_docid 单调推进，无新数据不写 cp
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("cp");
+        let cfg = crate::config::Config::default();
+        let data_dir = dir.path().join("data");
+        let mut engine = Engine::open(&data_dir, &cfg).unwrap();
+
+        // 首次全量：base=0 → scan 全部，游标推进到最大 docid
+        for d in 1..=3u64 {
+            engine.put(d, format!("{{\"d\":{d}}}").into_bytes(), &[]).unwrap();
+        }
+        let base0 = load_checkpoint(&cp).unwrap(); // 缺失 → 0
+        let all = engine.scan_range(Some(base0 + 1), None).unwrap();
+        let max0 = all.iter().map(|r| r.0).max().unwrap_or(base0);
+        assert_eq!(all.len(), 3, "首轮全量 3 行");
+        assert_eq!(max0, 3);
+        save_checkpoint(&cp, max0).unwrap();
+
+        // 追加 2 条 → 二次增量只导 docid 4、5，游标推进到 5
+        for d in 4..=5u64 {
+            engine.put(d, format!("{{\"d\":{d}}}").into_bytes(), &[]).unwrap();
+        }
+        let base1 = load_checkpoint(&cp).unwrap();
+        let inc = engine.scan_range(Some(base1 + 1), None).unwrap();
+        let max1 = inc.iter().map(|r| r.0).max().unwrap_or(base1);
+        assert_eq!(inc.len(), 2, "二次增量只导新增 2 行");
+        assert_eq!(inc.iter().map(|r| r.0).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(max1, 5);
+        save_checkpoint(&cp, max1).unwrap();
+
+        // 无新数据 → max_docid == base，不写 cp（游标不推进）
+        let base2 = load_checkpoint(&cp).unwrap();
+        let none = engine.scan_range(Some(base2 + 1), None).unwrap();
+        let max2 = none.iter().map(|r| r.0).max().unwrap_or(base2);
+        assert!(none.is_empty(), "无新数据");
+        assert_eq!(max2, base2, "max_docid 不越过 base");
+        assert_eq!(load_checkpoint(&cp).unwrap(), 5, "cp 保持 5 不变");
+    }
 }
