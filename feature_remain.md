@@ -13,6 +13,7 @@
 
 | 功能 | 模块 | 说明 |
 |---|---|---|
+| L1/L2 延迟大合并（Ex-8.11，已排期 P2） | Compaction/写放大 | 值得做：`l0==0 && (l1>1||l2>1)` 即全收敛 → 级联写放大属实（column_family.rs:1573-1583）。新增 L1/L2 独立段数/大小阈值受控实验（A/B 在 50m 库测写放大/点查/范围）；前置 Ex-8.2 剪枝防范围读放大回退；L0 全局键索引与主动异步压 L0 已落地不重复（design_remain §11 / development_remain §15） |
 | "量变优化"五方向（已评估，2026-09-03） | 引擎/运维 | 删除语义对齐（scan 位图）✅ Ex-8.1 已修（e63603a）；剩余 Ex-8.10 txn 扫描位图过滤（P1）+ Ex-8.9 空闲感知维护（P3）；IO 合并预读/熔断/keys-only 已落地或并入 Ex-8.2/8.3；后台预热 P3 可选（design_remain §10 / development_remain §14） |
 | 全局纪元 + 多文件 WAL（已评估，2026-09-03） | 写路径/WAL | ❌ 不立项：单 NVMe 并发 fsync 无增益（设备串行）；序号（per-CF seq + WAL 头 next_seq）与水位语义（组提交 + flushed_seq/manifest）已覆盖且更简单；单 docid 本地事务无跨文件因果；真多设备由 Ex-5.10 条带化承担。远期触发 = 无锁多写者 + 独立 WAL + NVMe 多队列（design_remain §9 / development_remain §13） |
 | 范围查询优化（Ex-8.1~8.3，已排期 2026-09-03） | 引擎读路径/性能 | 根因：非事务 `id BETWEEN` 走收集路径（逐 SST 线性走块索引 + L2 全量 clone + 收集排序）→ 50m 范围 86ms 且位置依赖。**Ex-8.1 ✅（e63603a，553 全绿 + 50m 验收：86ms→3.1ms，MySQL 差距 ~102×→3.7×）**：流式 merge 折叠同源同 key 多版本 + scan/count 删除位图过滤（put 复活）+ 非事务 id BETWEEN 流式化；demo range-window 6 passed。Ex-8.2 scan 层/文件剪枝 → Ex-8.3 块缓存 + keys-only；详见 design_remain §7 / development_remain §11 |

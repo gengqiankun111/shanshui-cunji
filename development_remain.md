@@ -189,6 +189,18 @@
 - **已标注不新立项**：后台预热（P3 可选 Linux 门控）、scan IO 合并预读（SCAN_GROUP=8 已落地，
   增量并入 Ex-8.2/8.3）、熔断（看门狗+cap 已具备）、零拷贝（并入 Ex-8.3 keys-only 投影）
 
+## 15. L1/L2 延迟大合并实验（Ex-8.11，design_remain §11，2026-09-03 排期）
+
+- **Ex-8.11（P2，受控实验，不直接改默认）L1/L2 独立触发阈值**：
+  - [ ] 前置：Ex-8.2（scan 层/文件范围剪枝）先行落地（否则放宽阈值 → 范围扫描源数线性涨回退）
+  - [ ] 新增配置 `l1_trigger_files` / `l1_max_size_mb` / `l2_trigger_files` / `l2_max_size_mb`
+    （needs_compact 分支 `l0==0 && (l1>n || l1 大小>m)` 化，合并冷却/urgency/分批参数共存）
+  - [ ] demo（src/demo/compaction-tune 扩展或新对照）：A/B 档（现收敛-1 段 vs L1 攒 4/8/12 段）
+    在 50m 库测：写放大（合并次数/重写字节）、点查 p99、范围 p50、空间放大、合并 CPU
+  - [ ] 验收口径：写放大 -30%+ 且范围 p50 无回退（配合 Ex-8.2）即采纳调默认
+- **已标注不新立项**：L0 全局键范围索引（R 项 Zone Map 已落地）、主动异步压 L0（P/O 项已落地）、
+  文件系统式存储（质变否决）
+
 ## 已完成基线（勿重复）
 
 - 排期大项 A~Y 全完成（development_process_order.md 第 2 章）
