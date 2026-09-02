@@ -152,10 +152,11 @@
 > 分片跳表 / L1+B+Tree 存储 / 16KB 默认块 / TRIM / 大页 NUMA / 倒排回表 B+Tree 化等已否决或平台远期，
 > 见 design_remain §8.1。本清单 = 采纳候选（每项 demo-first 验证后实施）。
 
-- **Ex-8.5（P2）并行 Flush**：
-  - [ ] demo：单线程 vs 分片并行写 SST fragment（imm memtable 按 key 段切分，多 worker zstd + 写段，
-    顺序合并 fragment）对照（复用 Ex-7.2 绑核思路）
-  - [ ] 与合并背压（P 项 auto_compact）/ io_uring 队列关系评估；memtable 256MB 上限下频次实测
+- **Ex-8.5（P2）Flush 频率优化（2026-09-03 修正：档位实验优先，不做并行 flush 代码）**：
+  - [ ] **先零成本档位 A/B**：memtable.max_size_mb 256 → 512MB（config 一行），50m 库测 flush 频次/
+    停顿/L0 增长/写吞吐——双缓冲切换已不阻塞写（已有）
+  - [ ] 并行 flush（多 immutable 分片写 SST fragment）**仅当**档位实验证实 flush 为瓶颈再实施
+    （并行 flush 会推高 L0 数与 compaction 压力，非优先路径）
 - **Ex-8.6（P2）段级 min/max seq 元数据 + 快照读整段跳过**：
   - [ ] 段元数据加 min_seq/max_seq（manifest/SST footer 版本兼容）；get_at / scan_range_at 剪枝
     （快照 seq ≤ 段 min_seq → 整段跳过，仅读历史快照时生效）
@@ -185,21 +186,27 @@
   - [ ] `scan_range_txn` / `scan_range_at` 快照视图排除位图已删 docid（与 get_at/scan_stream 对齐；
     delete 位图语义跨全部读路径一致）；demo + 单测（txn 扫描删除段 + put 复活 + flush/compact 后）
 - **Ex-8.9（P3）空闲感知维护调度**：
-  - [ ] 以读写计数/限流水位为负载信号，低负载窗口收紧：合并（W 项 urgency 权重）+ 删除位图脏页
-    回收 + 倒排 GC；高负载退避（与 Ex-7.4 动态限流联动）
+  - [ ] 负载信号：读/写计数（metrics）、CPU/IO 等待、L0 段数；低负载窗口（QPS<峰 20% 且 CPU<40%）：
+    收紧合并阈值（urgency 权重提高）、触发倒排 GC、深度合并 L0→1、执行删除位图脏页回收；
+    高负载退避（与 Ex-7.4 动态限流联动）
   - [ ] demo：交变负载（峰/闲）下合并与回收的波峰转移对照
+- **Ex-8.13（P3）倒排后台 IO 预算共享**（design_remain §13 矛盾③收尾）：
+  - [ ] 倒排 flush_segment/GC 写纳入既有后台 io_limiter（与 compaction/导出共享后台预算语义），
+    或并入 Ex-8.9 空闲窗口执行——消除与 compaction 的前台/后台 IO 争用
+  - [ ] demo：合并 + 倒排 GC 并发窗口的写/读延迟对照
 - **已标注不新立项**：后台预热（P3 可选 Linux 门控）、scan IO 合并预读（SCAN_GROUP=8 已落地，
   增量并入 Ex-8.2/8.3）、熔断（看门狗+cap 已具备）、零拷贝（并入 Ex-8.3 keys-only 投影）
 
 ## 15. L1/L2 延迟大合并实验（Ex-8.11，design_remain §11，2026-09-03 排期）
 
 - **Ex-8.11（P2，受控实验，不直接改默认）L1/L2 独立触发阈值**：
-  - [ ] 前置：Ex-8.2（scan 层/文件范围剪枝）先行落地（否则放宽阈值 → 范围扫描源数线性涨回退）
+  - [ ] 前置：Ex-8.2（scan 层/文件范围剪枝）✅ 已落地（49469f6）——放宽阈值的读放大前提满足
   - [ ] 新增配置 `l1_trigger_files` / `l1_max_size_mb` / `l2_trigger_files` / `l2_max_size_mb`
     （needs_compact 分支 `l0==0 && (l1>n || l1 大小>m)` 化，合并冷却/urgency/分批参数共存）
-  - [ ] demo（src/demo/compaction-tune 扩展或新对照）：A/B 档（现收敛-1 段 vs L1 攒 4/8/12 段）
-    在 50m 库测：写放大（合并次数/重写字节）、点查 p99、范围 p50、空间放大、合并 CPU
-  - [ ] 验收口径：写放大 -30%+ 且范围 p50 无回退（配合 Ex-8.2）即采纳调默认
+  - [ ] A/B 档：现收敛（l1>1 即合并）vs l1 攒 8~12 段（阈值联动方向：l0 维持动态 8~16 不回退）；
+    50m 库测：写放大（合并次数/重写字节）、点查 p99、范围 p50、空间放大、合并 CPU
+  - [ ] 注意：L0 段数不放宽（overlap 层）；"L0 二分候选段索引"仅当未来放宽 L0 才启用
+  - [ ] 验收口径：写放大 -30%+ 且范围 p50 无回退即采纳调默认
 - **已标注不新立项**：L0 全局键范围索引（R 项 Zone Map 已落地）、主动异步压 L0（P/O 项已落地）、
   文件系统式存储（质变否决）
 

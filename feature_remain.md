@@ -18,7 +18,8 @@
 | "量变优化"五方向（已评估，2026-09-03） | 引擎/运维 | 删除语义对齐（scan 位图）✅ Ex-8.1 已修（e63603a）；剩余 Ex-8.10 txn 扫描位图过滤（P1）+ Ex-8.9 空闲感知维护（P3）；IO 合并预读/熔断/keys-only 已落地或并入 Ex-8.2/8.3；后台预热 P3 可选（design_remain §10 / development_remain §14） |
 | 全局纪元 + 多文件 WAL（已评估，2026-09-03） | 写路径/WAL | ❌ 不立项：单 NVMe 并发 fsync 无增益（设备串行）；序号（per-CF seq + WAL 头 next_seq）与水位语义（组提交 + flushed_seq/manifest）已覆盖且更简单；单 docid 本地事务无跨文件因果；真多设备由 Ex-5.10 条带化承担。远期触发 = 无锁多写者 + 独立 WAL + NVMe 多队列（design_remain §9 / development_remain §13） |
 | 范围查询优化（Ex-8.1~8.3，已排期 2026-09-03） | 引擎读路径/性能 | 根因：非事务 `id BETWEEN` 走收集路径（逐 SST 线性走块索引 + L2 全量 clone + 收集排序）→ 50m 范围 86ms 且位置依赖。**Ex-8.1 ✅（e63603a，553 全绿 + 50m 验收：86ms→3.1ms，MySQL 差距 ~102×→3.7×）**：流式 merge 折叠同源同 key 多版本 + scan/count 删除位图过滤（put 复活）+ 非事务 id BETWEEN 流式化；demo range-window 6 passed。Ex-8.2 scan 层/文件剪枝 → Ex-8.3 块缓存 + keys-only；详见 design_remain §7 / development_remain §11 |
-| 并行 Flush（Ex-8.5，P2 候选） | 写路径/性能 | demo-first：imm memtable 分片并行写 SST fragment；与合并背压/io_uring 队列关系实测（design_remain §8.1） |
+| Flush 频率优化（Ex-8.5，P2，2026-09-03 修正） | 写路径/性能 | 先零成本 memtable 档位 A/B（256→512MB config 一行）测 flush 频次/停顿/L0 增长；并行 flush（多 immutable 分片）仅当档位实验证实 flush 为瓶颈再实施（并行 flush 推高 L0/compaction 压力，非优先；design_remain §13） |
+| 倒排后台 IO 预算共享（Ex-8.13，P3 候选） | 倒排/后台 IO | 倒排 flush/GC 写纳入既有后台 io_limiter（与 compaction/导出共享预算语义）或并入 Ex-8.9 空闲窗口，消除与合并的 IO 争用（design_remain §13 矛盾③收尾） |
 | 段级 min/max seq 快照剪枝（Ex-8.6，P2 候选） | 引擎读路径 | 段元数据加 seq 范围，get_at/scan_range_at 整段跳过历史；与 Ex-8.2 key 范围剪枝互补 |
 | 删除密度 urgency（Ex-8.7，P3 候选） | Compaction | urgency 加位图置位率加权，删除密集段优先合并释放空间 |
 | posting LRU 双区热点化（Ex-8.8，P2 候选） | 倒排检索 | 现有 posting LRU 256（c380792）仿 HotCache 双区 promote + 容量参数化，不新增缓存结构 |
