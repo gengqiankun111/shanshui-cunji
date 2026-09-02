@@ -1082,10 +1082,8 @@ fn txn_select(
     session: &mut Session,
     sql: &str,
 ) -> QueryResponse {
-    let columns = vec![
-        column_payload("id", MYSQL_TYPE_LONGLONG, 63),
-        column_payload("doc", MYSQL_TYPE_VAR_STRING, 45),
-    ];
+    let proj = parse_projection(sql);
+    let columns = proj_columns(proj.as_deref());
     let upper = sql.to_uppercase();
     // 聚合：`SELECT SUM(k) FROM ... WHERE id BETWEEN A AND B` → 单行单列数值
     let is_sum = upper.contains("SUM(");
@@ -1112,17 +1110,12 @@ fn txn_select(
                 rows: vec![vec![sum.to_string().into_bytes()]],
             };
         }
-        // 普通范围查询：组装结果 + ORDER BY / LIMIT
-        let mut data: Vec<Vec<Vec<u8>>> = rows
+        // 普通范围查询：按投影裁剪 + ORDER BY / LIMIT
+        let data: Vec<(u64, Vec<Vec<u8>>)> = rows
             .into_iter()
-            .map(|(id, doc)| vec![id.to_string().into_bytes(), doc])
+            .map(|(id, doc)| (id, proj_row(proj.as_deref(), id, &doc)))
             .collect();
-        if upper.contains("ORDER BY") {
-            data.sort_by(|a, b| a[1].cmp(&b[1]));
-        }
-        if let Some(lim) = extract_limit(sql) {
-            data.truncate(lim.min(data.len()));
-        }
+        let data = sort_limit_by_docid(data, upper.contains("ORDER BY"), extract_limit(sql));
         return QueryResponse::Set { columns, rows: data };
     }
     // 点查 / IN：逐 id 快照 get（同事务写可见）
@@ -1150,22 +1143,17 @@ fn txn_select(
             rows: vec![vec![sum.to_string().into_bytes()]],
         };
     }
-    // 普通点查 / IN：逐 id 快照 get
-    let mut data: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ids.len());
+    // 普通点查 / IN：逐 id 快照 get（按投影裁剪）
+    let mut data: Vec<(u64, Vec<Vec<u8>>)> = Vec::with_capacity(ids.len());
     for id in &ids {
         match engine.txn_get(txn, *id) {
-            Ok(Some(v)) => data.push(vec![id.to_string().into_bytes(), v]),
+            Ok(Some(v)) => data.push((*id, proj_row(proj.as_deref(), *id, &v))),
             Ok(None) => {}
             Err(e) => return QueryResponse::Err(3500, format!("事务读失败: {e}")),
         }
     }
-    // ORDER BY ... LIMIT N：按 doc 字节排序后截断（sysbench 不校验内容，仅测吞吐）
-    if upper.contains("ORDER BY") {
-        data.sort_by(|a, b| a[1].cmp(&b[1]));
-    }
-    if let Some(lim) = extract_limit(sql) {
-        data.truncate(lim.min(data.len()));
-    }
+    // ORDER BY ... LIMIT N：按 docid 数值排序后截断
+    let data = sort_limit_by_docid(data, upper.contains("ORDER BY"), extract_limit(sql));
     QueryResponse::Set { columns, rows: data }
 }
 
@@ -1331,9 +1319,10 @@ fn stmt_prepare(session: &mut Session, sql: &str) -> Vec<Vec<u8>> {
     session.statements.insert(stmt_id, sql.to_string());
     let mut packets = Vec::new();
     // PREPARE_OK：0x00 + stmt_id(4) + num_columns(2) + num_params(2) + filler(1) + warnings(2)
+    let proj_cols = parse_projection(sql).unwrap_or_else(|| vec![0, 1]);
     let mut ok = vec![0x00];
     ok.extend_from_slice(&stmt_id.to_le_bytes());
-    ok.extend_from_slice(&2u16.to_le_bytes()); // 列 = id, doc
+    ok.extend_from_slice(&(proj_cols.len() as u16).to_le_bytes()); // 列 = 投影列数（EXECUTE 对齐）
     ok.extend_from_slice(&num_params.to_le_bytes());
     ok.push(0);
     ok.extend_from_slice(&0u16.to_le_bytes());
@@ -1345,9 +1334,8 @@ fn stmt_prepare(session: &mut Session, sql: &str) -> Vec<Vec<u8>> {
     if num_params > 0 {
         packets.push(eof_payload());
     }
-    // 列定义 + EOF（id / doc）
-    packets.push(column_payload("id", MYSQL_TYPE_LONGLONG, 63));
-    packets.push(column_payload("doc", MYSQL_TYPE_VAR_STRING, 45));
+    // 列定义 + EOF（与投影一致：`SELECT id` 只声明 1 列 id，EXECUTE 结果列数不越界）
+    packets.extend(proj_columns(Some(&proj_cols)));
     packets.push(eof_payload());
     packets
 }
@@ -1546,6 +1534,84 @@ fn show_response(upper: &str) -> QueryResponse {
     }
 }
 
+/// SELECT 列投影解析——结果集列裁剪（避免无脑返回整 doc JSON，降低回包字节与序列化开销）。
+///
+/// 支持简单列清单：`id` / `doc` / `*`（保书写顺序）；编码 `Some(Vec<u8>)`（0=id 列，1=doc 列）。
+/// 含函数 / 别名 / 未知列名（doc 内 JSON 字段等）→ `None`，调用方维持 id+doc 双列现状
+/// （字段级投影需 NULL/类型映射，留后续排期）。
+fn parse_projection(sql: &str) -> Option<Vec<u8>> {
+    let lower = sql.to_lowercase();
+    let f = lower.find(" from ")?;
+    let list = lower[7..f].trim();
+    // DISTINCT / 复杂子句 → 不裁剪（现状双列）
+    if list.is_empty() || list.starts_with("distinct") || list.contains('(') {
+        return None;
+    }
+    let mut cols = Vec::new();
+    for item in list.split(',') {
+        let c = item.trim().trim_matches('`').trim();
+        match c {
+            "" => return None,
+            "*" => {
+                cols.push(0);
+                cols.push(1);
+            }
+            "id" | "docid" => cols.push(0),
+            "doc" | "document" => cols.push(1),
+            _ => return None, // 未知列（JSON 字段等）→ 回退双列
+        }
+    }
+    if cols.is_empty() {
+        None
+    } else {
+        Some(cols)
+    }
+}
+
+/// 按投影构建 ResultSet 列定义（None = id + doc 双列，与现状一致）。
+fn proj_columns(proj: Option<&[u8]>) -> Vec<Vec<u8>> {
+    let cols = proj.unwrap_or(&[0, 1]);
+    cols.iter()
+        .map(|&c| {
+            if c == 0 {
+                column_payload("id", MYSQL_TYPE_LONGLONG, 63)
+            } else {
+                column_payload("doc", MYSQL_TYPE_VAR_STRING, 45)
+            }
+        })
+        .collect()
+}
+
+/// 按投影构建一行（None = id + doc 双列；id 列 → 数字文本，doc 列 → 原 doc 字节）。
+fn proj_row(proj: Option<&[u8]>, id: u64, doc: &[u8]) -> Vec<Vec<u8>> {
+    let cols = proj.unwrap_or(&[0, 1]);
+    cols.iter()
+        .map(|&c| {
+            if c == 0 {
+                id.to_string().into_bytes()
+            } else {
+                doc.to_vec()
+            }
+        })
+        .collect()
+}
+
+/// ORDER BY / LIMIT 收尾：统一按 docid 数值升序（对齐 MySQL 主键排序列语义；
+/// 旧实现按 doc 字节序，`SELECT id ... ORDER BY id` 场景排序键错误）。
+fn sort_limit_by_docid(
+    mut rows: Vec<(u64, Vec<Vec<u8>>)>,
+    order_by: bool,
+    limit: Option<usize>,
+) -> Vec<Vec<Vec<u8>>> {
+    if order_by {
+        rows.sort_by_key(|(id, _)| *id);
+    }
+    if let Some(l) = limit {
+        rows.truncate(l.min(rows.len()));
+    }
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
 /// SELECT：VERSION() / @@ 系统值 → 单行结果；`WHERE id=N` → 主键点查；
 /// 否则走 sqlish 引擎。
 fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
@@ -1560,14 +1626,13 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
         let rows = vec![vec![SERVER_VERSION.as_bytes().to_vec()]];
         return QueryResponse::Set { columns, rows };
     }
-    let columns = vec![
-        column_payload("id", MYSQL_TYPE_LONGLONG, 63),
-        column_payload("doc", MYSQL_TYPE_VAR_STRING, 45),
-    ];
+    // 列投影：`SELECT id` → 仅 id 列（省去整 doc 回包/序列化）；`*` / 未知列 → 双列现状
+    let proj = parse_projection(sql);
+    let columns = proj_columns(proj.as_deref());
     // MySQL 客户端以 `id` 为主键列 → 主键点查（sqlish 侧为 docid 特例）
     if let Some(id) = extract_point_id(sql) {
         let rows = match engine.get(id) {
-            Ok(Some(v)) => vec![vec![id.to_string().into_bytes(), v]],
+            Ok(Some(v)) => vec![proj_row(proj.as_deref(), id, &v)],
             _ => Vec::new(),
         };
         return QueryResponse::Set { columns, rows };
@@ -1594,16 +1659,11 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
                 rows: vec![vec![sum.to_string().into_bytes()]],
             };
         }
-        let mut data: Vec<Vec<Vec<u8>>> = rows
+        let data: Vec<(u64, Vec<Vec<u8>>)> = rows
             .into_iter()
-            .map(|(id, doc)| vec![id.to_string().into_bytes(), doc])
+            .map(|(id, doc)| (id, proj_row(proj.as_deref(), id, &doc)))
             .collect();
-        if upper2.contains("ORDER BY") {
-            data.sort_by(|a, b| a[1].cmp(&b[1]));
-        }
-        if let Some(lim) = extract_limit(sql) {
-            data.truncate(lim.min(data.len()));
-        }
+        let data = sort_limit_by_docid(data, upper2.contains("ORDER BY"), extract_limit(sql));
         return QueryResponse::Set { columns, rows: data };
     }
     // sysbench 扩展：`id BETWEEN A AND B` / `id IN (...)` → 逐 id 点查；
@@ -1627,18 +1687,13 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
                 rows: vec![vec![sum.to_string().into_bytes()]],
             };
         }
-        let mut data: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ids.len());
+        let mut data: Vec<(u64, Vec<Vec<u8>>)> = Vec::with_capacity(ids.len());
         for id in ids {
             if let Ok(Some(v)) = engine.get(id) {
-                data.push(vec![id.to_string().into_bytes(), v]);
+                data.push((id, proj_row(proj.as_deref(), id, &v)));
             }
         }
-        if upper2.contains("ORDER BY") {
-            data.sort_by(|a, b| a[1].cmp(&b[1]));
-        }
-        if let Some(lim) = extract_limit(sql) {
-            data.truncate(lim.min(data.len()));
-        }
+        let data = sort_limit_by_docid(data, upper2.contains("ORDER BY"), extract_limit(sql));
         return QueryResponse::Set { columns, rows: data };
     }
     // sysbench select_random_points/ranges：`WHERE k IN/BETWEEN ...`（k 为非索引随机键，
@@ -1664,12 +1719,12 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             rows: Vec::new(),
         };
     }
-    // 一般 SELECT → sqlish 引擎（id + doc 两列）
+    // 一般 SELECT → sqlish 引擎（结果按投影列裁剪）
     match crate::sqlish::execute(engine, sql, 10_000) {
         Ok(rows) => {
             let data: Vec<Vec<Vec<u8>>> = rows
-                .iter()
-                .map(|(id, v)| vec![id.to_string().into_bytes(), v.clone()])
+                .into_iter()
+                .map(|(id, v)| proj_row(proj.as_deref(), id, &v))
                 .collect();
             QueryResponse::Set {
                 columns,
@@ -2157,6 +2212,114 @@ mod tests {
         assert!(!check_native_password(&token, &scramble, pw));
         // 空密码：响应为空 → 接受
         assert!(check_native_password(&[], &scramble, ""));
+    }
+
+    // ---------- 单元：SELECT 列投影（结果集裁剪） ----------
+
+    #[test]
+    fn parse_projection_variants() {
+        // id 单列 → 主键点查/范围只回 id（响应最小化）
+        assert_eq!(
+            parse_projection("SELECT id FROM orders WHERE id=1"),
+            Some(vec![0])
+        );
+        // 反引号 / 大小写 / docid 别名
+        assert_eq!(
+            parse_projection("select `id` from orders where id=2"),
+            Some(vec![0])
+        );
+        assert_eq!(
+            parse_projection("SELECT docid FROM orders WHERE id=3"),
+            Some(vec![0])
+        );
+        // 显式双列 / 保书写顺序
+        assert_eq!(
+            parse_projection("SELECT id, doc FROM orders"),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            parse_projection("SELECT doc, id FROM orders"),
+            Some(vec![1, 0])
+        );
+        // * → id + doc
+        assert_eq!(
+            parse_projection("SELECT * FROM orders WHERE id=4"),
+            Some(vec![0, 1])
+        );
+        // 回退场景：JSON 字段列 / 函数 / DISTINCT / 无 FROM
+        assert_eq!(parse_projection("SELECT status FROM orders WHERE id=5"), None);
+        assert_eq!(parse_projection("SELECT COUNT(id) FROM orders"), None);
+        assert_eq!(
+            parse_projection("SELECT DISTINCT c FROM sbtest WHERE id BETWEEN 1 AND 9"),
+            None
+        );
+        assert_eq!(parse_projection("SELECT id"), None);
+        // 解析只看 SELECT 与 FROM 之间（带 ORDER BY / LIMIT 不影响）
+        assert_eq!(
+            parse_projection("SELECT id FROM orders WHERE id BETWEEN 1 AND 9 ORDER BY id LIMIT 5"),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn projection_row_and_columns() {
+        let doc = br#"{"status":"active","amount":10}"#;
+        // id-only：单列（不携带整 doc）
+        assert_eq!(proj_row(Some(&[0]), 7, doc), vec![b"7".to_vec()]);
+        // 保序（doc 在前）
+        assert_eq!(proj_row(Some(&[1, 0]), 7, doc), vec![doc.to_vec(), b"7".to_vec()]);
+        // None（* / 回退）→ id + doc
+        assert_eq!(proj_row(None, 7, doc), vec![b"7".to_vec(), doc.to_vec()]);
+        // 列定义数量与投影一致
+        assert_eq!(proj_columns(Some(&[0])).len(), 1);
+        assert_eq!(proj_columns(Some(&[1, 0])).len(), 2);
+        assert_eq!(proj_columns(None).len(), 2);
+    }
+
+    #[test]
+    fn projection_end_to_end_point_query_returns_single_id_column() {
+        // 端到端：真实引擎 + `SELECT id` 点查 → 结果集仅 1 列 id（不再夹带整 doc 回包）
+        let mut engine = test_engine();
+        let doc = br#"{"status":"active","city":"beijing","amount":88}"#;
+        engine.put(42, doc.to_vec(), &[]).unwrap();
+        let resp = select_response(&engine, "SELECT id FROM orders WHERE id=42");
+        let QueryResponse::Set { columns, rows } = resp else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(columns.len(), 1, "SELECT id 只应声明 1 列");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[0][0], b"42");
+        // 对照：SELECT * 仍 id+doc 双列（行为不变）
+        let resp2 = select_response(&engine, "SELECT * FROM orders WHERE id=42");
+        let QueryResponse::Set { columns: c2, rows: r2 } = resp2 else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(c2.len(), 2);
+        assert_eq!(r2[0].len(), 2);
+        assert_eq!(r2[0][0], b"42");
+        assert_eq!(r2[0][1], doc);
+    }
+
+    #[test]
+    fn projection_between_order_by_limit() {
+        let mut engine = test_engine();
+        for i in 0..3u64 {
+            engine
+                .put(i, format!(r#"{{"st":"s{i}"}}"#).into_bytes(), &[])
+                .unwrap();
+        }
+        // SELECT id ... BETWEEN 1 AND 2 ORDER BY id → 只回 id、按 docid 升序
+        let resp = select_response(
+            &engine,
+            "SELECT id FROM orders WHERE id BETWEEN 1 AND 2 ORDER BY id",
+        );
+        let QueryResponse::Set { columns, rows } = resp else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(columns.len(), 1);
+        let got: Vec<&[u8]> = rows.iter().map(|r| r[0].as_slice()).collect();
+        assert_eq!(got, vec![b"1", b"2"]);
     }
 
     // ---------- 单元：SQL 解析 ----------

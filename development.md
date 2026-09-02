@@ -2529,6 +2529,32 @@ impl RuntimePools {
    停机 → 节点 2 当选 → 继续提议）+ 纯传输往返；9 raft_rpc 测试 0.05s 全绿，**538 全绿**。
 6. **后续**：scale_out 编排与 raft 联动（真实节点部署联调，随部署推进）。
 
+### 7.89 mysql_server SELECT 列投影（结果集裁剪——点查不再整 doc 回包）
+
+> 2026-09-02。7.87 对比 + 多量级复测（100 万~1000 万，tmp_mysql_scc_scale_summary.md）
+> 暴露点查落后 MySQL ~1.25× 且各量级稳定：瓶颈不在引擎读（HotCache 热点实测 QPS 不涨），
+> 而在 **mysql_server 每点查固定返回 `id + 整份 doc JSON` 两列**（`SELECT id` 也回 ~200B doc；
+> MySQL 只回 8B id，响应字节 ~25×）。
+
+1. **方案（src/mysql.rs）**：
+   - `parse_projection`：解析 SELECT 与 FROM 间列清单（`id`/`doc`/`*` 保序；含函数/未知
+     JSON 字段/DISTINCT → None 回退 id+doc 双列现状——字段级投影需 NULL/类型映射留后续排期）；
+   - `proj_columns`/`proj_row`：按投影生成列定义与行（id → LONGLONG 数字文本，doc → 原字节）；
+   - 接入 `select_response`（主键点查 / BETWEEN / IN / sqlish 兜底）+ `txn_select`（事务快照读）；
+   - `stmt_prepare` 列数 + 列定义同步投影（PREPARE/EXECUTE 列数一致，JDBC 客户端不越界）；
+   - ORDER BY 收尾统一按 docid 数值升序（旧按 doc 字节序，`SELECT id ... ORDER BY id` 语义修正）。
+2. **回归**：全量 **538 全绿**（+4：parse_projection 变体、投影行列构建、端到端点查单列、
+   BETWEEN+ORDER BY+LIMIT 单列投影）。
+3. **A/B 实测**（1000 万库，16 线程 × 12s pymysql `SELECT id` 点查；MySQL buffer pool 8G）：
+
+   | 场景 | 优化前 SCC | 优化后 SCC | MySQL | SCC/MySQL |
+   |---|---|---|---|---|
+   | 全范围随机 | 6,502 QPS | 6,981 QPS | 7,676 | 0.91（前 0.78） |
+   | 热点集 512 | 6,572 QPS | 7,138 QPS | 7,456 | 0.96（前 0.81） |
+
+   随机点查落后 1.28× → 1.10×，热点近追平；剩余差距在协议往返 + 每语句固定开销
+   （spawn_blocking / RwLock / ResultSet 构建），非引擎读路径。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
