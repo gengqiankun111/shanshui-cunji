@@ -2594,6 +2594,22 @@ impl RuntimePools {
    `SELECT price`(浮点 doc) → DOUBLE → **float**；`status,title` → VAR_STRING → 字符串；
    `flag`(bool) → LONGLONG 1/0——与 MySQL 3306 同语义对照一致。
 
+### 7.92 mysql_server 嵌套字段投影（`SELECT a.b` 点路径下钻）
+
+> 2026-09-02。7.90/7.91 只覆盖 doc 顶层字段；文档库常存嵌套对象
+> （`{"addr":{"city":..}}`），`SELECT addr.city` 需要点路径逐层下钻。
+
+1. **方案（src/mysql.rs）**：
+   - `lookup_in_map`：单层 key 查找（大小写容错：精确 → 小写 → 遍历不敏感），抽出复用；
+   - `doc_field_kind_cell` 按 `.` 拆路径逐层下钻（每层 Object 内查找；中间值非对象 → 视为
+     缺失 NULL）——顶层字段路径自动兼容，取值/类型聚合（7.91）原链路不变；
+   - `field_col_name`：列头取路径**最后一段**（对齐 MySQL `SELECT a.b` 列名 = b）；
+     proj_columns（prepare）/ build_result_set（实际结果集）同步。
+2. **回归**：全量 **542 全绿**（+1 端到端嵌套：列头最后段 + 取值 + 缺失 NULL + 嵌套浮点
+   DOUBLE；doc_field 边界扩嵌套下钻/中间非对象）。
+3. **实测**（1000 万库 release，pymysql）：`SELECT name, addr.city` → 列头 [name, city]，
+   city='bj'；`addr.geo.lat/lng` → DOUBLE float 39.9/116.4；`addr.zip` 缺失 → None。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

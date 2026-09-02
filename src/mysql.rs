@@ -1660,31 +1660,50 @@ impl FieldAgg {
     }
 }
 
-/// doc 顶层字段取值（大小写容错：精确 → 小写 → 遍历不敏感命中）。
-/// 返回 (类型, cell)；缺失 / JSON null / 非对象 doc → (Null, NULL 哨兵)。
+/// doc 内单层 key 查找（大小写容错：精确 → 小写 → 遍历不敏感命中）。
+fn lookup_in_map<'a>(
+    m: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(v) = m.get(key) {
+        return Some(v);
+    }
+    let lk = key.to_lowercase();
+    if let Some(v) = m.get(&lk) {
+        return Some(v);
+    }
+    m.iter()
+        .find(|(k, _)| k.to_lowercase() == lk)
+        .map(|(_, v)| v)
+}
+
+/// doc 顶层字段 / 嵌套字段取值（点路径 `a.b.c` 逐层下钻，每层大小写容错）。
+/// 返回 (类型, cell)；缺失 / 中间非对象 / JSON null → (Null, NULL 哨兵)。
 fn doc_field_kind_cell(
     obj: Option<&serde_json::Map<String, serde_json::Value>>,
-    field: &str,
+    path: &str,
 ) -> (ValKind, Vec<u8>) {
     let Some(m) = obj else {
         return (ValKind::Null, vec![MYSQL_NULL_CELL]);
     };
-    let v = if let Some(v) = m.get(field) {
-        Some(v)
-    } else {
-        let lf = field.to_lowercase();
-        if let Some(v) = m.get(&lf) {
-            Some(v)
-        } else {
-            m.iter()
-                .find(|(k, _)| k.to_lowercase() == lf)
-                .map(|(_, v)| v)
-        }
-    };
-    match v {
+    let mut segs = path.split('.');
+    let first = segs.next().unwrap_or("");
+    let mut node = lookup_in_map(m, first);
+    for seg in segs {
+        node = match node {
+            Some(serde_json::Value::Object(nm)) => lookup_in_map(nm, seg),
+            _ => None, // 中间值非对象 → 无法下钻，视为缺失
+        };
+    }
+    match node {
         Some(v) => (value_kind(v), value_cell(v)),
         None => (ValKind::Null, vec![MYSQL_NULL_CELL]),
     }
+}
+
+/// 字段列结果集列名：MySQL `SELECT a.b` 列名为路径最后一段（b）。
+fn field_col_name(field: &str) -> &str {
+    field.rsplit('.').next().unwrap_or(field)
 }
 
 /// 按投影构建 ResultSet 列定义（None = id + doc 双列；id → LONGLONG；
@@ -1695,7 +1714,7 @@ fn proj_columns(proj: Option<&[ProjCol]>) -> Vec<Vec<u8>> {
         .map(|c| match c {
             ProjCol::Id => column_payload("id", MYSQL_TYPE_LONGLONG, 63),
             ProjCol::Doc => column_payload("doc", MYSQL_TYPE_VAR_STRING, 45),
-            ProjCol::Field(f) => column_payload(f, MYSQL_TYPE_VAR_STRING, 45),
+            ProjCol::Field(f) => column_payload(field_col_name(f), MYSQL_TYPE_VAR_STRING, 45),
         })
         .collect()
 }
@@ -1745,7 +1764,7 @@ fn build_result_set(
             ProjCol::Doc => column_payload("doc", MYSQL_TYPE_VAR_STRING, 45),
             ProjCol::Field(f) => {
                 let t = aggs[i].map(|a| a.col_type()).unwrap_or(MYSQL_TYPE_VAR_STRING);
-                column_payload(f, t, 63)
+                column_payload(field_col_name(f), t, 63)
             }
         })
         .collect();
@@ -2553,6 +2572,65 @@ mod tests {
         );
         // 非对象 doc → NULL
         assert_eq!(doc_field_kind_cell(None, "f").0, ValKind::Null);
+        // 嵌套点路径：逐层下钻（大小写容错逐层生效）
+        assert_eq!(
+            doc_field_kind_cell(
+                obj(br#"{"addr":{"city":"bj","geo":{"lat":1.5}}}"#).as_ref(),
+                "addr.city"
+            )
+            .1,
+            b"bj".to_vec()
+        );
+        assert_eq!(
+            doc_field_kind_cell(
+                obj(br#"{"addr":{"city":"bj","geo":{"lat":1.5}}}"#).as_ref(),
+                "addr.geo.lat"
+            )
+            .0,
+            ValKind::Float
+        );
+        // 缺失嵌套 / 中间非对象（下钻到字符串值）→ NULL
+        assert_eq!(
+            doc_field_kind_cell(obj(br#"{"addr":{"city":"bj"}}"#).as_ref(), "addr.zip").0,
+            ValKind::Null
+        );
+        assert_eq!(
+            doc_field_kind_cell(obj(br#"{"addr":{"city":"bj"}}"#).as_ref(), "addr.city.deep").0,
+            ValKind::Null
+        );
+    }
+
+    #[test]
+    fn projection_end_to_end_nested_field() {
+        let mut engine = test_engine();
+        engine
+            .put(1, br#"{"addr":{"city":"bj","geo":{"lat":1.5}},"name":"n1"}"#.to_vec(), &[])
+            .unwrap();
+        // 嵌套字段投影：SELECT name, addr.city → 列名取最后一段（city）
+        let resp = select_response(&engine, "SELECT name, addr.city FROM orders WHERE id=1");
+        let QueryResponse::Set { columns, rows } = resp else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(columns.len(), 2);
+        assert!(
+            columns[1].windows(4).any(|w| w == b"city"),
+            "嵌套列头应为最后一段 city"
+        );
+        assert_eq!(rows[0][0], b"n1");
+        assert_eq!(rows[0][1], b"bj");
+        // 缺失深层 → NULL
+        let resp2 = select_response(&engine, "SELECT addr.zip FROM orders WHERE id=1");
+        let QueryResponse::Set { rows: r2, .. } = resp2 else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(r2[0][0], vec![MYSQL_NULL_CELL]);
+        // 嵌套浮点 → DOUBLE 类型 + 值
+        let resp3 = select_response(&engine, "SELECT addr.geo.lat FROM orders WHERE id=1");
+        let QueryResponse::Set { columns: c3, rows: r3 } = resp3 else {
+            panic!("应为 ResultSet");
+        };
+        assert_eq!(col_payload_type(&c3[0]), MYSQL_TYPE_DOUBLE);
+        assert_eq!(r3[0][0], b"1.5");
     }
 
     #[test]
