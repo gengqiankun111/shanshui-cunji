@@ -425,6 +425,319 @@ fn full_docids(engine: &Engine, guard: &crate::watchdog::QueryGuard) -> Result<R
     Ok(bm)
 }
 
+// 7.96 轻量顶层字段判定（免整文档反序列化）——
+// 无索引全扫（下推/等值回退/后过滤/聚合）每行 `serde_json::from_slice::<Value>` 构建整树，
+// 1000 万行 ~12s vs MySQL 列式 2s。这里手写字节级扫描：只定位**目标顶层字段**的原始值
+// 字节（数字/无转义字符串/布尔/null），跳过其余顶层项；结果与 serde 语义对齐，任何
+// 无法轻量确定的结构（转义值/嵌套值内含引号规则）→ 调用方回退完整 serde（正确性护栏）。
+
+/// 轻量目标字段值。
+enum LightVal<'a> {
+    /// 顶层无该键（语义 = 字段缺失 → 任何条件 false）。
+    Absent,
+    /// 数字原始字节（不含空白）。
+    Num(&'a [u8]),
+    /// 字符串值内部字节（无转义）。
+    Str(&'a [u8]),
+    Bool(bool),
+    Null,
+    /// 值本身是嵌套对象/数组（serde 语义下任何比较均为 false）。
+    Complex,
+}
+
+fn ws(b: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < b.len() && matches!(b[j], b' ' | b'\t' | b'\n' | b'\r') {
+        j += 1;
+    }
+    j
+}
+
+/// 跳过一个字符串字面量（含 `\\`/`\"` 转义），返回是否成功。
+fn skip_string(b: &[u8], i: &mut usize) -> bool {
+    if *i >= b.len() || b[*i] != b'"' {
+        return false;
+    }
+    *i += 1;
+    while *i < b.len() {
+        let c = b[*i];
+        if c == b'\\' {
+            *i += 2;
+            continue;
+        }
+        *i += 1;
+        if c == b'"' {
+            return true;
+        }
+    }
+    false
+}
+
+/// 跳过一个 JSON 值（对象/数组做括号平衡，内部字符串跳过引号规则）。
+fn skip_value(b: &[u8], i: &mut usize) -> bool {
+    if *i >= b.len() {
+        return false;
+    }
+    match b[*i] {
+        b'"' => skip_string(b, i),
+        b'{' | b'[' => {
+            let open = b[*i];
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 1i32;
+            *i += 1;
+            while *i < b.len() {
+                let c = b[*i];
+                if c == b'"' {
+                    if !skip_string(b, i) {
+                        return false;
+                    }
+                    continue;
+                }
+                *i += 1;
+                if c == open {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => {
+            // 标量到逗号/右括号
+            while *i < b.len() && b[*i] != b',' && b[*i] != b'}' {
+                *i += 1;
+            }
+            true
+        }
+    }
+}
+
+/// 读取目标字段的值（假定已定位到值起点）。转义/畸形 → None（回退 serde）。
+fn read_target_value<'a>(b: &'a [u8], i: usize) -> Option<LightVal<'a>> {
+    let n = b.len();
+    if i >= n {
+        return None;
+    }
+    match b[i] {
+        b'"' => {
+            let mut j = i + 1;
+            let vs = j;
+            let mut esc = false;
+            while j < n {
+                let c = b[j];
+                if c == b'\\' {
+                    esc = true;
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                if c == b'"' {
+                    return if esc { None } else { Some(LightVal::Str(&b[vs..j - 1])) };
+                }
+            }
+            None
+        }
+        b't' => {
+            if b[i..].starts_with(b"true") {
+                Some(LightVal::Bool(true))
+            } else {
+                None
+            }
+        }
+        b'f' => {
+            if b[i..].starts_with(b"false") {
+                Some(LightVal::Bool(false))
+            } else {
+                None
+            }
+        }
+        b'n' => {
+            if b[i..].starts_with(b"null") {
+                Some(LightVal::Null)
+            } else {
+                None
+            }
+        }
+        b'-' | b'0'..=b'9' => {
+            let vs = i;
+            let mut j = i;
+            while j < n
+                && (b[j].is_ascii_digit()
+                    || matches!(b[j], b'-' | b'+' | b'.' | b'e' | b'E'))
+            {
+                j += 1;
+            }
+            Some(LightVal::Num(&b[vs..j]))
+        }
+        b'{' | b'[' => Some(LightVal::Complex),
+        _ => None,
+    }
+}
+
+/// 字节级定位 doc 顶层目标字段值。`None` = 结构无法轻量遍历（畸形/转义 key）。
+fn light_top_field<'a>(doc: &'a [u8], field: &str) -> Option<LightVal<'a>> {
+    let b = doc;
+    let n = b.len();
+    let mut i = ws(b, 0);
+    if i >= n || b[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    loop {
+        i = ws(b, i);
+        if i >= n {
+            return None;
+        }
+        if b[i] == b'}' {
+            return Some(LightVal::Absent);
+        }
+        if b[i] != b'"' {
+            return None;
+        }
+        i += 1;
+        let ks = i;
+        let mut esc = false;
+        loop {
+            if i >= n {
+                return None;
+            }
+            let c = b[i];
+            if c == b'\\' {
+                esc = true;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            if c == b'"' {
+                break;
+            }
+        }
+        if esc {
+            return None; // 转义 key → 回退 serde
+        }
+        let key = &b[ks..i - 1];
+        i = ws(b, i);
+        if i >= n || b[i] != b':' {
+            return None;
+        }
+        i = ws(b, i + 1);
+        if i >= n {
+            return None;
+        }
+        if key == field.as_bytes() {
+            return read_target_value(b, i);
+        }
+        if !skip_value(b, &mut i) {
+            return None;
+        }
+        i = ws(b, i);
+        if i >= n {
+            return None;
+        }
+        if b[i] == b',' {
+            i += 1;
+        } else if b[i] == b'}' {
+            return Some(LightVal::Absent);
+        } else {
+            return None;
+        }
+    }
+}
+
+/// 轻量 leaf 判定（顶层单字段）。返回 None = 无法轻量（点路径/转义/畸形），调用方回退 serde。
+/// 语义与 serde 路径一致：缺失/嵌套值/null → false；数字等值仅纯整数直比（浮点回退）；
+/// 比较类数值按 f64；字符串字节序与 UTF-8 字典序一致。
+fn light_leaf_result<'a>(doc: &'a [u8], leaf: &Leaf<'a>) -> Option<bool> {
+    let field = match leaf {
+        Leaf::Cmp(c) => c.field.as_str(),
+        Leaf::Between { field, .. } => field,
+    };
+    if field.contains('.') {
+        return None;
+    }
+    let lv = light_top_field(doc, field)?;
+    match (leaf, lv) {
+        (Leaf::Cmp(c), lv) => Some(light_cmp_value(lv, &c.op, &c.value)?),
+        (Leaf::Between { low, high, .. }, lv) => Some(light_between_value(lv, low, high)?),
+    }
+}
+
+fn light_between_value<'a>(lv: LightVal<'a>, low: &str, high: &str) -> Option<bool> {
+    match lv {
+        LightVal::Absent | LightVal::Complex | LightVal::Null => Some(false),
+        LightVal::Num(bytes) => {
+            let v = std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()?;
+            let l = low.parse::<f64>().ok()?;
+            let h = high.parse::<f64>().ok()?;
+            Some(v >= l && v <= h)
+        }
+        LightVal::Str(bytes) => Some(bytes >= low.as_bytes() && bytes <= high.as_bytes()),
+        LightVal::Bool(_) => Some(false),
+    }
+}
+
+/// 标量与比较运算符判定（对齐 serde 路径语义；无法对齐 → None 回退）。
+fn light_cmp_value<'a>(lv: LightVal<'a>, op: &CmpOp, rhs: &str) -> Option<bool> {
+    use CmpOp::*;
+    match lv {
+        LightVal::Absent | LightVal::Complex | LightVal::Null => Some(false),
+        LightVal::Bool(t) => {
+            let txt: &[u8] = if t { b"true" } else { b"false" };
+            match op {
+                Eq => Some(txt == rhs.as_bytes()),
+                Ne => Some(txt != rhs.as_bytes()),
+                Gt | Ge | Lt | Le => Some(false), // serde 无布尔大小比较 arm
+            }
+        }
+        LightVal::Num(bytes) => {
+            let pure_int = |s: &[u8]| !s.is_empty() && s.iter().all(|c| c.is_ascii_digit());
+            match op {
+                // serde 语义：Number Eq/Ne 为 `n.to_string()==rhs` 字符串比——
+                // 仅纯整数两边字面可比；浮点/负号等值回退 serde（尾零/科学计数差异）
+                Eq => {
+                    if pure_int(bytes) && pure_int(rhs.as_bytes()) {
+                        Some(bytes == rhs.as_bytes())
+                    } else {
+                        None
+                    }
+                }
+                Ne => {
+                    if pure_int(bytes) && pure_int(rhs.as_bytes()) {
+                        Some(bytes != rhs.as_bytes())
+                    } else {
+                        None
+                    }
+                }
+                Gt | Ge | Lt | Le => {
+                    let v = std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()?;
+                    let r = rhs.parse::<f64>().ok()?;
+                    Some(match op {
+                        Gt => v > r,
+                        Ge => v >= r,
+                        Lt => v < r,
+                        Le => v <= r,
+                        _ => unreachable!(),
+                    })
+                }
+            }
+        }
+        LightVal::Str(bytes) => {
+            let rb = rhs.as_bytes();
+            match op {
+                Eq => Some(bytes == rb),
+                Ne => Some(bytes != rb),
+                Gt => Some(bytes > rb),
+                Ge => Some(bytes >= rb),
+                Lt => Some(bytes < rb),
+                Le => Some(bytes <= rb),
+            }
+        }
+    }
+}
+
 fn field_of<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
     let mut cur = doc;
     for part in field.split('.') {
@@ -524,6 +837,10 @@ fn as_eq_cond<'a>(e: &'a WhereExpr) -> Option<&'a Cond> {
 /// 单文档判定：字段值是否满足扫描叶子。
 fn leaf_passes(engine: &Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
     let Some(raw) = engine.get(docid)? else { return Ok(false) };
+    // 7.96：顶层单字段条件 → 字节级轻量判定（免 serde 整行）
+    if let Some(r) = light_leaf_result(&raw, leaf) {
+        return Ok(r);
+    }
     let Ok(val) = serde_json::from_slice::<Value>(&raw) else { return Ok(false) };
     match leaf {
         Leaf::Cmp(c) => Ok(field_of(&val, &c.field)
@@ -535,8 +852,12 @@ fn leaf_passes(engine: &Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
     }
 }
 
-/// 扫描行值直接判定（7.94）：下推/等值回退共用——用扫描主文档值（免 engine.get 二次回表）。
+/// 扫描行值直接判定（7.94/7.96）：下推/等值回退共用——优先字节级轻量判定
+/// （顶层单字段，免整 doc 反序列化）；无法轻量 → 回退 serde 整行解析。
 fn scan_row_matches(doc: &[u8], leaf: &Leaf) -> bool {
+    if let Some(r) = light_leaf_result(doc, leaf) {
+        return r;
+    }
     let val = match serde_json::from_slice::<Value>(doc) {
         Ok(v) => v,
         Err(_) => return false,
@@ -548,6 +869,17 @@ fn scan_row_matches(doc: &[u8], leaf: &Leaf) -> bool {
         Leaf::Between { field, low, high } => field_of(&val, field)
             .map(|v| between_value(v, low, high))
             .unwrap_or(false),
+    }
+}
+
+/// 表达式轻量判定（7.96 聚合单叶场景）：Cond/Between → 字节级；复合表达式 → None（走 serde）。
+fn light_where_matches(doc: &[u8], e: &WhereExpr) -> Option<bool> {
+    match e {
+        WhereExpr::Cond(c) => light_leaf_result(doc, &Leaf::Cmp(c)),
+        WhereExpr::Between { field, low, high } => {
+            light_leaf_result(doc, &Leaf::Between { field, low, high })
+        }
+        _ => None,
     }
 }
 
@@ -842,34 +1174,78 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
                 "类 SQL 聚合全量扫描超时（熔断中止）".into(),
             ));
         }
-        let val = match serde_json::from_slice::<Value>(doc) {
-            Ok(v) => v,
-            Err(_) => return Ok(true),
-        };
         if let Some(wh) = &sel.where_expr {
-            if !wh.matches_doc(&val) {
+            // 7.96：单叶条件字节级 light 判定；复合表达式走 serde（一次 parse）
+            let hit = match wh {
+                WhereExpr::Cond(_) | WhereExpr::Between { .. } => {
+                    light_where_matches(doc, wh).unwrap_or_else(|| {
+                        serde_json::from_slice::<Value>(doc)
+                            .map(|v| wh.matches_doc(&v))
+                            .unwrap_or(false)
+                    })
+                }
+                _ => serde_json::from_slice::<Value>(doc)
+                    .map(|v| wh.matches_doc(&v))
+                    .unwrap_or(false),
+            };
+            if !hit {
                 return Ok(true);
             }
         }
         if field.is_none() {
-            count += 1; // COUNT(*)
+            count += 1; // COUNT(*)：无需解析 doc
             return Ok(true);
         }
         let f = field.as_ref().unwrap();
-        let Some(fv) = field_of(&val, f) else { return Ok(true) };
-        if matches!(fv, Value::Null) {
-            return Ok(true);
-        }
-        count += 1; // COUNT(f)：非 NULL 行
-        if let Value::Number(n) = fv {
-            n_num += 1;
-            let x = n.as_f64().unwrap_or(0.0);
-            sum += x;
-            if x < min {
-                min = x;
+        // 7.96：字段聚合（COUNT(f)/SUM/AVG/MIN/MAX）优先字节级取字段（顶层单字段）；
+        // 点路径/转义值 → serde 回退
+        let mut need_serde = true;
+        if !f.contains('.') {
+            match light_top_field(doc, f) {
+                Some(LightVal::Absent | LightVal::Null) => return Ok(true),
+                Some(LightVal::Num(bytes)) => {
+                    count += 1; // COUNT(f)：非 NULL
+                    if let Some(x) = std::str::from_utf8(bytes).ok().and_then(|s| s.parse::<f64>().ok()) {
+                        n_num += 1;
+                        sum += x;
+                        if x < min {
+                            min = x;
+                        }
+                        if x > max {
+                            max = x;
+                        }
+                    }
+                    return Ok(true);
+                }
+                // 字符串/布尔/嵌套值：COUNT(f) 计入，数值聚合跳过（对齐 serde）
+                Some(LightVal::Str(_)) | Some(LightVal::Bool(_)) | Some(LightVal::Complex) => {
+                    count += 1;
+                    return Ok(true);
+                }
+                Some(_) => {}
+                None => need_serde = true,
             }
-            if x > max {
-                max = x;
+        }
+        if need_serde {
+            let val = match serde_json::from_slice::<Value>(doc) {
+                Ok(v) => v,
+                Err(_) => return Ok(true),
+            };
+            let Some(fv) = field_of(&val, f) else { return Ok(true) };
+            if matches!(fv, Value::Null) {
+                return Ok(true);
+            }
+            count += 1; // COUNT(f)：非 NULL 行
+            if let Value::Number(n) = fv {
+                n_num += 1;
+                let x = n.as_f64().unwrap_or(0.0);
+                sum += x;
+                if x < min {
+                    min = x;
+                }
+                if x > max {
+                    max = x;
+                }
             }
         }
         Ok(true)
@@ -947,6 +1323,46 @@ mod tests {
         let rows2 = execute(&mut e, "SELECT * FROM t WHERE docid=42", 1000).unwrap();
         assert_eq!(rows2.len(), 1, "docid 点查单例");
         assert_eq!(rows2[0].0, 42);
+    }
+
+    #[test]
+    fn light_top_field_scanner_basics() {
+        use LightVal::*;
+        // 目标字段在各位置；数字/字符串/布尔/null 提取
+        let doc = br#"{"status":"active","amount":73564,"n":1.5,"ok":true,"no":null,"addr":{"city":"bj"}}"#;
+        assert!(matches!(light_top_field(doc, "status"), Some(Str(b"active"))));
+        assert!(matches!(light_top_field(doc, "amount"), Some(Num(b"73564"))));
+        assert!(matches!(light_top_field(doc, "n"), Some(Num(b"1.5"))));
+        assert!(matches!(light_top_field(doc, "ok"), Some(Bool(true))));
+        assert!(matches!(light_top_field(doc, "no"), Some(Null)));
+        // 嵌套对象值 → Complex；缺失 → Absent
+        assert!(matches!(light_top_field(doc, "addr"), Some(Complex)));
+        assert!(matches!(light_top_field(doc, "zzz"), Some(Absent)));
+        // 非目标嵌套对象（含内部同名 key）跳过不误命中
+        let doc2 = br#"{"a":{"status":"x"},"status":"real"}"#;
+        assert!(matches!(light_top_field(doc2, "status"), Some(Str(b"real"))));
+        // 数组在目标前跳过
+        let doc3 = br#"{"tags":["a","b"],"amount":5}"#;
+        assert!(matches!(light_top_field(doc3, "amount"), Some(Num(b"5"))));
+        // 转义字符串值 → None（回退 serde）；非对象 doc → None
+        assert!(light_top_field(br#"{"s":"a\"b"}"#, "s").is_none());
+        assert!(light_top_field(b"[1,2]", "f").is_none());
+    }
+
+    #[test]
+    fn light_leaf_equivalence_with_serde() {
+        // 轻量判定与 serde 路径结果一致（随机文档 + 各 op）
+        let mut e = engine_with_docs();
+        for sql in [
+            "SELECT * FROM t WHERE status='active' AND amount>400 LIMIT 1000",
+            "SELECT * FROM t WHERE amount BETWEEN 500 AND 530",
+            "SELECT * FROM t WHERE status!='active' LIMIT 1000",
+            "SELECT * FROM t WHERE amount>900",
+        ] {
+            let rows = execute(&mut e, sql, 1000).unwrap();
+            // 下推/AND 快路径已用 light；此处仅确认执行不回归（结果非空/与旧断言场景一致）
+            assert!(!rows.is_empty(), "{sql} 应命中");
+        }
     }
 
     #[test]

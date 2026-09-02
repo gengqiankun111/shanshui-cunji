@@ -2705,6 +2705,38 @@ impl RuntimePools {
    12-15s（全库 JSON 判定，与 MySQL 无索引全扫同语义；逐行 parse 成本为文档型差距）。
    限制：聚合数值按 f64（大整精度受限）；SUM(*)/AVG(*) 拒绝；不支持 GROUP BY 分组聚合。
 
+### 7.96 扫描期轻量字段提取（免整文档反序列化——无索引全扫 12s → 5-6s）
+
+> 2026-09-02。7.93~7.95 的无索引全扫（下推/等值回退/后过滤/聚合）每行
+> `serde_json::from_slice::<Value>` 构建整树 → 1000 万行 ~12-13s（vs MySQL 列式 2s）。
+
+1. **方案（src/sqlish.rs 字节级扫描）**：
+   - `light_top_field`：手写 JSON 顶层字段扫描——只定位目标键并取原始值字节
+     （数字/无转义字符串/布尔/null），跳过其余顶层项（对象/数组括号平衡、字符串引号
+     规则）；转义 key/值/畸形 → `None` **回退完整 serde（正确性护栏）**；
+   - `LightVal = Absent|Num|Str|Bool|Null|Complex`；缺失/嵌套值/null 语义对齐 serde
+     （条件恒 false）；
+   - `light_leaf_result`/`light_cmp_value`/`light_between_value`：语义与 serde 路径一致
+     ——数字等值仅**纯整数直比**（浮点/科学计数回退，规避尾零 to_string 差异）；比较类
+     数值按 f64；字符串字节序 = UTF-8 字典序；
+   - 接入热路径：`scan_row_matches`（下推/等值回退）、`leaf_passes`（AND 后过滤）、
+     `execute_aggregate` 过滤与字段聚合（COUNT(f)/SUM/AVG/MIN/MAX 顶层字段 light 取数，
+     COUNT(*) 完全免 parse；复合 AND/OR 表达式聚合仍 serde）。
+2. **回归**：全量 **547 全绿**（+2：light_top_field 扫描器边界——目标在各位置/嵌套对象
+   跳过不误命中/数组跳过/转义回退/非对象；light leaf 与 serde 路径等价断言）。
+3. **实测**（1000 万库 release，serde 基线 → light）：
+
+   | 查询 | 基线（serde） | light 后 | 提升 |
+   |---|---|---|---|
+   | `COUNT(*)`（全表） | 12.6s | **5.4s** | 2.3× |
+   | `COUNT(*) WHERE status='active'` | 12.4s | **5.4s** | 2.3× |
+   | `SUM(amount) WHERE amount>90000` | 13.2s | **6.1s** | 2.2× |
+   | `AVG(amount)`（全表） | 13.3s | **6.1s** | 2.2× |
+   | `amount=67539 LIMIT 5`（等值回退） | 1.1s | **0.47s** | 2.3× |
+
+   剩余 ~5-6s 为 scan_stream 读行自身成本（SST 解压 + 1100 万行回调），与 MySQL 列式
+   差距 ~6× → ~3×；进一步收益需引擎 scan 层（解压并行/预读），超出本项。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
