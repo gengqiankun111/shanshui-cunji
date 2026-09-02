@@ -2574,6 +2574,26 @@ impl RuntimePools {
 3. **实测**（1000 万库 release）：`SELECT id,status,city,amount,ts,title WHERE id=5` 六列按序；
    `SELECT status,missing_col` → 缺失列 pymysql 返回 `None`；BETWEEN 范围 `SELECT title` 单列流式。
 
+### 7.91 mysql_server 字段列类型精确化（LONGLONG/DOUBLE/VAR_STRING 按值推断）
+
+> 2026-09-02。7.90 字段投影统一 VAR_STRING 文本化——`SELECT amount` 返回字符串 '73564'，
+> 客户端拿不到数值。无 schema 文档库列类型不能静态声明，改为**按结果集整列实际值推断**。
+
+1. **方案（src/mysql.rs）**：
+   - `ValKind = Null|Bool|Int|Float|Str` 归类（`value_kind`；JSON bool 归整型 1/0，与 MySQL 无
+     BOOLEAN 列类型语义一致）；`value_cell` 保持文本编码；
+   - `FieldAgg` 逐行聚合字段列值类型；`col_type` 决议：含文本/数组/对象 → VAR_STRING；
+     只数字/布尔 → 有浮点 DOUBLE 否则 LONGLONG；全 NULL/空 → VAR_STRING（保守）；
+   - `build_result_set`：统一"原始 (id, doc) 行 → 行 cell + 列定义"，点查/BETWEEN/IN/sqlish/
+     txn_select 全部接入；`SELECT id/doc` 纯列不 parse doc（热路径零解析不变）；
+   - 类型决议跨整列（NULL 行不降级：数字+缺失混合仍 LONGLONG），列定义先于行发送故行值
+     文本必与列类型相容（整列整数 → LONGLONG 行文本纯整数；有浮点 → DOUBLE 全列 float 可解析）。
+2. **回归**：全量 **541 全绿**（+1 field_column_type_inference：列定义 type 字节断言
+   LONGLONG/DOUBLE/VAR_STRING/全缺失保守/混合不降级；+doc_field_kind 类型归类边界）。
+3. **实测**（1000 万库 release，pymysql）：`SELECT amount,ts` → LONGLONG，取值 **int**；
+   `SELECT price`(浮点 doc) → DOUBLE → **float**；`status,title` → VAR_STRING → 字符串；
+   `flag`(bool) → LONGLONG 1/0——与 MySQL 3306 同语义对照一致。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
