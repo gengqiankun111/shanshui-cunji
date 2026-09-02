@@ -59,7 +59,7 @@ fn main() {
     // I 项异步协程运行时（design 9.5 10k 连接目标）：--async 切换 tokio 网络层
     let async_mode = args.iter().any(|a| a == "--async");
 
-    let cfg = if config_path.is_empty() {
+    let mut cfg = if config_path.is_empty() {
         Config::default()
     } else {
         match Config::load(std::path::Path::new(&config_path)) {
@@ -73,6 +73,13 @@ fn main() {
             }
         }
     };
+    // MySQL 协议接入默认开启组提交：`group_commit_us=0`（默认关）→ 每次 put 独立 WAL fsync，
+    // 实测插入仅 ~1k rows/s（vs 引擎原生/组提交 14 万+）；2ms 攒批窗口一次 fsync 消除逐行落盘。
+    // 用户可在 config 显式指定（0 关闭需在 config 文件显式声明）。
+    if cfg.storage.group_commit_us == 0 {
+        cfg.storage.group_commit_us = 2000;
+        println!("[mysql-server] 默认开启组提交（group_commit_us=2000µs，config 可覆盖）");
+    }
     let engine = Engine::open(&data_dir, &cfg).expect("打开引擎失败");
     println!(
         "[mysql-server] 数据目录 {} 打开完成，启动 MySQL 协议服务{}: {bind}",

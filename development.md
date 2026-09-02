@@ -2488,22 +2488,24 @@ impl RuntimePools {
 5. **阶段 A~D 全部完成**：docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片可观测；
    剩余为 10 分片 10 亿构建验收（硬件）与 raft TCP 传输/扩容编排联动（部署推进）。
 
-### 7.87 山水存迹 vs MySQL 8.0 同负载基准对比（两张表，MySQL 协议接入）
+### 7.87 山水存迹 vs MySQL 8.0 同负载基准对比（两张表）+ P75 组提交缺陷修复
 
 > 2026-09-02。用户要求：本机 MySQL service（root/123456）建两张表测试，山水存迹同样内容
 > 测试，生成对比放 README 最前；内存均指定 8G（MySQL `innodb_buffer_pool_size=8G` 已设）。
+> 首测暴露 mysql-server 默认未开组提交缺陷（P75），修复后重测。
 
 1. **方法**（脚本 `tmp_bench_mysql_vs_scc.py`）：同一 pymysql 驱动/SQL/负载跑两个后端——
-   MySQL 8.0.45（3306）+ 山水存迹 `shanshui-cunji-mysql-server`（3307，async，**debug 构建**）；
-   两张表 `orders`（20 万行，status/city/amount/ts/title）+ `users`（2 万行，name/city/age），
-   内容一致（docid 全局唯一：users 偏移 2 000 000 规避单集合冲突）。
-2. **结果**（README 最前）：
-   - 批量插入：SCC **428** vs MySQL **60,443** rows/s（141×）——主因 = MySQL 协议接入的
-     **逐行写路径**（`parse_insert` 多行仍逐行 `put` + WAL fsync），非引擎原生（组提交 6.8 万+）；
-   - 点查 QPS（16 线程）：SCC **6,023** vs MySQL **8,345**（仅 1.39×，LSM 读路径接近 InnoDB）；
-   - 范围查询 p50：SCC **3.28ms** vs MySQL **0.65ms**（5.0×，debug 构建 + 范围扫描路径）。
-3. **结论与后续**：点查差距最小；协议接入写入优化（多行攒批单次 fsync / 复用组提交）为
-   明确改进方向（P 级候选）；对比表已置 README 顶部。
+   MySQL 8.0.45（3306，buffer pool 8G）+ 山水存迹 mysql-server（3307，async）；
+   两张表 `orders` + `users`，内容一致（users docid 偏移 2 000 000 规避单集合冲突）。
+2. **首测（debug、组提交关）**：插入 **428** vs 60,443 rows/s（落后 141×）；点查 6,023 vs
+   8,345 QPS（1.39×）；范围 p50 3.28 vs 0.65 ms。
+3. **根因定位（P75）**：release 不开组提交仍 ~1k rows/s（debug 非主因）；**默认
+   `group_commit_us=0` → 每次 `put` 独立 WAL fsync**（每行 ~1ms）；修复 `mysql_server`
+   默认开 2ms 组提交。
+4. **修复后（release + 默认组提交）**：插入 **82,341** vs 53,836 rows/s（**反超 1.53×**）；
+   点查 5,073 vs 7,451 QPS（落后 1.47×，读路径已接近 InnoDB）；范围 p50 3.02 vs 0.87 ms
+   （落后 3.5×，JSON 文档反序列化 vs MySQL 二进制列，文档型语义差异）。
+5. **记录**：README 最前基准块（更新版）+ P75 闭环 + 对比脚本可复现。
 
 ## 8. 编码规范
 

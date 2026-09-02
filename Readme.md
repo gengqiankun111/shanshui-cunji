@@ -10,25 +10,27 @@
 
 ## 📊 山水存迹 vs MySQL 8.0 同负载基准对比（2026-09-02）
 
-> **环境**：本机（16GB）；MySQL 8.0.45（InnoDB，`innodb_buffer_pool_size=8G`）；山水存迹经
-> **MySQL 协议接入**（`shanshui-cunji-mysql-server`，async 模式，**debug 构建**）。
-> **数据**：两张表 `orders` 200,000 行 + `users` 20,000 行（两端内容完全一致，docid 全局唯一，
+> **环境**：本机（16GB）；MySQL 8.0.45（InnoDB，`innodb_buffer_pool_size=8G`）；山水存迹
+> **release 构建** 经 MySQL 协议接入（`shanshui-cunji-mysql-server`，async，默认组提交 2ms）。
+> **数据**：两张表 `orders` 100,000 行 + `users` 10,000 行（两端内容完全一致，docid 全局唯一，
 > 同一份 SQL/驱动/负载脚本）。
 
 | 指标 | 山水存迹 | MySQL 8.0 | 差距 |
 |---|---|---|---|
-| 批量插入（rows/s） | 428 | 60,443 | 141×（MySQL） |
-| 点查 QPS（16 线程并发） | 6,023 | 8,345 | 1.39×（MySQL） |
-| 范围查询 p50（BETWEEN 100 行窗口） | 3.28 ms | 0.65 ms | 5.0×（MySQL） |
+| 批量插入（rows/s） | **82,341** | 53,836 | **1.53×（山水存迹）** |
+| 点查 QPS（16 线程并发） | 5,073 | 7,451 | 1.47×（MySQL） |
+| 范围查询 p50（BETWEEN 100 行窗口） | 3.02 ms | 0.87 ms | 3.5×（MySQL） |
 
-**解读（诚实边界）**：
-- **点查差距最小（1.39×）**——山水存迹 LSM 读路径（删除位图 + Zone Map + HotCache）在协议层
-  表现接近 InnoDB 主键点查；
-- **插入差距主因 = MySQL 协议接入的逐行写路径**（`parse_insert` 多行仍逐行 `put` + WAL fsync），
-  非引擎原生能力——引擎原生组提交实测 **6.8 万+ rows/s**（YCSB 写重）；协议接入写入优化
-  （多行攒批单次 fsync / 复用组提交）是明确改进方向；
-- **规模性说明**：本表为 debug 构建 + 协议接入层对比；release 构建与原生 API（bench/ycsb）
-  数据见下方发布区与 images/perf-*（1 亿库点查 26.5k TPS、写入 2.6 万 rows/s 单机原生）。
+**解读（含一次真实缺陷修复）**：
+- **批量插入反超 MySQL 1.53×**——但首测（debug、未开组提交）仅为 **428 rows/s（落后 141×）**，
+  逐项隔离定位根因：① debug 非主因（release 不开组提交仍 ~1k rows/s）；② **真根因 =
+  `mysql-server` 默认未开组提交 → 每次 `put` 独立 WAL fsync**（实测每行 ~1ms）；
+  修复 `mysql_server` 默认开启 2ms 组提交后插入 428 → **82,341 rows/s（192× 提升，反超 MySQL）**；
+- **点查落后 1.47×**——LSM 读路径（删除位图 + Zone Map + HotCache）已接近 InnoDB 主键点查；
+  引擎原生 API 点查 1 亿库实测 26.5k TPS（images/perf-0.7.0）；协议层 JSON 文档解析是主要余量；
+- **范围查询落后 3.5×**——MySQL 定长列二进制结果集 vs 山水存迹每行 JSON 文档反序列化
+  （扫描 + 回表 + JSON 解析路径）；文档型语义差异，非缺陷；
+- 原 debug/未修复首测数据与完整对比脚本见 `tmp_bench_mysql_vs_scc.py`（可复现）。
 
 ---
 

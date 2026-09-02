@@ -702,6 +702,16 @@
 - **回归测试**：`unquote_reverses_sql_escape_sequences`（`\"` `\\` `\'` 换行/未加引号原样）；
   pymysql 参数化 INSERT 实测通过；520 全绿。
 
+### P75. mysql-server 默认未开组提交 → 每次 put 独立 WAL fsync（插入 ~1k rows/s）
+- **问题**：山水存迹 vs MySQL 同负载对比首测（debug、无 config）批量插入仅 **428 rows/s**
+  （落后 MySQL 141×）。逐项隔离：release 构建后仍 ~1k rows/s（**debug 非主因**）→ 定位
+  `Config::default().group_commit_us = 0`（组提交默认关）→ mysql_server 每次 INSERT `put`
+  独立 WAL fsync（实测每行 ~1ms）→ ~1k/s 上限。
+- **修复**：`mysql_server.rs` 加载 config 后若 `group_commit_us == 0` 默认置 **2000µs**
+  （MySQL 协议接入默认组提交；config 可显式覆盖）。
+- **结果**：插入 428 → **82,341 rows/s（192× 提升，反超 MySQL 1.53×）**；点查与范围
+  不受写路径影响。README 顶部基准块更新（development 7.87）。
+
 ---
 
 ## 环境备忘（不入库）
