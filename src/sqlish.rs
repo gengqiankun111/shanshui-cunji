@@ -65,6 +65,9 @@ pub struct Select {
     pub where_expr: Option<WhereExpr>,
     pub limit: Option<u64>,
     pub offset: u64,
+    /// 聚合（7.95）：`(函数名小写, 参数字段)`——`COUNT(*)` 字段为 None；
+    /// `COUNT(f)/SUM(f)/AVG(f)/MIN(f)/MAX(f)` 字段 Some。普通 SELECT 为 None。
+    pub agg: Option<(String, Option<String>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,10 +246,40 @@ impl Parser {
     fn parse_select(&mut self) -> PRes<Select> {
         self.expect_kw("SELECT")?;
         let mut columns = Vec::new();
+        let mut agg = None;
         loop {
-            match self.next()? {
+            let item = self.next()?;
+            match item {
                 Tok::Star => columns.push("*".into()),
-                Tok::Ident(i) => columns.push(i),
+                Tok::Ident(i) => {
+                    // 7.95 聚合函数列：COUNT(*) / COUNT(f) / SUM(f) / AVG(f) / MIN(f) / MAX(f)
+                    if matches!(self.peek()?, Tok::LParen) {
+                        let upper = i.to_uppercase();
+                        if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                            self.next()?; // LParen
+                            let arg = match self.next()? {
+                                Tok::Star => None,
+                                Tok::Ident(f) => Some(f),
+                                t => {
+                                    return Err(format!("聚合参数期望 * 或字段名，实际 {t:?}"))
+                                }
+                            };
+                            match self.next()? {
+                                Tok::RParen => {}
+                                t => return Err(format!("聚合期望右括号，实际 {t:?}")),
+                            }
+                            if agg.is_some() {
+                                return Err("暂不支持多列/多聚合（无 GROUP BY）".into());
+                            }
+                            agg = Some((upper.to_lowercase(), arg));
+                            columns.push(upper);
+                        } else {
+                            return Err(format!("不支持的函数列: {i}"));
+                        }
+                    } else {
+                        columns.push(i);
+                    }
+                }
                 t => return Err(format!("期望列名或 *，实际 {t:?}")),
             }
             match self.next()? {
@@ -286,7 +319,7 @@ impl Parser {
                 t => return Err(format!("意外 token {t:?}")),
             }
         }
-        Ok(Select { columns, table, where_expr, limit, offset })
+        Ok(Select { columns, table, where_expr, limit, offset, agg })
     }
     fn parse_expr(&mut self) -> PRes<WhereExpr> {
         self.parse_or()
@@ -443,6 +476,24 @@ fn between_value(doc_val: &Value, low: &str, high: &str) -> bool {
         }
         String(s) => s.as_str() >= low && s.as_str() <= high,
         _ => false,
+    }
+}
+
+impl WhereExpr {
+    /// 行级判定（7.95 聚合全量过滤用）：文档 JSON 值是否满足表达式（递归 AND/OR/NOT），
+    /// 与 eval 位图语义一致（字段点路径；数值/字典序比较）。
+    pub fn matches_doc(&self, doc: &Value) -> bool {
+        match self {
+            WhereExpr::Cond(c) => field_of(doc, &c.field)
+                .map(|v| cmp_value(v, &c.op, &c.value))
+                .unwrap_or(false),
+            WhereExpr::Between { field, low, high } => field_of(doc, field)
+                .map(|v| between_value(v, low, high))
+                .unwrap_or(false),
+            WhereExpr::Not(x) => !x.matches_doc(doc),
+            WhereExpr::And(a, b) => a.matches_doc(doc) && b.matches_doc(doc),
+            WhereExpr::Or(a, b) => a.matches_doc(doc) || b.matches_doc(doc),
+        }
     }
 }
 
@@ -752,6 +803,99 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     Ok(rows)
 }
 
+/// 聚合标量结果（7.95）：列头 + 值（is_null 时 text 忽略）。
+pub struct AggScalar {
+    /// 列头（函数原样串，如 `COUNT(*)` / `AVG(amount)`）。
+    pub header: String,
+    /// SQL NULL（空集 SUM/AVG/MIN/MAX；COUNT 恒 0 不 NULL）。
+    pub is_null: bool,
+    /// 数值文本（COUNT 整数；SUM/AVG/MIN/MAX 数字，整值无小数点）。
+    pub text: String,
+}
+
+/// 聚合执行（7.95）：`SELECT COUNT(*)/COUNT(f)/SUM(f)/AVG(f)/MIN(f)/MAX(f) ... WHERE <expr>`
+/// → 单行单列标量；非聚合 SQL 返回 Ok(None)（调用方走普通查询）。
+///
+/// **全量单遍扫描**（WhereExpr::matches_doc 行级过滤）——聚合必须精确，不依赖倒排完整性
+/// （等值 posting 可能只覆盖增量写入）；与 MySQL 无索引聚合同语义，看门狗预算保护。
+/// COUNT(f) = 字段存在且非 JSON null（任意类型）；SUM/AVG/MIN/MAX 只统计数值字段行
+/// （非数值行跳过；数值按 f64 累加——大整数超 2^53 精度受限，标注限制）。
+pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>> {
+    let sel = parse_select(sql)?;
+    let Some((name, field)) = sel.agg.clone() else {
+        return Ok(None);
+    };
+    if field.is_none() && name != "count" {
+        return Err(Error::Config(format!("{name}(*) 不支持（仅 COUNT(*)）")));
+    }
+    let guard = engine.query_guard();
+    let mut count = 0u64;
+    let mut n_num = 0u64;
+    let mut sum = 0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut scanned = 0u64;
+    engine.scan_stream(None, None, |_docid, doc| {
+        scanned += 1;
+        if scanned % 4096 == 0 && guard.is_expired() {
+            return Err(Error::QueryTooExpensive(
+                "类 SQL 聚合全量扫描超时（熔断中止）".into(),
+            ));
+        }
+        let val = match serde_json::from_slice::<Value>(doc) {
+            Ok(v) => v,
+            Err(_) => return Ok(true),
+        };
+        if let Some(wh) = &sel.where_expr {
+            if !wh.matches_doc(&val) {
+                return Ok(true);
+            }
+        }
+        if field.is_none() {
+            count += 1; // COUNT(*)
+            return Ok(true);
+        }
+        let f = field.as_ref().unwrap();
+        let Some(fv) = field_of(&val, f) else { return Ok(true) };
+        if matches!(fv, Value::Null) {
+            return Ok(true);
+        }
+        count += 1; // COUNT(f)：非 NULL 行
+        if let Value::Number(n) = fv {
+            n_num += 1;
+            let x = n.as_f64().unwrap_or(0.0);
+            sum += x;
+            if x < min {
+                min = x;
+            }
+            if x > max {
+                max = x;
+            }
+        }
+        Ok(true)
+    })?;
+    let arg = field.as_deref().unwrap_or("*");
+    let header = format!("{}({arg})", name.to_uppercase());
+    let (is_null, text) = match name.as_str() {
+        "count" => (false, count.to_string()),
+        "sum" if n_num > 0 => (false, fmt_num(sum)),
+        "avg" if n_num > 0 => (false, fmt_num(sum / n_num as f64)),
+        "min" if n_num > 0 => (false, fmt_num(min)),
+        "max" if n_num > 0 => (false, fmt_num(max)),
+        _ => (true, String::new()), // 空集 SUM/AVG/MIN/MAX → NULL
+    };
+    Ok(Some(AggScalar { header, is_null, text }))
+}
+
+/// 数字文本化：整值（Rust f64 to_string）无小数点。
+fn fmt_num(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        format!("{}", x as i64)
+    } else {
+        x.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +947,37 @@ mod tests {
         let rows2 = execute(&mut e, "SELECT * FROM t WHERE docid=42", 1000).unwrap();
         assert_eq!(rows2.len(), 1, "docid 点查单例");
         assert_eq!(rows2[0].0, 42);
+    }
+
+    #[test]
+    fn sql_aggregate_functions() {
+        // 7.95：COUNT(*)/COUNT(f)/SUM/AVG/MIN/MAX（全量 matches_doc，不依赖倒排完整性）
+        let mut e = engine_with_docs(); // docid i：amount = i*10（0..990）
+        let agg = |sql: &str| execute_aggregate(&e, sql).unwrap().unwrap();
+        // 无 WHERE 全表
+        assert_eq!((agg("SELECT COUNT(*) FROM t").text.as_str()), "100");
+        assert_eq!(agg("SELECT COUNT(*) FROM t").header, "COUNT(*)");
+        // WHERE 字段条件（等值/比较/组合）
+        assert_eq!(agg("SELECT COUNT(*) FROM t WHERE amount>900").text, "9");
+        assert_eq!(agg("SELECT COUNT(*) FROM t WHERE status='active'").text, "34");
+        assert_eq!(agg("SELECT COUNT(*) FROM t WHERE status='active' AND amount>400").text, "20");
+        // COUNT(f)：缺失字段 = 0；SUM/AVG/MIN/MAX
+        assert_eq!(agg("SELECT COUNT(missing) FROM t").text, "0");
+        assert_eq!(agg("SELECT COUNT(amount) FROM t").text, "100");
+        assert_eq!(agg("SELECT SUM(amount) FROM t").text, "49500");
+        assert_eq!(agg("SELECT AVG(amount) FROM t").text, "495");
+        assert_eq!(agg("SELECT MIN(amount) FROM t").text, "0");
+        assert_eq!(agg("SELECT MAX(amount) FROM t").text, "990");
+        assert_eq!(agg("SELECT SUM(amount) FROM t WHERE status='active'").text, "16830");
+        // 空集：COUNT → 0；SUM/AVG → NULL
+        assert_eq!(agg("SELECT COUNT(*) FROM t WHERE amount>10000").text, "0");
+        let s = execute_aggregate(&e, "SELECT SUM(amount) FROM t WHERE amount>10000").unwrap().unwrap();
+        assert!(s.is_null, "空集 SUM 应为 NULL");
+        // 列头与限制：SUM(*) 拒绝
+        assert_eq!(agg("SELECT AVG(amount) FROM t").header, "AVG(amount)");
+        assert!(execute_aggregate(&e, "SELECT SUM(*) FROM t").is_err());
+        // 普通 SELECT → None（走普通查询路径）
+        assert!(execute_aggregate(&e, "SELECT * FROM t WHERE amount>900").unwrap().is_none());
     }
 
     #[test]

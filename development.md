@@ -2671,6 +2671,40 @@ impl RuntimePools {
    数字等值命中语义对齐 MySQL；剩余差距 = JSON 全文档反序列化 vs InnoDB 列式扫描
    （文档型无索引全扫成本，命中后早停仍快）。
 
+### 7.95 聚合函数支持（COUNT/SUM/AVG/MIN/MAX + WHERE 字段条件）
+
+> 2026-09-02。探针遗留：`SELECT COUNT(*) ... WHERE status='active'` 直接语法错误
+> （sqlish 列解析不支持函数）；SQL 对比常用 COUNT/SUM 汇总。
+
+1. **sqlish**：
+   - AST `Select.agg: Option<(fn, Option<field>)>`；parse_select 列解析识别
+     `COUNT(*) / COUNT(f) / SUM(f) / AVG(f) / MIN(f) / MAX(f)`（多聚合/多列 → 报错，无
+     GROUP BY；`SUM(*)` 等非 COUNT 无参 → 报错）；
+   - `WhereExpr::matches_doc`：表达式行级递归判定（Cond/Between/Not/And/Or，与 eval 位图
+     语义一致）——**聚合全量单遍扫描**，不依赖倒排完整性（等值 posting 可能只覆盖增量
+     写入，聚合必须精确，对齐 MySQL 无索引聚合语义；看门狗 30s 预算保护）；
+   - `execute_aggregate`：COUNT(f) = 字段存在且非 JSON null；SUM/AVG/MIN/MAX 只统计数值
+     字段行（非数值跳过；数值按 f64 累加——大整数超 2^53 精度受限标注限制）；
+     空集：COUNT → 0，SUM/AVG/MIN/MAX → NULL；返回列头 + 值。
+2. **mysql.rs**：`select_response` sqlish 兜底前调 `execute_aggregate` → 单行单列
+   ResultSet（列头 = 函数原样串，COUNT/SUM → LONGLONG，AVG/MIN/MAX → DOUBLE；NULL → 0xfb）；
+   id 主键窗口聚合（BETWEEN/IN 分支）先行返回不受影响。
+3. **回归**：全量 **545 全绿**（+1 sql_aggregate_functions：COUNT(*)/COUNT(f)/SUM/AVG/MIN/MAX
+   与 WHERE 等值/比较/组合、缺失字段 0、空集 NULL、SUM(*) 拒绝、普通 SELECT → None）。
+4. **实测**（SCC vs MySQL 3306 同条件；SCC 库含历史协议测试增量行，分布型指标对照一致）：
+
+   | 查询 | SCC | MySQL |
+   |---|---|---|
+   | `COUNT(*) WHERE status='active'` | 2,009,285 | 1,999,283 |
+   | `COUNT(*) WHERE amount>90000` | 1,001,755 | 999,744 |
+   | `SUM(amount) WHERE amount>90000` | 95,170,024,262 | 94,979,036,087 |
+   | `AVG(amount)` | ~49,994 | ~49,994 |
+   | `MIN/MAX(amount)` | 1 / 100000 | 1 / 100000 |
+   | 空集 `SUM` | NULL | NULL |
+
+   12-15s（全库 JSON 判定，与 MySQL 无索引全扫同语义；逐行 parse 成本为文档型差距）。
+   限制：聚合数值按 f64（大整精度受限）；SUM(*)/AVG(*) 拒绝；不支持 GROUP BY 分组聚合。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

@@ -1929,6 +1929,30 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             rows: Vec::new(),
         };
     }
+    // 7.95 聚合（字段条件 / 无 WHERE）：COUNT/SUM/AVG/MIN/MAX → 单行单列。
+    // 放在 sqlish 兜底前——id 主键窗口聚合（BETWEEN/IN 分支）已先行返回，不受影响；
+    // 聚合走全量单遍扫描 matches_doc（不依赖倒排完整性，与 MySQL 无索引聚合同语义）。
+    match crate::sqlish::execute_aggregate(engine, sql) {
+        Ok(Some(agg)) => {
+            let (col_type, charset) = if agg.header.starts_with("AVG(")
+                || agg.header.starts_with("MIN(")
+                || agg.header.starts_with("MAX(")
+            {
+                (MYSQL_TYPE_DOUBLE, 63)
+            } else {
+                (MYSQL_TYPE_LONGLONG, 63) // COUNT / SUM
+            };
+            let row = if agg.is_null {
+                vec![vec![vec![MYSQL_NULL_CELL]]]
+            } else {
+                vec![vec![agg.text.into_bytes()]]
+            };
+            let columns = vec![column_payload(&agg.header, col_type, charset)];
+            return QueryResponse::Set { columns, rows: row };
+        }
+        Ok(None) => {}
+        Err(e) => return QueryResponse::Err(1064, format!("query error: {e}")),
+    }
     // 一般 SELECT → sqlish 引擎（结果按投影列裁剪；limit/排序 sqlish 内部处理）
     match crate::sqlish::execute(engine, sql, 10_000) {
         Ok(rows) => build_result_set(proj.as_deref(), rows, false, None),
