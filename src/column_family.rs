@@ -780,6 +780,64 @@ impl ColumnFamily {
             for it in sst_iters.iter_mut() {
                 cur.push(it.next().transpose()?);
             }
+            // 7.98：小源数（≤4，典型 1 SST + memtable 全扫）线性取最小——heap push/pop
+            // 每行 log K 结构开销（1100 万行全扫 ~1s）；线性逐源比较 K 次常数极小。
+            // 源多（多 L0/层）仍用最小堆避免 O(N·K) 退化。
+            if total <= 4 {
+                loop {
+                    // 找最小 key 的源
+                    let mut min_src: Option<usize> = None;
+                    for (i, c) in cur.iter().enumerate() {
+                        if let Some((k, _, _)) = c {
+                            match min_src {
+                                None => min_src = Some(i),
+                                Some(mi) => {
+                                    if k < &cur[mi].as_ref().unwrap().0 {
+                                        min_src = Some(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let Some(i0) = min_src else { break };
+                    let min_key = cur[i0].as_ref().unwrap().0.clone();
+                    // 收集同 key 源
+                    let mut to_advance: Vec<usize> = vec![i0];
+                    for i in 0..total {
+                        if i != i0 {
+                            if let Some((k, _, _)) = &cur[i] {
+                                if *k == min_key {
+                                    to_advance.push(i);
+                                }
+                            }
+                        }
+                    }
+                    let mut best_seq = 0u64;
+                    let mut best_val: Option<Vec<u8>> = None;
+                    for i in to_advance {
+                        let (k, v, seq) = cur[i].take().unwrap();
+                        debug_assert!(k == min_key, "同 key 归并");
+                        if seq <= snapshot_seq && seq >= best_seq {
+                            best_seq = seq;
+                            best_val = v;
+                        }
+                        cur[i] = if i < mem_count {
+                            mem_iters[i].next().transpose()?
+                        } else {
+                            sst_iters[i - mem_count].next().transpose()?
+                        };
+                    }
+                    if let Some(v) = best_val {
+                        if let Some(limiter) = self.scan_limiter.lock().unwrap().as_mut() {
+                            limiter.acquire(v.len() as u64)?;
+                        }
+                        if !f(min_key.as_slice(), &v)? {
+                            break; // 提前终止
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // k-way merge 用最小堆（O(N log K)，避免每轮线性扫全部源 O(N·K)——K 大时不可接受）
             let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
                 std::collections::BinaryHeap::new();
