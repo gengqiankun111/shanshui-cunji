@@ -10,7 +10,11 @@
 //! 多数派语义（N/2+1）与脑裂安全同 raft_meta.rs 阶段一。
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +62,201 @@ impl RaftTransport for LocalRaftTransport {
     }
 }
 
+// ============================ TCP 传输（raft 阶段二真实接线） ============================
+
+/// 单帧长度上限（64MB，防恶意长度放大内存；对齐 rpc.rs）。
+const MAX_RAFT_FRAME: usize = 64 * 1024 * 1024;
+
+/// 写一帧 `[u32 LE 长度][JSON]`（复用 rpc.rs 帧格式；握手帧同格式）。
+fn write_raft_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
+    let len = (payload.len() as u32).to_le_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// 读一帧（EOF/连接关闭 → Io 错误 → 调用方退出）。
+fn read_raft_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_RAFT_FRAME {
+        return Err(Error::Rpc(format!("帧长度超限: {len}")));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// TCP 传输：真实节点间 JSON-over-TCP（每节点一个监听端口）。
+///
+/// - **连接握手**：出站连接建立后首帧声明本节点 id（`{"raft_peer_id":N}`），
+///   接收端据此确定消息来源（inbox 项 `(from, msg)`）；
+/// - **接收**：accept 线程 + 每连接一个 reader 线程 → 反序列化 → 推入收件箱；
+/// - **发送**：懒连接缓存（peer id → TcpStream），断线清理下次重连；
+/// - `recv` 非阻塞（pop 收件箱），驱动循环轮询（RaftNodeRuntime::pump 语义不变）。
+pub struct TcpRaftTransport {
+    id: u8,
+    peers: HashMap<u8, String>,
+    outbound: Mutex<HashMap<u8, TcpStream>>,
+    inbox: Arc<Mutex<VecDeque<(u8, RaftMsg)>>>,
+    listener: Option<TcpListener>,
+    stop: Arc<AtomicBool>,
+    accept_thread: Option<JoinHandle<()>>,
+}
+
+impl TcpRaftTransport {
+    /// 绑定监听端口（`listen_addr` 可 `127.0.0.1:0` 自动分配，经 `peer_addr()` 查询）。
+    pub fn bind(id: u8, listen_addr: &str) -> Result<Self> {
+        let listener = TcpListener::bind(listen_addr)?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let inbox: Arc<Mutex<VecDeque<(u8, RaftMsg)>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let inbox_clone = Arc::clone(&inbox);
+        let stop_clone = Arc::clone(&stop);
+        let listener_clone = listener
+            .try_clone()
+            .map_err(|e| Error::Io(e))?;
+        // accept 线程：非阻塞轮询 + 每连接一个 reader 线程
+        let accept_thread = std::thread::spawn(move || {
+            let inbox = Arc::clone(&inbox_clone);
+            loop {
+                if stop_clone.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                match listener_clone.accept() {
+                    Ok((stream, _)) => {
+                        let inbox = Arc::clone(&inbox);
+                        std::thread::spawn(move || {
+                            let mut stream = stream;
+                            // 握手：首帧 = 声明对端节点 id
+                            let handshake = match read_raft_frame(&mut stream) {
+                                Ok(b) => b,
+                                Err(_) => return,
+                            };
+                            let from: u8 = serde_json::from_slice::<serde_json::Value>(&handshake)
+                                .ok()
+                                .and_then(|v| v.get("raft_peer_id")?.as_u64())
+                                .and_then(|v| u8::try_from(v).ok())
+                                .unwrap_or(255);
+                            loop {
+                                match read_raft_frame(&mut stream) {
+                                    Ok(b) => {
+                                        if let Ok(msg) = serde_json::from_slice::<RaftMsg>(&b) {
+                                            inbox.lock().unwrap().push_back((from, msg));
+                                        }
+                                    }
+                                    Err(_) => break, // 连接关闭/对端断开
+                                }
+                            }
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        if stop_clone.load(AtomicOrdering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            id,
+            peers: HashMap::new(),
+            outbound: Mutex::new(HashMap::new()),
+            inbox,
+            listener: Some(listener),
+            stop,
+            accept_thread: Some(accept_thread),
+        })
+    }
+
+    /// 实际监听地址（`127.0.0.1:0` 绑定后查询真实端口）。
+    pub fn peer_addr(&self) -> Result<String> {
+        Ok(self
+            .listener
+            .as_ref()
+            .ok_or_else(|| Error::Rpc("listener 已关闭".into()))?
+            .local_addr()?
+            .to_string())
+    }
+
+    /// 登记对端节点地址（peer id → 节点监听地址）。
+    pub fn add_peer(&mut self, peer_id: u8, addr: String) {
+        self.peers.insert(peer_id, addr);
+    }
+
+    /// 停止传输（Drop 兜底）：置 stop 标志 + 释放监听端口。
+    /// **不 join accept 线程**——Windows 上 std 非阻塞 accept 实为阻塞等待（内部 poll 无
+    /// 超时），stop 无法中断其 accept，join 会挂死（实测挂起根因之一）；Linux 非阻塞
+    /// accept 返回 EAGAIN 轮询可正常退出。accept 线程在进程退出时回收（测试/节点停机
+    /// 场景均可接受）。
+    pub fn shutdown(&mut self) {
+        self.stop.store(true, AtomicOrdering::Release);
+        self.listener = None; // 释放监听端口
+        self.accept_thread.take();
+    }
+
+    /// 获取（或建立）到 peer 的连接：首次连接发握手帧声明本节点 id。
+    /// 网络调用全部带超时（连接 2s / 读写 5s），防对端不可达挂死驱动循环。
+    fn conn(&self, to: u8) -> Result<TcpStream> {
+        let addr = self
+            .peers
+            .get(&to)
+            .ok_or_else(|| Error::Rpc(format!("未知 peer {to}")))?;
+        let sock: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|_| Error::Rpc(format!("peer 地址非法: {addr}")))?;
+        let mut stream = TcpStream::connect_timeout(&sock, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let handshake = serde_json::json!({"raft_peer_id": self.id}).to_string();
+        write_raft_frame(&mut stream, handshake.as_bytes())?;
+        Ok(stream)
+    }
+
+    /// 序列化 RaftMsg（serde 错误 → Error::Serialize）。
+    fn encode(msg: &RaftMsg) -> Result<Vec<u8>> {
+        serde_json::to_vec(msg).map_err(|e| Error::Serialize(e.to_string()))
+    }
+}
+
+impl Drop for TcpRaftTransport {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl RaftTransport for TcpRaftTransport {
+    fn send(&mut self, to: u8, msg: RaftMsg) -> Result<()> {
+        let payload = Self::encode(&msg)?;
+        // 锁作用域关键：remove 的 MutexGuard 必须显式结束——`if let Some(s) =
+        // self.outbound.lock().unwrap().remove(&to)` 的 if-let scrutinee 临时 guard 存活到
+        // 整个 if 块，内层 insert 同线程二次 lock 同一 Mutex 死锁（实测挂起根因）。
+        let cached = self.outbound.lock().unwrap().remove(&to);
+        if let Some(mut s) = cached {
+            match write_raft_frame(&mut s, &payload) {
+                Ok(()) => {
+                    self.outbound.lock().unwrap().insert(to, s);
+                    return Ok(());
+                }
+                Err(_) => {} // 断开 → 清理重连
+            }
+        }
+        let mut s = self.conn(to)?;
+        write_raft_frame(&mut s, &payload)?;
+        self.outbound.lock().unwrap().insert(to, s);
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Option<(u8, RaftMsg)>> {
+        Ok(self.inbox.lock().unwrap().pop_front())
+    }
+}
+
 /// 单节点 Raft 运行时：状态机 + 传输驱动。
 pub struct RaftNodeRuntime<T: RaftTransport> {
     id: u8,
@@ -75,6 +274,9 @@ pub struct RaftNodeRuntime<T: RaftTransport> {
     state: MetaCenter,
     /// 最近心跳（failover 检测）。
     last_heartbeat: Instant,
+    /// 最近一次发起选举的时刻（选举冷却：candidate 在 timeout 内不重复 term++，
+    /// 防 TCP 异步下 VoteResp 到达时 term 已递增被忽略）。
+    last_election: Instant,
     peers: Vec<u8>,
     quorum: u32,
     heartbeat_timeout: Duration,
@@ -97,6 +299,7 @@ impl<T: RaftTransport> RaftNodeRuntime<T> {
             leader: None,
             state: seed,
             last_heartbeat: Instant::now(),
+            last_election: Instant::now(),
             peers,
             quorum: (node_count as u32) / 2 + 1,
             heartbeat_timeout: Duration::from_millis(100),
@@ -213,11 +416,17 @@ impl<T: RaftTransport> RaftNodeRuntime<T> {
         if now.duration_since(self.last_heartbeat) < self.heartbeat_timeout {
             return None;
         }
+        // 选举冷却：距上次发起选举不足 timeout 不重复（candidate 不逐轮 term++，
+        // 否则 TCP 异步下 VoteResp 到达时 term 已递增被忽略，永不当选）
+        if now.duration_since(self.last_election) < self.heartbeat_timeout {
+            return None;
+        }
         // 超时 → 选举：term+1、自投、广播 VoteReq
         self.term += 1;
         self.role = RaftRole::Candidate;
         self.voted_for = Some(self.id);
         self.votes = 1;
+        self.last_election = now;
         let (term, cand) = (self.term, self.id);
         for &p in &self.peers.clone() {
             let _ = self.transport.send(p, RaftMsg::VoteReq { term, cand });
@@ -397,5 +606,134 @@ mod tests {
         }
         assert_eq!(rt[0].master().as_deref(), Some("node-z"));
         assert_eq!(rt[1].master().as_deref(), Some("node-z"), "存活 follower 复制成功");
+    }
+
+    // ============ 真实 TCP 三节点（raft 阶段二接线验证） ============
+
+    #[test]
+    fn tcp_transport_roundtrip() {
+        // 纯传输层往返（不经状态机）：n1 → n2 一条 VoteReq，n2 轮询 recv 应收到
+        let mut a = TcpRaftTransport::bind(1, "127.0.0.1:0").unwrap();
+        let mut b = TcpRaftTransport::bind(2, "127.0.0.1:0").unwrap();
+        a.add_peer(2, b.peer_addr().unwrap());
+        b.add_peer(1, a.peer_addr().unwrap());
+        a.send(2, RaftMsg::VoteReq { term: 1, cand: 1 }).unwrap();
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(m) = b.recv().unwrap() {
+                got = Some(m);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got, Some((1, RaftMsg::VoteReq { term: 1, cand: 1 })), "传输往返");
+    }
+
+    /// 真实 TCP 3 节点集群（各自绑定随机端口，互相登记地址）。
+    fn cluster3_tcp() -> Vec<RaftNodeRuntime<TcpRaftTransport>> {
+        let mut transports: Vec<(u8, TcpRaftTransport)> = Vec::new();
+        let mut addrs: Vec<(u8, String)> = Vec::new();
+        for id in 1..=3u8 {
+            let t = TcpRaftTransport::bind(id, "127.0.0.1:0").unwrap();
+            addrs.push((id, t.peer_addr().unwrap()));
+            transports.push((id, t));
+        }
+        let mut runtimes = Vec::new();
+        for (id, mut t) in transports {
+            let peers_ids: Vec<u8> = (1..=3u8).filter(|&p| p != id).collect();
+            for &pid in &peers_ids {
+                let addr = addrs.iter().find(|(aid, _)| *aid == pid).unwrap().1.clone();
+                t.add_peer(pid, addr);
+            }
+            runtimes.push(RaftNodeRuntime::new(id, peers_ids, seed(), t));
+        }
+        runtimes
+    }
+
+    /// TCP 版只让 target 竞选（其余节点心跳刷新不超时；网络异步：每轮间小 sleep）。
+    fn elect_single_tcp(rt: &mut [RaftNodeRuntime<TcpRaftTransport>], target: usize) {
+        let far = Instant::now() + Duration::from_millis(60_000);
+        for (i, r) in rt.iter_mut().enumerate() {
+            if i != target {
+                r.last_heartbeat = far;
+            }
+        }
+        for _ in 0..200 {
+            for r in rt.iter_mut() {
+                r.pump(Instant::now() + Duration::from_millis(200)).unwrap();
+            }
+            if rt[target].role() == RaftRole::Leader {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("TCP 选举超时（target 未当选）");
+    }
+
+    #[test]
+    fn tcp_election_via_network() {
+        let mut rt = cluster3_tcp();
+        elect_single_tcp(&mut rt, 0);
+        assert_eq!(rt[0].role(), RaftRole::Leader, "节点 1 经真实 TCP 当选");
+        assert_eq!(rt[1].role(), RaftRole::Follower);
+        assert_eq!(rt[2].role(), RaftRole::Follower);
+    }
+
+    #[test]
+    fn tcp_log_replication_via_network() {
+        let mut rt = cluster3_tcp();
+        elect_single_tcp(&mut rt, 0);
+        rt[0].propose(register_op("tcp-node")).unwrap();
+        for _ in 0..100 {
+            for r in rt.iter_mut() {
+                r.pump(Instant::now() + Duration::from_millis(200)).unwrap();
+            }
+            if rt[0].master().as_deref() == Some("tcp-node")
+                && rt[1].master().as_deref() == Some("tcp-node")
+                && rt[2].master().as_deref() == Some("tcp-node")
+            {
+                return; // 3 节点状态一致
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("TCP 日志复制未达一致: {:?}", (rt[0].master(), rt[1].master(), rt[2].master()));
+    }
+
+    #[test]
+    fn tcp_failover_leader_down() {
+        let mut rt = cluster3_tcp(); // [节点1, 节点2, 节点3]
+        elect_single_tcp(&mut rt, 0);
+        assert_eq!(rt[0].role(), RaftRole::Leader);
+        // leader（节点 1）真实停机：drop 其 transport（listener/连接关闭）
+        let mut down = rt.remove(0); // rt 变为 [节点2, 节点3]
+        down.transport.shutdown();
+        drop(down);
+        // 节点 2（现 rt[0]）竞选：心跳置旧触发超时；节点 3（现 rt[1]）刷新不竞选
+        rt[0].last_heartbeat = Instant::now() - Duration::from_millis(300);
+        rt[1].last_heartbeat = Instant::now() + Duration::from_millis(60_000);
+        let mut new_leader = None;
+        for _ in 0..200 {
+            rt[0].pump(Instant::now() + Duration::from_millis(200)).unwrap();
+            rt[1].pump(Instant::now() + Duration::from_millis(200)).unwrap();
+            if rt[0].role() == RaftRole::Leader {
+                new_leader = Some(2);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(new_leader, Some(2), "TCP failover：节点 2 超时当选新 leader");
+        // 新 leader（节点 2）继续提议
+        rt[0].propose(register_op("after-down")).unwrap();
+        for _ in 0..100 {
+            rt[0].pump(Instant::now() + Duration::from_millis(200)).unwrap();
+            rt[1].pump(Instant::now() + Duration::from_millis(200)).unwrap();
+            if rt[0].master().as_deref() == Some("after-down")
+                && rt[1].master().as_deref() == Some("after-down")
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("failover 后提议未达一致");
     }
 }

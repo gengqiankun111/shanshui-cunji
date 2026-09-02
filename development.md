@@ -2507,6 +2507,28 @@ impl RuntimePools {
    （落后 3.5×，JSON 文档反序列化 vs MySQL 二进制列，文档型语义差异）。
 5. **记录**：README 最前基准块（更新版）+ P75 闭环 + 对比脚本可复现。
 
+### 7.88 raft TCP 传输落地（raft 阶段二真实接线）+ 三处挂起修复（P76）
+
+> 2026-09-02。待开发项 #4：raft 消息走真实 TCP（复用 rpc.rs JSON-over-TCP 帧）。
+> 测试反复挂起 60s+，逐步诊断定位三处根因（P76），修复后 9 测试 0.05s 全绿。
+
+1. **实现**（`src/raft_rpc.rs` 增 `TcpRaftTransport`）：每节点监听端口 + accept 线程 +
+   每连接 reader 线程（首帧握手声明节点 id → inbox）；出站懒连接缓存；连接 2s/读写 5s
+   超时防不可达挂死。
+2. **挂起根因一（send 锁重入死锁）**：`if let Some(s) = self.outbound.lock().unwrap()
+   .remove(&to)`——if-let scrutinee 的临时 MutexGuard 存活到整个 if 块，内层 `insert`
+   同线程二次 lock 同一 Mutex → **死锁**（propose 命中缓存连接时必然挂死）。
+   修复：remove 的锁显式作用域化（`let cached = ...` 再 if let）。
+3. **挂起根因二（shutdown join 卡死）**：Windows 上 std 非阻塞 accept 实为阻塞等待
+   （内部 poll 无超时），`stop` 无法中断 → `accept_thread.join()` 挂死。
+   修复：shutdown 不 join（Linux 非阻塞 accept 返回 EAGAIN 轮询可正常退出；注释说明）。
+4. **挂起根因三（选举无冷却）**：candidate 的 `last_heartbeat` 不更新 → 每轮 pump 都
+   `term++` 重广播 VoteReq；TCP 异步下 VoteResp 到达时 term 已递增被忽略 → 永不当选。
+   修复：`maybe_elect` 加**选举冷却**（距上次选举不足 timeout 不重复 term++，`last_election`）。
+5. **验证**：真实 TCP 3 节点经网络选举/日志复制（master 三节点一致）/failover（leader 真实
+   停机 → 节点 2 当选 → 继续提议）+ 纯传输往返；9 raft_rpc 测试 0.05s 全绿，**538 全绿**。
+6. **后续**：scale_out 编排与 raft 联动（真实节点部署联调，随部署推进）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

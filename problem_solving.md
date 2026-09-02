@@ -712,6 +712,24 @@
 - **结果**：插入 428 → **82,341 rows/s（192× 提升，反超 MySQL 1.53×）**；点查与范围
   不受写路径影响。README 顶部基准块更新（development 7.87）。
 
+### P76. raft TCP 传输测试挂起 60s+（三处根因：锁重入死锁 / shutdown join / 选举无冷却）
+- **问题**：raft TCP 传输（raft_rpc.rs `TcpRaftTransport`）单测反复挂起 60s+。逐层诊断
+  （消息流正常：VoteReq→VoteResp 均送达 inbox）后定位三处独立根因：
+  1. **send 锁重入死锁**：`if let Some(s) = self.outbound.lock().unwrap().remove(&to)`
+     的 if-let scrutinee 临时 MutexGuard 存活到整个 if 块，内层 `insert` 同线程二次
+     lock 同一 Mutex → 死锁（首次命中缓存连接发送即挂死——诊断确认卡在"回插"点）；
+  2. **shutdown join 卡死**：Windows 上 std 非阻塞 `accept` 实为阻塞等待（内部 poll 无
+     超时），`stop` 标志无法中断 → `accept_thread.join()` 挂死（诊断：卡在"等待 accept
+     线程退出"）；
+  3. **选举无冷却**：candidate 的 `last_heartbeat` 不更新 → 每轮 pump `maybe_elect`
+     都 `term++` 重广播 VoteReq；TCP 异步下 VoteResp 到达时 term 已递增被忽略 → 永不当选
+     （Local 同步队列因 recv 先于 maybe_elect 未暴露）。
+- **修复**：① remove 锁显式作用域化（`let cached = ...` 再 if let）；② shutdown 不 join
+  accept 线程（Linux 非阻塞 accept EAGAIN 轮询正常退出；线程随进程回收）；③ `maybe_elect`
+  加选举冷却（`last_election`，距上次选举不足 timeout 不重复 term++）。
+- **回归测试**：真实 TCP 3 节点选举/日志复制/failover + 纯传输往返，9 raft_rpc 测试
+  0.05s 全绿；538 全绿（development 7.88）。
+
 ---
 
 ## 环境备忘（不入库）
