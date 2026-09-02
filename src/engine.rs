@@ -2332,6 +2332,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_block_cache_warm_repeat_consistent() {
+        // Ex-8.3：扫描路径块缓存（写穿 + 全组命中免 IO/解压）——首扫预热后重复窗口结果一致
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=20_000u64 {
+            e.put(i, format!("d{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        let w = (Some(9000u64), Some(9300u64));
+        let first = e.scan_range(w.0, w.1).unwrap();
+        assert_eq!(first.len(), 301);
+        // 二次（应全块缓存命中）与流式/计数一致
+        for _ in 0..3 {
+            assert_eq!(e.scan_range(w.0, w.1).unwrap(), first, "缓存后扫描应一致");
+        }
+        let mut s = 0u64;
+        e.scan_stream(w.0, w.1, |_d, _v| {
+            s += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(s, 301, "流式窗口应一致");
+        // 计数（keys-only 缓存路径）重复一致
+        let c1 = e.count_all_docs().unwrap();
+        let c2 = e.count_all_docs().unwrap();
+        assert_eq!(c1, c2);
+        assert_eq!(c1, 20_000);
+    }
+
+    #[test]
     fn batch_get_matches_get_with_delta_and_deletion_bitmap() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &cfg()).unwrap();

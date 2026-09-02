@@ -1300,6 +1300,10 @@ pub struct SstRangeIter<'a> {
     prefetch: std::collections::VecDeque<(usize, Vec<DecodedRow>)>,
     /// 7.100：仅 key 模式（行计数快路径）——`decode_data_block_keys` 免值解码。
     keys_only: bool,
+    /// Ex-8.3：可选块缓存（点查同款 BlockCache LRU，key=文件+块 offset）——扫描/计数路径
+    /// 读块**写穿**缓存：全组命中免磁盘 IO + 解压，重复窗口（分页/热范围/重测）直达；
+    /// None = 不缓存（低层/测试直用，行为与改造前一致）。
+    cache: Option<std::sync::Arc<crate::blockcache::BlockCache>>,
 }
 
 impl<'a> SstRangeIter<'a> {
@@ -1309,7 +1313,7 @@ impl<'a> SstRangeIter<'a> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Self> {
-        Self::with_mode(reader, start, end, false)
+        Self::with_mode(reader, start, end, false, None)
     }
 
     /// 7.100：key-only 迭代（免值解码，仅 key/seq/tombstone）——行计数专用。
@@ -1318,7 +1322,27 @@ impl<'a> SstRangeIter<'a> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Self> {
-        Self::with_mode(reader, start, end, true)
+        Self::with_mode(reader, start, end, true, None)
+    }
+
+    /// Ex-8.3：带块缓存的流式迭代（scan_stream_at 用）。
+    pub fn new_cached(
+        reader: &'a SstReader,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        cache: std::sync::Arc<crate::blockcache::BlockCache>,
+    ) -> Result<Self> {
+        Self::with_mode(reader, start, end, false, Some(cache))
+    }
+
+    /// Ex-8.3：带块缓存的 key-only 迭代（count_keys_range_filtered 用）。
+    pub fn new_keys_cached(
+        reader: &'a SstReader,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        cache: std::sync::Arc<crate::blockcache::BlockCache>,
+    ) -> Result<Self> {
+        Self::with_mode(reader, start, end, true, Some(cache))
     }
 
     fn with_mode(
@@ -1326,6 +1350,7 @@ impl<'a> SstRangeIter<'a> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         keys_only: bool,
+        cache: Option<std::sync::Arc<crate::blockcache::BlockCache>>,
     ) -> Result<Self> {
         // 二分定位起始块（start 无值从 0 开始；Level 2 索引懒加载后缓存，后续零 IO）
         let start_idx = match start {
@@ -1341,6 +1366,7 @@ impl<'a> SstRangeIter<'a> {
             end: end.map(|e| e.to_vec()),
             prefetch: std::collections::VecDeque::new(),
             keys_only,
+            cache,
         })
     }
 
@@ -1377,7 +1403,30 @@ impl<'a> SstRangeIter<'a> {
         }
         self.block_idx = picks.last().map(|(i, _)| *i + 1).unwrap_or(self.block_idx);
         let entries: Vec<IndexEntry> = picks.iter().map(|(_, e)| e.clone()).collect();
-        let blocks = self.reader.read_block_group(&entries)?;
+        // Ex-8.3：块缓存（与点查同 key=文件+offset）——全组命中免磁盘 IO + 解压（重复窗口直达）；
+        // 未全命中则整组读并**写穿**缓存（热窗口二次扫描起命中）。
+        let blocks = if let Some(cache) = &self.cache {
+            let file = self.reader.path().to_path_buf();
+            let cks: Vec<crate::blockcache::BlockCacheKey> = picks
+                .iter()
+                .map(|(_, e)| crate::blockcache::BlockCacheKey {
+                    file: file.clone(),
+                    offset: e.offset,
+                })
+                .collect();
+            let hits: Vec<Option<Vec<u8>>> = cks.iter().map(|ck| cache.get(ck)).collect();
+            if hits.iter().all(Option::is_some) {
+                hits.into_iter().map(|b| b.unwrap()).collect()
+            } else {
+                let group = self.reader.read_block_group(&entries)?;
+                for (ck, b) in cks.into_iter().zip(group.iter()) {
+                    cache.put(ck, b.clone());
+                }
+                group
+            }
+        } else {
+            self.reader.read_block_group(&entries)?
+        };
         for ((i, _), block) in picks.into_iter().zip(blocks) {
             let rows = if self.keys_only {
                 decode_data_block_keys(&block, self.reader.format)?

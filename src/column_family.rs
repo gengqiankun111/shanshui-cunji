@@ -773,7 +773,12 @@ impl ColumnFamily {
                 if !sst_intersects_window(sst, start, end) {
                     continue;
                 }
-                sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
+                sst_iters.push(crate::sstable::SstRangeIter::new_cached(
+                    sst,
+                    start,
+                    end,
+                    std::sync::Arc::clone(&self.block_cache),
+                )?);
             }
             let mem_count = mem_iters.len();
             let total = mem_count + sst_iters.len();
@@ -952,7 +957,12 @@ impl ColumnFamily {
                 if !sst_intersects_window(sst, start, end) {
                     continue;
                 }
-                sst_iters.push(crate::sstable::SstRangeIter::new_keys(sst, start, end)?);
+                sst_iters.push(crate::sstable::SstRangeIter::new_keys_cached(
+                    sst,
+                    start,
+                    end,
+                    std::sync::Arc::clone(&self.block_cache),
+                )?);
             }
             let mem_count = mem_iters.len();
             let total = mem_count + sst_iters.len();
