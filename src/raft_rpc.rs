@@ -341,12 +341,12 @@ impl<T: RaftTransport> RaftNodeRuntime<T> {
     /// 驱动一轮：处理收件箱全部消息，再检查超时选举。返回新 leader（如有）。
     pub fn pump(&mut self, now: Instant) -> Result<Option<u8>> {
         while let Some((from, msg)) = self.transport.recv()? {
-            self.handle(from, msg)?;
+            self.handle(from, msg, now)?;
         }
         Ok(self.maybe_elect(now))
     }
 
-    fn handle(&mut self, from: u8, msg: RaftMsg) -> Result<()> {
+    fn handle(&mut self, from: u8, msg: RaftMsg, now: Instant) -> Result<()> {
         match msg {
             RaftMsg::VoteReq { term, cand } => {
                 let grant = {
@@ -387,7 +387,9 @@ impl<T: RaftTransport> RaftNodeRuntime<T> {
                         self.role = RaftRole::Follower;
                     }
                     self.leader = Some(leader);
-                    self.last_heartbeat = Instant::now();
+                    // 心跳用驱动时钟 now 刷新（与 maybe_elect 同基准；若用真实时钟，
+                    // 注入未来 now 的驱动循环会使刚收 Append 的 follower 立即"超时"竞选）
+                    self.last_heartbeat = now;
                     for e in entries {
                         if !self.log.contains(&e) {
                             self.log.push(e);
@@ -465,6 +467,31 @@ impl<T: RaftTransport> RaftNodeRuntime<T> {
     pub fn set_heartbeat_timeout(&mut self, d: Duration) {
         self.heartbeat_timeout = d;
     }
+}
+
+/// 测试辅助（跨模块 e2e）：强制 `rt[target]` 超时并 pump 至当选 leader。
+/// 置 target 的 last_heartbeat/last_election 为过去（同时满足心跳超时与选举冷却），
+/// 其余节点心跳置未来（不竞选）。
+#[cfg(test)]
+pub(crate) fn force_election<T: RaftTransport>(rt: &mut [RaftNodeRuntime<T>], target: usize) {
+    let past = Instant::now() - Duration::from_millis(600);
+    rt[target].last_heartbeat = past;
+    rt[target].last_election = past;
+    for (i, r) in rt.iter_mut().enumerate() {
+        if i != target {
+            r.last_heartbeat = Instant::now() + Duration::from_millis(60_000);
+        }
+    }
+    for _ in 0..200 {
+        let t = Instant::now() + Duration::from_millis(300);
+        for r in rt.iter_mut() {
+            r.pump(t).unwrap();
+        }
+        if rt[target].role() == RaftRole::Leader {
+            return;
+        }
+    }
+    panic!("force_election 失败: 节点 {target} 未当选");
 }
 
 #[cfg(test)]

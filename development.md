@@ -2759,6 +2759,26 @@ impl RuntimePools {
    数值与 MySQL 同语义（SCC 库含 ~100 万历史协议测试残留行，计数差 ~1%）；剩余耗时
    以 scan 读行为主（SST 解压 + 逐行回调），逐行判定已字节级。
 
+### 7.98 scale_out 编排与 raft 元数据联动（RouteChannel 抽象，待开发项 #5）
+
+> 2026-09-02。扩容编排的路由副作用（注册 slave / 切换 master / 摘除）改为可提交到
+> **raft 复制日志**——多节点部署下集群 MetaCenter 一致，扩容切换不被单机路由掩盖。
+
+1. **`RouteChannel` trait**（`src/scale_out.rs`）：`register/unregister/master` 抽象——
+   `MetaCenter` 直写（单机/测试，行为同原实现）；`RaftRouteChannel<T>`（raft 适配器）：
+   register/unregister = `raft.propose(MetaOp)`（仅 leader 允许，非 leader 拒绝）；
+2. **coordinator 路由通道化**：`ScaleOutCoordinator.meta` → `routes: Box<dyn RouteChannel>`，
+   begin/resume/switch/rollback 副作用全部经通道提交（状态机/持久化/防跳步语义不变）；
+3. **raft_rpc 时钟一致性修复**：`handle` 接收驱动时钟 `now`，Append 心跳刷新用 `now`
+   （原用真实 `Instant::now()`——驱动循环注入未来 now 时，刚收 Append 的 follower 立即
+   "超时"竞选更高 term，原 leader 被降级 → 扩容 begin 的 propose 报"非 leader"）；
+   另增 `#[cfg(test)] force_election` 跨模块测试辅助。
+4. **验证**：raft 3 节点 + `RaftRouteChannel` 扩容 node-b：begin（propose 注册 slave）→
+   CATCH_UP → DRAIN → switch（propose master=b + 摘 a）→ **3 节点 meta 一致指向 node-b**；
+   回滚保持 node-a + follower 一致；非 leader 通道拒绝；scale_out 9 + raft_rpc 9 测试全绿，
+   **550 全绿**。
+5. **剩余（随部署）**：真实 TCP 传输上跑多节点扩容编排联调（本机 3 进程 / 远程多节点）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
