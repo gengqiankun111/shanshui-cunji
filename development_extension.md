@@ -25,8 +25,9 @@
      防重复投递叠加（复用 Replicator apply 语义）。
 - [x] **Ex-1.4 对账/排空**：`outbox_drained`（pending=0）供原子切换/扩容前排空校验；
      `scan_after` 游标遍历对账复用已有。
-- [ ] **Ex-1.5 与双写扩容协议衔接**：M5 扩容"双写→追平→切换"改造成"本地事务写 + outbox 待办 +
-     幂等 apply"，切换前排空校验（待真实扩容联调时落地）。
+- [x] **Ex-1.5 与双写扩容协议衔接**：M5 扩容"双写→追平→切换"改造完成——`src/scale_out.rs`
+     （7.76 `8f8c1ea`）本地事务写 + outbox 待办 + 排空校验（`outbox_drained`，未排空禁切）+
+     回滚预案 + 崩溃续跑（ADDING→CATCH_UP→DRAIN→SWITCH→DONE 状态机）。
 
 ### 验证
 

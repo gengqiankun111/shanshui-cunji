@@ -91,19 +91,29 @@
 
 | 阶段 | 内容 | 交付 | 状态 |
 |---|---|---|---|
-| **A** | 分片横向扩展：全局 docid 分配器 + 分片构建工具 + 10 分片 10 亿构建 | docid_alloc 模块 + 构建脚本 + 10 亿库 | 待开发 |
-| **B** | 倒排分片化验证：10 亿 posting 规模回归（广播检索 + Chunk 拼接 + 分块解码） | 10 亿库倒排查询基准 | 待验证 |
-| **C** | 扩容自动化衔接：scale_out + raft_meta 接 RPC（raft 阶段二） | 真实 10 节点扩容/故障切换联调 | 待开发 |
-| **D** | 可观测与运维：分片级 Metrics + docid 上限预警 | 监控面板 + 告警 | 待开发 |
+| **A** | 分片横向扩展：全局 docid 分配器 + 分片构建工具 + 10 分片 10 亿构建 | docid_alloc 模块 + 构建脚本 + 10 亿库 | ✅ 机制完成（docid_alloc.rs `a8c4e17` + shard_build.rs `ff4f1d7`）；10 亿库构建待硬件 |
+| **B** | 倒排分片化验证：10 亿 posting 规模回归（广播检索 + Chunk 拼接 + 分块解码） | 10 亿库倒排查询基准 | ✅ 机制+Engine 集成（shard_inverted.rs `f42bfea`：分片内 local 位图 + 前缀组合 + 跨分片分页）；亿级规模回归待硬件 |
+| **C** | 扩容自动化衔接：scale_out + raft_meta 接 RPC（raft 阶段二） | 真实 10 节点扩容/故障切换联调 | ✅ 机制（raft_rpc.rs `eab9a38`：RaftMsg serde + RaftTransport + RaftNodeRuntime）；TCP 传输/真实联调待部署 |
+| **D** | 可观测与运维：分片级 Metrics + docid 上限预警 | 监控面板 + 告警 | ✅ 机制+集成（shard_metrics.rs `3f2d69a`：水位 gauge + 读写计数 + 80%/90% 预警 + /metrics alert） |
+
+> 2026-09-02：阶段 A~D 全部落地（530 全绿，development.md 7.81~7.86）；剩余均为
+> 硬件/部署级验收（10 分片 10 亿构建 + 亿级 posting 规模 + 真实多节点 RPC 联调）。
 
 ## 7. 需要的新开发项（按序）
 
-1. **全局 docid 分配器**（`src/docid_alloc.rs`，阶段 A 核心）——分片前缀编码 + 分片内分配 +
-   路由解析；demo（`src/demo/docid-alloc`）+ 单测 + 边界测试；
-2. **分片构建工具**——10 分片并行导入（复用 import + docid 前缀）；
-3. **10 亿基准验证**——分片构建 + sysbench 全套回归（对照 1 亿库基线）；
-4. **raft RPC 接线**（阶段 C）——raft_meta 消息接 RPC 通道（真实节点间）+ 扩容编排联调；
-5. **docid 上限监控**——u32 边界预警（运维 Metrics）。
+1. ✅ **全局 docid 分配器**（`src/docid_alloc.rs`，阶段 A 核心）——分片前缀编码 + 分片内
+   分配 + 路由解析；demo（`src/demo/docid-alloc`）+ 单测 + 边界测试（7.81）；
+2. ✅ **分片构建工具**（`src/shard_build.rs` + `shanshui-cunji-shard-build`）——10 分片并行
+   导入（复用 import + docid 前缀，`--shard-id` 多进程并行入口）（7.82）；
+3. ⏳ **10 亿基准验证**——分片构建 + sysbench 全套回归（对照 1 亿库基线）；
+   验收脚本 `tmp_10b_acceptance.py` 已写并通过 4×1000 冒烟（生成/构建/抽样点查/倒排/
+   性能压测全流程），真机 10 分片 × 1 亿执行待硬件；
+4. ⏳ **raft RPC 接线**（阶段 C）——机制 ✅（`src/raft_rpc.rs`：RaftTransport trait +
+   LocalRaftTransport 进程内接线 + RaftNodeRuntime 选举/复制/failover，7.85）；
+   **剩余**：TCP 传输实现（复用 rpc.rs JSON-over-TCP）+ scale_out 编排与 raft 联动
+   （真实 10 节点扩容/故障切换联调，随部署推进）；
+5. ✅ **docid 上限监控**——分片水位预警（`src/shard_metrics.rs`：Warn 80% / Critical 90%，
+   /metrics `shanshui_shard_docid_alert`；10 亿库每分片 1 亿 = 0.009% 余量充足）（7.86）。
 
 ## 8. 风险与缓解
 
@@ -127,6 +137,8 @@
 
 ## 10. 触发与排期
 
-- **阶段 A**（P0 级）：全局 docid 分配器——10 亿库扩展的前提，可独立先行（不依赖分布式联调）；
-- **阶段 B/C/D**：随 10 亿构建与多节点部署推进（依赖硬件/节点规模）；
+- ✅ **阶段 A**（P0 级）：全局 docid 分配器 + 分片构建工具——已完成（7.81/7.82）；
+- ✅ **阶段 B/C/D**：分片化倒排 + raft RPC 机制 + 分片级可观测——已完成（7.83/7.85/7.86）；
+- ⏳ **验收执行**：10 分片 10 亿构建 + 亿级 posting 规模回归 + 真实 10 节点 raft 联调
+  （验收脚本 `tmp_10b_acceptance.py` 就绪，随硬件/节点规模推进）；
 - **远期**：Roaring64（docid 20 亿+）、存算分离彻底化（10 亿级规模，design_remain 已评估代理层）。

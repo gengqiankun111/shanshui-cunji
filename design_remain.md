@@ -62,13 +62,13 @@
 
 | 设计点 | 来源 | 状态 | 条件 |
 |---|---|---|---|
-| 多副本 raft 高可用（序节点/元数据游标） | design_extension 14.x / 710 | ✅ 阶段一落地（7.77 `e2a76a0`：元数据 Raft 自动 failover + 脑裂安全）；剩余阶段二（Calvin gseq raft 联动，RPC 接线） | 元数据切换需求已落地；Calvin 阶段三联动依赖 Calvin 落地 |
+| 多副本 raft 高可用（序节点/元数据游标） | design_extension 14.x / 710 | ✅ 阶段一落地（7.77 `e2a76a0`：元数据 Raft 自动 failover + 脑裂安全）+ 阶段二 RPC 接线机制 ✅（7.85 `eab9a38`：raft_rpc.rs RaftTransport/RaftNodeRuntime）；剩余 Calvin gseq raft 联动 + TCP 传输/真实多节点联调 | 元数据切换需求已落地；Calvin 阶段三联动依赖 Calvin 落地 |
 | Calvin 硬件卸载（gseq 接 DSA/PMem） | design_extension 14.9 | 🔍 评估完成（7.80 `demo gseq-hw`：AtomicU64 原子 seq 1-2 亿/s >> 100 万/s 目标 2+ 数量级）→ **无必要性**（远期跨机房+CPU 瓶颈时复评） | 跨机房强一致需求 + 单机 CPU gseq 瓶颈 |
 | 存算分离 / Indexer Node（倒排外置） | design 9.10 / 1130 | 🔍 查询代理层已落地（7.79 `46b2be7`：IndexerProxy 独立倒排 + 回表抽象，500 全绿）；彻底存算分离 | 百亿级规模（50 亿属过度设计，不推荐 MVP；代理层先挂现有节点） |
 | 两级索引（Level 1 内存常驻摘要 + Level 2 精确） | design 4.4.2（阶段 2） | ✅ 评估完成（7.80 `demo two-level-index`：全局摘要内存为 Zone Map 7812×、过滤收益为 0、点查已 sub-ms）→ **不引入**（现有 Block Index+布隆+Zone Map 已覆盖） | — |
 | Tiered 分层合并（每次只合最小 2 段） | development 7.3 | ✅ 评估完成（7.78 `demo tiered-compaction`：模拟验证写放大不优于 Leveled，当前分批+无锁合并已解决阻塞痛点）→ **暂不引入**（读放大回归风险） | 写放大再优化需求（key 级更新密集场景复评） |
 | io_uring 热路径实测收益 | development 7.71 | ✅ 已实测 | 阿里云 Debian 12 / 内核 6.1：池初始化成功、核隔离生效；2 核小机器写 -13%（SQPOLL 占核）、读持平（块缓存主导）→ 默认关；收益在多核/高 IOPS 场景（7.63 指引） |
-| **10 亿库扩展（分片横向扩展）** | `design-10b-extension.md`（2026-09-02） | 📋 规划完成——**阶段 A P0 可先行**（全局 docid 分配器：分片前缀 `shard_id<<40\|local_id`，路由 O(1)/分片内自增/扩容归属不变）；阶段 B 倒排分片化验证、C raft RPC 接线、D 分片可观测 | 10 亿规模需求（当前 1 亿库 10×；分片基建 + 扩容编排已就绪 70%+） |
+| **10 亿库扩展（分片横向扩展）** | `design-10b-extension.md`（2026-09-02） | ✅ 阶段 A~D 机制全部落地（7.81~7.86，530 全绿）：A docid 分配器+分片构建工具、B 分片化倒排（local 位图+前缀组合+跨分片分页）、C raft RPC 接线（RaftTransport）、D 分片可观测（水位预警）；⏳ 剩余 = 硬件验收（10 分片 10 亿构建 `tmp_10b_acceptance.py` 就绪、亿级 posting 规模、真实多节点联调） | 10 亿规模需求（当前 1 亿库 10×；分片基建 + 扩容编排已就绪 70%+） |
 
 ## 设计决策边界（已定，不重复评估）
 
