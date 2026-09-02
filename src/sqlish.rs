@@ -1176,6 +1176,16 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
     if field.is_none() && name != "count" {
         return Err(Error::Config(format!("{name}(*) 不支持（仅 COUNT(*)）")));
     }
+    if field.is_none() && sel.where_expr.is_none() {
+        // 7.100：COUNT(*) 无 WHERE → 引擎 key-only 流式计数（免文档值反序列化）。
+        // 语义与全表扫描 COUNT 一致（同 key 最新版本、Tombstone 跳过）。
+        let n = engine.count_all_docs()?;
+        return Ok(Some(AggScalar {
+            header: "COUNT(*)".into(),
+            is_null: false,
+            text: n.to_string(),
+        }));
+    }
     let guard = engine.query_guard();
     let mut count = 0u64;
     let mut n_num = 0u64;

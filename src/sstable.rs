@@ -1298,6 +1298,8 @@ pub struct SstRangeIter<'a> {
     /// U 项：块预读缓存（块下标 → 解码行）——`advance_block` 一次组读 ≤4 块
     /// （合并 read_at + 预解码），后续块直接消费（冷顺序扫描 IO 放大 4×4KB → 1×16KB）。
     prefetch: std::collections::VecDeque<(usize, Vec<DecodedRow>)>,
+    /// 7.100：仅 key 模式（行计数快路径）——`decode_data_block_keys` 免值解码。
+    keys_only: bool,
 }
 
 impl<'a> SstRangeIter<'a> {
@@ -1306,6 +1308,24 @@ impl<'a> SstRangeIter<'a> {
         reader: &'a SstReader,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::with_mode(reader, start, end, false)
+    }
+
+    /// 7.100：key-only 迭代（免值解码，仅 key/seq/tombstone）——行计数专用。
+    pub fn new_keys(
+        reader: &'a SstReader,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::with_mode(reader, start, end, true)
+    }
+
+    fn with_mode(
+        reader: &'a SstReader,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        keys_only: bool,
     ) -> Result<Self> {
         // 二分定位起始块（start 无值从 0 开始；Level 2 索引懒加载后缓存，后续零 IO）
         let start_idx = match start {
@@ -1320,6 +1340,7 @@ impl<'a> SstRangeIter<'a> {
             start: start.map(|s| s.to_vec()),
             end: end.map(|e| e.to_vec()),
             prefetch: std::collections::VecDeque::new(),
+            keys_only,
         })
     }
 
@@ -1358,8 +1379,15 @@ impl<'a> SstRangeIter<'a> {
         let entries: Vec<IndexEntry> = picks.iter().map(|(_, e)| e.clone()).collect();
         let blocks = self.reader.read_block_group(&entries)?;
         for ((i, _), block) in picks.into_iter().zip(blocks) {
-            self.prefetch
-                .push_back((i, decode_data_block(&block, self.reader.format)?));
+            let rows = if self.keys_only {
+                decode_data_block_keys(&block, self.reader.format)?
+                    .into_iter()
+                    .map(|(k, is_put, seq)| (k, is_put.then_some(Vec::new()), seq))
+                    .collect()
+            } else {
+                decode_data_block(&block, self.reader.format)?
+            };
+            self.prefetch.push_back((i, rows));
         }
         if let Some((_, rows)) = self.prefetch.pop_front() {
             self.rows = rows;
@@ -1478,6 +1506,50 @@ pub fn decode_data_block(data: &[u8], format: u16) -> Result<Vec<DecodedRow>> {
         let seq = u64::from_le_bytes(data[cur + 1..cur + 9].try_into().unwrap());
         cur += 9;
         rows.push((key, (flag == FLAG_PUT).then_some(value), seq));
+    }
+    Ok(rows)
+}
+
+/// 7.100 免值解码（行计数快路径）：行式块只解析 key/flag/seq，**跳过值字节不拷贝**——
+/// `COUNT(*)` 类全表计数不必构建/反序列化文档值（省 1100 万行 ~200B 的 alloc+memcpy）。
+/// PAX 列式块（列交错）回退完整解码后映射（主库默认行式，PAX 命中率低）。
+/// 返回 `(key, is_put, seq)`——值有无仅以 flag 表达，与 `decode_data_block` 的
+/// `value=None = Tombstone` 语义对应。
+pub fn decode_data_block_keys(data: &[u8], format: u16) -> Result<Vec<(Vec<u8>, bool, u64)>> {
+    if format >= SST_VERSION {
+        match data.first() {
+            Some(&BLOCK_KIND_PAX) => {
+                return Ok(decode_pax_block(data)?
+                    .into_iter()
+                    .map(|(k, v, seq)| (k, v.is_some(), seq))
+                    .collect());
+            }
+            Some(&BLOCK_KIND_ROW) | Some(_) => {}
+            None => return Err(Error::Corrupted("空数据块".into())),
+        }
+    }
+    let start = if format >= SST_VERSION { 1 } else { 0 };
+    let mut rows = Vec::new();
+    let mut cur = start;
+    while cur < data.len() {
+        let key = decode_varlen(data, &mut cur)?.to_vec();
+        // 值：4 字节 u32 长度前缀 + 值字节（直接跳过不拷贝）
+        if cur + 4 > data.len() {
+            return Err(Error::Corrupted("数据块值长度越界".into()));
+        }
+        let vlen = u32::from_le_bytes(data[cur..cur + 4].try_into().unwrap()) as usize;
+        cur += 4;
+        if cur + vlen > data.len() {
+            return Err(Error::Corrupted("数据块值内容越界".into()));
+        }
+        cur += vlen;
+        if cur + 9 > data.len() {
+            return Err(Error::Corrupted("数据块 flags/seq 越界".into()));
+        }
+        let flag = data[cur];
+        let seq = u64::from_le_bytes(data[cur + 1..cur + 9].try_into().unwrap());
+        cur += 9;
+        rows.push((key, flag == FLAG_PUT, seq));
     }
     Ok(rows)
 }

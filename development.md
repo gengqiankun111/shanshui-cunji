@@ -2806,6 +2806,32 @@ impl RuntimePools {
    剩余 ~4-5s 主要为 SST 顺序解压 + 读 IO（737 万行单段）；MySQL 无索引全扫 ~2-3.5s，
    文档型 JSON 存储的解压/IO 差距已收窄至 ~1.5-2×。
 
+### 7.100 COUNT(*) 无 WHERE 免值计数快路径（key-only 解码 + merge）
+
+> 2026-09-02。对照中唯一显著项：无 WHERE `COUNT(*)` SCC 4.72s vs MySQL 0.33s（14×，
+> MySQL 只扫 8B 主键；SCC 需读/解压整文档）。方案（用户选定）：**key-only 计数扫描**——
+> 语义精确（与 scan_stream 一致），免文档值反序列化/clone。
+
+1. **免值解码（src/sstable.rs）**：`decode_data_block_keys`——行式块只解析 key/flag/seq，
+   **跳过值字节不拷贝**（值 4 字节 u32 长度前缀 + 内容直接跨过）；PAX 列式块回退完整解码
+   后映射。`SstRangeIter::new_keys` keys-only 模式（put → 空值占位、Tombstone → None）。
+2. **merge 计数（src/column_family.rs）**：`count_keys_range`——与 `scan_stream` 相同
+   k-way merge 版本语义（同 key 取最新、Tombstone 跳过），线性取最小（7.99 同款），
+   仅计数可见 key；`Engine::count_all_docs` 包装。
+3. **SQL 接入（src/sqlish.rs）**：`execute_aggregate` 对 `COUNT(*)`（无 WHERE）先走引擎
+   key-only 计数，跳过全表值扫描。
+4. **回归**：全量 **551 全绿**（+1 `count_all_docs_matches_scan_stream`：5000 行覆盖 +
+   删除 + flush_primary 前后，key-only 计数与 scan_stream 逐次一致）。
+5. **实测**（1000 万库 release）：
+
+   | 查询 | 7.99 | 7.100 | MySQL |
+   |---|---|---|---|
+   | `COUNT(*) FROM orders` | 4.72s | **3.58s** | 0.33s |
+
+   免值省 ~1.1s（值 decode/clone），剩余 ~3.5s 为 SST 压缩块读取 + zstd 解压（块级，
+   key-only 无法跳过）；文档库结构使 COUNT 仍慢于 MySQL 主键索引计数（~11×），已记录
+   为结构限制，后续若要亚秒需引擎级 docid 可见计数维护（跨模块联动大工程，另行立项）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

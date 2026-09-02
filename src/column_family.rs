@@ -895,6 +895,74 @@ impl ColumnFamily {
         })
     }
 
+    /// 7.100 快速行计数（COUNT(*) 无 WHERE 快路径）：与 scan_stream 相同 k-way merge
+    /// 版本语义（同 key 取最新版本；Tombstone 跳过），但**免值**——SST 端 keys-only
+    /// 解码（跳过值字节不拷贝），仅统计可见 key 数。语义与 scan_stream 全表扫描一致。
+    pub fn count_keys_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<u64> {
+        let snapshot_seq = u64::MAX; // 最新视图（同 scan_stream）
+        self.memtable.with_iter_range(start, end, |mut mem_iters| {
+            let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
+            let snap = self.ssts.load();
+            for sst in snap.ssts.iter() {
+                sst_iters.push(crate::sstable::SstRangeIter::new_keys(sst, start, end)?);
+            }
+            let mem_count = mem_iters.len();
+            let total = mem_count + sst_iters.len();
+            if total == 0 {
+                return Ok(0u64);
+            }
+            let mut cur: Vec<Option<(Vec<u8>, Option<Vec<u8>>, u64)>> =
+                Vec::with_capacity(total);
+            for it in mem_iters.iter_mut() {
+                cur.push(it.next().transpose()?);
+            }
+            for it in sst_iters.iter_mut() {
+                cur.push(it.next().transpose()?);
+            }
+            let mut count = 0u64;
+            loop {
+                // 线性取最小（同 7.99 merge：源少时省 heap 结构开销）
+                let mut min_src: Option<usize> = None;
+                for (i, c) in cur.iter().enumerate() {
+                    if let Some((k, _, _)) = c {
+                        match min_src {
+                            None => min_src = Some(i),
+                            Some(mi) => {
+                                if k < &cur[mi].as_ref().unwrap().0 {
+                                    min_src = Some(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                let Some(i0) = min_src else { break };
+                let min_key = cur[i0].as_ref().unwrap().0.clone();
+                let mut best_seq = 0u64;
+                let mut best_put = false;
+                for (i, c) in cur.iter_mut().enumerate() {
+                    let Some((k, v, seq)) = c.take() else { continue };
+                    if k != min_key {
+                        *c = Some((k, v, seq)); // 非最小源放回，不推进
+                        continue;
+                    }
+                    if v.is_some() && seq <= snapshot_seq && seq >= best_seq {
+                        best_seq = seq;
+                        best_put = true;
+                    }
+                    *c = if i < mem_count {
+                        mem_iters[i].next().transpose()?
+                    } else {
+                        sst_iters[i - mem_count].next().transpose()?
+                    };
+                }
+                if best_put {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+    }
+
     /// 范围扫描并保留 seq 与 Tombstone（MVCC 快照 Delta 隔离用，M7-1）：
     /// 返回升序 `(key, seq, value)`，value=None 表示删除标记；每 key 仅保留最大 seq 版本。
     pub fn scan_raw_range_with_seq(

@@ -1286,6 +1286,13 @@ impl Engine {
         })
     }
 
+    /// 7.100 全库可见行计数（COUNT(*) 无 WHERE 快路径）：主数据 key-only 流式计数——
+    /// SST keys-only 解码免文档值反序列化/clone；merge 版本语义（同 key 最新、Tombstone
+    /// 跳过）与 `scan_stream` 全表扫描一致。
+    pub fn count_all_docs(&self) -> Result<u64> {
+        self.primary.count_keys_range(None, None)
+    }
+
     /// 导出共享后台 IO 限速（design 20.5）：启用/关闭顺序扫描路径限速（MB/s；0 = 关闭）。
     /// 与 Compaction 的 `io_limiter` 同 Token Bucket 策略（默认低于前台读写）——导出读 SST
     /// 与后台合并共享同一后台 IO 预算语义，对在线业务影响 <5% 目标。
@@ -2152,6 +2159,41 @@ mod tests {
         assert_eq!(map.len(), 4, "事务内删除 docid 4 应从扫描排除");
         assert!(!map.contains_key(&4));
         e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn count_all_docs_matches_scan_stream() {
+        // 7.100：key-only 免值计数与 scan_stream 全表可见行一致（覆盖 + 删除 + flush 混合）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..5000u64 {
+            let doc = serde_json::json!({"k": format!("d{i}"), "n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["k"]).unwrap();
+        }
+        // 覆盖（同 docid 二次 put 不增行）+ 删除
+        e.put(0, serde_json::to_vec(&serde_json::json!({"k": "d0-v2"})).unwrap(), &["k"]).unwrap();
+        e.delete(1).unwrap();
+        e.delete(2).unwrap();
+        e.delete(3).unwrap();
+        let fast = e.count_all_docs().unwrap();
+        let mut slow = 0u64;
+        e.scan_stream(None, None, |_d, _v| {
+            slow += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(fast, slow, "count_keys_range 应与 scan_stream 一致（memtable 期）");
+        // flush 后（SST keys-only 解码路径）再验
+        e.flush_primary().unwrap();
+        let fast2 = e.count_all_docs().unwrap();
+        let mut slow2 = 0u64;
+        e.scan_stream(None, None, |_d, _v| {
+            slow2 += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(fast2, slow2, "count_keys_range 应与 scan_stream 一致（flush 后）");
+        assert_eq!(fast, fast2, "flush 前后计数一致");
     }
 
     #[test]
