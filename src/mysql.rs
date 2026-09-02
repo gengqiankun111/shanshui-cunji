@@ -1854,11 +1854,19 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
         return build_result_set(proj.as_deref(), raw, false, limit);
     }
     // M 项 P0：`id BETWEEN A AND B` → 一次范围扫描（替代逐 id 点查）
+    // Ex-8.1：非事务收集路径（engine.scan_range → 逐 SST 线性走块索引 + L2 全量 clone +
+    // 收集排序，50m 下 86ms 且随窗口位置劣化）改走**流式窗口** engine.scan_stream
+    // （SstRangeIter 二分定位起始块 + Zone Map 只读相交块 + k-way merge；删除位图已过滤），
+    // 语义与收集路径等价（demo range-window 验证）。
     if let Some((a, b)) = extract_between_range(sql) {
-        let rows = match engine.scan_range(Some(a), Some(b)) {
-            Ok(r) => r,
-            Err(_) => Vec::new(),
-        };
+        let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
+        let res = engine.scan_stream(Some(a), Some(b), |docid, val| {
+            rows.push((docid, val.to_vec()));
+            Ok(true)
+        });
+        if res.is_err() {
+            rows.clear(); // 与旧 collect 路径一致：错误 → 空结果
+        }
         let upper2 = sql.to_uppercase();
         if upper2.contains("SUM(") || upper2.contains("COUNT(") {
             let mut sum: i64 = 0;

@@ -801,31 +801,38 @@ impl ColumnFamily {
                     }
                     let Some(i0) = min_src else { break };
                     let min_key = cur[i0].as_ref().unwrap().0.clone();
-                    // 收集同 key 源
-                    let mut to_advance: Vec<usize> = vec![i0];
-                    for i in 0..total {
-                        if i != i0 {
-                            if let Some((k, _, _)) = &cur[i] {
-                                if *k == min_key {
-                                    to_advance.push(i);
-                                }
-                            }
-                        }
-                    }
+                    // Ex-8.1（demo range-window）：收集同 key 候选须**吞并同源连续多版本行**
+                    // ——S 项 MemTable 多版本下，覆盖写未收敛刷盘会让同一源连续出现同 key 新旧两行；
+                    // 仅取各源首行会把旧版本当下一个"新 key"再输出（收集 100 vs 流式 110）。
+                    // frontier 循环：取走所有 key==min_key 的行取快照点前最大 seq，推进后若该源
+                    // 仍指向 min_key（更旧版本）则继续吞并，直至全部源越过该 key。
+                    let mut frontier: Vec<usize> = (0..total)
+                        .filter(|i| matches!(&cur[*i], Some((k, _, _)) if *k == min_key))
+                        .collect();
                     let mut best_seq = 0u64;
                     let mut best_val: Option<Vec<u8>> = None;
-                    for i in to_advance {
-                        let (k, v, seq) = cur[i].take().unwrap();
-                        debug_assert!(k == min_key, "同 key 归并");
-                        if seq <= snapshot_seq && seq >= best_seq {
-                            best_seq = seq;
-                            best_val = v;
+                    loop {
+                        let mut nxt: Vec<usize> = Vec::new();
+                        for i in frontier {
+                            let (k, v, seq) = cur[i].take().unwrap();
+                            debug_assert!(k == min_key, "同 key 归并");
+                            if seq <= snapshot_seq && seq >= best_seq {
+                                best_seq = seq;
+                                best_val = v;
+                            }
+                            cur[i] = if i < mem_count {
+                                mem_iters[i].next().transpose()?
+                            } else {
+                                sst_iters[i - mem_count].next().transpose()?
+                            };
+                            if matches!(&cur[i], Some((nk, _, _)) if *nk == min_key) {
+                                nxt.push(i); // 同源更旧版本，下一轮吞并
+                            }
                         }
-                        cur[i] = if i < mem_count {
-                            mem_iters[i].next().transpose()?
-                        } else {
-                            sst_iters[i - mem_count].next().transpose()?
-                        };
+                        if nxt.is_empty() {
+                            break;
+                        }
+                        frontier = nxt;
                     }
                     if let Some(v) = best_val {
                         if let Some(limiter) = self.scan_limiter.lock().unwrap().as_mut() {
@@ -862,19 +869,37 @@ impl ColumnFamily {
                 }
                 let mut best_seq = 0u64;
                 let mut best_val: Option<Vec<u8>> = None;
-                for i in to_advance {
-                    let (k, v, seq) = cur[i].take().unwrap();
-                    debug_assert!(k == min_key, "同 key 归并");
-                    if seq <= snapshot_seq && seq >= best_seq {
-                        best_seq = seq;
-                        best_val = v;
+                let mut advanced: Vec<usize> = Vec::new();
+                // Ex-8.1（demo range-window）：吞并同源连续同 key 多版本行（同线性分支）
+                let mut frontier = to_advance;
+                loop {
+                    let mut nxt: Vec<usize> = Vec::new();
+                    for i in frontier {
+                        let (k, v, seq) = cur[i].take().unwrap();
+                        debug_assert!(k == min_key, "同 key 归并");
+                        if seq <= snapshot_seq && seq >= best_seq {
+                            best_seq = seq;
+                            best_val = v;
+                        }
+                        cur[i] = if i < mem_count {
+                            mem_iters[i].next().transpose()?
+                        } else {
+                            sst_iters[i - mem_count].next().transpose()?
+                        };
+                        advanced.push(i);
+                        if matches!(&cur[i], Some((nk, _, _)) if *nk == min_key) {
+                            nxt.push(i);
+                        }
                     }
-                    // 推进该源到下一跳，重新入堆
-                    cur[i] = if i < mem_count {
-                        mem_iters[i].next().transpose()?
-                    } else {
-                        sst_iters[i - mem_count].next().transpose()?
-                    };
+                    if nxt.is_empty() {
+                        break;
+                    }
+                    frontier = nxt;
+                }
+                // 推进后的源重新入堆（其残余 key 已越过 min_key）；同一源多轮吞并只保留最终游标
+                advanced.sort_unstable();
+                advanced.dedup();
+                for i in advanced {
                     if let Some((nk, _, _)) = &cur[i] {
                         heap.push(std::cmp::Reverse((nk.clone(), i)));
                     }
@@ -895,10 +920,20 @@ impl ColumnFamily {
         })
     }
 
-    /// 7.100 快速行计数（COUNT(*) 无 WHERE 快路径）：与 scan_stream 相同 k-way merge
-    /// 版本语义（同 key 取最新版本；Tombstone 跳过），但**免值**——SST 端 keys-only
-    /// 解码（跳过值字节不拷贝），仅统计可见 key 数。语义与 scan_stream 全表扫描一致。
+    /// 7.100 快速行计数（COUNT(*) 无 WHERE 快路径）——无删除位图过滤版本，等价于
+    /// `count_keys_range_filtered(.., 永不跳过)`。
     pub fn count_keys_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<u64> {
+        self.count_keys_range_filtered(start, end, &mut |_| false)
+    }
+
+    /// Ex-8.1：带 skip 谓词的 keys-only 计数（删除位图过滤用）。merge 版本语义同
+    /// `count_keys_range`（同 key 取最新、Tombstone 跳过、同源多版本折叠）。
+    pub fn count_keys_range_filtered(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        skip: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<u64> {
         let snapshot_seq = u64::MAX; // 最新视图（同 scan_stream）
         self.memtable.with_iter_range(start, end, |mut mem_iters| {
             let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
@@ -939,23 +974,35 @@ impl ColumnFamily {
                 let min_key = cur[i0].as_ref().unwrap().0.clone();
                 let mut best_seq = 0u64;
                 let mut best_put = false;
-                for (i, c) in cur.iter_mut().enumerate() {
-                    let Some((k, v, seq)) = c.take() else { continue };
-                    if k != min_key {
-                        *c = Some((k, v, seq)); // 非最小源放回，不推进
-                        continue;
+                // Ex-8.1（demo range-window）：同 scan merge，吞并同源连续同 key 多版本行，
+                // 避免覆盖写未收敛刷盘时旧版本被重复计数（COUNT 语义与 scan/get 对齐）。
+                let mut frontier: Vec<usize> = (0..total)
+                    .filter(|i| matches!(&cur[*i], Some((k, _, _)) if *k == min_key))
+                    .collect();
+                loop {
+                    let mut nxt: Vec<usize> = Vec::new();
+                    for i in frontier {
+                        let (k, v, seq) = cur[i].take().unwrap();
+                        debug_assert!(k == min_key, "同 key 归并");
+                        if v.is_some() && seq <= snapshot_seq && seq >= best_seq {
+                            best_seq = seq;
+                            best_put = true;
+                        }
+                        cur[i] = if i < mem_count {
+                            mem_iters[i].next().transpose()?
+                        } else {
+                            sst_iters[i - mem_count].next().transpose()?
+                        };
+                        if matches!(&cur[i], Some((nk, _, _)) if *nk == min_key) {
+                            nxt.push(i);
+                        }
                     }
-                    if v.is_some() && seq <= snapshot_seq && seq >= best_seq {
-                        best_seq = seq;
-                        best_put = true;
+                    if nxt.is_empty() {
+                        break;
                     }
-                    *c = if i < mem_count {
-                        mem_iters[i].next().transpose()?
-                    } else {
-                        sst_iters[i - mem_count].next().transpose()?
-                    };
+                    frontier = nxt;
                 }
-                if best_put {
+                if best_put && !skip(min_key.as_slice()) {
                     count += 1;
                 }
             }

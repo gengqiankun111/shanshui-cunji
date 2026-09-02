@@ -1265,7 +1265,12 @@ impl Engine {
 
     /// 主键范围扫描。
     pub fn scan_range(&self, start: Option<u64>, end: Option<u64>) -> Result<Vec<QueryRow>> {
-        self.primary.scan_range(start, end)
+        let mut rows = self.primary.scan_range(start, end)?;
+        // Ex-8.1：删除位图语义对齐（get 不可见 → scan 也不返回已删 docid）
+        if let Some(bm) = &self.deletion_bitmap {
+            rows.retain(|(d, _)| !bm.is_deleted(*d));
+        }
+        Ok(rows)
     }
 
     /// 流式主键范围扫描（design 20.5 导出管道）：回调按 docid 升序收到 `(docid, value)`；
@@ -1282,6 +1287,12 @@ impl Engine {
             let docid = decode_docid(key).map_err(|_| {
                 crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
             })?;
+            // Ex-8.1：删除位图语义对齐（与 get/scan_range 一致，已删 docid 跳过）
+            if let Some(bm) = &self.deletion_bitmap {
+                if bm.is_deleted(docid) {
+                    return Ok(true);
+                }
+            }
             f(docid, val)
         })
     }
@@ -1290,6 +1301,15 @@ impl Engine {
     /// SST keys-only 解码免文档值反序列化/clone；merge 版本语义（同 key 最新、Tombstone
     /// 跳过）与 `scan_stream` 全表扫描一致。
     pub fn count_all_docs(&self) -> Result<u64> {
+        // Ex-8.1：删除位图启用且存在已删 docid 时，COUNT 与 scan/get 对齐（排除已删），
+        // 否则走 key-only 快速路径（零额外开销）。
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.deleted_count() > 0 {
+                return self
+                    .primary
+                    .count_keys_range_filtered(None, None, &mut |k| bm.is_deleted_key(k));
+            }
+        }
         self.primary.count_keys_range(None, None)
     }
 
@@ -2194,6 +2214,74 @@ mod tests {
         .unwrap();
         assert_eq!(fast2, slow2, "count_keys_range 应与 scan_stream 一致（flush 后）");
         assert_eq!(fast, fast2, "flush 前后计数一致");
+    }
+
+    #[test]
+    fn scan_collapses_within_source_multi_versions() {
+        // Ex-8.1（demo range-window 发现的折叠缺口）：同 docid 覆盖写后未 compaction 收敛刷盘，
+        // 同源（memtable/SST）连续同 key 多版本行——scan/流式/count 均应折叠为最新版本
+        // （修复前：收集 100 行 vs 流式/计数 110 行）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=100u64 {
+            e.put(i, format!("v0-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        for i in 10..=20u64 {
+            e.put(i, format!("v1-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        // 不 compaction，直接刷盘 → 同 key 新旧两行同落文件
+        e.flush_primary().unwrap();
+        let c = e.scan_range(None, None).unwrap();
+        assert_eq!(c.len(), 100, "scan_range（收集路径）应折叠同源多版本");
+        let mut s = 0u64;
+        e.scan_stream(None, None, |_d, _v| {
+            s += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(s, 100, "scan_stream（流式 merge）应折叠同源同 key 旧版本");
+        assert_eq!(e.count_all_docs().unwrap(), 100, "count 应折叠同源同 key 旧版本");
+        // 值取最新版本
+        let rows: std::collections::HashMap<u64, Vec<u8>> = e.scan_range(None, None).unwrap().into_iter().collect();
+        assert_eq!(rows.get(&15).unwrap(), b"v1-15", "覆盖写应返回最新版本");
+    }
+
+    #[test]
+    fn scan_excludes_deleted_and_revive() {
+        // Ex-8.1：删除位图语义对齐——delete 后 scan/流式/count 与 get 一致不可见；
+        // put 清位复活后重新可见。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=100u64 {
+            e.put(i, format!("d{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        for i in 30..=40u64 {
+            e.delete(i).unwrap(); // 11 个（30..=40 闭区间）
+        }
+        let rows = e.scan_range(None, None).unwrap();
+        assert_eq!(rows.len(), 89, "scan_range 应排除位图已删 docid");
+        assert!(rows.iter().all(|(d, _)| !(30..=40).contains(d)));
+        let mut s = 0u64;
+        let mut has_del = false;
+        e.scan_stream(None, None, |d, _v| {
+            s += 1;
+            if (30..=40).contains(&d) {
+                has_del = true;
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(s, 89, "scan_stream 应排除位图已删 docid");
+        assert!(!has_del);
+        assert_eq!(e.count_all_docs().unwrap(), 89, "count 应排除位图已删 docid");
+        assert!(e.get(35).unwrap().is_none(), "get 应不可见已删");
+        // put 复活：清位后重新可见
+        e.put(35, b"revived".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.get(35).unwrap().unwrap(), b"revived");
+        let rows2 = e.scan_range(None, None).unwrap();
+        assert_eq!(rows2.len(), 90, "put 复活后 scan 应重新可见");
+        assert!(rows2.iter().any(|(d, _)| *d == 35));
     }
 
     #[test]
