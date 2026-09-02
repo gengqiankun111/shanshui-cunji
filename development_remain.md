@@ -121,20 +121,16 @@
 - **来源**：design_remain §7 / 5000 万 MySQL 对照（范围 10m 18.8× → 50m ~102×）
 - **前置分析**：根因 = 收集路径线性索引税 + 流式路径无层/文件剪枝 + 全值解码/无块缓存
   （非缺 B+Tree；3308 实验：非事务收集 67~101ms 位置单调劣化 vs 事务流式恒 ~5ms）
-- **Ex-8.1（P0）非事务 id BETWEEN 改走流式窗口扫描**：
-  - [ ] mysql.rs 非事务 `id BETWEEN` 拦截点（1856-1878）由 `engine.scan_range`（收集路径：
-    逐 SST `sst.scan_range` 线性走块索引 + `index()` 全量 clone + HashMap 合并排序）改走
-    `engine.scan_stream` 窗口（SstRangeIter 二分定位起始块 + Zone Map 只读相交块 + 逐条回调收集）
-  - [ ] **前置正确性修复（demo range-window 发现，切换前提）**：
-    ① 流式 merge 折叠**同源同 key 旧版本**（覆盖写未收敛刷盘：收集 100 行 vs 流式 110 行，
-    demo `finding_multi_version_within_source_not_collapsed` #[ignore] 待修复后启用）；
-    ② 删除位图消费语义：scan 收集/流式两路径均不查位图（get 不可见但扫描返回已删 docid），
-    需定语义（对齐位图过滤 或 文档注明），demo `equiv_delete_multi_sst` 已记录观察
-  - [ ] 语义对齐：与收集路径同结果（窗口闭区间、无快照实时语义一致）+ SUM/COUNT/ORDER BY 分支保持
-  - [ ] 边界：空窗口 / 窗口跨 SST 文件边界 / 单文件内多块组 / 与删除位图/tombstone 交互
-  - [ ] demo ✅ 完成（src/demo/range-window，2026-09-03：6 passed + 1 #[ignore] 记录分歧；
-    memtable-only/单 SST/多段压实/删除/重开两路径全等价 + perf 对照观测）
-  - [ ] 预期：50m 范围 p50 86ms → ~5ms（与事务流式持平）；1 亿/更大库线性税消除
+- **Ex-8.1（P0）非事务 id BETWEEN 改走流式窗口扫描** — ✅ 内核完成（e63603a，553 全绿）
+  - [x] mysql.rs 非事务 `id BETWEEN` 拦截点（1856-1878）由 `engine.scan_range`（收集路径）改走
+    `engine.scan_stream` 窗口（SstRangeIter 二分定位起始块 + Zone Map 只读相交块 + k-way merge）
+  - [x] **前置正确性修复**：① 流式 merge 折叠同源同 key 旧版本（scan_stream_at 线性/heap +
+    count_keys_range 三处 frontier 吞并，demo finding #[ignore] 待启用）；
+    ② 删除位图语义对齐（engine.scan_range/scan_stream/count_all_docs 过滤位图已删，put 复活）
+  - [x] 语义对齐（SUM/COUNT/ORDER BY 分支保持）+ 边界（空窗口/越界/跨文件/删除）
+  - [x] demo ✅（src/demo/range-window：6 passed + 1 #[ignore] 记录分歧）
+  - [x] **50m 验收（2026-09-03，release 3308 复测）**：非事务 id BETWEEN p50 中位
+    **86ms → 3.1ms**（位置无关 2.96~3.43ms；MySQL 3306 0.84ms → 差距 **~102× → 3.7×**，目标"个位数×"达成）
 - **Ex-8.2（P0）scan 路径层 + 文件 key 范围剪枝**：
   - [ ] `scan_stream_at` / `scan_range` 复用 `layer_ranges/layer_indices`（现仅点查路径消费）：
     窗口 [start,end] 只构造相交 SST 的 SstRangeIter；memtable 按 docid 窗口 with_iter_range 已具备
@@ -180,6 +176,18 @@
   串行（O 项仅读并行，写仍单锁）+ 实测吞吐先定位写锁/倒排/合并瓶颈（A 项写放大）确证 WAL fsync 为天花板
 - **验收口径（若复评）**：manifest 持久化各文件 max_flushed_epoch + 恢复按水位（禁止逐号扫缺口）；
   与删除位图 flush 序（先位图后 WAL）保持；增量备份/环形 WAL 截断交互回归
+
+## 14. "量变优化"采纳候选（design_remain §10，2026-09-03 排期）
+
+- **Ex-8.10（P1，正确性收尾）事务扫描删除位图过滤**：
+  - [ ] `scan_range_txn` / `scan_range_at` 快照视图排除位图已删 docid（与 get_at/scan_stream 对齐；
+    delete 位图语义跨全部读路径一致）；demo + 单测（txn 扫描删除段 + put 复活 + flush/compact 后）
+- **Ex-8.9（P3）空闲感知维护调度**：
+  - [ ] 以读写计数/限流水位为负载信号，低负载窗口收紧：合并（W 项 urgency 权重）+ 删除位图脏页
+    回收 + 倒排 GC；高负载退避（与 Ex-7.4 动态限流联动）
+  - [ ] demo：交变负载（峰/闲）下合并与回收的波峰转移对照
+- **已标注不新立项**：后台预热（P3 可选 Linux 门控）、scan IO 合并预读（SCAN_GROUP=8 已落地，
+  增量并入 Ex-8.2/8.3）、熔断（看门狗+cap 已具备）、零拷贝（并入 Ex-8.3 keys-only 投影）
 
 ## 已完成基线（勿重复）
 

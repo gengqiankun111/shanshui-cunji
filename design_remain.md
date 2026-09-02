@@ -174,6 +174,24 @@
 - 多文件 WAL 并行 fsync 在单 NVMe 无理论收益；**先解除写路径串行**（远期），真多设备走条带化。
 - **远期触发项**（development_remain §13）：无锁多写者 + 独立 WAL 每写者 + NVMe 多队列，且吞吐目标实测先指向写锁/倒排/合并而非 fsync。
 
+## 10. "量变优化"五方向提案评估（2026-09-03）
+
+> **来源**：外部建议——①后台预热（L2 索引/FST 字典 madvise 预载）+ 空闲维护；②scan IO 合并与预读；
+> ③大查询熔断/降级；④零拷贝深化；⑤统一删除语义。逐项对照现状（已落地项不重复立项）。
+
+| 方向 | 判定 | 依据（现状） |
+|---|---|---|
+| ①后台预热 L2 索引/FST 字典 | ⏸ 可选小项（P3，Linux 门控） | L2 精确索引本为"每文件首次访问整段读入并常驻"（sstable.rs ensure_index），FST 字典 mmap 按需缺页冷启动亚秒（Ex-5.7）——重复 IO 已消除，预热仅把首查页缺失挪到启动期，收益小；madvise 需 mmap+Linux（Windows 无等价），零 unsafe 白名单约束 |
+| ①空闲感知维护（合并/位图回收挪低负载期） | 🔶 采纳候选（Ex-8.9，P3） | 已有保底定时器（mysql worker 10 分钟 + 倒排 GC 信号 10 分钟兜底）与 urgency（W 项）但非"负载感知"；增强 = 低负载窗口收紧合并/回收 |
+| ②scan IO 合并与预读 | ✅ 已落地（SCAN_GROUP=8 组读 read_block_group + 组预解码，U 项 85b9a62 / 7.99 ea9b113） | 提案核心已实现；剩余增量 = 扫描挂块缓存 + 残余收集路径组读化（并入 Ex-8.2/8.3）。**纠正判断**：50m 范围慢的主因是收集路径线性索引税（Ex-8.1 已修 86→~5ms），非 IO 模式；5ms→0.84ms 剩余差距主体是全值解码+冷 IO+无块缓存，Ex-8.3 ROI 更高 |
+| ③大查询熔断/降级 | ✅ 已具备 | 看门狗（--watchdog-secs 全扫超时熔断）+ sqlish cap=10_000（server.rs /sql + mysql 兜底）+ extract_between_range 窗口上限 min(b,a+10000)；增量可选 = mysql 语句级结果集硬上限配置化（P3，默认已 cap） |
+| ④零拷贝深化（扫描免临时 Vec 组装） | 🔶 并入 Ex-8.3 | 流式迭代已内存 O(批)（M8-P10）+ keys-only（7.100）+ 投影裁剪（7.89）；剩余值多次拷贝（merge 回调 val.to_vec）由 Ex-8.3 纯 id 投影 keys-only 消除；全量零拷贝（mmap 块内值引用）生命周期复杂，不做 |
+| ⑤统一删除语义（scan 返回已删） | ✅ 已修复（Ex-8.1，e63603a） | get/scan_range/scan_stream/count_all_docs 位图过滤已对齐；**残余**：事务 scan_range_txn（scan_range_at）未查位图 → Ex-8.10 收尾 |
+
+### 采纳汇总（→ development_remain §14）
+
+Ex-8.9 空闲感知维护（P3）/ Ex-8.10 txn 扫描位图过滤（P1 正确性收尾）；其余标注已有或并入 Ex-8.2/8.3。
+
 ## 设计决策边界（已定，不重复评估）
 
 - 2PC / TCC / Seata 本体：不做（L1 outbox + L2 SAGA 已覆盖）
