@@ -2737,6 +2737,28 @@ impl RuntimePools {
    剩余 ~5-6s 为 scan_stream 读行自身成本（SST 解压 + 1100 万行回调），与 MySQL 列式
    差距 ~6× → ~3×；进一步收益需引擎 scan 层（解压并行/预读），超出本项。
 
+### 7.97 复合表达式（AND/OR/NOT）扫描判定 light 化
+
+> 2026-09-02。7.96 只对单叶（Cond/Between）字节级；AND/OR/NOT 复合的过滤/聚合仍
+> serde 整行解析（聚合 `WHERE status='active' OR amount>90000` ~12s）。
+
+1. **方案（src/sqlish.rs）**：`light_where_matches` 递归支持 Cond/Between/And/Or/Not——
+   每行按需扫顶层单字段叶，AND 命中 false / OR 命中 true 短路减少扫描；任何叶无法轻量
+   （点路径/转义/畸形）→ None 整表达式回退 serde（正确性护栏）；`execute_aggregate`
+   过滤统一 light 优先（原先只单叶）。
+2. **回归**：全量 **547 全绿**（sql_aggregate_functions 扩展：OR 计数 40/SUM 22500、
+   NOT 计数 34——小库精确断言）。
+3. **实测**（1000 万库 release；serde 复合 ~12s）：
+
+   | 聚合 | 耗时 | MySQL（同条件） |
+   |---|---|---|
+   | `COUNT(*) WHERE active OR amount>90000` | 7.3s | 3.5s |
+   | `SUM(amount) WHERE active OR amount>90000` | 7.8s | 3.6s |
+   | `COUNT(*) WHERE NOT(status='closed')` | 6.5s | 2.6s |
+
+   数值与 MySQL 同语义（SCC 库含 ~100 万历史协议测试残留行，计数差 ~1%）；剩余耗时
+   以 scan 读行为主（SST 解压 + 逐行回调），逐行判定已字节级。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；

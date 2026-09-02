@@ -872,14 +872,30 @@ fn scan_row_matches(doc: &[u8], leaf: &Leaf) -> bool {
     }
 }
 
-/// 表达式轻量判定（7.96 聚合单叶场景）：Cond/Between → 字节级；复合表达式 → None（走 serde）。
+/// 表达式轻量判定（7.96/7.97）：Cond/Between/And/Or/Not 递归字节级——
+/// 每行按需扫顶层单字段叶，AND/OR 短路减少扫描；任何叶无法轻量（点路径/转义/畸形）
+/// → None（调用方回退 serde）。
 fn light_where_matches(doc: &[u8], e: &WhereExpr) -> Option<bool> {
     match e {
         WhereExpr::Cond(c) => light_leaf_result(doc, &Leaf::Cmp(c)),
         WhereExpr::Between { field, low, high } => {
             light_leaf_result(doc, &Leaf::Between { field, low, high })
         }
-        _ => None,
+        WhereExpr::Not(x) => light_where_matches(doc, x).map(|b| !b),
+        WhereExpr::And(a, b) => {
+            let la = light_where_matches(doc, a)?;
+            if !la {
+                return Some(false); // 短路
+            }
+            light_where_matches(doc, b)
+        }
+        WhereExpr::Or(a, b) => {
+            let la = light_where_matches(doc, a)?;
+            if la {
+                return Some(true); // 短路
+            }
+            light_where_matches(doc, b)
+        }
     }
 }
 
@@ -1175,16 +1191,11 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
             ));
         }
         if let Some(wh) = &sel.where_expr {
-            // 7.96：单叶条件字节级 light 判定；复合表达式走 serde（一次 parse）
-            let hit = match wh {
-                WhereExpr::Cond(_) | WhereExpr::Between { .. } => {
-                    light_where_matches(doc, wh).unwrap_or_else(|| {
-                        serde_json::from_slice::<Value>(doc)
-                            .map(|v| wh.matches_doc(&v))
-                            .unwrap_or(false)
-                    })
-                }
-                _ => serde_json::from_slice::<Value>(doc)
+            // 7.96/7.97：表达式（含 AND/OR/NOT 复合）字节级 light 判定；
+            // 含点路径/转义等无法轻量 → serde 回退
+            let hit = match light_where_matches(doc, wh) {
+                Some(r) => r,
+                None => serde_json::from_slice::<Value>(doc)
                     .map(|v| wh.matches_doc(&v))
                     .unwrap_or(false),
             };
@@ -1392,6 +1403,13 @@ mod tests {
         // 列头与限制：SUM(*) 拒绝
         assert_eq!(agg("SELECT AVG(amount) FROM t").header, "AVG(amount)");
         assert!(execute_aggregate(&e, "SELECT SUM(*) FROM t").is_err());
+        // 复合表达式（7.97 light）：OR / NOT
+        assert_eq!(agg("SELECT COUNT(*) FROM t WHERE status='active' OR amount>900").text, "40");
+        assert_eq!(agg("SELECT COUNT(*) FROM t WHERE NOT(status='inactive')").text, "34");
+        assert_eq!(
+            agg("SELECT SUM(amount) FROM t WHERE status='active' OR amount>900").text,
+            "22500"
+        );
         // 普通 SELECT → None（走普通查询路径）
         assert!(execute_aggregate(&e, "SELECT * FROM t WHERE amount>900").unwrap().is_none());
     }
