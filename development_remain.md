@@ -139,10 +139,13 @@
   - [x] demo/单测（scan_prunes_disjoint_ssts_windows：3 不相交文件 × 8 窗口收集==流式 +
     全扫/跨文件边界/越界空窗口）
 - **Ex-8.3（P1）扫描路径块缓存 + keys-only 投影**：
-  - [ ] SstRangeIter/scan_range 读块挂既有 blockcache（当前只点查 get_from_sst 挂载）
-  - [ ] 纯 `SELECT id` 窗口扫描走 keys-only 解码（7.100 `decode_data_block_keys` 模式扩展到
-    有界窗口 + 行式格式值跳过；PAX 回退）
-  - [ ] demo + 单测（keys-only 窗口 vs 全解码同结果；热点窗口重复读块缓存命中）
+  - [x] Part A ✅（0d8fdcf，555 全绿）：SstRangeIter 可选块缓存（new_cached/new_keys_cached，
+    与点查同 key=文件+块 offset）——读块写穿 + 全组命中免磁盘 IO/解压；scan_stream_at /
+    count_keys_range_filtered 挂 CF block_cache（此前仅点查挂载）
+  - [ ] Part B：纯 `SELECT id` 窗口扫描走 keys-only 解码（7.100 `decode_data_block_keys` 扩展到
+    有界窗口 + 行式值跳过；PAX 回退）并接线 mysql 投影判定
+  - [ ] demo/单测：scan_block_cache_warm_repeat_consistent ✅（预热后重复窗口一致）；Part B
+    keys-only 窗口 vs 全解码同结果 + 热点窗口块缓存命中
 - **Ex-8.4（远期，不主动排期）**：L1/L2 B+Tree 存储替换（触发条件见 design_remain §7.2）
 - **验收**：Ex-8.1~8.3 落地后 50m 范围查询对照复测（tmp_bench_mysql_vs_scc_50m.py + probe），
   目标 MySQL 差距 100× → 个位数×；全量回归全绿后按工作流提交 + 回填 feature_remain / development.md 7.x
