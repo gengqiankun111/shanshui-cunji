@@ -201,6 +201,18 @@
 - **已标注不新立项**：L0 全局键范围索引（R 项 Zone Map 已落地）、主动异步压 L0（P/O 项已落地）、
   文件系统式存储（质变否决）
 
+## 16. 分层压缩实验（Ex-8.12，design_remain §12，2026-09-03 排期）
+
+- **Ex-8.12（P2，受控实验）分层压缩（L0/L1 热档 ↔ L2+ 冷档）**：
+  - [ ] 新增配置（沿用现有 compression/compression_level 语义）：
+    `sstable.compression_level_l2`（或 level→档位映射），CF 按 compaction `out_level` 选档
+    （flush→L0 与 L1 输出用热档 zstd3/lz4；L2 输出用冷档 zstd 6~15）
+  - [ ] 风险核查：Ex-5.8 数据块级复用对跨层等级变化失效（L1→L2 需重压缩）——量化重压缩写放大；
+    L0/L1 切 lz4/none 的中间层体积放大对照（档位 A：L0/L1=zstd3+L2=zstd6/15；档位 B：L0/L1=lz4）
+  - [ ] demo/50m 库 A/B：空间（数据目录字节）、写放大（合并次数/重写字节）、范围 p50/点查 p99、
+    压缩 CPU；验收：L2 zstd 高等级不劣化范围读（解压近等级无关）且空间 -10%+ 即采纳默认
+- **已标注不新立项**：共享字典压缩（远期触发：Ex-8.12 后空间仍瓶颈再评估，ScyllaDB 式基建）
+
 ## 已完成基线（勿重复）
 
 - 排期大项 A~Y 全完成（development_process_order.md 第 2 章）
