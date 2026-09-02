@@ -26,11 +26,13 @@ pub struct Config {
     pub hotcache: HotCacheConfig,
     pub blockcache: BlockCacheConfig,
     pub runtime: RuntimeConfig,
+    pub affinity: AffinityConfig,
     pub sstable: SstableConfig,
     pub storage: StorageConfig,
     pub inverted: InvertedConfig,
     pub join: JoinConfig,
     pub enrich: EnrichConfig,
+    pub outbox: OutboxConfig,
     pub cluster: ClusterConfig,
     pub sharding: ShardingConfig,
     pub replication: ReplicationConfig,
@@ -39,6 +41,7 @@ pub struct Config {
     pub compaction: CompactionConfig,
     pub sidecar: SidecarConfig,
     pub cache_external: CacheExternalConfig,
+    pub watchdog: WatchdogConfig,
 }
 
 impl Config {
@@ -161,6 +164,19 @@ impl Config {
         {
             return Err(Error::Config(
                 "memory.watermark_high 须 > 0，且 watermark_stall 须 >= watermark_high".into(),
+            ));
+        }
+        if self.watchdog.disk_throttle_ratio >= self.watchdog.disk_warn_ratio
+            || self.watchdog.disk_stall_ratio > self.watchdog.disk_throttle_ratio
+            || self.watchdog.disk_warn_ratio <= 0.0
+        {
+            return Err(Error::Config(
+                "watchdog 磁盘水位须 0 < warn，且 warn > throttle >= stall".into(),
+            ));
+        }
+        if self.watchdog.cpu_query_limit == 0 || self.watchdog.disk_sample_secs == 0 {
+            return Err(Error::Config(
+                "watchdog.cpu_query_limit / disk_sample_secs 必须 > 0".into(),
             ));
         }
         if self.memtable.max_size_mb == 0 {
@@ -376,6 +392,38 @@ impl Default for MemoryConfig {
     }
 }
 
+/// 看门狗扩展配置（P52 落地：CPU / 硬盘超限三级响应）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatchdogConfig {
+    /// 磁盘剩余空间预警水位（剩余/总量 低于此值 → 预警 + 触发回收）。
+    pub disk_warn_ratio: f64,
+    /// 磁盘剩余空间限流水位（低于 → 拒绝新写入，只读保持）。
+    pub disk_throttle_ratio: f64,
+    /// 磁盘剩余空间熔断水位（低于 → 强制只读，返回 Stalled）。
+    pub disk_stall_ratio: f64,
+    /// 磁盘熔断绝对下限（MB）：剩余空间同时低于 stall_ratio 且低于此绝对量才熔断
+    /// （避免小比例但剩余空间仍充裕的盘误熔断；对齐 MySQL 预留空间思想）。
+    pub disk_stall_min_mb: usize,
+    /// 磁盘可用空间采样间隔（秒）：避免写路径每次 syscall 查询。
+    pub disk_sample_secs: u64,
+    /// CPU 并发查询上限（代理信号：active 查询数超限 → Stalled 拒绝新查询）。
+    pub cpu_query_limit: usize,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            disk_warn_ratio: 0.20,
+            disk_throttle_ratio: 0.10,
+            disk_stall_ratio: 0.05,
+            disk_stall_min_mb: 1024,
+            disk_sample_secs: 1,
+            cpu_query_limit: 64,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemtableConfig {
@@ -434,7 +482,9 @@ impl Default for BlockCacheConfig {
     fn default() -> Self {
         Self {
             max_memory_mb: 2048,
-            block_size_kb: 16,
+            // Ex-5.1（design 4.8）：SSD 原生 4KB 块（对齐 SSD 页），点查读放大 16×→4×。
+            // 压缩率略降（小块 zstd 窗口小，重复数据下压缩后体积 +~30%），SSD 空间便宜可接受。
+            block_size_kb: 4,
             eviction_high_water: DEFAULT_EVICTION_HIGH_WATER,
         }
     }
@@ -470,6 +520,31 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// CPU 绑核（Ex-7.2，design_extension v0.5 第 12.2）：网络/计算/IO 三池物理核分区。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AffinityConfig {
+    /// 是否启用绑核（默认 true：多核机器自动分区；1 核机器自动退化为 no-op）。
+    pub enabled: bool,
+    /// 网络线程绑定的核列表（空 = 自动：核 0 起最低编号核）。
+    pub network_cores: Vec<usize>,
+    /// 计算线程（Compaction 并行等）绑定的核列表（空 = 自动：中间段核）。
+    pub compute_cores: Vec<usize>,
+    /// IO 后台线程（组提交刷盘等）绑定的核列表（空 = 自动：尾部核）。
+    pub io_cores: Vec<usize>,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            network_cores: Vec::new(),
+            compute_cores: Vec::new(),
+            io_cores: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SstableConfig {
@@ -489,7 +564,9 @@ impl Default for SstableConfig {
             compression: "zstd".into(),
             compression_level: 3,
             bloom_fpr: 0.01,
-            index_granularity: 16,
+            // Ex-5.1：与 4KB 块联动（块数 ×4），64 粒度保持 L1 摘要内存与 16KB 块×16 相当
+            // （demo 实测 4KB+g64 vs 16KB+g16 摘要数比例 0.99）。
+            index_granularity: 64,
         }
     }
 }
@@ -503,6 +580,14 @@ pub struct StorageConfig {
     pub ttl_days: Option<u32>,
     /// 数据目录。
     pub data_dir: String,
+    /// 多 SSD 条带化（Ex-5.10，design 4.8.3 P2）：WAL 独占最快 SSD 的目录
+    /// （None = 用 `data_dir` 内各列族目录，维持旧布局）。
+    pub wal_dir: Option<String>,
+    /// 多 SSD 条带化：SSTable 数据盘目录（primary/cidx/delta 列族落此盘；
+    /// None = 用 `data_dir` 内各列族目录）。
+    pub sst_dir: Option<String>,
+    /// 多 SSD 条带化：倒排索引独立盘目录（None = 用 `data_dir` 内 inverted）。
+    pub inverted_dir: Option<String>,
     /// 热字段白名单（阶段 1.5 PAX 列式块）：高频查询字段进热列组（块头），其余进冷列组（块尾）。
     pub hot_fields: Vec<String>,
     /// TTL 时间分桶粒度：`day`（MVP）/ `hour`（预留，阶段 1.5 仅 day）。
@@ -520,22 +605,73 @@ pub struct StorageConfig {
     pub group_commit_us: u64,
     /// 组提交字节阈值：WAL 待刷缓冲 ≥ 此值立即 fsync（不等窗口）。
     pub group_commit_bytes: usize,
+    /// Compaction 并行度（Ex-5.4，design 4.8.3）：并行压实 primary/cidx/delta 三列族
+    /// （SSD 并发 IO 强，demo 实测 3 CF 并行 2.14×）；0 = 自动（min(4, 核数/2)）；
+    /// 1 = 串行；>1 = 指定并行数。
+    pub compaction_parallel: usize,
+    /// 删除位图（Ex-5.6，design 4.6 / 4.8.3 阶段二）：独立于 LSM 的按 DocId 1bit 删除位图
+    /// （4KB 页对齐）——删除仅写 1bit + fsync 1 页（-99% IO），查询 O(1) 跳过已删文档，
+    /// 墓碑不再污染 LSM 层级；compaction 按位图物理删除，put 清位复活。
+    /// true = 开启（默认）；false = 回退传统 Tombstone 路径。
+    pub deletion_bitmap_enabled: bool,
+    /// L 项（Compaction 智能调度）：动态窗口下限——低峰（写压力低）时 L0 更晚收敛，
+    /// 合并次数更少、写放大更低（空间换写放大，SSD 时代）。
+    pub l0_stall_min: usize,
+    /// L 项：动态窗口上限——高峰（写压力高）时 L0 更早收敛，提前防段堆积 + 写 Stall。
+    pub l0_stall_max: usize,
+    /// L 项：合并冷却轮次（compact 输出段 N 轮内不参与下一轮合并，防"刚合并又合并"的
+    /// 无谓重写，写放大 -10~20%）；0 = 关闭。纯调度策略，不改数据格式（崩溃安全）。
+    pub compaction_cooldown: u32,
+    /// P 项：事件驱动自动 Compaction——写入路径自触发（Flush 后 L0 文件数/大小超阈值 →
+    /// 同步合并收敛，替代仅 CLI 显式 compact）。true = 开启（默认）；false = 保持仅显式调用。
+    pub auto_compact: bool,
+    /// P 项：L0 大小软阈值（MB）——L0 文件总字节超此值触发合并（与段数阈值互补，
+    /// 防大段少量堆积；0 = 仅用段数阈值，默认关闭）。
+    pub l0_max_size_mb: u64,
+    /// 单次合并输入大小上限（MB，默认 1024）：L0 段多且总大小超限时**分批**合并
+    /// （每轮只合并 ≤ 上限的部分段）——单次合并快 → 后台 worker 持读锁时间短 →
+    /// 写锁等待短（修复大 L0 一次全合并长时间阻塞写）；多轮收敛由 worker 循环兜底。
+    /// 0 = 不限（旧行为，一次合并全部 L0）。
+    pub compact_input_max_mb: u64,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            l0_stall_threshold: 8,
+            // Ex-5.4（design 4.8.3）：L0 触发阈值放宽（8→12，SSD 空间换写放大——
+            // L0 更晚收敛 → 压实频率低，写放大 15~25×→6~10×；空间放大 1.2×→1.8×）。
+            l0_stall_threshold: 12,
             ttl_days: None,
             data_dir: "./data".into(),
+            // Ex-5.10：多 SSD 条带化默认关闭（None = 单盘 data_dir 布局）；
+            // 配置 wal_dir/sst_dir/inverted_dir 指向不同盘实现 WAL 独占最快盘 + 数据/倒排分盘。
+            wal_dir: None,
+            sst_dir: None,
+            inverted_dir: None,
             hot_fields: Vec::new(),
             time_bucket: "day".into(),
             ttl_field: "timestamp".into(),
             io_rate_limit_mb: 0,
             wal_mode: "append".into(),
-            wal_ring_size_mb: 64,
+            // Ex-5.5：环形 WAL 规模化默认（64→256MB）——减少小环频繁回绕强制 Flush；
+            // 大容量预分配（GB 级）+ 环形覆盖均匀（SSD 磨损天然均衡）已由 RingWal 支持。
+            wal_ring_size_mb: 256,
             group_commit_us: 0,
             group_commit_bytes: 256 * 1024,
+            compaction_parallel: 0, // 0 = 自动（并行）
+            // Ex-5.6（design 4.6）：SSD 原生删除位图默认开启——删除 1bit+1 页 fsync（-99% IO），
+            // 查询 O(1) 跳过，墓碑不污染 LSM；关闭回退传统 Tombstone 路径。
+            deletion_bitmap_enabled: true,
+            // L 项（Compaction 智能调度）：动态窗口 8~16（基础 12 ± 4，随写压力浮动，
+            // 高峰收窄提前收敛、低峰放宽降写放大）；合并冷却 2 轮防刚合并又合并。
+            l0_stall_min: 8,
+            l0_stall_max: 16,
+            compaction_cooldown: 2,
+            // P 项：事件驱动自动 Compaction 默认开启；大小阈值默认关闭（仅段数阈值，
+            // 保持既有行为；需按段大小触发时配置 l0_max_size_mb）。
+            auto_compact: true,
+            l0_max_size_mb: 0,
+            compact_input_max_mb: 1024,
         }
     }
 }
@@ -547,6 +683,10 @@ pub struct InvertedConfig {
     pub engine: String,
     /// 倒排字典内存硬上限（MB）。
     pub max_memory_bytes: usize,
+    /// 倒排刷盘阈值（term-docid 对数，L 项）：内存累计达此值刷一段。100 万 → 500 万：
+    /// 段数 -83%（5000 万库 1240→210 段）、查询段遍历 -83%、刷盘频率 -80%；代价 = 内存
+    /// +阈值大小、单次刷盘停顿 ×5。0 = 用默认 100 万。
+    pub flush_threshold: u64,
     /// 魔鬼倒排列表门控：超过则不展开，降级全表扫描 + Zone Map。
     pub max_posting_scan: u64,
     /// 倒排段 GC 阈值（MB，design 5.2.2 / 5.2.4⑤）：段文件总量超此值触发后台合并。
@@ -558,6 +698,9 @@ pub struct InvertedConfig {
     /// 倒排字段白名单（M8-P4）：非空时**只对声明字段建立倒排词条**（其余字段不索引）——
     /// 高基数 ID / 长文本字段建倒排是纯浪费（每 term 单 posting，字典膨胀 45 万倍，实测）；
     /// 经验准则：100 字段表倒排字段 ≤ 20（枚举/标签类）；空 = 全部字符串字段建（默认兼容）。
+    /// Ex-4 配置模板（design_extension 9.4）见仓库 `config.import-example.toml`——
+    /// 枚举/低基数白名单 + 高基数 exclude_fields 排除 + 长文本 fulltext 分词，db-50m 实测
+    /// inverted 523.5MB → ~200MB（排除 note 后）。
     pub inverted_fields: Vec<String>,
     /// 倒排字段黑名单（M8-P4）：这些字段**不建倒排**（白名单非空时黑名单忽略）。
     pub exclude_fields: Vec<String>,
@@ -580,6 +723,7 @@ impl Default for InvertedConfig {
             // 阶段 1.5 起默认 FST + mmap 字典（design 5.2.4.1：亚秒冷启动、按需加载）
             engine: "fst".into(),
             max_memory_bytes: 12 * 1024 * 1024 * 1024,
+            flush_threshold: 1_000_000,
             max_posting_scan: 1_000_000,
             segment_max_size_mb: 1024,
             bitmap_fields: Vec::new(),
@@ -615,7 +759,8 @@ impl Default for JoinConfig {
     }
 }
 
-/// 写入 Enrich（预连接，development 5.21 / design 19）。
+/// 写入 Enrich（预连接，development 5.21 / design 19.2 ② / 19.3）。
+/// 钩子由业务方注入（Engine::set_enrich 查 Redis/MySQL/HTTP/本地表）；config 控制开关与失败策略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnrichConfig {
@@ -625,6 +770,10 @@ pub struct EnrichConfig {
     pub source: String,
     /// 失败策略："reject"（拒绝写入）/ "degrade"（降级写入原文档）。
     pub fail_policy: String,
+    /// local 数据源关联源字段（主文档中指向关联键的字段，默认 user_id）。
+    pub from_field: String,
+    /// local 数据源关联目标字段（关联文档中被查找的字段，默认 docid）。
+    pub to_field: String,
 }
 
 impl Default for EnrichConfig {
@@ -633,8 +782,19 @@ impl Default for EnrichConfig {
             enabled: false,
             source: "local".into(),
             fail_policy: "degrade".into(),
+            from_field: "user_id".into(),
+            to_field: "docid".into(),
         }
     }
+}
+
+/// 本地消息表（Ex-1，design_extension v0.1 L1）：业务写 + outbox 消息同一本地事务，
+/// 后台投递幂等消费（双写扩容衔接 / 异步索引补偿 / 跨节点异步写）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboxConfig {
+    /// 是否启用 outbox 列族（默认关闭——按需开启，零额外开销）。
+    pub enabled: bool,
 }
 
 /// 集群节点（design 9.8）：节点标识与内部 RPC。
@@ -868,7 +1028,8 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.hotcache.eviction_policy, "lfu");
         assert_eq!(cfg.sstable.compression, "zstd");
-        assert_eq!(cfg.storage.l0_stall_threshold, 8);
+        assert_eq!(cfg.storage.l0_stall_threshold, 12);
+        assert!(cfg.storage.deletion_bitmap_enabled, "删除位图默认开启（Ex-5.6）");
     }
 
     #[test]

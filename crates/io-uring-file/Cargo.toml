@@ -1,0 +1,12 @@
+[package]
+name = "io-uring-file"
+version = "0.1.0"
+edition = "2021"
+description = "io_uring 文件 IO 安全封装（unsafe 白名单隔离，V 项）：主库 forbid(unsafe_code) 下 Linux SQPOLL 队列 read/write/fsync 提交；非 Linux 平台编译为空 crate"
+
+# io-uring crate 仅 Linux 可用——target 条件依赖：非 Linux 目标不编译（本 crate 根 cfg 门控为空实现）
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+tempfile = "3"

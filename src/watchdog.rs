@@ -81,10 +81,12 @@ impl MemoryGuardian {
 }
 
 /// 查询超时守卫：记录截止时刻，供执行器熔断检查。
+/// CPU 并发占用（P52）：`try_begin_query` 构造时携带 `CpuGuardian` Arc，drop 自动释放。
 pub struct QueryGuard {
     deadline: Instant,
     query_id: u64,
     timeout: Duration,
+    cpu_release: Option<std::sync::Arc<CpuGuardian>>,
 }
 
 impl QueryGuard {
@@ -93,6 +95,7 @@ impl QueryGuard {
             deadline: Instant::now() + timeout,
             query_id,
             timeout,
+            cpu_release: None,
         }
     }
 
@@ -115,11 +118,21 @@ impl QueryGuard {
     }
 }
 
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        if let Some(c) = &self.cpu_release {
+            c.end();
+        }
+    }
+}
+
 /// 看门狗：管理查询超时熔断与内存限流。
 pub struct Watchdog {
     memory: MemoryGuardian,
     query_timeout: Duration,
     next_query_id: std::sync::atomic::AtomicU64,
+    disk: DiskGuardian,
+    cpu: std::sync::Arc<CpuGuardian>,
 }
 
 impl Watchdog {
@@ -128,6 +141,8 @@ impl Watchdog {
             memory: MemoryGuardian::new(cfg),
             query_timeout,
             next_query_id: std::sync::atomic::AtomicU64::new(1),
+            disk: DiskGuardian::new(cfg),
+            cpu: std::sync::Arc::new(CpuGuardian::new(cfg.watchdog.cpu_query_limit)),
         }
     }
 
@@ -139,6 +154,45 @@ impl Watchdog {
         QueryGuard::new(id, self.query_timeout)
     }
 
+    /// 开始一个查询（CPU 并发限制版）：active 查询数达上限 → `Stalled` 拒绝
+    /// （防 CPU 风暴，代理信号 = 并发查询数）。守卫 drop 时自动释放占用。
+    pub fn try_begin_query(&self) -> Result<QueryGuard> {
+        self.cpu.try_begin()?;
+        Ok(QueryGuard {
+            deadline: Instant::now() + self.query_timeout,
+            query_id: self
+                .next_query_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            timeout: self.query_timeout,
+            cpu_release: Some(self.cpu.clone()),
+        })
+    }
+
+    /// 写路径统一入口（P52）：内存 + 磁盘分级检查。
+    /// - 任一资源达硬水位（内存 stall / 磁盘 stall）→ Err（熔断拒绝写）；
+    /// - 软水位（内存 throttled / 磁盘 throttled）→ Ok（限流信号由调用方降速，MVP 放行）；
+    /// - 磁盘预警（warn）→ 记录计数，写放行。
+    pub fn check_all(&self, mem_ratio: f64, data_dir: &std::path::Path) -> Result<()> {
+        let _ = self.memory.check(mem_ratio)?; // 硬水位 Err(MemoryOverload)
+        match self.disk.sample(data_dir)? {
+            DiskStatus::Stalled => {
+                return Err(Error::Stalled("磁盘剩余空间达熔断水位，拒绝新写入".into()))
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 磁盘空间状态（admin status / 测试）。
+    pub fn disk_status(&self, data_dir: &std::path::Path) -> Result<DiskStatus> {
+        self.disk.sample(data_dir)
+    }
+
+    /// 当前 CPU 并发查询数（admin status）。
+    pub fn cpu_active(&self) -> usize {
+        self.cpu.active()
+    }
+
     /// 内存检查（写入路径调用）。
     pub fn memory_check(&self, usage_ratio: f64) -> Result<MemoryStatus> {
         self.memory.check(usage_ratio)
@@ -146,6 +200,183 @@ impl Watchdog {
 
     pub fn memory(&self) -> &MemoryGuardian {
         &self.memory
+    }
+
+    pub fn disk(&self) -> &DiskGuardian {
+        &self.disk
+    }
+
+    pub fn cpu(&self) -> &CpuGuardian {
+        &self.cpu
+    }
+}
+
+/// 磁盘空间状态分级（P52）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskStatus {
+    /// 剩余空间充足（> warn）。
+    Normal,
+    /// 预警（warn ~ throttle 之间）：记录计数，写放行（回收由调用方触发）。
+    Throttled,
+    /// 限流 / 熔断（<= throttle）：拒绝新写入，只读保持。
+    Stalled,
+}
+
+/// 磁盘空间看门狗（P52）：按剩余空间水位分级（预警 → 限流/熔断），带采样缓存
+/// （避免写路径每次 syscall 查询可用空间）。
+pub struct DiskGuardian {
+    warn_ratio: f64,
+    throttle_ratio: f64,
+    stall_ratio: f64,
+    /// 熔断绝对下限（字节）：剩余同时低于 stall_ratio 与绝对量才熔断。
+    stall_min_bytes: u64,
+    sample_secs: Duration,
+    /// 采样缓存：(上次采样时刻, 可用字节, 总量字节)。
+    cache: std::sync::Mutex<Option<(Instant, u64, u64)>>,
+    warn_count: std::sync::atomic::AtomicU64,
+    throttled_count: std::sync::atomic::AtomicU64,
+    stalled_count: std::sync::atomic::AtomicU64,
+}
+
+impl DiskGuardian {
+    pub fn new(cfg: &Config) -> Self {
+        Self {
+            warn_ratio: cfg.watchdog.disk_warn_ratio,
+            throttle_ratio: cfg.watchdog.disk_throttle_ratio,
+            stall_ratio: cfg.watchdog.disk_stall_ratio,
+            stall_min_bytes: (cfg.watchdog.disk_stall_min_mb as u64) * 1024 * 1024,
+            sample_secs: Duration::from_secs(cfg.watchdog.disk_sample_secs),
+            cache: std::sync::Mutex::new(None),
+            warn_count: std::sync::atomic::AtomicU64::new(0),
+            throttled_count: std::sync::atomic::AtomicU64::new(0),
+            stalled_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 采样 data_dir 所在文件系统的剩余空间水位并分级（带间隔缓存）。
+    /// syscall 失败（路径不可用等）→ 返回 Normal（不因检测失败阻塞写）。
+    pub fn sample(&self, data_dir: &std::path::Path) -> Result<DiskStatus> {
+        let now = Instant::now();
+        let cached = {
+            let c = self.cache.lock().unwrap();
+            c.filter(|(t, _, _)| now.duration_since(*t) < self.sample_secs)
+                .map(|(_, a, b)| (a, b))
+        };
+        let (avail, total) = match cached {
+            Some(v) => v,
+            None => {
+                let v = disk_space::space_info(data_dir)
+                    .map_err(Error::from)
+                    .unwrap_or((u64::MAX, u64::MAX));
+                *self.cache.lock().unwrap() = Some((now, v.0, v.1));
+                v
+            }
+        };
+        Ok(self.classify(avail, total))
+    }
+
+    /// 按可用/总量分级（核心逻辑，可单测）。
+    /// 熔断 = 剩余比例 ≤ stall_ratio **且** 剩余绝对字节 < stall_min_bytes
+    /// （防止小比例但剩余空间仍充裕的盘误熔断）。
+    pub fn classify(&self, avail: u64, total: u64) -> DiskStatus {
+        if total == 0 {
+            return DiskStatus::Normal;
+        }
+        let ratio = avail as f64 / total as f64;
+        if ratio <= self.stall_ratio && avail < self.stall_min_bytes {
+            self.stalled_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DiskStatus::Stalled
+        } else if ratio <= self.throttle_ratio {
+            self.throttled_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DiskStatus::Throttled
+        } else if ratio <= self.warn_ratio {
+            self.warn_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DiskStatus::Throttled
+        } else {
+            DiskStatus::Normal
+        }
+    }
+
+    pub fn warn_count(&self) -> u64 {
+        self.warn_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn throttled_count(&self) -> u64 {
+        self.throttled_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn stalled_count(&self) -> u64 {
+        self.stalled_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// CPU 并发看门狗（P52）：active 查询数代理 CPU 压力，超限拒绝新查询
+/// （防 CPU 风暴；物理并发由引擎/服务器线程模型决定，此处为逻辑上限）。
+pub struct CpuGuardian {
+    limit: usize,
+    active: std::sync::atomic::AtomicUsize,
+    rejected_count: std::sync::atomic::AtomicU64,
+}
+
+impl CpuGuardian {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            rejected_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 尝试进入一个查询。达到上限 → `Stalled` 拒绝（计数）。
+    pub fn try_begin(&self) -> Result<()> {
+        loop {
+            let cur = self.active.load(std::sync::atomic::Ordering::Relaxed);
+            if cur >= self.limit {
+                self.rejected_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(Error::Stalled(format!(
+                    "并发查询数 {} 达上限 {}{}，拒绝新查询",
+                    cur,
+                    self.limit,
+                    ""
+                )));
+            }
+            if self
+                .active
+                .compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// 查询结束释放占用（QueryGuard drop 自动调用）。
+    pub fn end(&self) {
+        self.active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub fn active(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 }
 
@@ -341,6 +572,67 @@ mod tests {
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    // ---------- P52：磁盘空间看门狗 ----------
+
+    #[test]
+    fn disk_classify_levels_by_ratio() {
+        let w = Watchdog::new(&cfg(), DEFAULT_QUERY_TIMEOUT);
+        let d = w.disk();
+        // 默认水位：warn=0.20 throttle=0.10 stall=0.05
+        assert_eq!(d.classify(0, 10_000), DiskStatus::Stalled, "0% 剩余 → 熔断");
+        assert_eq!(d.classify(400, 10_000), DiskStatus::Stalled, "4% → 熔断");
+        assert_eq!(d.classify(700, 10_000), DiskStatus::Throttled, "7% → 限流");
+        assert_eq!(d.classify(1_500, 10_000), DiskStatus::Throttled, "15% → 预警");
+        assert_eq!(d.classify(5_000, 10_000), DiskStatus::Normal, "50% → 正常");
+        assert_eq!(d.classify(0, 0), DiskStatus::Normal, "总量 0 → 保守放行");
+    }
+
+    #[test]
+    fn disk_sample_caches_repeated_query() {
+        let w = Watchdog::new(&cfg(), DEFAULT_QUERY_TIMEOUT);
+        let dir = tempfile::tempdir().unwrap();
+        // 采样缓存：1s 内连续调用返回一致结果（真实磁盘状态可能为任意分级，只验证一致性）
+        let s1 = w.disk_status(dir.path()).unwrap();
+        let s2 = w.disk_status(dir.path()).unwrap();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn check_all_rejects_when_memory_stall() {
+        let w = Watchdog::new(&cfg(), DEFAULT_QUERY_TIMEOUT);
+        let dir = tempfile::tempdir().unwrap();
+        // 内存硬水位 → 拒绝写（磁盘分级逻辑由 disk_classify_levels_by_ratio 覆盖）
+        assert!(w.check_all(1.5, dir.path()).is_err());
+    }
+
+    // ---------- P52：CPU 并发看门狗 ----------
+
+    #[test]
+    fn cpu_limit_rejects_and_releases_on_drop() {
+        let c = CpuGuardian::new(2);
+        assert!(c.try_begin().is_ok());
+        assert!(c.try_begin().is_ok());
+        assert!(c.try_begin().is_err(), "达上限应拒绝");
+        assert_eq!(c.active(), 2);
+        assert_eq!(c.rejected_count(), 1);
+        c.end();
+        c.end();
+        assert_eq!(c.active(), 0);
+        assert!(c.try_begin().is_ok(), "释放后可再进入");
+    }
+
+    #[test]
+    fn watchdog_try_begin_query_limits_concurrency() {
+        let mut c = cfg();
+        c.watchdog.cpu_query_limit = 1;
+        let w = Watchdog::new(&c, DEFAULT_QUERY_TIMEOUT);
+        let g1 = w.try_begin_query().unwrap();
+        assert!(w.try_begin_query().is_err(), "并发超限应拒绝");
+        drop(g1); // QueryGuard drop → CPU 槽释放
+        assert!(w.try_begin_query().is_ok());
+        assert!(w.cpu_active() <= 1);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# 大数据量功能/性能基准配置（shanshui-cunji demo --scale N --config config.bench.toml）
+# demo 测试文档字段：status/city（倒排）+ title/content/remark（fulltext 分词）
+# 用法：shanshui-cunji demo --scale 20000000 --config config.bench.toml --out images/perf-0.6.0/2000万
+
+[storage]
+data_dir = "D:/shanshui-data/db-bench"   # demo 内部使用临时目录，此配置仅兜底
+
+[inverted]
+engine = "fst"                             # FST + mmap 字典（Ex-5.7）
+inverted_fields = ["status", "city"]       # 倒排白名单（demo terms 提取同此）
+fulltext_fields = ["title", "content", "remark"]   # 长文本分词字段（M8-P7）
+bitmap_fields = ["status", "city"]         # 内存位图白名单（M7-2：COUNT/AND 快速路径 O(1)）
+max_term_len = 96                          # 超长 term 自动跳过（兜底）

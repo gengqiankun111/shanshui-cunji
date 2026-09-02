@@ -1,0 +1,22 @@
+# 倒排字段策略配置模板（design_extension 9.4，Ex-4 固化）
+#
+# 三准则（posting 密度 N/M = 行数/唯一 term 数）：
+#   1. 枚举/低基数（唯一值 <1K）→ inverted_fields 白名单建倒排（≤20 字段）；
+#   2. 高基数/唯一字段（note/user_id/订单号/时间戳）→ exclude_fields 排除；
+#   3. 长文本（>max_term_len）→ fulltext_fields 分词建词索引（不整串进字典）。
+#
+# 实测收益（db-50m）：排除 note 后 inverted 523.5MB → ~200MB，构建时间同步下降；
+# 查询（status/city/tag 等枚举过滤）不受影响。
+# 用法：shanshui-cunji-import --parquet ds.parquet --config config.import-example.toml --data-dir <目标>
+
+[storage]
+data_dir = "D:/shanshui-data/db-opt"   # 目标数据目录（重建用新目录，不动既有库）
+
+[inverted]
+engine = "fst"                         # fst：FST + mmap 字典（Ex-5.7，冷启动亚秒）；hash：免 FST 编译
+inverted_fields = ["status", "city", "tag_a", "tag_b", "region", "device", "channel"]  # 白名单 ≤20
+fulltext_fields = ["title", "content", "remark"]   # 长文本分词字段（无则留空）
+exclude_fields = ["note"]                          # 高基数/唯一字段排除（db-50m 的 note-{i}）
+max_term_len = 96                                  # 超长 term 自动跳过（兜底）
+
+# 可选：导入用 append WAL + 组提交（性能最优）；环形 WAL 配置见 [wal]

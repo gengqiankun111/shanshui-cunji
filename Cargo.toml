@@ -21,11 +21,31 @@ roaring = "0.10"
 crc32fast = "1"
 fst = "0.4"
 memmap2 = "0.9"
+# Ex-5.7（P23 决策）：只读 mmap 安全封装（独立 crate = unsafe 白名单），主库保持零 unsafe；
+# 倒排 FST 字典按需加载（冷启动零堆分配，design 5.2.4.1）
+mmap-file = { path = "crates/mmap-file" }
+# 看门狗硬盘超限保护（P52 落地）：跨平台磁盘可用空间查询（独立 crate = unsafe 白名单，
+# 与 mmap-file 同模式，主库保持零 unsafe；Windows GetDiskFreeSpaceExW / Unix statvfs）
+disk-space = { path = "crates/disk-space" }
+# H 项 MySQL 协议适配：mysql_native_password 认证（sha1 scramble，MySQL wire protocol）
+sha1 = "0.10"
 csv = "1"
+# Ex-7.2（design_extension v0.5 第 12.2）：CPU 绑核（网络/计算/IO 三池物理核分区，
+# 跳过超线程虚拟核由显式核列表配置；core_affinity 跨 Windows/Linux/macOS）
+core_affinity = "0.8"
+# Ex-6.2/6.3（design_extension v0.4 第 11 章）：原子指针发布（ArcSwap）——倒排段清单/FST
+# 字典读路径拿 Arc 快照无锁（flush/gc 更新 rcu 发布；unsafe 在依赖内部，主库零 unsafe 不变）
+arc-swap = "1"
+# V 项（design_extension v0.5 第 12.3）：io_uring 后端（Linux 专属，SQPOLL 队列 read/write/fsync）——
+# 独立 crate = unsafe 白名单（与 mmap-file 同模式，主库零 unsafe 不变）；非 Linux 目标不编译
+io-uring-file = { path = "crates/io-uring-file" }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 parquet = "59.2.0"
 arrow = "59.2.0"
 jieba-rs = { version = "0.10", optional = true }
+# I 项异步协程运行时（design 9.5：10k 连接目标——网络层协程化，连接 idle 不占 OS 线程；
+# 查询执行经 spawn_blocking 复用现有同步引擎）
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 
 [[bin]]
 name = "shanshui-cunji-migrate"
@@ -48,8 +68,16 @@ name = "shanshui-cunji-ycsb"
 path = "src/bin/ycsb.rs"
 
 [[bin]]
+name = "shanshui-cunji-mysql-server"
+path = "src/bin/mysql_server.rs"
+
+[[bin]]
 name = "shanshui-cunji-gen-dataset"
 path = "src/bin/gen_dataset.rs"
+
+[[bin]]
+name = "shanshui-cunji-shard-build"
+path = "src/bin/shard_build.rs"
 
 [features]
 # 默认开启 mimalloc；`--no-default-features` 构建用系统分配器（压测对比基线）；

@@ -55,7 +55,7 @@
 | 从 MySQL 迁移太痛苦 | 一键迁移工具 + 类 SQL 语法，DAO 层不用重写 |
 | 怕宕机、怕丢数据、运维累 | 自愈看门狗、崩溃安全、备份还原、平滑扩容 |
 
-**存储介质**：shanshui-cunji 是**纯硬盘持久化（Disk-Based）**——数据写入须经 WAL fsync + 落盘 SSTable 才算成功；HotCache / 倒排字典等内存仅是加速层，断电或重启后磁盘数据完好、WAL 恢复。**数据量只受磁盘限制（TB 级），不受内存限制**。
+**存储介质**：shanshui-cunji 是**纯 SSD 持久化（NVMe/SATA SSD Only）**——数据写入须经 WAL fsync + 落盘 SSTable 才算成功；HotCache / 倒排字典等内存仅是加速层，断电或重启后磁盘数据完好、WAL 恢复。**数据量只受磁盘限制（TB 级），不受内存限制**。⚠️ 存储格式按 SSD 优化设计（4KB 块 / 环形 WAL 等），**开发环境若使用机械硬盘（HDD）性能会大幅下降（10 倍级），压测数据无参考价值——不要压测**，性能验证须在 SSD 上进行（详见 [design.md](./design.md) 4.8）。
 
 ---
 
@@ -128,6 +128,7 @@
 - 🛡️ **7x24 自愈**：内存限流、Compaction 假死自愈、慢查询熔断、进程探针
 - 🔄 **平滑迁移**：MySQL 全量/增量导入，类 SQL WHERE 语法
 - 📦 **数据安全**：WAL 崩溃安全 + Tombstone 删除 + 备份还原 + TTL 自动过期
+- 🧾 **事务与隔离级别**：本地原子事务（WriteBatch 单次 WAL fsync 提交）+ 三种隔离级别 **READ COMMITTED / REPEATABLE READ / SERIALIZABLE**（快照读 + 提交时写冲突检测 + docid 级锁 + 死锁检测）；MySQL 协议默认 **REPEATABLE READ**，与 MySQL 语义对齐
 
 ---
 

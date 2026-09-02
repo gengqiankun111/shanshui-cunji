@@ -1,0 +1,584 @@
+﻿
+═══ shanshui-cunji 0.6.0 功能冒烟测试（scale=20000000）═══
+
+[2m2026-08-30T03:18:35.476800Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:18:35.477706Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T03:18:35.477721Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T03:18:35.478285Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:18:35.479420Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:18:36.107041Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000001.seg
+[2m2026-08-30T03:18:36.792289Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000002.seg
+[2m2026-08-30T03:18:37.448830Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000003.seg
+[2m2026-08-30T03:18:38.087496Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000004.seg
+[2m2026-08-30T03:18:38.694470Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000005.seg
+[2m2026-08-30T03:18:39.340409Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000006.seg
+[2m2026-08-30T03:18:40.111447Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000007.seg
+[2m2026-08-30T03:18:40.817295Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000008.seg
+[2m2026-08-30T03:18:41.572178Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000009.seg
+[2m2026-08-30T03:18:42.326976Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000010.seg
+[2m2026-08-30T03:18:43.124743Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000011.seg
+[2m2026-08-30T03:18:43.886138Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000012.seg
+[2m2026-08-30T03:18:44.543032Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000013.seg
+[2m2026-08-30T03:18:45.151490Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000014.seg
+[2m2026-08-30T03:18:45.782667Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000015.seg
+[2m2026-08-30T03:18:46.393082Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000016.seg
+[2m2026-08-30T03:18:47.009447Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000017.seg
+[2m2026-08-30T03:18:47.625247Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000018.seg
+[2m2026-08-30T03:18:48.242019Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000019.seg
+[2m2026-08-30T03:18:48.905350Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000020.seg
+[2m2026-08-30T03:18:49.510237Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000021.seg
+[2m2026-08-30T03:18:50.142816Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000022.seg
+[2m2026-08-30T03:18:50.916421Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000023.seg
+[2m2026-08-30T03:18:51.545310Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000024.seg
+[2m2026-08-30T03:18:52.235350Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000025.seg
+[2m2026-08-30T03:18:52.837646Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000026.seg
+[2m2026-08-30T03:18:56.305361Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (1078349 条)
+[2m2026-08-30T03:18:56.533226Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000027.seg
+[2m2026-08-30T03:18:57.150046Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000028.seg
+[2m2026-08-30T03:18:57.767216Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000029.seg
+[2m2026-08-30T03:18:58.371087Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000030.seg
+[2m2026-08-30T03:18:58.996962Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000031.seg
+[2m2026-08-30T03:18:59.614111Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000032.seg
+[2m2026-08-30T03:19:00.238370Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000033.seg
+[2m2026-08-30T03:19:00.863230Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000034.seg
+[2m2026-08-30T03:19:01.507899Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000035.seg
+[2m2026-08-30T03:19:02.135068Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000036.seg
+[2m2026-08-30T03:19:02.769208Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000037.seg
+[2m2026-08-30T03:19:03.405518Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000038.seg
+[2m2026-08-30T03:19:04.008910Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000039.seg
+[2m2026-08-30T03:19:04.635415Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000040.seg
+[2m2026-08-30T03:19:05.257988Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000041.seg
+[2m2026-08-30T03:19:05.856480Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000042.seg
+[2m2026-08-30T03:19:06.476018Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000043.seg
+[2m2026-08-30T03:19:07.091835Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000044.seg
+[2m2026-08-30T03:19:07.707118Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000045.seg
+[2m2026-08-30T03:19:08.577089Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000046.seg
+[2m2026-08-30T03:19:09.220713Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000047.seg
+[2m2026-08-30T03:19:09.828866Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000048.seg
+[2m2026-08-30T03:19:10.422208Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000049.seg
+[2m2026-08-30T03:19:11.033960Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000050.seg
+[2m2026-08-30T03:19:11.647382Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000051.seg
+[2m2026-08-30T03:19:12.269032Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000052.seg
+[2m2026-08-30T03:19:12.911554Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000053.seg
+[2m2026-08-30T03:19:16.207763Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (1065122 条)
+[2m2026-08-30T03:19:16.774199Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000054.seg
+[2m2026-08-30T03:19:17.387268Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000055.seg
+[2m2026-08-30T03:19:18.025706Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000056.seg
+[2m2026-08-30T03:19:18.644245Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000057.seg
+[2m2026-08-30T03:19:19.251895Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000058.seg
+[2m2026-08-30T03:19:19.859900Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000059.seg
+[2m2026-08-30T03:19:20.477167Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000060.seg
+[2m2026-08-30T03:19:21.093099Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000061.seg
+[2m2026-08-30T03:19:21.701984Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000062.seg
+[2m2026-08-30T03:19:22.319339Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000063.seg
+[2m2026-08-30T03:19:22.921595Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000064.seg
+[2m2026-08-30T03:19:23.554409Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000065.seg
+[2m2026-08-30T03:19:24.178285Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000066.seg
+[2m2026-08-30T03:19:24.797503Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000067.seg
+[2m2026-08-30T03:19:25.456458Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000068.seg
+[2m2026-08-30T03:19:26.057302Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000069.seg
+[2m2026-08-30T03:19:26.688228Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000070.seg
+[2m2026-08-30T03:19:27.288479Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000071.seg
+[2m2026-08-30T03:19:27.879853Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000072.seg
+[2m2026-08-30T03:19:28.497136Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000073.seg
+[2m2026-08-30T03:19:29.127030Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000074.seg
+[2m2026-08-30T03:19:29.750017Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000075.seg
+[2m2026-08-30T03:19:30.357129Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000076.seg
+[2m2026-08-30T03:19:30.997352Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000077.seg
+[2m2026-08-30T03:19:31.605246Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000078.seg
+[2m2026-08-30T03:19:32.231135Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000079.seg
+[2m2026-08-30T03:19:35.552786Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1065122 条)
+[2m2026-08-30T03:19:35.902653Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000080.seg
+[2m2026-08-30T03:19:36.553348Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000081.seg
+[2m2026-08-30T03:19:37.159903Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000082.seg
+[2m2026-08-30T03:19:37.783696Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000083.seg
+[2m2026-08-30T03:19:38.411457Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000084.seg
+[2m2026-08-30T03:19:39.049429Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000085.seg
+[2m2026-08-30T03:19:39.662563Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000086.seg
+[2m2026-08-30T03:19:40.277691Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000087.seg
+[2m2026-08-30T03:19:40.889171Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000088.seg
+[2m2026-08-30T03:19:41.533778Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000089.seg
+[2m2026-08-30T03:19:42.165584Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000090.seg
+[2m2026-08-30T03:19:42.780989Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000091.seg
+[2m2026-08-30T03:19:43.848404Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000092.seg
+[2m2026-08-30T03:19:44.457553Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000093.seg
+[2m2026-08-30T03:19:45.073829Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000094.seg
+[2m2026-08-30T03:19:45.723613Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000095.seg
+[2m2026-08-30T03:19:46.611859Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000096.seg
+[2m2026-08-30T03:19:47.312434Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000097.seg
+[2m2026-08-30T03:19:48.139038Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000098.seg
+[2m2026-08-30T03:19:48.913744Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000099.seg
+[2m2026-08-30T03:19:49.730655Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000100.seg
+[2m2026-08-30T03:19:50.458292Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000101.seg
+[2m2026-08-30T03:19:51.041101Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000102.seg
+[2m2026-08-30T03:19:51.609190Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000103.seg
+[2m2026-08-30T03:19:52.211500Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000104.seg
+[2m2026-08-30T03:19:52.822664Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000105.seg
+[2m2026-08-30T03:19:56.306937Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000004.sst (1065122 条)
+[2m2026-08-30T03:19:56.415739Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000106.seg
+[2m2026-08-30T03:19:57.004747Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000107.seg
+[2m2026-08-30T03:19:57.688653Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000108.seg
+[2m2026-08-30T03:19:58.429307Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000109.seg
+[2m2026-08-30T03:19:59.187347Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000110.seg
+[2m2026-08-30T03:19:59.994839Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000111.seg
+[2m2026-08-30T03:20:00.739345Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000112.seg
+[2m2026-08-30T03:20:01.386556Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000113.seg
+[2m2026-08-30T03:20:01.994154Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000114.seg
+[2m2026-08-30T03:20:02.620136Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000115.seg
+[2m2026-08-30T03:20:03.241933Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000116.seg
+[2m2026-08-30T03:20:03.947403Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000117.seg
+[2m2026-08-30T03:20:04.586528Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000118.seg
+[2m2026-08-30T03:20:05.255121Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000119.seg
+[2m2026-08-30T03:20:05.864621Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000120.seg
+[2m2026-08-30T03:20:06.488218Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000121.seg
+[2m2026-08-30T03:20:07.107330Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000122.seg
+[2m2026-08-30T03:20:07.722452Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000123.seg
+[2m2026-08-30T03:20:08.424622Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000124.seg
+[2m2026-08-30T03:20:09.202922Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000125.seg
+[2m2026-08-30T03:20:10.020660Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000126.seg
+[2m2026-08-30T03:20:10.933590Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000127.seg
+[2m2026-08-30T03:20:11.627425Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000128.seg
+[2m2026-08-30T03:20:12.324635Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000129.seg
+[2m2026-08-30T03:20:13.014883Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000130.seg
+[2m2026-08-30T03:20:13.803846Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000131.seg
+[2m2026-08-30T03:20:14.463281Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000132.seg
+[2m2026-08-30T03:20:17.693696Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000005.sst (1065122 条)
+[2m2026-08-30T03:20:18.136123Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000133.seg
+[2m2026-08-30T03:20:18.746563Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000134.seg
+[2m2026-08-30T03:20:19.482669Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000135.seg
+[2m2026-08-30T03:20:20.209002Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000136.seg
+[2m2026-08-30T03:20:20.872619Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000137.seg
+[2m2026-08-30T03:20:21.564767Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000138.seg
+[2m2026-08-30T03:20:22.185837Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000139.seg
+[2m2026-08-30T03:20:22.823179Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000140.seg
+[2m2026-08-30T03:20:23.442993Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000141.seg
+[2m2026-08-30T03:20:24.089056Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000142.seg
+[2m2026-08-30T03:20:24.697188Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000143.seg
+[2m2026-08-30T03:20:25.389414Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000144.seg
+[2m2026-08-30T03:20:26.022958Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000145.seg
+[2m2026-08-30T03:20:26.680879Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000146.seg
+[2m2026-08-30T03:20:27.408533Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000147.seg
+[2m2026-08-30T03:20:28.134321Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000148.seg
+[2m2026-08-30T03:20:28.836627Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000149.seg
+[2m2026-08-30T03:20:29.459011Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000150.seg
+[2m2026-08-30T03:20:30.084880Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000151.seg
+[2m2026-08-30T03:20:30.725876Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000152.seg
+[2m2026-08-30T03:20:31.344808Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000153.seg
+[2m2026-08-30T03:20:32.012028Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000154.seg
+[2m2026-08-30T03:20:32.643617Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000155.seg
+[2m2026-08-30T03:20:33.284463Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000156.seg
+[2m2026-08-30T03:20:33.905838Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000157.seg
+[2m2026-08-30T03:20:34.515597Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000158.seg
+[2m2026-08-30T03:20:38.126578Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000006.sst (1065122 条)
+[2m2026-08-30T03:20:38.341212Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000159.seg
+[2m2026-08-30T03:20:39.008829Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000160.seg
+[2m2026-08-30T03:20:39.710703Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000161.seg
+[2m2026-08-30T03:20:40.481481Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000162.seg
+[2m2026-08-30T03:20:41.149009Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000163.seg
+[2m2026-08-30T03:20:41.777855Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000164.seg
+[2m2026-08-30T03:20:42.418603Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000165.seg
+[2m2026-08-30T03:20:43.037193Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000166.seg
+[2m2026-08-30T03:20:43.669377Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000167.seg
+[2m2026-08-30T03:20:44.304594Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000168.seg
+[2m2026-08-30T03:20:44.948245Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000169.seg
+[2m2026-08-30T03:20:45.576667Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000170.seg
+[2m2026-08-30T03:20:46.227416Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000171.seg
+[2m2026-08-30T03:20:46.869254Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000172.seg
+[2m2026-08-30T03:20:47.563724Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000173.seg
+[2m2026-08-30T03:20:48.198351Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000174.seg
+[2m2026-08-30T03:20:48.822728Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000175.seg
+[2m2026-08-30T03:20:49.489854Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000176.seg
+[2m2026-08-30T03:20:50.126090Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000177.seg
+[2m2026-08-30T03:20:50.759845Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000178.seg
+[2m2026-08-30T03:20:51.419873Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000179.seg
+[2m2026-08-30T03:20:52.046657Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000180.seg
+[2m2026-08-30T03:20:52.689501Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000181.seg
+[2m2026-08-30T03:20:53.340955Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000182.seg
+[2m2026-08-30T03:20:54.992941Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000183.seg
+[2m2026-08-30T03:20:55.629055Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000184.seg
+[2m2026-08-30T03:20:56.282796Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000185.seg
+[2m2026-08-30T03:20:59.435612Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000007.sst (1065122 条)
+[2m2026-08-30T03:21:00.088591Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000186.seg
+[2m2026-08-30T03:21:00.748549Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000187.seg
+[2m2026-08-30T03:21:01.406358Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000188.seg
+[2m2026-08-30T03:21:02.048183Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000189.seg
+[2m2026-08-30T03:21:02.674523Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000190.seg
+[2m2026-08-30T03:21:03.310945Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000191.seg
+[2m2026-08-30T03:21:03.936030Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000192.seg
+[2m2026-08-30T03:21:04.583984Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000193.seg
+[2m2026-08-30T03:21:05.235820Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000194.seg
+[2m2026-08-30T03:21:05.866010Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000195.seg
+[2m2026-08-30T03:21:06.479772Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000196.seg
+[2m2026-08-30T03:21:07.101945Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000197.seg
+[2m2026-08-30T03:21:07.732664Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000198.seg
+[2m2026-08-30T03:21:08.365620Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000199.seg
+[2m2026-08-30T03:21:09.105156Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000200.seg
+[2m2026-08-30T03:21:09.724318Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000201.seg
+[2m2026-08-30T03:21:10.350453Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000202.seg
+[2m2026-08-30T03:21:10.974132Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000203.seg
+[2m2026-08-30T03:21:11.595311Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000204.seg
+[2m2026-08-30T03:21:12.218445Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000205.seg
+[2m2026-08-30T03:21:12.834583Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000206.seg
+[2m2026-08-30T03:21:13.459111Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000207.seg
+[2m2026-08-30T03:21:14.093378Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000208.seg
+[2m2026-08-30T03:21:14.713183Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000209.seg
+[2m2026-08-30T03:21:15.372867Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000210.seg
+[2m2026-08-30T03:21:15.996801Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000211.seg
+[2m2026-08-30T03:21:19.338707Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000008.sst (1065122 条)
+[2m2026-08-30T03:21:19.662885Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000212.seg
+[2m2026-08-30T03:21:20.322184Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000213.seg
+[2m2026-08-30T03:21:20.951356Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000214.seg
+[2m2026-08-30T03:21:21.594373Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000215.seg
+[2m2026-08-30T03:21:22.216486Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000216.seg
+[2m2026-08-30T03:21:22.857114Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000217.seg
+[2m2026-08-30T03:21:23.489089Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000218.seg
+[2m2026-08-30T03:21:24.111210Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000219.seg
+[2m2026-08-30T03:21:24.737532Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000220.seg
+[2m2026-08-30T03:21:25.341255Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000221.seg
+[2m2026-08-30T03:21:25.959809Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000222.seg
+[2m2026-08-30T03:21:26.581959Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000223.seg
+[2m2026-08-30T03:21:27.200406Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000224.seg
+[2m2026-08-30T03:21:27.812658Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000225.seg
+[2m2026-08-30T03:21:28.436385Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000226.seg
+[2m2026-08-30T03:21:29.033259Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000227.seg
+[2m2026-08-30T03:21:29.660410Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000228.seg
+[2m2026-08-30T03:21:30.286137Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000229.seg
+[2m2026-08-30T03:21:30.894942Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000230.seg
+[2m2026-08-30T03:21:31.505381Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000231.seg
+[2m2026-08-30T03:21:32.127813Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000232.seg
+[2m2026-08-30T03:21:32.771904Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000233.seg
+[2m2026-08-30T03:21:33.417063Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000234.seg
+[2m2026-08-30T03:21:34.033894Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000235.seg
+[2m2026-08-30T03:21:34.647979Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000236.seg
+[2m2026-08-30T03:21:35.277985Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000237.seg
+[2m2026-08-30T03:21:35.947596Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000238.seg
+[2m2026-08-30T03:21:39.046697Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000009.sst (1065122 条)
+[2m2026-08-30T03:21:39.826436Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000239.seg
+[2m2026-08-30T03:21:40.583009Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000240.seg
+[2m2026-08-30T03:21:41.297902Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000241.seg
+[2m2026-08-30T03:21:41.920938Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000242.seg
+[2m2026-08-30T03:21:42.540843Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000243.seg
+[2m2026-08-30T03:21:43.182741Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000244.seg
+[2m2026-08-30T03:21:43.806616Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000245.seg
+[2m2026-08-30T03:21:44.551224Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000246.seg
+[2m2026-08-30T03:21:45.334553Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000247.seg
+[2m2026-08-30T03:21:46.057873Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000248.seg
+[2m2026-08-30T03:21:46.705628Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000249.seg
+[2m2026-08-30T03:21:47.324075Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000250.seg
+[2m2026-08-30T03:21:47.973501Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000251.seg
+[2m2026-08-30T03:21:48.602580Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000252.seg
+[2m2026-08-30T03:21:49.243268Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000253.seg
+[2m2026-08-30T03:21:49.884293Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000254.seg
+[2m2026-08-30T03:21:50.522893Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000255.seg
+[2m2026-08-30T03:21:51.169127Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000256.seg
+[2m2026-08-30T03:21:51.793234Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000257.seg
+[2m2026-08-30T03:21:52.437278Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000258.seg
+[2m2026-08-30T03:21:53.071409Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000259.seg
+[2m2026-08-30T03:21:53.699956Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000260.seg
+[2m2026-08-30T03:21:54.360096Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000261.seg
+[2m2026-08-30T03:21:55.005937Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000262.seg
+[2m2026-08-30T03:21:55.634050Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000263.seg
+[2m2026-08-30T03:21:56.266577Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000264.seg
+[2m2026-08-30T03:21:59.330859Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000010.sst (1057306 条)
+[2m2026-08-30T03:21:59.842236Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000265.seg
+[2m2026-08-30T03:22:00.481599Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000266.seg
+[2m2026-08-30T03:22:01.120583Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000267.seg
+[2m2026-08-30T03:22:01.769028Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000268.seg
+[2m2026-08-30T03:22:02.407115Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000269.seg
+[2m2026-08-30T03:22:03.070749Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000270.seg
+[2m2026-08-30T03:22:03.710352Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000271.seg
+[2m2026-08-30T03:22:04.321206Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000272.seg
+[2m2026-08-30T03:22:04.912740Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000273.seg
+[2m2026-08-30T03:22:05.511693Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000274.seg
+[2m2026-08-30T03:22:06.101415Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000275.seg
+[2m2026-08-30T03:22:06.685698Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000276.seg
+[2m2026-08-30T03:22:07.304653Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000277.seg
+[2m2026-08-30T03:22:07.905502Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000278.seg
+[2m2026-08-30T03:22:08.536236Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000279.seg
+[2m2026-08-30T03:22:09.159035Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000280.seg
+[2m2026-08-30T03:22:09.789569Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000281.seg
+[2m2026-08-30T03:22:10.429854Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000282.seg
+[2m2026-08-30T03:22:11.077446Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000283.seg
+[2m2026-08-30T03:22:11.668213Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000284.seg
+[2m2026-08-30T03:22:12.262895Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000285.seg
+[2m2026-08-30T03:22:12.877492Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000286.seg
+[2m2026-08-30T03:22:13.475575Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000287.seg
+[2m2026-08-30T03:22:14.148810Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000288.seg
+[2m2026-08-30T03:22:14.791381Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000289.seg
+[2m2026-08-30T03:22:15.376073Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000290.seg
+[2m2026-08-30T03:22:18.383120Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000011.sst (1052592 条)
+[2m2026-08-30T03:22:18.843559Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000291.seg
+[2m2026-08-30T03:22:19.552782Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000292.seg
+[2m2026-08-30T03:22:20.156291Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000293.seg
+[2m2026-08-30T03:22:20.769767Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000294.seg
+[2m2026-08-30T03:22:21.369197Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000295.seg
+[2m2026-08-30T03:22:22.037331Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000296.seg
+[2m2026-08-30T03:22:22.615334Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000297.seg
+[2m2026-08-30T03:22:23.197981Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000298.seg
+[2m2026-08-30T03:22:23.767828Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000299.seg
+[2m2026-08-30T03:22:24.337230Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000300.seg
+[2m2026-08-30T03:22:24.942066Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000301.seg
+[2m2026-08-30T03:22:25.577097Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000302.seg
+[2m2026-08-30T03:22:26.163981Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000303.seg
+[2m2026-08-30T03:22:26.818595Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000304.seg
+[2m2026-08-30T03:22:27.451886Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000305.seg
+[2m2026-08-30T03:22:28.047634Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000306.seg
+[2m2026-08-30T03:22:28.625651Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000307.seg
+[2m2026-08-30T03:22:29.217584Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000308.seg
+[2m2026-08-30T03:22:29.881483Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000309.seg
+[2m2026-08-30T03:22:30.477548Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000310.seg
+[2m2026-08-30T03:22:31.088186Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000311.seg
+[2m2026-08-30T03:22:31.708005Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000312.seg
+[2m2026-08-30T03:22:32.325362Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000313.seg
+[2m2026-08-30T03:22:32.982580Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000314.seg
+[2m2026-08-30T03:22:33.665366Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000315.seg
+[2m2026-08-30T03:22:34.371869Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000316.seg
+[2m2026-08-30T03:22:37.503472Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000012.sst (1052592 条)
+[2m2026-08-30T03:22:37.905631Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000317.seg
+[2m2026-08-30T03:22:38.531959Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000318.seg
+[2m2026-08-30T03:22:39.216411Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000319.seg
+[2m2026-08-30T03:22:39.985453Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000320.seg
+[2m2026-08-30T03:22:40.658694Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000321.seg
+[2m2026-08-30T03:22:41.314766Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000322.seg
+[2m2026-08-30T03:22:41.949890Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000323.seg
+[2m2026-08-30T03:22:42.660816Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000324.seg
+[2m2026-08-30T03:22:43.340815Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000325.seg
+[2m2026-08-30T03:22:44.006819Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000326.seg
+[2m2026-08-30T03:22:44.688133Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000327.seg
+[2m2026-08-30T03:22:45.387121Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000328.seg
+[2m2026-08-30T03:22:46.096834Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000329.seg
+[2m2026-08-30T03:22:46.770363Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000330.seg
+[2m2026-08-30T03:22:47.482169Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000331.seg
+[2m2026-08-30T03:22:48.219742Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000332.seg
+[2m2026-08-30T03:22:48.856918Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000333.seg
+[2m2026-08-30T03:22:49.467820Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000334.seg
+[2m2026-08-30T03:22:50.105474Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000335.seg
+[2m2026-08-30T03:22:50.691657Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000336.seg
+[2m2026-08-30T03:22:51.284500Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000337.seg
+[2m2026-08-30T03:22:51.868772Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000338.seg
+[2m2026-08-30T03:22:52.459140Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000339.seg
+[2m2026-08-30T03:22:53.055834Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000340.seg
+[2m2026-08-30T03:22:53.639408Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000341.seg
+[2m2026-08-30T03:22:54.229622Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000342.seg
+[2m2026-08-30T03:22:57.233901Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000013.sst (1052592 条)
+[2m2026-08-30T03:22:57.577793Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000343.seg
+[2m2026-08-30T03:22:58.215234Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000344.seg
+[2m2026-08-30T03:22:58.823033Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000345.seg
+[2m2026-08-30T03:22:59.506894Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000346.seg
+[2m2026-08-30T03:23:00.141039Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000347.seg
+[2m2026-08-30T03:23:00.734214Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000348.seg
+[2m2026-08-30T03:23:01.331136Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000349.seg
+[2m2026-08-30T03:23:01.955406Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000350.seg
+[2m2026-08-30T03:23:02.588993Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000351.seg
+[2m2026-08-30T03:23:03.197691Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000352.seg
+[2m2026-08-30T03:23:03.795479Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000353.seg
+[2m2026-08-30T03:23:04.397724Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000354.seg
+[2m2026-08-30T03:23:04.989065Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000355.seg
+[2m2026-08-30T03:23:05.596303Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000356.seg
+[2m2026-08-30T03:23:06.251601Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000357.seg
+[2m2026-08-30T03:23:06.863610Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000358.seg
+[2m2026-08-30T03:23:07.493178Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000359.seg
+[2m2026-08-30T03:23:08.134229Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000360.seg
+[2m2026-08-30T03:23:08.786687Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000361.seg
+[2m2026-08-30T03:23:09.483303Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000362.seg
+[2m2026-08-30T03:23:10.139825Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000363.seg
+[2m2026-08-30T03:23:10.774992Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000364.seg
+[2m2026-08-30T03:23:11.419947Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000365.seg
+[2m2026-08-30T03:23:12.063708Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000366.seg
+[2m2026-08-30T03:23:12.787016Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000367.seg
+[2m2026-08-30T03:23:13.549828Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000368.seg
+[2m2026-08-30T03:23:16.916261Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000014.sst (1052592 条)
+[2m2026-08-30T03:23:17.316195Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000369.seg
+[2m2026-08-30T03:23:18.418814Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000370.seg
+[2m2026-08-30T03:23:19.265568Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000371.seg
+[2m2026-08-30T03:23:19.972054Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000372.seg
+[2m2026-08-30T03:23:20.638351Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000373.seg
+[2m2026-08-30T03:23:21.625406Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000374.seg
+[2m2026-08-30T03:23:24.141044Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000375.seg
+[2m2026-08-30T03:23:24.897620Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000376.seg
+[2m2026-08-30T03:23:25.646634Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000377.seg
+[2m2026-08-30T03:23:26.445251Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000378.seg
+[2m2026-08-30T03:23:27.182422Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000379.seg
+[2m2026-08-30T03:23:27.824822Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000380.seg
+[2m2026-08-30T03:23:28.461766Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000381.seg
+[2m2026-08-30T03:23:29.099438Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000382.seg
+[2m2026-08-30T03:23:29.767071Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000383.seg
+[2m2026-08-30T03:23:30.561953Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000384.seg
+[2m2026-08-30T03:23:31.346189Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000385.seg
+[2m2026-08-30T03:23:32.142279Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000386.seg
+[2m2026-08-30T03:23:32.881183Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000387.seg
+[2m2026-08-30T03:23:33.643156Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000388.seg
+[2m2026-08-30T03:23:34.381432Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000389.seg
+[2m2026-08-30T03:23:35.101438Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000390.seg
+[2m2026-08-30T03:23:35.834016Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000391.seg
+[2m2026-08-30T03:23:36.542434Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000392.seg
+[2m2026-08-30T03:23:37.256000Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000393.seg
+[2m2026-08-30T03:23:38.019648Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000394.seg
+[2m2026-08-30T03:23:41.491366Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000015.sst (1052592 条)
+[2m2026-08-30T03:23:41.727723Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000395.seg
+[2m2026-08-30T03:23:42.407497Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000396.seg
+[2m2026-08-30T03:23:43.051046Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000397.seg
+[2m2026-08-30T03:23:43.766827Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000398.seg
+[2m2026-08-30T03:23:44.408600Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000399.seg
+[2m2026-08-30T03:23:45.046137Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000400.seg
+[2m2026-08-30T03:23:45.683459Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000401.seg
+[2m2026-08-30T03:23:46.311987Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000402.seg
+[2m2026-08-30T03:23:46.952548Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000403.seg
+[2m2026-08-30T03:23:47.705415Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000404.seg
+[2m2026-08-30T03:23:48.426543Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000405.seg
+[2m2026-08-30T03:23:49.054190Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000406.seg
+[2m2026-08-30T03:23:49.686485Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000407.seg
+[2m2026-08-30T03:23:50.306828Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000408.seg
+[2m2026-08-30T03:23:50.943579Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000409.seg
+[2m2026-08-30T03:23:51.575220Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000410.seg
+[2m2026-08-30T03:23:52.207401Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000411.seg
+[2m2026-08-30T03:23:52.919043Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000412.seg
+[2m2026-08-30T03:23:53.551507Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000413.seg
+[2m2026-08-30T03:23:54.177321Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000414.seg
+[2m2026-08-30T03:23:54.817208Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000415.seg
+[2m2026-08-30T03:23:55.466962Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000416.seg
+[2m2026-08-30T03:23:56.117766Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000417.seg
+[2m2026-08-30T03:23:56.848615Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000418.seg
+[2m2026-08-30T03:23:57.559448Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000419.seg
+[2m2026-08-30T03:23:58.186208Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000420.seg
+[2m2026-08-30T03:24:01.588783Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000016.sst (1052592 条)
+[2m2026-08-30T03:24:01.759720Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000421.seg
+[2m2026-08-30T03:24:02.443045Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000422.seg
+[2m2026-08-30T03:24:03.092141Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000423.seg
+[2m2026-08-30T03:24:03.808582Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000424.seg
+[2m2026-08-30T03:24:04.526279Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000425.seg
+[2m2026-08-30T03:24:05.254236Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000426.seg
+[2m2026-08-30T03:24:05.939163Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000427.seg
+[2m2026-08-30T03:24:06.581517Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000428.seg
+[2m2026-08-30T03:24:07.222523Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000429.seg
+[2m2026-08-30T03:24:07.936933Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000430.seg
+[2m2026-08-30T03:24:08.587270Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000431.seg
+[2m2026-08-30T03:24:09.220110Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000432.seg
+[2m2026-08-30T03:24:09.860177Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000433.seg
+[2m2026-08-30T03:24:10.493204Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000434.seg
+[2m2026-08-30T03:24:11.121883Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000435.seg
+[2m2026-08-30T03:24:11.831736Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000436.seg
+[2m2026-08-30T03:24:12.541024Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000437.seg
+[2m2026-08-30T03:24:13.161709Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000438.seg
+[2m2026-08-30T03:24:13.796506Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000439.seg
+[2m2026-08-30T03:24:14.419780Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000440.seg
+[2m2026-08-30T03:24:15.070466Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000441.seg
+[2m2026-08-30T03:24:15.757653Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000442.seg
+[2m2026-08-30T03:24:16.406251Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000443.seg
+[2m2026-08-30T03:24:17.050760Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000444.seg
+[2m2026-08-30T03:24:17.698115Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000445.seg
+[2m2026-08-30T03:24:18.615187Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000446.seg
+[2m2026-08-30T03:24:21.981827Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000017.sst (1052592 条)
+[2m2026-08-30T03:24:22.125614Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000447.seg
+[2m2026-08-30T03:24:22.958085Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000448.seg
+[2m2026-08-30T03:24:23.811406Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000449.seg
+[2m2026-08-30T03:24:24.474496Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000450.seg
+[2m2026-08-30T03:24:25.126029Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000451.seg
+[2m2026-08-30T03:24:25.761754Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000452.seg
+[2m2026-08-30T03:24:26.403822Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000453.seg
+[2m2026-08-30T03:24:27.129788Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000454.seg
+[2m2026-08-30T03:24:27.769145Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000455.seg
+[2m2026-08-30T03:24:28.408586Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000456.seg
+[2m2026-08-30T03:24:29.049510Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000457.seg
+[2m2026-08-30T03:24:29.748979Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000458.seg
+[2m2026-08-30T03:24:30.387564Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000459.seg
+[2m2026-08-30T03:24:31.019452Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000460.seg
+[2m2026-08-30T03:24:31.645392Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000461.seg
+[2m2026-08-30T03:24:32.281021Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000462.seg
+[2m2026-08-30T03:24:32.982056Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000463.seg
+[2m2026-08-30T03:24:33.647711Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000464.seg
+[2m2026-08-30T03:24:34.379155Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000465.seg
+[2m2026-08-30T03:24:35.045861Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000466.seg
+[2m2026-08-30T03:24:35.669877Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000467.seg
+[2m2026-08-30T03:24:36.313681Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000468.seg
+[2m2026-08-30T03:24:36.986752Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000469.seg
+[2m2026-08-30T03:24:37.661620Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000470.seg
+[2m2026-08-30T03:24:38.289881Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000471.seg
+[2m2026-08-30T03:24:38.918504Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000472.seg
+[2m2026-08-30T03:24:39.538663Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000473.seg
+[2m2026-08-30T03:24:42.388848Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000018.sst (1052592 条)
+[2m2026-08-30T03:24:43.035751Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000474.seg
+[2m2026-08-30T03:24:43.759348Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000475.seg
+[2m2026-08-30T03:24:44.431148Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000476.seg
+[2m2026-08-30T03:24:45.102431Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000477.seg
+[2m2026-08-30T03:24:45.748318Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000478.seg
+[2m2026-08-30T03:24:46.393330Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000479.seg
+[2m2026-08-30T03:24:47.025624Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000480.seg
+[2m2026-08-30T03:24:47.733810Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000481.seg
+[2m2026-08-30T03:24:48.389878Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000482.seg
+[2m2026-08-30T03:24:49.030219Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000483.seg
+[2m2026-08-30T03:24:49.685979Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000484.seg
+[2m2026-08-30T03:24:50.380359Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000485.seg
+[2m2026-08-30T03:24:51.041627Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000486.seg
+[2m2026-08-30T03:24:51.801642Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000487.seg
+[2m2026-08-30T03:24:52.542462Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000488.seg
+[2m2026-08-30T03:24:53.344994Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000489.seg
+[2m2026-08-30T03:24:54.084354Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000490.seg
+[2m2026-08-30T03:24:54.784914Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000491.seg
+[2m2026-08-30T03:24:55.469000Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000492.seg
+[2m2026-08-30T03:24:56.257206Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000493.seg
+[2m2026-08-30T03:24:56.950501Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000494.seg
+[2m2026-08-30T03:24:57.782930Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000495.seg
+[2m2026-08-30T03:24:59.015388Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排刷盘完成: inverted-00000496.seg
+[2m2026-08-30T03:25:33.977826Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排 GC 完成: 496 段合并为 1（释放 144297173 字节）
+[2m2026-08-30T03:25:37.960646Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx-demo] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.920201Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.921297Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T03:25:49.921312Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T03:25:49.922423Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.923760Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.925418Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.926469Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T03:25:49.926482Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T03:25:49.927527Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.929168Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.930906Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.932062Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T03:25:49.932077Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T03:25:49.933251Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.934699Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.936481Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.937535Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 0 个段，下一个 id=1
+[2m2026-08-30T03:25:49.937552Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 0/0 段
+[2m2026-08-30T03:25:49.938360Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:25:49.939702Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:27:02.722006Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (1062997 条)
+[2m2026-08-30T03:27:05.888037Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (1063014 条)
+[2m2026-08-30T03:27:09.469181Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (1069632 条)
+[2m2026-08-30T03:27:13.188379Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000001.sst (1078216 条)
+[2m2026-08-30T03:28:26.476363Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (1059707 条)
+[2m2026-08-30T03:28:29.533228Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (1059724 条)
+[2m2026-08-30T03:28:33.569088Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (1066323 条)
+[2m2026-08-30T03:28:38.146018Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000002.sst (1074879 条)
+[2m2026-08-30T03:29:53.449538Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1051720 条)
+[2m2026-08-30T03:30:00.058897Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1051736 条)
+[2m2026-08-30T03:30:08.642350Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1058052 条)
+[2m2026-08-30T03:30:16.756736Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000003.sst (1066238 条)
+[2m2026-08-30T03:32:29.495044Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000004.sst (1047304 条)
+[2m2026-08-30T03:32:49.293346Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000004.sst (1047320 条)
+[2m2026-08-30T03:33:07.542509Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000004.sst (1053765 条)
+[2m2026-08-30T03:33:26.117963Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000004.sst (1062120 条)
+[2m2026-08-30T03:36:37.980344Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 刷盘完成: sst-00000019.sst (922633 条)
+[2m2026-08-30T03:39:32.750300Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [primary] 加载 19 个 SST，下一个 id=20
+[2m2026-08-30T03:39:32.752882Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m 倒排索引打开: 1 个段，下一个 id=498
+[2m2026-08-30T03:39:32.754233Z[0m [32m INFO[0m [2mshanshui_cunji::inverted[0m[2m:[0m FST 字典加载: 1/1 段
+[2m2026-08-30T03:40:00.758666Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [cidx] 加载 0 个 SST，下一个 id=1
+[2m2026-08-30T03:40:00.759931Z[0m [32m INFO[0m [2mshanshui_cunji::column_family[0m[2m:[0m 列族 [delta] 加载 0 个 SST，下一个 id=1
+功能               结果       耗时(ms)  说明
+----------------------------------------------------------------------------------------------------
+构造测试数据           ✅     150077.28  生成 20000000 条文档（status/city 倒排 + title/content/remark fulltext 分词；流式生成 100000 条耗时 750 ms）
+批量插入             ✅     422470.39  写入 20000000 / 20000000 条，422470 ms（47341 条/s；WAL 攒批 + 定期倒排刷盘 + 段 GC 合并 496 旧段 → 1 段，释放 137 MB）
+查询 · 主键          ✅          9.00  10 次主键点查，命中 10，未命中 0（稀疏索引→布隆→Zone Map→块缓存）
+查询 · HotCache    ✅          0.01  10 次重复查询，HotCache 命中 10 / 10（写后回填 + 读后回填）
+查询 · 组合索引        ✅        125.56  status=active 前缀扫描命中 100000 条（写入索引 100000 条）；10 次前缀点查命中 3
+查询 · 倒排词条        ✅       6853.65  city=beijing 命中 5000000 条（预期 5000000）；抽样回表 200000/200000 条验证；10 次检索累计命中 70000000；10 次 COUNT（内存位图）累计 70000000
+查询 · fulltext 分词 ✅       4739.01  10 次分词检索（content 字段：中文 bigram / 英文整词，每次回表 ≤10），累计命中 63030112
+查询 · 类 SQL       ✅        240.29  10 次等值 `status='active' AND city='beijing'`（倒排 AND 交集）+ 100 次 `AND amount BETWEEN lo AND hi`（后过滤快路径），累计命中 500+5000
+分片路由             ✅     636792.15  4 分片分布：shard0=5000000, shard1=5000000, shard2=5000000, shard3=5000000（合计 20000000）；分片点查命中 10/10
+删除               ✅         12.34  删除 10 条并验证不可见（Tombstone 落盘 + HotCache 失效）：10/10
+优化器路由            ✅          0.00  静态路由 5 类访问路径自检通过（主键点查/范围/组合索引/倒排/全扫）
+备份 · 还原          ✅     214171.76  备份 20000000 条库 → 还原重开：未删可读 9/9（缺失 0），已删仍不可见 1/1，city=beijing 计数 5000000（预期 5000000，含 tombstone）
+----------------------------------------------------------------------------------------------------
+总计：12/12 通过
+
+📄 HTML 报告已生成: images\perf-0.6.0\2000万-probe\report.html

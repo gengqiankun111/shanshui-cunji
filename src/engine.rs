@@ -8,11 +8,13 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
+use tracing::{info, warn};
 
+use crate::bitmap::DeletionBitmap;
 use crate::column_family::ColumnFamily;
 use crate::config::model::Config;
 use crate::error::Result;
@@ -20,19 +22,23 @@ use crate::hotcache::HotCache;
 use crate::inverted::InvertedIndex;
 use crate::keys::{decode_docid, encode_docid, encode_varlen};
 use crate::optimizer::{route, AccessPath, QuerySpec};
+use crate::outbox::Outbox;
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
 /// 引擎：组合主数据 + 组合索引 + Delta 增量 + 倒排 + HotCache。
 pub struct Engine {
     /// 主数据列族（value = 序列化文档字节）。
-    primary: ColumnFamily,
+    /// P72（无锁合并）：`Arc<ColumnFamily>`——mysql 后台 worker clone 三 CF Arc 后无锁合并，
+    /// flush/compact 的 ssts 变更经 CF 内部 `sst_mutate` 互斥（不再依赖 Engine RwLock 串行）。
+    primary: Arc<ColumnFamily>,
     /// 组合索引列族（key = encode_composite_key）。
-    cidx: Option<ColumnFamily>,
+    cidx: Option<Arc<ColumnFamily>>,
     /// Delta 增量列族（阶段 1.5，key = encode_docid ++ VarLen(field)，Merge-on-Read 覆盖 Base）。
-    delta: ColumnFamily,
-    /// 倒排索引。
-    inverted: InvertedIndex,
-    /// 文档热缓存。
+    delta: Arc<ColumnFamily>,
+    /// 倒排索引。J 项（7.73）：`Arc`（后台 GC worker 无锁 clone 后执行 gc）。
+    pub inverted: Arc<InvertedIndex>,
+    /// 文档热缓存（7.72：内部 RwLock+DashMap 粒度化——读路径 `&self` 读读并行、
+    /// 写路径（put/invalidate/promote）写锁，不再整包 Mutex 串行热缓存访问）。
     hotcache: HotCache,
     /// 看门狗（OOM 限流 + 查询超时熔断）。
     watchdog: Watchdog,
@@ -60,13 +66,169 @@ pub struct Engine {
     /// 中文分词器（M8-P13）：true = jieba 完整词典分词（需 cjk-jieba feature）；
     /// false = bigram（M8-P9）。来自 `[inverted] cjk_segmenter`。
     use_jieba: bool,
+    /// 写入 Enrich（design 19 / development 5.21）：Some((fail_policy, from_field, to_field)) =
+    /// 启用 local 数据源预连接（server /put 走 join::put_with_enrich）；None = 关闭（零开销）。
+    enrich: Option<(String, String, String)>,
     /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
     /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
     skip_hotcache: bool,
+    /// 倒排更新攒批缓冲（Ex-5.3）：put 时 term 先入缓冲，达阈值/查询/flush 时
+    /// 一次性 `add_batch` 批量刷入内存字典——低基数 term 跨行聚合，
+    /// 减少 DashMap 锁操作次数（N×字段数 → ~唯一 term 数）。
+    /// 崩溃安全：WAL 回放重新走 put 重建倒排，缓冲丢失不丢数据。
+    /// O 项第②步：内部 `Mutex`——倒排读路径 `&self` 下也能先刷缓冲再查（一致性）。
+    pending_inverted: Mutex<Vec<(String, u64)>>,
+    /// Compaction 并行度（Ex-5.4）：并行压实 primary/cidx/delta 三列族；
+    /// 0 = 自动（min(4, 核数/2)），1 = 串行，>1 = 指定并行数。
+    compaction_parallel: usize,
+    /// P 项：事件驱动自动 Compaction（`storage.auto_compact`）——写入路径自触发：
+    /// 写前 L0 达硬顶（l0_stall_max）先合并（背压），写后 L0 超阈值（段数/大小）合并收敛。
+    auto_compact: bool,
+    /// O 项第③步：后台合并信号——写路径检测 L0 超阈值时置位（AcqRel）；mysql 服务
+    /// 的后台 worker 读取后读锁下合并。无 worker 场景（demo/rpc/测试）由同步路径直接消费。
+    pub compact_pending: Arc<AtomicBool>,
+    /// O 项第③步：后台合并 worker 挂载标记（服务进程 spawn 时置 true）——
+    /// true 时写路径只发信号（合并不阻塞读写）；false 保持同步合并（写入退避=背压）。
+    pub compact_worker: Arc<AtomicBool>,
+    /// J 项（7.73）：倒排段 GC 后台信号——写路径刷盘后检测段超 GC 阈值时置位；mysql 服务
+    /// 的后台 GC worker 读取后检查 `should_gc()` 并执行 `inverted.gc()`（无 worker 场景
+    /// 由 demo/显式 inverted_gc 消费）。
+    pub inverted_gc_pending: Arc<AtomicBool>,
+    /// 删除位图（Ex-5.6）：Some = 开启（delete 写 1bit 跳 Tombstone、get O(1) 跳过、
+    /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
+    /// P72：`Arc`——worker 无锁合并 clone 后并发读位图过滤（写路径在 Engine 写锁内）。
+    deletion_bitmap: Option<Arc<DeletionBitmap>>,
+    /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
+    /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
+    affinity: crate::affinity::CpuPartition,
+    /// 后台 IO 限速基准（字节/秒，Ex-7.4）：`storage.io_rate_limit_mb` 换算；0 = 不限速。
+    io_rate_base_bytes: u64,
+    /// MemTable 容量上限（字节，Ex-7.4 写压力代理基准，`memtable.max_size_mb`）。
+    memtable_max_bytes: usize,
+    /// 本地消息表（Ex-1）：Some = 启用（业务写同一本地事务入队 outbox，后台投递幂等消费）；
+    /// None = 关闭（默认零开销）。
+    outbox: Option<Outbox>,
+    /// 事务锁表（F 阶段三）：docid 级排他写锁 / 共享读锁 + wait-for 死锁检测。
+    /// O 项第②步：内部 `Mutex`——RR 快照读只读并行时，SERIALIZABLE 读锁 / 提交写锁经锁内互斥。
+    txn_locks: Mutex<crate::txn::LockTable>,
+    /// 数据目录（P52 看门狗磁盘水位检测目标）。
+    data_dir: std::path::PathBuf,
+    /// V 项：io_uring 后端池（Linux + `runtime.io_uring_enabled` 时初始化；Windows 无此字段）。
+    /// 按 IoClass 三队列 SQPOLL，read_at/write_at/fsync 经 `io_uring_*` 方法转发；
+    /// 已接入热路径——CF 打开时注入（SST 块读 + WAL fsync 走 SQPOLL 队列）。
+    #[cfg(target_os = "linux")]
+    iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
+    /// X 项：Prometheus 风格指标（读写计数 + 延迟直方图 + Compaction/Flush 次数；
+    /// 网络层连接/语句由服务进程写入共享 Metrics）。
+    pub metrics: crate::metrics::Metrics,
+    /// 10 亿库阶段 D：分片级指标（docid 水位 + 读写计数 + 上限预警）；默认 None，
+    /// 分片部署时 `attach_shard_metrics(n)` 挂载。
+    pub shard_metrics: std::sync::Mutex<Option<crate::shard_metrics::ShardMetricsRegistry>>,
 }
+
+/// 倒排攒批缓冲阈值（条，Ex-5.3）：达此值强制 `flush_inverted_pending`。
+const INVERTED_PENDING_CAP: usize = 8192;
 
 /// 查询结果行：docid + 文档字节。
 pub type QueryRow = (u64, Vec<u8>);
+
+/// 合并两列族的压实报告（Ex-5.4：multi-CF 聚合；out_level 保留 base 值）。
+fn merge_report(base: &mut crate::column_family::CompactReport, other: &crate::column_family::CompactReport) {
+    base.merged_ssts += other.merged_ssts;
+    base.kept_keys += other.kept_keys;
+    base.freed_bytes += other.freed_bytes;
+}
+
+/// P72（无锁合并）：`Engine::compaction_targets` 的产物——已 clone 的三 CF Arc + 删除位图 Arc
+/// 与最高紧迫度档判定。mysql worker drop Engine 读锁后调 `run()` 无锁合并。
+pub struct CompactTargets {
+    /// 删除位图（Some 且 deleted_count>0 → 合并过滤已删键；None = 传统 Tombstone 路径）。
+    pub deletion_bitmap: Option<Arc<DeletionBitmap>>,
+    /// 主数据列族 Arc（clone 共享）。
+    pub primary: Arc<ColumnFamily>,
+    /// 组合索引列族（可能未启用 / 非最高紧迫度档）。
+    pub cidx: Option<Arc<ColumnFamily>>,
+    /// Delta 增量列族 Arc。
+    pub delta: Arc<ColumnFamily>,
+    /// 各列族是否为本轮最高紧迫度档（紧凑调度，与 `Engine::compact` 一致）。
+    pub do_primary: bool,
+    pub do_cidx: bool,
+    pub do_delta: bool,
+}
+
+impl CompactTargets {
+    /// 无锁合并执行：仅压最高紧迫度档列族（串行；并列场景由 worker 下一轮收敛）。
+    /// 与写并发安全：compact 不碰 memtable；ssts 变更经 CF `sst_mutate` 与 flush 互斥。
+    pub fn run(&self) -> Result<crate::column_family::CompactReport> {
+        let empty = crate::column_family::CompactReport {
+            merged_ssts: 0,
+            kept_keys: 0,
+            freed_bytes: 0,
+            out_level: 0,
+        };
+        let mut rep = empty;
+        let bm = self.deletion_bitmap.as_ref();
+        let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
+        if self.do_primary {
+            let r = if needs_filter {
+                let f = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
+                self.primary.compact_filtered(&f)?
+            } else {
+                self.primary.compact()?
+            };
+            merge_report(&mut rep, &r);
+        }
+        if self.do_cidx {
+            if let Some(c) = &self.cidx {
+                let r = c.compact()?;
+                merge_report(&mut rep, &r);
+            }
+        }
+        if self.do_delta {
+            let r = self.delta.compact()?;
+            merge_report(&mut rep, &r);
+        }
+        Ok(rep)
+    }
+}
+
+/// N 项：Delta 批量覆盖收集——单次范围扫描 `[min..max]`（docid 编码 + 字段变长前缀），
+/// 按 docid 分组返回字段覆盖列表（`null` 值 = 删除字段），替代逐 docid 扫描。
+/// key 布局与 `Engine::patch`/`get` 一致：8 字节 docid ++ 4 字节 VarLen 前缀 ++ 字段名。
+/// O 项第②步：`&ColumnFamily`（delta 扫描读路径已 &self）。
+fn batch_delta_overrides(
+    delta: &ColumnFamily,
+    docids: &[u64],
+) -> Result<std::collections::HashMap<u64, Vec<(String, serde_json::Value)>>> {
+    let mut out: std::collections::HashMap<u64, Vec<(String, serde_json::Value)>> =
+        std::collections::HashMap::new();
+    let (Some(&min), Some(&max)) = (docids.iter().min(), docids.iter().max()) else {
+        return Ok(out);
+    };
+    let start = encode_docid(min).to_vec();
+    let mut end = encode_docid(max).to_vec();
+    end.extend_from_slice(&[0xFF; 4]);
+    let rows = delta.scan_raw_range(Some(&start), Some(&end))?;
+    for (k, v) in rows {
+        if k.len() < 12 {
+            continue;
+        }
+        let docid = match decode_docid(&k[..8]) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let field = match String::from_utf8(k[12..].to_vec()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let val: serde_json::Value = match serde_json::from_slice(&v) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        out.entry(docid).or_default().push((field, val));
+    }
+    Ok(out)
+}
 
 /// 分页查询结果（M8-P8）：`total` = 全量命中数（倒排 bitmap.len()，O(1)），
 /// `rows` = 当前页（只回表 limit 行，内存 O(limit) 不随 total 膨胀——
@@ -108,9 +270,22 @@ pub struct EngineStats {
     pub mem_ratio: f64,
     /// 内存硬上限（MB）。
     pub max_memory_mb: usize,
+    /// 磁盘剩余空间占比（0~1；检测失败 = 1.0）。
+    pub disk_ratio: f64,
+    /// 磁盘空间状态（Normal/Throttled/Stalled，P52）。
+    pub disk_status: String,
+    /// CPU 并发查询数（P52 代理信号）。
+    pub cpu_active_queries: usize,
+    /// CPU 并发查询上限。
+    pub cpu_query_limit: usize,
 }
 
 impl Engine {
+    /// 数据目录（Ex-2.5 网关 SAGA 状态持久化目录据此派生 `{data_dir}/saga`）。
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     /// 打开（或创建）引擎。倒排刷盘阈值取自内存预算的比例（MVP 固定 1M posting）。
     pub fn open(data_dir: &Path, cfg: &Config) -> Result<Self> {
         Self::open_with_timeout(data_dir, cfg, DEFAULT_QUERY_TIMEOUT)
@@ -122,32 +297,143 @@ impl Engine {
         cfg: &Config,
         query_timeout: std::time::Duration,
     ) -> Result<Self> {
-        let primary = ColumnFamily::open("primary", &data_dir.join("primary"), cfg)?;
+        // Ex-5.10 多 SSD 条带化目录路由：WAL 独占最快盘（wal_dir），SSTable 数据盘（sst_dir），
+        // 倒排独立盘（inverted_dir）；未配置时回退单盘 data_dir 布局（旧行为）。
+        let sst_root = cfg.storage.sst_dir.as_deref().map(Path::new).unwrap_or(data_dir);
+        let wal_root = cfg.storage.wal_dir.as_deref().map(Path::new).unwrap_or(sst_root);
+        let inverted_root = cfg
+            .storage
+            .inverted_dir
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(data_dir);
+        // V 项：io_uring 后端池初始化（Linux + `runtime.io_uring_enabled`）——SQPOLL 三队列
+        // （WAL/SST/倒排）+ affinity 三池外预留核；提前到 CF 打开之前创建，注入各 CF
+        // （SST 块读 + WAL fsync 走 io_uring）。Windows 编译为空（cfg 移除变量）。
+        #[cfg(target_os = "linux")]
+        let iou = {
+            let affinity = crate::affinity::plan_partition(&cfg.affinity);
+            if crate::io_queue::io_uring_enabled(&cfg.runtime) {
+                let sqpoll_cpu =
+                    crate::affinity::reserve_sqpoll_core(&affinity).map(|c| c as u32);
+                let pool = crate::io_queue::backend::IoUringPool::open(256, 1000, sqpoll_cpu);
+                match &pool {
+                    Ok(_) => info!(
+                        "io_uring 后端池初始化成功（SQPOLL 三队列，预留核={:?}）",
+                        sqpoll_cpu
+                    ),
+                    Err(e) => warn!(
+                        "io_uring 后端池初始化失败，回退同步 IO: {e}（io_uring_enabled 未生效）"
+                    ),
+                }
+                pool.ok().map(std::sync::Arc::new)
+            } else {
+                info!("io_uring 未启用（runtime.io_uring_enabled=false），走同步 IO");
+                None
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let primary = Arc::new(ColumnFamily::open_with_io_uring(
+            "primary",
+            &sst_root.join("primary"),
+            Some(wal_root),
+            cfg,
+            iou.clone(),
+        )?);
+        #[cfg(not(target_os = "linux"))]
+        let primary = Arc::new(ColumnFamily::open_with_wal_dir(
+            "primary",
+            &sst_root.join("primary"),
+            Some(wal_root),
+            cfg,
+        )?);
         let mut inverted = InvertedIndex::open_with_gc(
-            &data_dir.join("inverted"),
-            1_000_000,
+            &inverted_root.join("inverted"),
+            // L 项：倒排刷盘阈值可配（config.inverted.flush_threshold；0 = 默认 100 万 term 对）
+            if cfg.inverted.flush_threshold > 0 {
+                cfg.inverted.flush_threshold
+            } else {
+                1_000_000
+            },
             &cfg.inverted.engine,
             cfg.inverted.segment_max_size_mb * 1024 * 1024,
         )?;
         // 位图索引（design 5.2.4，M7-2）：白名单非空时全量重建内存位图
         inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
-        let cidx = ColumnFamily::open("cidx", &data_dir.join("cidx"), cfg).ok();
-        let delta = ColumnFamily::open("delta", &data_dir.join("delta"), cfg)?;
+        let cidx = {
+            // V 项：Linux + 启用时注入 io_uring 池（cidx 可选 CF，失败容忍）
+            #[cfg(target_os = "linux")]
+            {
+                ColumnFamily::open_with_io_uring(
+                    "cidx",
+                    &sst_root.join("cidx"),
+                    Some(wal_root),
+                    cfg,
+                    iou.clone(),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                ColumnFamily::open_with_wal_dir(
+                    "cidx",
+                    &sst_root.join("cidx"),
+                    Some(wal_root),
+                    cfg,
+                )
+            }
+        }
+        .ok()
+        .map(Arc::new);
+        #[cfg(target_os = "linux")]
+        let delta = Arc::new(ColumnFamily::open_with_io_uring(
+            "delta",
+            &sst_root.join("delta"),
+            Some(wal_root),
+            cfg,
+            iou.clone(),
+        )?);
+        #[cfg(not(target_os = "linux"))]
+        let delta = Arc::new(ColumnFamily::open_with_wal_dir(
+            "delta",
+            &sst_root.join("delta"),
+            Some(wal_root),
+            cfg,
+        )?);
+        // 删除位图（Ex-5.6）：开启时加载/创建独立位图文件（4KB 页对齐，见 bitmap.rs）
+        let deletion_bitmap = if cfg.storage.deletion_bitmap_enabled {
+            Some(Arc::new(DeletionBitmap::open(&data_dir.join("deletion.bitmap"))?))
+        } else {
+            None
+        };
+        // 本地消息表（Ex-1）：开启时打开 outbox 列族（数据盘，与 primary 同崩溃安全模型）
+        let outbox = if cfg.outbox.enabled {
+            Some(Outbox::open(&sst_root.join("outbox"), cfg)?)
+        } else {
+            None
+        };
         // MVCC 全局 seq（M7-1）：以各列族 WAL 恢复后的 next_seq 取最大作为全局起点，
-        // 此后 primary / delta 写入共享同一计数器（跨列族快照隔离正确）。
+        // 此后 primary / delta / outbox 写入共享同一计数器（跨列族快照隔离正确）。
         let global_seq = Arc::new(AtomicU64::new(
-            primary.wal_next_seq().max(delta.wal_next_seq()),
+            primary
+                .wal_next_seq()
+                .max(delta.wal_next_seq())
+                .max(outbox.as_ref().map_or(0, |o| o.wal_next_seq())),
         ));
+        // P72：open 阶段 worker 尚未 clone Arc → get_mut 唯一引用可行（此后 CF 内部 &self 维护）
         let mut primary = primary;
-        primary.set_external_seq(Arc::clone(&global_seq));
+        Arc::get_mut(&mut primary)
+            .unwrap()
+            .set_external_seq(Arc::clone(&global_seq));
         let mut delta = delta;
-        delta.set_external_seq(Arc::clone(&global_seq));
+        Arc::get_mut(&mut delta)
+            .unwrap()
+            .set_external_seq(Arc::clone(&global_seq));
         let hotcache = HotCache::new(cfg.hotcache.clone());
         let watchdog = Watchdog::new(cfg, query_timeout);
         let mut engine = Self {
             primary,
             cidx,
-            inverted,
+            inverted: Arc::new(inverted),
             delta,
             hotcache,
             watchdog,
@@ -166,7 +452,34 @@ impl Engine {
             max_term_len: cfg.inverted.max_term_len,
             fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
             use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
+            // 写入 Enrich（design 19 / development 5.21）：`[enrich] enabled && source=local` 启用
+            enrich: if cfg.enrich.enabled && cfg.enrich.source == "local" {
+                Some((
+                    cfg.enrich.fail_policy.clone(),
+                    cfg.enrich.from_field.clone(),
+                    cfg.enrich.to_field.clone(),
+                ))
+            } else {
+                None
+            },
             skip_hotcache: false,
+            pending_inverted: Mutex::new(Vec::new()),
+            compaction_parallel: cfg.storage.compaction_parallel,
+            auto_compact: cfg.storage.auto_compact,
+            compact_pending: Arc::new(AtomicBool::new(false)),
+            compact_worker: Arc::new(AtomicBool::new(false)),
+            inverted_gc_pending: Arc::new(AtomicBool::new(false)),
+            deletion_bitmap,
+            affinity: crate::affinity::plan_partition(&cfg.affinity),
+            io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
+            memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
+            outbox,
+            txn_locks: Mutex::new(crate::txn::LockTable::new()),
+            data_dir: data_dir.to_path_buf(),
+            #[cfg(target_os = "linux")]
+            iou,
+            metrics: crate::metrics::Metrics::default(),
+            shard_metrics: std::sync::Mutex::new(None),
         };
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
@@ -197,7 +510,10 @@ impl Engine {
             Duration::from_millis(10)
         };
         self.gc_stop = Some(stop);
-        self.gc_thread = Some(std::thread::spawn(move || loop {
+        let io_cores = self.affinity.io.clone(); // Ex-7.2：IO 后台线程绑 io 核
+        self.gc_thread = Some(std::thread::spawn(move || {
+            crate::affinity::bind_current(&io_cores); // 失败仅忽略（no-op）
+            loop {
             std::thread::sleep(tick);
             if stop2.load(Ordering::Relaxed) {
                 break;
@@ -211,6 +527,7 @@ impl Engine {
                         }
                     }
                 });
+            }
             }
         }));
     }
@@ -240,12 +557,44 @@ impl Engine {
     /// 写入文档（docid + 序列化字节 + 该文档涉及的倒排词条）。
     /// 写失效链：先失效 HotCache 与组合索引旧条目，最后写 LSM（design 6.6）。
     /// OOM Guardian：写入前按水位限流/熔断（design 14.1.1）。
+    /// X 项：写操作计数 + 延迟直方图。
     pub fn put(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
-        // 内存限流：软水位返回限流信号（MVP 仍放行，记录计数）；硬水位直接拒绝
-        let _status = self.watchdog.memory_check(self.mem_ratio)?;
+        let t = std::time::Instant::now();
+        // 看门狗统一检查（P52）：内存硬水位熔断 + 磁盘剩余空间熔断；软水位放行记录
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.put_nosync(docid, value, terms)?;
         // 组提交（M8）：开启时窗口内攒批一次 fsync，否则逐条 fsync（强安全）
-        self.maybe_group_commit()
+        self.maybe_group_commit()?;
+        // Ex-7.4：按前台写压力动态调整 Compaction 限速（MemTable 水位让路）
+        self.adjust_compaction_io_rate();
+        self.metrics.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_latency(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// Ex-7.4：动态限流——按主数据 MemTable 水位（前台写压力代理）下调 Compaction 限速：
+    /// 压力 p → 限速 = base × (1 - 0.5p)——压力 0 全速追赶 L0 合并，压力 1 让路 50%
+    /// 磁盘带宽给前台写（design_extension 12.6：写压力高时压缩 Compaction 带宽）。
+    /// L 项：同源压力同步给各列族 set_write_pressure（动态 L0 阈值反馈），独立于限速配置。
+    fn adjust_compaction_io_rate(&mut self) {
+        let used = self.primary.memtable_bytes() as f64;
+        let max = self.memtable_max_bytes.max(1) as f64;
+        let pressure = (used / max).clamp(0.0, 1.0);
+        // L 项：写压力 → 各列族动态 L0 阈值（高峰收窄提前收敛）
+        self.primary.set_write_pressure(pressure);
+        self.delta.set_write_pressure(pressure);
+        if let Some(c) = &self.cidx {
+            c.set_write_pressure(pressure);
+        }
+        if self.io_rate_base_bytes == 0 {
+            return; // 未配置限速（io_rate_limit_mb = 0）
+        }
+        let rate = (self.io_rate_base_bytes as f64 * (1.0 - 0.5 * pressure)) as u64;
+        self.primary.set_io_rate_bytes(rate);
+        self.delta.set_io_rate_bytes(rate);
+        if let Some(c) = &self.cidx {
+            c.set_io_rate_bytes(rate);
+        }
     }
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
@@ -258,26 +607,212 @@ impl Engine {
         self.primary
             .put_bytes_nosync(encode_docid(docid).to_vec(), value.clone())?;
         self.delta.delete_prefix(&encode_docid(docid))?;
-        // ③ 倒排（内存字典累积，达阈值由调用方/后台刷盘）；
+        // ②.5 删除位图复活（Ex-5.6）：put 覆盖 delete → 清位（O(1) 内存，位未置时零 IO）；
+        //     持久性与 WAL 同步（flush_wal 先刷位图后刷 WAL）
+        if let Some(bm) = &self.deletion_bitmap {
+            bm.clear(docid);
+        }
+        // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
         //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
         for t in terms {
             if self.inverted_allowed(t) {
-                self.inverted.add(t, docid);
+                self.pending_inverted.lock().unwrap().push((t.to_string(), docid));
             }
+        }
+        if self.pending_inverted.lock().unwrap().len() >= INVERTED_PENDING_CAP {
+            self.flush_inverted_pending();
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中；批量导入模式跳过，P40）
         if !self.skip_hotcache {
             self.hotcache.put(docid, value);
         }
+        // P 项：事件驱动自动 Compaction——写后检查（Flush 可能刚新增 L0 段），
+        // L0 段数/大小超阈值 → 同步合并收敛（写入自然退避 = 背压）。
+        self.auto_compact()?;
         Ok(())
+    }
+
+    /// 批量写入（原子批次，用户端批量语义）：一次性提交一组 `(docid, value, terms)`——
+    /// put_nosync 攒批 + 一次 `flush_wal` 统一提交（整批落盘或崩溃后按 WAL 批次整体重放，
+    /// 无中间态；与组提交正交——显式批次边界，延迟可预期）。
+    /// 为 D 项（LSM 事务阶段一 WriteBatch 原子写）的前置基础；单条语义同 `put`。
+    pub fn put_batch(&mut self, items: &[(u64, Vec<u8>, Vec<String>)]) -> Result<()> {
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
+        for (docid, value, terms) in items {
+            let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            self.put_nosync(*docid, value.clone(), &refs)?;
+        }
+        self.flush_wal()
+    }
+
+    // ===== D/E/F 事务三阶段 =====
+
+    /// D 阶段一：WriteBatch 原子提交。预校验（失败零副作用 = "失败回滚"）→ 逐条应用 →
+    /// 单次 `flush_wal`。崩溃原子：WAL 单次 fsync 批次整体重放（整批恢复或整批丢弃，无中间态）。
+    /// 等价于 `put_batch` + delete 语义 + 事务上下文（回滚 = 丢弃未应用的批次）。
+    pub fn write(&mut self, batch: &crate::txn::WriteBatch) -> Result<()> {
+        batch.validate()?;
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
+        for op in batch.ops() {
+            match op {
+                crate::txn::Op::Put {
+                    docid,
+                    value,
+                    terms,
+                } => {
+                    let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                    self.put_nosync(*docid, value.clone(), &refs)?;
+                }
+                crate::txn::Op::Delete { docid } => self.delete(*docid)?,
+            }
+        }
+        self.flush_wal()
+    }
+
+    /// E/F：开启事务。快照 seq = 当前已分配最大全局 seq（RR/SERIALIZABLE 一致读基准）。
+    pub fn txn_begin(&mut self, isolation: crate::txn::Isolation) -> crate::txn::Transaction {
+        crate::txn::Transaction::new(isolation, self.begin_snapshot())
+    }
+
+    /// E/F：事务读。RC = 最新已提交（`get`）；RR/SERIALIZABLE = 快照一致读（`get_at`）；
+    /// SERIALIZABLE 读目标额外加共享锁（2PL，读锁持有至提交）。
+    /// H-4：先查本事务未提交的写（`read_own`，同事务写后读可见），再走引擎。
+    /// O 项第②步：读路径 `&self`（RR/RC 快照只读并行；SERIALIZABLE 读锁经 `txn_locks` 内部 Mutex）。
+    pub fn txn_get(
+        &self,
+        txn: &mut crate::txn::Transaction,
+        docid: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        // 同事务写后读可见（未提交的攒批写优先）
+        if let Some(own) = txn.read_own(docid) {
+            return Ok(own.map(|v| v.to_vec()));
+        }
+        // T 项：RR/SERIALIZABLE 快照读——事务内点查小缓存（同 key 二次读直达，免 LSM 冷读
+        // 放大；快照 seq 事务内恒定 → 缓存结果一致）。命中跳过加锁（首次读已加）。
+        if txn.isolation.uses_snapshot() {
+            if let Some(v) = txn.snap_get(docid) {
+                return Ok(v);
+            }
+        }
+        if txn.isolation.locks_reads() {
+            self.txn_locks.lock().unwrap().acquire_shared(txn.id, docid)?;
+            txn.add_lock(docid);
+        }
+        let result = if txn.isolation.uses_snapshot() {
+            self.get_at(docid, txn.snapshot())
+        } else {
+            self.get(docid)
+        };
+        // 仅快照读写缓存（RC 读最新，缓存会破坏语义）；错误结果不缓存
+        if txn.isolation.uses_snapshot() {
+            if let Ok(v) = &result {
+                txn.snap_put(docid, v.clone());
+            }
+        }
+        result
+    }
+
+    /// E/F：事务提交。写锁（write_set 全目标排他，含共享→排他升级）→
+    /// 写写冲突检测（RR/SERIALIZABLE：目标在快照后被并发事务修改 → `TxnConflict` abort）→
+    /// 应用 ops + 单次 flush_wal → 释放全部锁（失败路径同样释放，防锁泄漏）。
+    pub fn txn_commit(&mut self, mut txn: crate::txn::Transaction) -> Result<()> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        let result = (|| -> Result<()> {
+            txn.validate()?;
+            // P52：提交前统一看门狗检查（内存/磁盘熔断）
+            self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
+            // ① 写锁（SERIALIZABLE 已持共享锁的 docid 自动升级为排他）
+            let targets: Vec<u64> = txn.write_set().iter().copied().collect();
+            for d in targets {
+                self.txn_locks
+                    .lock()
+                    .unwrap()
+                    .acquire_exclusive(txn.id, d)?;
+                txn.add_lock(d);
+            }
+            // ② 写写冲突检测（RR/SERIALIZABLE）
+            if txn.isolation.checks_write_conflict() {
+                for &d in txn.write_set() {
+                    let cur = self.last_write_seq(d)?;
+                    if cur > txn.snapshot() {
+                        return Err(crate::error::Error::TxnConflict(format!(
+                            "txn#{} 写冲突：docid={d} 在快照 {} 后被并发事务修改（当前 seq {cur}）",
+                            txn.id,
+                            txn.snapshot()
+                        )));
+                    }
+                }
+            }
+            // ③ 应用 + 单次 flush_wal（崩溃原子）
+            for op in txn.ops() {
+                match op {
+                    crate::txn::Op::Put {
+                        docid,
+                        value,
+                        terms,
+                    } => {
+                        let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                        self.put_nosync(*docid, value.clone(), &refs)?;
+                    }
+                    crate::txn::Op::Delete { docid } => self.delete(*docid)?,
+                }
+            }
+            self.flush_wal()?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            txn.mark_finished();
+        }
+        self.txn_locks.lock().unwrap().release(txn.id);
+        result
+    }
+
+    /// E/F：事务回滚（丢弃攒批 + 释放锁，引擎零变更）。
+    pub fn txn_rollback(&mut self, mut txn: crate::txn::Transaction) {
+        if txn.is_finished() {
+            return;
+        }
+        txn.mark_finished();
+        self.txn_locks.lock().unwrap().release(txn.id);
+    }
+
+    /// 写冲突检测辅助：docid 最后一次写入的全局 seq（主数据权威源）。
+    /// 删除位图模式下删除视为当前 seq 的写（保守：宁可多冲突不漏检）。
+    fn last_write_seq(&mut self, docid: u64) -> Result<u64> {
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.is_deleted(docid) {
+                return Ok(self.current_seq());
+            }
+        }
+        match self.primary.get_bytes(&encode_docid(docid))? {
+            Some((_, seq)) => Ok(seq),
+            None => Ok(0),
+        }
     }
 
     /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
     /// term 编码 `field=value`，field 为 JSON 字段路径（嵌套用 `.` 连接）。
+    /// fulltext 词 term（`ft:{field}:{token}`）与 inverted_fields 白名单正交：是否建索引
+    /// 由 fulltext_fields 声明决定（白名单非空时 ft: term 不被滤掉，否则无法分词检索）。
     fn inverted_allowed(&self, term: &str) -> bool {
         // 超长 term（长文本整串）自动跳过：防止误配下字典膨胀
         if self.max_term_len > 0 && term.len() > self.max_term_len {
             return false;
+        }
+        if let Some(rest) = term.strip_prefix("ft:") {
+            let field = rest.split(':').next().unwrap_or("");
+            return self.fulltext_fields.contains(field);
         }
         let field = term.split('=').next().unwrap_or("");
         if let Some(include) = &self.inverted_include {
@@ -287,9 +822,18 @@ impl Engine {
     }
 
     /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
+    /// Ex-5.6：删除位图脏页**先于** WAL fsync 落盘——若崩溃发生在 WAL fsync 之后、
+    /// 环形 WAL 截断推进之前，位图已持久（删除不丢）；反之位图先持久、WAL 回放重删幂等。
     pub fn flush_wal(&mut self) -> Result<()> {
+        if let Some(bm) = &self.deletion_bitmap {
+            bm.flush()?;
+        }
         self.primary.sync_wal()?;
         self.delta.sync_wal()?;
+        // Ex-1：outbox 消息与业务写同 fsync 点（本地原子：崩溃恢复按 seq 回放）
+        if let Some(ob) = &mut self.outbox {
+            ob.sync_wal()?;
+        }
         Ok(())
     }
 
@@ -367,11 +911,25 @@ impl Engine {
         Ok(applied)
     }
 
-    /// 删除文档：主数据 Tombstone + 失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
+    /// 删除文档：失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
+    /// Ex-5.6：删除位图开启时**仅写 1bit + WAL 删除记录**（不写 memtable Tombstone，
+    /// 不逐条 fsync——墓碑不进入 LSM 层级，-99% IO）；WAL 记录供增量备份导出/崩溃回放
+    /// （回放转本函数重新置位，幂等）。关闭时回退传统 Tombstone 路径。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.hotcache.invalidate(docid);
-        self.primary.delete(docid)?;
-        self.delta.delete_prefix(&encode_docid(docid))?;
+        match &self.deletion_bitmap {
+            Some(bm) => {
+                bm.mark_deleted(docid);
+                self.primary
+                    .delete_record_wal(encode_docid(docid).to_vec())?;
+                self.delta.delete_prefix(&encode_docid(docid))?;
+            }
+            None => {
+                self.primary.delete(docid)?;
+                self.delta.delete_prefix(&encode_docid(docid))?;
+            }
+        }
         Ok(())
     }
 
@@ -390,7 +948,17 @@ impl Engine {
     }
 
     /// 点查文档：HotCache 命中直达，否则主数据 LSM + Delta Merge-on-Read。
-    pub fn get(&mut self, docid: u64) -> Result<Option<Vec<u8>>> {
+    /// Ex-5.6：删除位图开启时先 O(1) 判定，已删文档直接返回 None（零 LSM 读）。
+    /// O 项第②步：读路径 `&self`（HotCache 内部 Mutex）。
+    /// X 项：读操作计数 + 延迟直方图（完整路径）。
+    pub fn get(&self, docid: u64) -> Result<Option<Vec<u8>>> {
+        self.metrics.read_ops.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.is_deleted(docid) {
+                return Ok(None);
+            }
+        }
         if let Some(v) = self.hotcache.get(docid) {
             return Ok(Some(v));
         }
@@ -428,7 +996,80 @@ impl Engine {
         let merged =
             serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
         self.hotcache.put(docid, merged.clone());
+        self.metrics.record_latency(t.elapsed().as_nanos() as u64);
         Ok(Some(merged))
+    }
+
+    /// 批量回表（N 项：借鉴 batch_get 建议落地；倒排/全文检索 posting 回表路径）。
+    /// 语义与 `get` 一致（删除位图 / HotCache / Delta 字段覆盖），但一次处理多个 docid：
+    /// ① 删除位图 O(1) 批量过滤；② HotCache 批量命中；③ primary `get_many` 批量读
+    /// （SST 层按块分组，同块多 key 只读/解压一次，块缓存复用）；④ Delta 覆盖用**单次
+    /// 范围扫描** [min..max] 按 docid 分组，替代逐 docid 扫描。
+    /// 输入要求：docids 升序且无重复（倒排 bitmap 迭代天然满足）。
+    /// 返回与输入顺序对齐的 `Vec<Option<value>>`。
+    /// O 项第②步：读路径 `&self`（HotCache 内部 RwLock 读读并行 + DashMap 无锁计数）。
+    pub fn batch_get(&self, docids: &[u64]) -> Result<Vec<Option<Vec<u8>>>> {
+        let n = docids.len();
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; n];
+        if n == 0 {
+            return Ok(out);
+        }
+        // ① 删除位图 + ② HotCache
+        let mut need_primary: Vec<usize> = Vec::new();
+        for (i, &d) in docids.iter().enumerate() {
+            if let Some(bm) = &self.deletion_bitmap {
+                if bm.is_deleted(d) {
+                    continue;
+                }
+            }
+            if let Some(v) = self.hotcache.get(d) {
+                out[i] = Some(v);
+            } else {
+                need_primary.push(i);
+            }
+        }
+        if need_primary.is_empty() {
+            return Ok(out);
+        }
+        let sub: Vec<u64> = need_primary.iter().map(|&i| docids[i]).collect();
+        let found = self.primary.get_many(&sub)?; // Vec<Option<(value, seq)>>
+        // ④ Delta 批量覆盖（单次范围扫描，按 docid 分组）
+        let overrides = batch_delta_overrides(&self.delta, &sub)?;
+        for (j, &i) in need_primary.iter().enumerate() {
+            let d = docids[i];
+            let Some((bv, _seq)) = &found[j] else {
+                continue;
+            };
+            let obj: serde_json::Value = match serde_json::from_slice(bv) {
+                Ok(v) => v,
+                Err(_) => {
+                    // 非 JSON 原始字节文档：无 Delta 覆盖
+                    out[i] = Some(bv.clone());
+                    continue;
+                }
+            };
+            let mut map = match obj {
+                serde_json::Value::Object(m) => m,
+                _ => {
+                    out[i] = Some(bv.clone());
+                    continue;
+                }
+            };
+            if let Some(over) = overrides.get(&d) {
+                for (field, val) in over {
+                    if val.is_null() {
+                        map.shift_remove(field);
+                    } else {
+                        map.insert(field.clone(), val.clone());
+                    }
+                }
+            }
+            let merged = serde_json::to_vec(&map)
+                .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+            self.hotcache.put(d, merged.clone());
+            out[i] = Some(merged);
+        }
+        Ok(out)
     }
 
     /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
@@ -441,7 +1082,17 @@ impl Engine {
     /// **Delta 增量按全局 seq 过滤**（M7-1：跨列族共享 seq 分配，快照后的字段级热更不可见；
     /// null 删除字段 / Tombstone 均按快照点判定）。
     /// 不走 HotCache（避免快照读污染热缓存）。
-    pub fn get_at(&mut self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
+    /// Ex-5.6：删除位图开启时已删文档在任何快照点均不可见（位图删除为立即/全局语义，
+    /// 快照隔离仅保证更新可见性；位图置位后该 docid 视为物理删除）。
+    /// O 项第②步：读路径 `&self`。
+    /// X 项：读操作计数（事务内点查）。
+    pub fn get_at(&self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
+        self.metrics.read_ops.fetch_add(1, Ordering::Relaxed);
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.is_deleted(docid) {
+                return Ok(None);
+            }
+        }
         let found = self
             .primary
             .get_bytes_at(&encode_docid(docid), snapshot_seq)?;
@@ -505,21 +1156,19 @@ impl Engine {
         limit: Option<u64>,
         offset: u64,
     ) -> Result<PagedRows> {
-        let bitmap = self.inverted.search(term)?;
-        let total = bitmap.len() as u64;
+        // Ex-5.3：查询前刷入攒批缓冲，保证 put 后未达阈值的数据立即可查（一致性）
+        self.flush_inverted_pending();
+        // K 项（7.74）：v3 分块快速路径——只解码 [offset, offset+limit) 覆盖的容器
+        // （大 posting 近页从全量反序列化降至窗口解码，x211）；total 来自容器头基数。
+        let (total, ids) = self
+            .inverted
+            .search_paged(term, offset, limit.unwrap_or(u64::MAX))?;
         let mut rows = Vec::new();
-        let cap = limit.unwrap_or(u64::MAX);
-        let mut skipped = 0u64;
-        for docid in bitmap {
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            if rows.len() as u64 >= cap {
-                break;
-            }
-            if let Some(v) = self.get(docid as u64)? {
-                rows.push((docid as u64, v));
+        // N 项：收集可见窗口 docid（bitmap 升序）→ 一次 `batch_get` 批量回表。
+        let vals = self.batch_get(&ids.iter().map(|&d| d as u64).collect::<Vec<_>>())?;
+        for (d, v) in ids.into_iter().zip(vals) {
+            if let Some(v) = v {
+                rows.push((d as u64, v));
             }
         }
         Ok(PagedRows { total, rows })
@@ -615,13 +1264,79 @@ impl Engine {
     }
 
     /// 主键范围扫描。
-    pub fn scan_range(&mut self, start: Option<u64>, end: Option<u64>) -> Result<Vec<QueryRow>> {
+    pub fn scan_range(&self, start: Option<u64>, end: Option<u64>) -> Result<Vec<QueryRow>> {
         self.primary.scan_range(start, end)
+    }
+
+    /// 流式主键范围扫描（design 20.5 导出管道）：回调按 docid 升序收到 `(docid, value)`；
+    /// 返回 `false` 提前终止（取满批/游标续扫）。内存 O(批)，不随扫描总量膨胀。
+    pub fn scan_stream<F: FnMut(u64, &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        mut f: F,
+    ) -> Result<()> {
+        let sk = start.map(|s| encode_docid(s).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        self.primary.scan_stream(sk.as_deref(), ek.as_deref(), |key, val| {
+            let docid = decode_docid(key).map_err(|_| {
+                crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+            })?;
+            f(docid, val)
+        })
+    }
+
+    /// 导出共享后台 IO 限速（design 20.5）：启用/关闭顺序扫描路径限速（MB/s；0 = 关闭）。
+    /// 与 Compaction 的 `io_limiter` 同 Token Bucket 策略（默认低于前台读写）——导出读 SST
+    /// 与后台合并共享同一后台 IO 预算语义，对在线业务影响 <5% 目标。
+    pub fn set_scan_rate_limit(&self, mb: u64) {
+        let bytes = mb.saturating_mul(1024 * 1024);
+        self.primary.set_scan_rate_limit(bytes);
+        self.delta.set_scan_rate_limit(bytes);
+        if let Some(c) = &self.cidx {
+            c.set_scan_rate_limit(bytes);
+        }
+    }
+
+    /// 事务范围扫描（M 项，事务类查询优化 P0）：RR/SERIALIZABLE 走 `scan_range_at`
+    /// 快照版本过滤（一次 k-way merge 扫描，替代逐 id `txn_get`）；同事务未提交写
+    /// （`read_own`）覆盖扫描结果；事务内删除的 docid 从结果中排除。
+    /// O 项第②步：事务范围读 `&self`（RR 快照只读并行）。
+    pub fn scan_range_txn(
+        &self,
+        txn: &mut crate::txn::Transaction,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Vec<QueryRow>> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        // 扫描快照视图（RC 语义 = 最新视图；RR/SERIALIZABLE = 快照过滤）
+        let snapshot = if txn.isolation.uses_snapshot() {
+            txn.snapshot()
+        } else {
+            u64::MAX
+        };
+        let mut out: Vec<QueryRow> = self.primary.scan_range_at(snapshot, start, end)?;
+        // 同事务写覆盖：write_set 中的 docid 用 read_own 值替换/排除
+        for row in out.iter_mut() {
+            if let Some(own) = txn.read_own(row.0) {
+                match own {
+                    Some(v) => row.1 = v.to_vec(),
+                    None => row.1.clear(), // 事务内已删除：标记为空（下方过滤）
+                }
+            }
+        }
+        out.retain(|(_, v)| !v.is_empty());
+        Ok(out)
     }
 
     /// 组合索引前缀查询：编码前缀键范围扫描 → 回表主数据。
     pub fn query_by_composite_prefix(&mut self, fields: &[&[u8]]) -> Result<Vec<QueryRow>> {
-        let Some(cidx) = &mut self.cidx else {
+        let Some(cidx) = self.cidx.clone() else {
             return Ok(Vec::new());
         };
         let start = crate::keys::encode_composite_key(fields, 0);
@@ -640,7 +1355,10 @@ impl Engine {
     /// 查询执行器：按 QuerySpec 静态路由到访问路径并执行（design 7.1 最小集枚举）。
     /// 看门狗：查询超时熔断（逐行检查 QueryGuard，超时返回 QueryTooExpensive）。
     pub fn execute(&mut self, spec: &QuerySpec) -> Result<Vec<QueryRow>> {
-        let guard = self.watchdog.begin_query();
+        // P52：CPU 并发限制（超限返回 Stalled）+ 查询超时熔断
+        let guard = self.watchdog.try_begin_query()?;
+        // Ex-5.3：倒排查询前刷入攒批缓冲（Inverted 分支可能命中 pending 中的 term）
+        self.flush_inverted_pending();
         let rows = match route(spec) {
             AccessPath::PrimaryPoint => {
                 let docid = spec
@@ -679,25 +1397,122 @@ impl Engine {
         Ok(rows)
     }
 
-    /// 倒排内存累积条数（供后台刷盘决策）。
+    /// 倒排内存累积条数（供后台刷盘决策；含攒批缓冲，Ex-5.3）。
     pub fn inverted_mem_docids(&self) -> u64 {
-        self.inverted.mem_docids()
+        self.inverted.mem_docids() + self.pending_inverted.lock().unwrap().len() as u64
     }
 
-    /// 强制倒排刷盘。
-    pub fn flush_inverted(&mut self) -> Result<()> {
-        self.inverted.flush_segment()
+    // ============ 10 亿库阶段 D：分片级可观测 ============
+
+    /// 挂载分片级指标（n 分片；分片部署时调用一次）。
+    pub fn attach_shard_metrics(&self, n_shards: u16) {
+        *self.shard_metrics.lock().unwrap() =
+            Some(crate::shard_metrics::ShardMetricsRegistry::new(n_shards));
     }
 
-    /// 倒排某词条命中的 docid 集合（不回表，供测试/监控）。
+    /// 上报分片 docid 水位（构建/写入推进时）。
+    pub fn update_shard_watermark(&self, shard_id: u16, wm: u64) {
+        if let Some(r) = self.shard_metrics.lock().unwrap().as_ref() {
+            r.update_watermark(shard_id, wm);
+        }
+    }
+
+    pub fn record_shard_write(&self, shard_id: u16) {
+        if let Some(r) = self.shard_metrics.lock().unwrap().as_ref() {
+            r.record_write(shard_id);
+        }
+    }
+
+    pub fn record_shard_read(&self, shard_id: u16) {
+        if let Some(r) = self.shard_metrics.lock().unwrap().as_ref() {
+            r.record_read(shard_id);
+        }
+    }
+
+    /// 分片级指标 Prometheus 渲染（未挂载返回空串）。
+    pub fn shard_metrics_render(&self) -> String {
+        self.shard_metrics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.render())
+            .unwrap_or_default()
+    }
+
+    /// 分片 docid 水位预警列表（Warn/Critical）。
+    pub fn shard_watermark_alerts(
+        &self,
+    ) -> Vec<(u16, crate::shard_metrics::WatermarkLevel, f64)> {
+        self.shard_metrics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.alerts())
+            .unwrap_or_default()
+    }
+
+    /// 将倒排攒批缓冲一次性刷入内存字典（Ex-5.3 批处理）。
+    /// 低基数 term 跨行聚合：一组 (term, docid) 按 term 分组合并，每 term 一次锁操作。
+    /// 崩溃安全：WAL 回放重新走 put 重建倒排，缓冲丢失不丢数据。
+    /// O 项第②步：`&self`（pending_inverted 内部 Mutex，读路径查询前也可刷缓冲）。
+    fn flush_inverted_pending(&self) {
+        let items: Vec<(String, u64)> = std::mem::take(&mut *self.pending_inverted.lock().unwrap());
+        if items.is_empty() {
+            return;
+        }
+        let refs: Vec<(&str, u64)> = items.iter().map(|(t, d)| (t.as_str(), *d)).collect();
+        self.inverted.add_batch(&refs);
+    }
+
+    /// 强制倒排刷盘（先刷入攒批缓冲，再整段落盘）。
+    /// J 项（7.73）：刷盘后检测段总量超 GC 阈值 → 置后台 GC 信号（mysql worker 消费；
+    /// 无 worker 时由显式 `inverted_gc` / 兜底周期消费）。
+    pub fn flush_inverted(&self) -> Result<()> {
+        self.flush_inverted_pending();
+        self.inverted.flush_segment()?;
+        // J 项：段数/大小超阈值 → 后台 GC 信号（避免段数爆炸放大查询延迟）
+        if self.inverted.should_gc() {
+            self.inverted_gc_pending.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// 倒排段 GC 合并（design 5.2.2/5.2.4⑤）：段文件总量超阈值时合并为少量大段。
+    /// 大数据量导入后段数可能爆炸（demo 每 100 万 term 对刷一段 → 5000 万库数百段），
+    /// 查询每次遍历全部段（高频 term 每段反序列化 posting）→ 段数直接放大查询延迟。
+    /// J 项（7.73）：改 `&self`（inverted 内部 mutate 锁与 flush 互斥）——批量导入后
+    /// 由后台 GC worker 自动周期触发（写路径刷盘置信号），显式调用仍可用。
+    pub fn inverted_gc(&self) -> Result<crate::inverted::GcReport> {
+        self.flush_inverted_pending();
+        self.inverted.gc()
+    }
+
+    /// 查询看门狗守卫（类 SQL 扫描过滤/回表熔断用）：`is_expired()` 超时后返回
+    /// QueryTooExpensive（复用 engine.execute 的查询超时机制）。
+    pub fn query_guard(&self) -> crate::watchdog::QueryGuard {
+        self.watchdog.begin_query()
+    }
+
+    /// 写入 Enrich 配置（design 19 / development 5.21）：Some((fail_policy, from_field,
+    /// to_field)) = 启用 local 数据源预连接（server /put 走 join::put_with_enrich）；None = 关闭。
+    pub fn enrich_config(&self) -> Option<(&str, &str, &str)> {
+        self.enrich
+            .as_ref()
+            .map(|(f, a, b)| (f.as_str(), a.as_str(), b.as_str()))
+    }
+
+    /// 倒排某词条命中的 docid 集合（不回表，供测试/监控/sqlish 等值筛选）。
+    /// O 项第②步：读路径 `&self`（查询前刷入攒批缓冲保证一致性）。
     pub fn inverted_posting(&self, term: &str) -> Result<RoaringBitmap> {
+        self.flush_inverted_pending();
         self.inverted.search(term)
     }
 
     /// 倒排某词条命中的文档数（COUNT 聚合，<0.1ms）。
     /// 位图索引快速路径（design 5.2.4，M7-2）：term 命中 `bitmap_fields` 白名单 → 内存位图计数；
     /// 否则回退倒排段扫描。
-    pub fn inverted_doc_count(&self, term: &str) -> Result<u64> {
+    pub fn inverted_doc_count(&mut self, term: &str) -> Result<u64> {
+        self.flush_inverted_pending();
         if let Some((field, value)) = term.split_once('=') {
             if let Some(n) = self.inverted.bitmap_count(field, value) {
                 return Ok(n);
@@ -708,7 +1523,8 @@ impl Engine {
 
     /// 按字段前缀分组（GROUP BY 聚合）：返回 `field=value` 各分组的文档数。
     /// 位图索引快速路径（M7-2）：字段命中白名单 → 内存位图分组；否则回退倒排段扫描。
-    pub fn inverted_group_by(&self, field: &str) -> Result<Vec<(String, u64)>> {
+    pub fn inverted_group_by(&mut self, field: &str) -> Result<Vec<(String, u64)>> {
+        self.flush_inverted_pending();
         if let Some(rows) = self.inverted.bitmap_group_by(field) {
             return Ok(rows);
         }
@@ -717,22 +1533,255 @@ impl Engine {
 
     /// 内存位图组合 AND 计数（design 5.2.4，M7-2）：全部 term 命中白名单 → 交集计数（亚毫秒）；
     /// 否则返回 None（调用方回退逐词条倒排查询）。
-    pub fn inverted_bitmap_and_count(&self, terms: &[&str]) -> Option<u64> {
+    pub fn inverted_bitmap_and_count(&mut self, terms: &[&str]) -> Option<u64> {
+        self.flush_inverted_pending();
         self.inverted.bitmap_and(terms).map(|b| b.len())
     }
 
-    /// 基础 Compaction（design 4.5，阶段 3）：主数据列族全量合并。
-    pub fn compact(&mut self) -> Result<crate::column_family::CompactReport> {
-        self.primary.compact()
+    /// 基础 Compaction（design 4.5，阶段 3；Ex-5.4 并行化）：primary/cidx/delta 列族压实。
+    /// 并行度 `compaction_parallel`：0 = 自动（min(4, 核数/2)）；1 = 串行；>1 = 指定。
+    /// W 项：跨列族**紧迫度调度**——每轮仅压实紧迫度最高档（L0 压力/大小超限最大）的列族，
+    /// 并列档并行（保留 SSD 并发收益）；其余列族由后台 worker 后续轮次（`while needs_compact`）
+    /// 压实——压力最大的列族（通常 primary 主数据）优先收敛，读路径最快受益。
+    /// Ex-5.6：删除位图开启时 primary 压实按位图**物理丢弃**已删 docid 的旧数据（墓碑不污染层级）。
+    /// O 项第③步：`&self`——后台合并 worker 在引擎**读锁**下执行（合并不阻塞读；
+    /// 与写互斥由 Engine RwLock 保证，快照 store 无并发丢失）。
+    pub fn compact(&self) -> Result<crate::column_family::CompactReport> {
+        // W 项：紧迫度 = 列族 compaction_urgency（L0 段数×10 + 大小超限 +8）
+        let pu = self.primary.compaction_urgency();
+        let du = self.delta.compaction_urgency();
+        let cu = self.cidx.as_ref().map_or(0, |c| c.compaction_urgency());
+        let max = pu.max(du).max(cu);
+        let empty = crate::column_family::CompactReport {
+            merged_ssts: 0,
+            kept_keys: 0,
+            freed_bytes: 0,
+            out_level: 0,
+        };
+        if max == 0 {
+            return Ok(empty); // 无压力（调用方应在 needs_compact 下进入）
+        }
+        let do_p = pu == max;
+        let do_c = self.cidx.is_some() && cu == max;
+        let do_d = du == max;
+
+        let parallel = if self.compaction_parallel == 0 {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() / 2).clamp(1, 4))
+                .unwrap_or(1)
+        } else {
+            self.compaction_parallel.max(1)
+        };
+        let cf_count = usize::from(do_p) + usize::from(do_c) + usize::from(do_d);
+        let threads = parallel.min(cf_count.max(1));
+        // Ex-5.6/5.8：位图不可变借用（与列族共享借用互不冲突）。
+        let bm = self.deletion_bitmap.as_ref();
+        let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
+        let filter = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
+        if threads <= 1 {
+            // 串行：仅最高紧迫度档列族
+            let mut rep = empty;
+            if do_p {
+                let r = if needs_filter {
+                    self.primary.compact_filtered(&filter)?
+                } else {
+                    self.primary.compact()?
+                };
+                merge_report(&mut rep, &r);
+            }
+            if do_c {
+                let r = self.cidx.as_ref().unwrap().compact()?;
+                merge_report(&mut rep, &r);
+            }
+            if do_d {
+                let r = self.delta.compact()?;
+                merge_report(&mut rep, &r);
+            }
+            self.metrics.compact_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(rep);
+        }
+        // 并行：仅最高紧迫度档（并列）列族
+        let compute_cores = self.affinity.compute.clone(); // Ex-7.2：Compaction 并行线程绑 compute 核
+        let (p, c, d) = (&self.primary, self.cidx.as_ref(), &self.delta);
+        let merged = std::thread::scope(|s| -> Result<crate::column_family::CompactReport> {
+            let h1 = if do_p {
+                let cc = compute_cores.clone();
+                let f = filter;
+                Some(s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    if needs_filter {
+                        p.compact_filtered(&f)
+                    } else {
+                        p.compact()
+                    }
+                }))
+            } else {
+                None
+            };
+            let h2 = if do_c {
+                let cc = compute_cores.clone();
+                let cf = c.unwrap();
+                Some(s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    cf.compact()
+                }))
+            } else {
+                None
+            };
+            let h3 = if do_d {
+                let cc = compute_cores.clone();
+                Some(s.spawn(move || {
+                    crate::affinity::bind_current(&cc);
+                    d.compact()
+                }))
+            } else {
+                None
+            };
+            let mut merged = empty;
+            for h in [h1, h2, h3].into_iter().flatten() {
+                let r = h.join().unwrap()?;
+                merge_report(&mut merged, &r);
+            }
+            self.metrics.compact_count.fetch_add(1, Ordering::Relaxed);
+            Ok(merged)
+        })?;
+        Ok(merged)
     }
 
-    /// 是否需要 Compaction（主数据列族 L0 段数超过阈值）。
+    /// 是否需要 Compaction（主数据 / delta / cidx 任一列族 L0 超阈值或 L1/L2 需收敛）。
     pub fn needs_compact(&self) -> bool {
         self.primary.needs_compact()
+            || self.delta.needs_compact()
+            || self.cidx.as_ref().map_or(false, |c| c.needs_compact())
+    }
+
+    /// P72（无锁合并）：读取三 CF Arc + 删除位图 Arc + 紧迫度判定（紧凑调度复刻 `compact`）——
+    /// mysql worker 在 Engine 读锁内**快速**调用本方法（clone 廉价），drop 锁后对返回的
+    /// `CompactTargets::run()` 执行**无锁合并**（与写并发；ssts 变更经 CF `sst_mutate` 互斥，
+    /// flush 同锁 → 无丢失更新）。返回 None = 无紧迫度（不需要合并）。
+    pub fn compaction_targets(&self) -> Option<CompactTargets> {
+        let pu = self.primary.compaction_urgency();
+        let du = self.delta.compaction_urgency();
+        let cu = self.cidx.as_ref().map_or(0, |c| c.compaction_urgency());
+        let max = pu.max(du).max(cu);
+        if max == 0 {
+            return None;
+        }
+        Some(CompactTargets {
+            deletion_bitmap: self.deletion_bitmap.clone(),
+            primary: self.primary.clone(),
+            cidx: self.cidx.clone(),
+            delta: self.delta.clone(),
+            do_primary: pu == max,
+            do_cidx: self.cidx.is_some() && cu == max,
+            do_delta: du == max,
+        })
+    }
+
+    /// 主数据列族当前 L0 段数（P 项自动 Compaction 收敛性观测 / 测试）。
+    pub fn primary_l0_count(&self) -> usize {
+        self.primary.l0_count()
+    }
+
+    /// X 项：全列族累计刷盘次数（/metrics flush 指标）。
+    pub fn total_flush_count(&self) -> u64 {
+        self.primary.flush_count()
+            + self.delta.flush_count()
+            + self.cidx.as_ref().map_or(0, |c| c.flush_count())
+    }
+
+    /// P 项：事件驱动自动 Compaction——写入路径自触发（Flush 后 L0 段数/大小超阈值 → 合并收敛）。
+    /// O 项第③步双分支：
+    /// - **有后台 worker**（mysql 服务挂载，`compact_worker=true`）：只置 `compact_pending` 信号，
+    ///   实际合并由 worker 在引擎**读锁**下执行——读写均不被合并阻塞（合并不阻塞读）；
+    /// - **无 worker**（demo/rpc/测试）：保持同步执行（单写者模型：合并期间阻塞读写，
+    ///   写入自然退避 = 背压，L0 有界）。
+    /// guard 上限 8：一次写入最多收敛 8 轮（正常 1~2 轮即收敛，防异常空转死循环）。
+    fn auto_compact(&mut self) -> Result<()> {
+        if !self.auto_compact {
+            return Ok(());
+        }
+        if self.compact_worker.load(Ordering::Acquire) {
+            if self.needs_compact() {
+                self.compact_pending.store(true, Ordering::Release);
+            }
+            return Ok(());
+        }
+        let mut guard = 0;
+        while self.needs_compact() && guard < 8 {
+            self.compact()?;
+            guard += 1;
+        }
+        Ok(())
+    }
+
+    /// Ex-7.2：网络核列表（server 主线程绑核用）。
+    pub fn network_cores(&self) -> Vec<usize> {
+        self.affinity.network.clone()
+    }
+
+    // ============ Ex-1 本地消息表（Outbox）============
+
+    /// 入队 outbox 消息（Ex-1.1）：docid + 全局 seq 幂等键，与业务写共享 fsync 点
+    /// （`maybe_group_commit`）——崩溃恢复按 seq 回放，消息与业务写本地原子。
+    /// 返回幂等键（docid, seq）；outbox 关闭时返回 Err(Unsupported)。
+    pub fn enqueue_outbox(&mut self, docid: u64, payload: &[u8]) -> Result<(u64, u64)> {
+        let Some(ob) = &mut self.outbox else {
+            return Err(crate::error::Error::Unsupported(
+                "outbox 未启用（config.outbox.enabled = true）".into(),
+            ));
+        };
+        let seq = self.global_seq.fetch_add(1, Ordering::Relaxed);
+        ob.enqueue(docid, seq, payload)?;
+        self.maybe_group_commit()?; // 与业务写同 fsync 点（本地原子）
+        Ok((docid, seq))
+    }
+
+    /// 投递器（Ex-1.2）：扫描 pending → 回调投递（true=成功）→ 标记 done。
+    /// 返回投递成功数；失败留 pending（调用方退避重试）。投递成功后统一落盘
+    /// （done 状态持久，防重投）。
+    pub fn dispatch_outbox(&mut self, deliver: impl FnMut(&[u8], &[u8]) -> bool) -> Result<usize> {
+        let n = match &mut self.outbox {
+            Some(ob) => ob.dispatch(deliver)?,
+            None => 0,
+        };
+        if n > 0 {
+            self.flush_wal()?;
+        }
+        Ok(n)
+    }
+
+    /// 当前 pending 消息数（排空校验/监控）。
+    pub fn outbox_pending(&mut self) -> Result<usize> {
+        match &mut self.outbox {
+            Some(ob) => ob.pending_count(),
+            None => Ok(0),
+        }
+    }
+
+    /// 是否已排空（Ex-1.4：扩容/切换前置条件）。
+    pub fn outbox_drained(&mut self) -> Result<bool> {
+        match &mut self.outbox {
+            Some(ob) => ob.drained(),
+            None => Ok(true),
+        }
     }
 
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
+        // P52：磁盘剩余空间占比（syscall 带缓存，1s 间隔）
+        let (disk_ratio, disk_status) = match disk_space::space_info(&self.data_dir) {
+            Ok((avail, total)) if total > 0 => {
+                let r = avail as f64 / total as f64;
+                let s = match self.watchdog.disk().classify(avail, total) {
+                    crate::watchdog::DiskStatus::Normal => "normal",
+                    crate::watchdog::DiskStatus::Throttled => "throttled",
+                    crate::watchdog::DiskStatus::Stalled => "stalled",
+                };
+                (r, s.to_string())
+            }
+            _ => (1.0, "unknown".into()),
+        };
         EngineStats {
             sst_file_count: self.primary.sst_count()
                 + self.delta.sst_count()
@@ -742,6 +1791,10 @@ impl Engine {
             seq: 0, // 阶段 2 接入执行器统计
             mem_ratio: self.mem_ratio,
             max_memory_mb: self.max_memory_mb,
+            disk_ratio,
+            disk_status,
+            cpu_active_queries: self.watchdog.cpu_active(),
+            cpu_query_limit: self.watchdog.cpu().limit(),
         }
     }
 
@@ -753,7 +1806,7 @@ impl Engine {
         if self.primary.memtable_bytes() > 0 {
             self.primary.switch_and_flush()?;
         }
-        if let Some(cidx) = &mut self.cidx {
+        if let Some(cidx) = &self.cidx {
             if cidx.memtable_bytes() > 0 {
                 cidx.switch_and_flush()?;
             }
@@ -775,6 +1828,10 @@ impl Drop for Engine {
         if self.group_commit.is_some() {
             let _ = self.flush_wal();
         }
+        // Ex-5.6：正常退出兜底落盘删除位图脏页（组提交关闭时 flush_wal 不执行，位图独立 flush）
+        if let Some(bm) = &self.deletion_bitmap {
+            let _ = bm.flush();
+        }
     }
 }
 
@@ -794,6 +1851,155 @@ mod tests {
             .join(name)
     }
 
+    #[test]
+    fn shard_metrics_attach_and_render() {
+        // 10 亿库阶段 D：挂载分片指标 → 水位上报 → /metrics 渲染 + 预警
+        let cfg = Config::default();
+        let e = Engine::open(&tmp(), &cfg).unwrap();
+        assert!(e.shard_metrics_render().is_empty(), "未挂载渲染为空");
+        e.attach_shard_metrics(10);
+        e.update_shard_watermark(0, 100_000_000); // 每分片 1 亿（10 亿库）
+        e.record_shard_write(0);
+        e.record_shard_read(0);
+        let out = e.shard_metrics_render();
+        assert!(out.contains("shanshui_shard_docid_watermark{shard=\"0\"} 100000000"));
+        assert!(out.contains("shanshui_shard_writes_total{shard=\"0\"} 1"));
+        assert!(e.shard_watermark_alerts().is_empty(), "10 亿库水位无预警");
+        // 高水位（≈82%）→ Warn 预警
+        e.update_shard_watermark(1, 900_000_000_000);
+        let alerts = e.shard_watermark_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].0, 1);
+        assert_eq!(alerts[0].1, crate::shard_metrics::WatermarkLevel::Warn);
+    }
+
+    #[test]
+    fn compact_targets_run_matches_engine_compact() {
+        // P72（无锁合并）：`Engine::compaction_targets` + `CompactTargets::run`（worker 无锁路径）
+        // 与 `Engine::compact`（读锁内串行）收敛结果一致——多列族压力 + 删除位图过滤双路径。
+        let mut cfg = Config::default();
+        cfg.memtable.max_size_mb = 1; // 小 MemTable → 写入快速 flush 多段
+        cfg.storage.l0_stall_threshold = 2; // 低 L0 阈值 → 2 段即触发合并
+        let mut e1 = Engine::open(&tmp(), &cfg).unwrap();
+        let mut e2 = Engine::open(&tmp(), &cfg).unwrap();
+        let val = vec![b'x'; 1024];
+        for seg in 0..4u64 {
+            for i in seg * 500..seg * 500 + 500 {
+                let t: &[&str] = &["tag_a"];
+                e1.put(i, val.clone(), t).unwrap();
+                e2.put(i, val.clone(), t).unwrap();
+            }
+        }
+        // 删除一部分（删除位图开启）→ 合并需物理丢弃
+        for i in (0..2_000u64).step_by(3) {
+            e1.delete(i).unwrap();
+            e2.delete(i).unwrap();
+        }
+        e1.flush_wal().unwrap();
+        e2.flush_wal().unwrap();
+        // e1：Engine::compact 读锁路径收敛；e2：无锁路径（compaction_targets 循环 run）收敛
+        while e1.needs_compact() {
+            let _ = e1.compact().unwrap();
+        }
+        while e2.needs_compact() {
+            let Some(t) = e2.compaction_targets() else { break };
+            t.run().unwrap();
+        }
+        assert!(!e1.needs_compact());
+        assert!(!e2.needs_compact());
+        // 收敛后数据一致（存活 docid 全部命中；已删不可见）
+        for i in 0..2_000u64 {
+            let v1 = e1.get(i).unwrap();
+            let v2 = e2.get(i).unwrap();
+            assert_eq!(v1, v2, "docid={i}");
+        }
+        // 段数收敛一致（同输入 → 同压实结果）
+        assert_eq!(e1.primary_l0_count(), e2.primary_l0_count());
+        assert_eq!(e1.primary.sst_count(), e2.primary.sst_count());
+    }
+
+    #[test]
+    fn persist_manifest_reflects_memory_snapshot_only() {
+        // P73：persist_manifest 基于内存快照（ssts ArcSwap）重建清单——磁盘上存在但不在
+        // 内存快照中的文件（如无锁合并并发时"正在写入的半写段"）不得写入 manifest，
+        // 否则重启加载失败。确定性验证：放置幽灵段后 flush，manifest 不含它。
+        let mut cfg = Config::default();
+        cfg.memtable.max_size_mb = 1; // 小 MemTable → flush 触发 manifest 重写
+        let data_dir = tmp();
+        let mut engine = Engine::open(&data_dir, &cfg).unwrap();
+        for i in 0..2000u64 {
+            engine.put(i, format!("v{i}").into_bytes(), &[]).unwrap();
+        }
+        engine.flush_primary().unwrap();
+        // 磁盘放"幽灵"段（模拟并发写入中的半写段 / 残留文件）
+        let ghost = data_dir.join("primary").join("sst-99999999.sst");
+        std::fs::write(&ghost, b"partial-written-not-in-snapshot").unwrap();
+        // 再写并 flush → persist 重写 manifest
+        for i in 2000..3000u64 {
+            engine.put(i, format!("v{i}").into_bytes(), &[]).unwrap();
+        }
+        engine.flush_primary().unwrap();
+        let m: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(data_dir.join("primary").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let files = m["sst_files"].as_array().expect("manifest sst_files");
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.as_str().unwrap().contains("99999999")),
+            "manifest 不得引用非内存快照段（幽灵段）"
+        );
+        assert!(files.len() >= 2, "flush 段应在 manifest 中");
+        // 重开：数据完整（manifest 与磁盘一致可加载）
+        drop(engine);
+        let engine = Engine::open(&data_dir, &cfg).unwrap();
+        for i in (0..3000u64).step_by(997) {
+            let v = engine.get(i).unwrap();
+            assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()), "docid={i}");
+        }
+    }
+
+    #[test]
+    fn scan_rate_limit_slows_stream() {
+        // design 20.5：导出共享后台 IO 限速——启用限速后顺序扫描显著变慢（Token Bucket 生效），
+        // 关闭后恢复；前台点查不受限速影响（scan_limiter 只作用于 scan_stream）。
+        let mut cfg = Config::default();
+        cfg.memtable.max_size_mb = 1;
+        let mut engine = Engine::open(&tmp(), &cfg).unwrap();
+        for i in 0..10u64 {
+            engine.put(i, vec![b'x'; 200_000], &[]).unwrap(); // 200KB × 10 = 2MB
+        }
+        engine.flush_primary().unwrap();
+        // 无限制：扫描快
+        let t0 = std::time::Instant::now();
+        let mut n = 0u64;
+        engine
+            .scan_stream(None, None, |_, v| {
+                n += 1;
+                assert_eq!(v.len(), 200_000);
+                Ok(true)
+            })
+            .unwrap();
+        let fast = t0.elapsed();
+        assert_eq!(n, 10);
+        // 限速 1MB/s：2MB 数据（1s 突发桶 + 1MB 需补桶）→ 显著慢于无限速
+        engine.set_scan_rate_limit(1);
+        let t1 = std::time::Instant::now();
+        engine.scan_stream(None, None, |_, _| Ok(true)).unwrap();
+        let slow = t1.elapsed();
+        assert!(slow > fast, "限速后扫描应更慢（fast={fast:?} slow={slow:?}）");
+        assert!(
+            slow.as_millis() >= 300,
+            "限速 1MB/s 扫描 2MB 应 ≥300ms（实际 {slow:?}）"
+        );
+        // 关闭限速恢复
+        engine.set_scan_rate_limit(0);
+        let t2 = std::time::Instant::now();
+        engine.scan_stream(None, None, |_, _| Ok(true)).unwrap();
+        assert!(t2.elapsed() < slow, "关闭限速后应恢复快速扫描");
+    }
+
     fn cfg() -> Config {
         let mut c = Config::default();
         c.sstable.compression = "none".into();
@@ -804,6 +2010,474 @@ mod tests {
         let mut c = cfg();
         c.storage.group_commit_us = window_us;
         c
+    }
+
+    // ---------- D/E/F LSM 事务三阶段 ----------
+
+    #[test]
+    fn write_batch_atomic_commit_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut wb = crate::txn::WriteBatch::new();
+        wb.put(1, b"doc-1".to_vec(), vec!["t1".into()]);
+        wb.put(2, b"doc-2".to_vec(), vec!["t2".into()]);
+        wb.delete(3); // 删除不存在的 docid 应合法（幂等）
+        e.write(&wb).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1");
+        assert_eq!(e.get(2).unwrap().unwrap(), b"doc-2");
+        assert!(e.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_batch_validate_rejects_zero_docid_before_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut wb = crate::txn::WriteBatch::new();
+        wb.put(0, b"x".to_vec(), vec![]);
+        wb.put(10, b"ok".to_vec(), vec![]);
+        assert!(e.write(&wb).is_err(), "预校验失败 → 拒绝提交");
+        assert!(e.get(10).unwrap().is_none(), "预校验失败不得应用任何 op（失败回滚语义）");
+    }
+
+    #[test]
+    fn write_batch_rollback_discards_ops() {
+        let mut wb = crate::txn::WriteBatch::new();
+        wb.put(1, b"x".to_vec(), vec![]);
+        wb.delete(2);
+        wb.rollback();
+        assert!(wb.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.write(&wb).unwrap(); // 空批合法提交
+        assert!(e.get(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn txn_rr_snapshot_read_ignores_concurrent_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // MemTable 不保留多版本（design 4.7 已知局限）：快照读需旧版本已落 SST
+        e.flush_primary().unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 快照后并发写入（模拟其他事务已提交）
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let got = e.txn_get(&mut txn, 1).unwrap();
+        assert_eq!(got.unwrap(), b"v0", "RR 应读事务开始前的快照值");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_rr_snapshot_sees_old_version_in_memtable_without_flush() {
+        // S 项（严格 MVCC）：旧实现快照读需旧版本已落 SST（MemTable 仅保最新）——
+        // 事务活跃期 + 并发写同 key 且未 flush 时，快照读会读到新版本（正确性缺陷）。
+        // 修复后 MemTable 保留版本链，未刷盘也能读到快照点版本。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // 不 flush：v0 留在 MemTable
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 快照后并发写同 key（仍不 flush）→ MemTable 出现新版本
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let got = e.txn_get(&mut txn, 1).unwrap();
+        assert_eq!(
+            got.unwrap(),
+            b"v0",
+            "RR 快照应读到旧版本（无需 flush 落 SST）"
+        );
+        // 同事务写覆盖（read_own 优先）
+        txn.put(1, b"own".to_vec(), vec![]);
+        assert_eq!(e.txn_get(&mut txn, 1).unwrap().unwrap(), b"own");
+        e.txn_rollback(txn);
+        // 提交后最新可见
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+    }
+
+    #[test]
+    fn txn_snapshot_cache_repeated_get_hits_without_stale() {
+        // T 项：RR 快照读事务内点查小缓存——同 key 二次读直达（snap_get 命中）且结果一致
+        // （快照 seq 恒定）；RC 不缓存（读最新语义）；事务 drop 即弃（重新 begin 缓存为空）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        e.flush_primary().unwrap();
+
+        // RR：第一次读写入缓存，第二次读命中缓存（外部已改但快照一致）
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        assert_eq!(txn.snap_get(1), None, "缓存初始为空");
+        let first = e.txn_get(&mut txn, 1).unwrap().unwrap();
+        assert_eq!(first, b"v0");
+        assert_eq!(txn.snap_get(1), Some(Some(b"v0".to_vec())), "首读后已缓存");
+        // 外部并发写（seq > 快照）→ 二次读仍走缓存返回快照值
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        assert_eq!(e.txn_get(&mut txn, 1).unwrap().unwrap(), b"v0", "缓存命中=快照一致");
+        assert_eq!(txn.snap_get(2), None, "未读过的 key 不在缓存");
+        // 同事务写后读 → read_own 优先于缓存
+        txn.put(1, b"own".to_vec(), vec![]);
+        assert_eq!(e.txn_get(&mut txn, 1).unwrap().unwrap(), b"own");
+        e.txn_rollback(txn);
+
+        // 新事务缓存为空（随 Transaction drop 即弃）
+        let mut txn2 = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        assert_eq!(txn2.snap_get(1), None, "新事务缓存应为空");
+        assert_eq!(e.txn_get(&mut txn2, 1).unwrap().unwrap(), b"v1", "读最新已提交");
+        e.txn_rollback(txn2);
+
+        // RC：不缓存（每次读最新，缓存会破坏语义）
+        let mut txn3 = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        assert_eq!(e.txn_get(&mut txn3, 1).unwrap().unwrap(), b"v1");
+        assert_eq!(txn3.snap_get(1), None, "RC 不写缓存");
+        e.txn_rollback(txn3);
+    }
+
+    #[test]
+    fn scan_range_txn_snapshot_filter_and_own_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=5u64 {
+            e.put(i, format!("v0-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap(); // 旧版本落 SST（MemTable 不保留多版本）
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 快照后并发写 docid 3 → 扫描应显示快照值 v0-3（隔离并发写）
+        e.put(3, b"v1-3".to_vec(), &["t"]).unwrap();
+        // 事务内写 docid 2 / 事务内删除 docid 4 → 扫描应覆盖/排除
+        txn.put(2, b"own-2".to_vec(), vec!["t".into()]);
+        txn.delete(4);
+        let rows = e.scan_range_txn(&mut txn, Some(1), Some(5)).unwrap();
+        let map: std::collections::HashMap<u64, Vec<u8>> = rows.into_iter().collect();
+        assert_eq!(map.get(&1).unwrap(), b"v0-1");
+        assert_eq!(map.get(&2).unwrap(), b"own-2", "同事务写应覆盖扫描结果");
+        assert_eq!(map.get(&3).unwrap(), b"v0-3", "快照隔离：并发写不可见");
+        assert_eq!(map.len(), 4, "事务内删除 docid 4 应从扫描排除");
+        assert!(!map.contains_key(&4));
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn batch_get_matches_get_with_delta_and_deletion_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..40u64 {
+            let doc = serde_json::json!({"k": format!("d{i}"), "n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["t"]).unwrap();
+        }
+        // Delta 字段级覆盖（patch）+ 删除位图删除
+        e.patch(1, &[("k", serde_json::Value::String("patched".into()))]).unwrap();
+        e.patch(2, &[("extra", serde_json::Value::from(42))]).unwrap();
+        e.delete(4).unwrap();
+        let ids: Vec<u64> = (0..45).filter(|i| i % 2 == 0).collect();
+        let batch = e.batch_get(&ids).unwrap();
+        assert_eq!(batch.len(), ids.len());
+        for (i, &d) in ids.iter().enumerate() {
+            let single = e.get(d).unwrap();
+            assert_eq!(batch[i], single, "docid {d} batch_get 与 get 结果不一致");
+        }
+        // 删除语义：docid 4 在两条路径均为 None
+        assert!(e.get(4).unwrap().is_none());
+        let idx4 = ids.iter().position(|&x| x == 4).unwrap();
+        assert!(batch[idx4].is_none());
+    }
+
+    #[test]
+    fn search_term_paged_batch_backfill_matches_individual_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..30u64 {
+            let doc = serde_json::json!({"city": "beijing", "i": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["city=beijing"]).unwrap();
+        }
+        // 倒排回表：批量路径应与逐条 get 一致（含分页 offset/limit 语义）
+        let p1 = e.search_term_paged("city=beijing", Some(10), 5).unwrap();
+        assert_eq!(p1.total, 30);
+        assert_eq!(p1.rows.len(), 10);
+        for (d, v) in &p1.rows {
+            assert_eq!(e.get(*d).unwrap().unwrap(), *v, "docid {d} 回表值不一致");
+        }
+        let p2 = e.search_term_paged("city=beijing", Some(5), 25).unwrap();
+        assert_eq!(p2.rows.len(), 5, "末页应返回剩余 5 行");
+        // 删除后回表应过滤（Tombstone / 删除位图）
+        e.delete(3).unwrap();
+        let p3 = e.search_term_paged("city=beijing", None, 0).unwrap();
+        assert_eq!(p3.total, 30, "posting 含已删 docid（回表过滤）");
+        assert!(!p3.rows.iter().any(|(d, _)| *d == 3), "已删 docid 不应回表");
+    }
+
+    // ---------- P 项：事件驱动自动 Compaction ----------
+
+    fn p_compact_cfg() -> Config {
+        let mut c = cfg();
+        c.storage.auto_compact = true;
+        c.storage.l0_stall_min = 2;
+        c.storage.l0_stall_max = 3;
+        c.storage.l0_stall_threshold = 2; // L0 > 2 即触发
+        c.memtable.max_size_mb = 1; // 1MB MemTable → 快速多次 flush
+        c.storage.group_commit_us = 2000; // 组提交避免逐条 fsync 拖慢测试
+        c
+    }
+
+    fn fill_small_docs(e: &mut Engine, rounds: u32, per_round: u32) {
+        let mut id = 0u64;
+        for _ in 0..rounds {
+            for _ in 0..per_round {
+                let doc = serde_json::json!({"k": id, "c": "x".repeat(8000)});
+                e.put(id, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+                id += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn auto_compact_keeps_l0_bounded_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &p_compact_cfg()).unwrap();
+        // ~6MB 数据 → 多次 MemTable flush → 写路径自触发合并收敛 L0
+        fill_small_docs(&mut e, 12, 64);
+        assert!(
+            e.primary_l0_count() <= 3,
+            "auto_compact 应把 L0 收敛到阈值内（实际 {}）",
+            e.primary_l0_count()
+        );
+        assert!(!e.needs_compact(), "收敛后不应再需要合并");
+        assert!(e.get(0).unwrap().is_some(), "数据应完整可读");
+        assert!(e.get(12 * 64 - 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn background_trigger_sets_pending_and_readlock_compact_converges() {
+        // O 项第③步：挂载后台 worker（compact_worker=true）后，写路径只置信号不阻塞；
+        // Engine::compact 可在 &self（读锁语义）下执行并收敛 L0。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &p_compact_cfg()).unwrap();
+        e.compact_worker.store(true, Ordering::Release);
+        fill_small_docs(&mut e, 12, 64);
+        assert!(
+            e.compact_pending.load(Ordering::Acquire),
+            "写路径应置 pending 信号（后台合并触发）"
+        );
+        assert!(e.needs_compact(), "L0 超阈值应判需要合并");
+        // 后台语义：合并经 &Engine（读锁）执行——验证 &self 路径收敛
+        let eng = &e;
+        let _ = eng.compact().unwrap();
+        assert!(!eng.needs_compact(), "读锁合并后应收敛");
+        assert!(eng.get(0).unwrap().is_some(), "数据应完整可读");
+        assert!(eng.get(12 * 64 - 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn metrics_count_reads_writes_flush_compact() {
+        // X 项：读写操作计数 + 延迟直方图 + flush/compact 计数埋点
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = p_compact_cfg();
+        c.memtable.max_size_mb = 1; // 小 MemTable → 写入过程触发 flush
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        assert_eq!(e.metrics.read_ops.load(Ordering::Relaxed), 0);
+        assert_eq!(e.metrics.write_ops.load(Ordering::Relaxed), 0);
+        for i in 0..64u64 {
+            e.put(i, format!("v{i}").into_bytes(), &["t"]).unwrap();
+        }
+        assert!(e.metrics.write_ops.load(Ordering::Relaxed) >= 64, "put 应计数");
+        let _ = e.get(0).unwrap();
+        assert_eq!(e.metrics.read_ops.load(Ordering::Relaxed), 1, "get 应计数");
+        // flush：64 条 × ~12B 远小于 1MB → 显式刷盘触发计数
+        let f0 = e.total_flush_count();
+        e.flush_primary().unwrap();
+        assert!(e.total_flush_count() >= f0 + 1, "flush 应计数");
+        // 延迟直方图：64 次 put 记录延迟（get 命中 hotcache 提前返回不计延迟）
+        let sum: u64 = e
+            .metrics
+            .latency_buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .sum();
+        assert!(sum >= 64, "put 应记录延迟（实际 {sum}）");
+        // compact 计数
+        let c0 = e.metrics.compact_count.load(Ordering::Relaxed);
+        if e.needs_compact() {
+            let _ = e.compact().unwrap();
+            assert!(
+                e.metrics.compact_count.load(Ordering::Relaxed) >= c0 + 1,
+                "compact 应计数"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_compact_off_leaves_l0_accumulated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = p_compact_cfg();
+        c.storage.auto_compact = false;
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        fill_small_docs(&mut e, 12, 64);
+        assert!(
+            e.primary_l0_count() >= 4,
+            "关闭 auto_compact 后 L0 应累积（实际 {}）",
+            e.primary_l0_count()
+        );
+        assert!(e.needs_compact(), "L0 超阈值应判需要合并");
+    }
+
+    #[test]
+    fn rwlock_concurrent_reads_and_writes() {
+        // O 项第②步：Engine 跨线程共享（Arc<RwLock<Engine>>）——多读线程读锁并行 +
+        // 写线程写锁互斥；验证 SstReader Sync 化后读路径无数据竞争。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..100u64 {
+            e.put(i, format!("v{i}").into_bytes(), &[]).unwrap();
+        }
+        let engine = std::sync::Arc::new(std::sync::RwLock::new(e));
+        let mut handles = Vec::new();
+        // 4 个读线程：各自并发点查固定 docid（读读并行）
+        for t in 0..4u64 {
+            let eng = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let g = eng.read().unwrap();
+                    let v = g.get(t).unwrap().expect("读线程应命中");
+                    assert_eq!(v, format!("v{t}").into_bytes());
+                }
+            }));
+        }
+        // 1 个写线程：并发写入新 docid（写锁互斥）
+        let w = engine.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 100..110u64 {
+                let mut g = w.write().unwrap();
+                g.put(i, format!("w{i}").into_bytes(), &[]).unwrap();
+            }
+        }));
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 写线程提交后可见
+        let g = engine.read().unwrap();
+        assert!(g.get(105).unwrap().is_some());
+        assert!(g.get(4).unwrap().is_some());
+    }
+
+    #[test]
+    fn txn_rr_write_conflict_detected_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap(); // 并发事务在快照后修改 docid=1
+        txn.put(1, b"txn-write".to_vec(), vec![]);
+        assert!(
+            e.txn_commit(txn).is_err(),
+            "RR 提交应因写写冲突 abort（last_write_seq > snapshot）"
+        );
+        // 冲突 abort 后引擎保持并发写结果，且锁已释放
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+        assert_eq!(e.txn_locks.lock().unwrap().lock_count(), 0, "abort 后锁应全部释放");
+    }
+
+    #[test]
+    fn txn_rc_reads_latest_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let got = e.txn_get(&mut txn, 1).unwrap();
+        assert_eq!(got.unwrap(), b"v1", "RC 应读最新已提交版本");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_serializable_read_lock_blocks_concurrent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // txn1 读 docid=1（共享锁，SERIALIZABLE 持有至提交）
+        let mut t1 = e.txn_begin(crate::txn::Isolation::Serializable);
+        let v = e.txn_get(&mut t1, 1).unwrap();
+        assert_eq!(v.unwrap(), b"v0");
+        // txn2 写 docid=1 → 共享读锁未释放 → 排他请求冲突
+        let mut t2 = e.txn_begin(crate::txn::Isolation::Serializable);
+        t2.put(1, b"v2".to_vec(), vec![]);
+        assert!(e.txn_commit(t2).is_err(), "SERIALIZABLE 读锁持有期间排他写应冲突");
+        // txn1 提交释放读锁后，新事务可写
+        e.txn_commit(t1).unwrap();
+        let mut t3 = e.txn_begin(crate::txn::Isolation::Serializable);
+        t3.put(1, b"v3".to_vec(), vec![]);
+        e.txn_commit(t3).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v3");
+    }
+
+    #[test]
+    fn txn_serializable_upgrades_read_lock_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v0".to_vec(), &["t"]).unwrap();
+        // 同一事务先读后写同一 docid：共享 → 排他升级（2PL 合法）
+        let mut t1 = e.txn_begin(crate::txn::Isolation::Serializable);
+        let v = e.txn_get(&mut t1, 1).unwrap();
+        assert_eq!(v.unwrap(), b"v0");
+        t1.put(1, b"v1".to_vec(), vec![]);
+        e.txn_commit(t1).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1");
+    }
+
+    #[test]
+    fn txn_deadlock_detected_at_engine_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 通过锁表构造 wait-for 环：txn9001 持 10 等 20；txn9002 持 20 等 10
+        e.txn_locks.lock().unwrap().acquire_exclusive(9001, 10).unwrap();
+        e.txn_locks.lock().unwrap().acquire_exclusive(9002, 20).unwrap();
+        let r1 = e.txn_locks.lock().unwrap().acquire_exclusive(9001, 20);
+        assert!(matches!(r1, Err(crate::error::Error::TxnConflict(_))), "无环 → 冲突");
+        let r2 = e.txn_locks.lock().unwrap().acquire_exclusive(9002, 10);
+        assert!(
+            matches!(r2, Err(crate::error::Error::TxnDeadlock(_))),
+            "环 → 检测死锁（victim abort）"
+        );
+        e.txn_locks.lock().unwrap().release(9001);
+        e.txn_locks.lock().unwrap().release(9002);
+        assert_eq!(e.txn_locks.lock().unwrap().lock_count(), 0);
+    }
+
+    #[test]
+    fn txn_delete_and_mixed_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(5, b"keep".to_vec(), &["t"]).unwrap();
+        e.put(6, b"del".to_vec(), &["t"]).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        txn.delete(6);
+        txn.put(7, b"new".to_vec(), vec!["t".into()]);
+        e.txn_commit(txn).unwrap();
+        assert!(e.get(6).unwrap().is_none(), "事务删除生效");
+        assert_eq!(e.get(7).unwrap().unwrap(), b"new");
+        assert_eq!(e.get(5).unwrap().unwrap(), b"keep");
+    }
+
+    #[test]
+    fn txn_rollback_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        txn.put(1, b"x".to_vec(), vec![]);
+        txn.delete(2);
+        e.txn_rollback(txn);
+        assert!(e.get(1).unwrap().is_none(), "回滚后无写入");
+        assert_eq!(e.txn_locks.lock().unwrap().lock_count(), 0, "回滚释放全部锁");
+    }
+
+    #[test]
+    fn txn_snapshot_advances_with_committed_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        let s0 = e.txn_begin(crate::txn::Isolation::RepeatableRead).snapshot();
+        e.put(1, b"v1".to_vec(), &["t"]).unwrap();
+        let s1 = e.txn_begin(crate::txn::Isolation::RepeatableRead).snapshot();
+        assert!(s1 > s0, "提交后新事务快照 seq 应推进");
+        // 旧快照仍读到写前状态（历史版本由 WAL/MemTable seq 过滤保证）
+        let got = e.get_at(1, s0).unwrap();
+        assert!(got.is_none(), "旧快照点 docid=1 尚不存在");
+        assert_eq!(e.get_at(1, s1).unwrap().unwrap(), b"v1");
     }
 
     // ---------- 组提交（M8） ----------
@@ -914,6 +2588,27 @@ mod tests {
         // fulltext_search 回表
         let hits = e.fulltext_search("content", "数据").unwrap();
         assert!(hits.iter().any(|(id, _)| *id == 1 || *id == 2));
+    }
+
+    #[test]
+    fn fulltext_survives_inverted_whitelist() {
+        // M8-P4/P7 正交：inverted_fields 白名单非空时，ft: 词 term 不受白名单过滤
+        // （否则长文本分词索引被白名单误滤，fulltext 检索恒空）
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.inverted.inverted_fields = vec!["status".into()]; // 白名单只建 status
+        c.inverted.fulltext_fields = vec!["content".into()];
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        let val = serde_json::json!({"docid": 1, "status": "active", "content": "山水存迹"});
+        let ft = e.fulltext_fields().clone();
+        let terms = crate::server::extract_terms_with_fulltext(&val, None, Some(&ft));
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put_nosync(1, serde_json::to_vec(&val).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        // 白名单字段 term 建了；ft: 词 term 也建了（不被滤掉）
+        assert!(e.inverted_posting("status=active").unwrap().contains(1));
+        assert!(e.inverted_posting("ft:content:山水").unwrap().contains(1));
+        assert_eq!(e.fulltext_search("content", "山水").unwrap().len(), 1);
     }
 
     #[test]
@@ -1090,10 +2785,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &gc_cfg(2_000)).unwrap();
         e.put(1, b"doc-1".to_vec(), &["t"]).unwrap();
-        // 窗口内第 1 条通常不触发 fsync（有待刷缓冲）
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let pending = e.primary.wal_handle().lock().unwrap().pending_bytes()
-            + e.delta.wal_handle().lock().unwrap().pending_bytes();
+        // 窗口内第 1 条通常不触发 fsync（有待刷缓冲）；有界轮询等后台线程兜底落盘
+        // （并行测试负载下后台线程调度可能延迟，固定 sleep 易 flaky）
+        let mut pending = 1usize;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            pending = e.primary.wal_handle().lock().unwrap().pending_bytes()
+                + e.delta.wal_handle().lock().unwrap().pending_bytes();
+            if pending == 0 {
+                break;
+            }
+        }
         assert_eq!(pending, 0, "后台线程应在窗口内兜底落盘");
     }
 
@@ -1219,6 +2921,54 @@ mod tests {
     }
 
     #[test]
+    fn put_batch_atomic_batch_visible_and_indexed() {
+        // put_batch：批量原子提交——全部可见、倒排可查、覆盖语义正确（D 项 WriteBatch 前置）
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        let items: Vec<(u64, Vec<u8>, Vec<String>)> = (1..=100u64)
+            .map(|i| {
+                (
+                    i,
+                    format!("doc-{i}").into_bytes(),
+                    vec![format!("status={}", if i % 2 == 0 { "active" } else { "inactive" })],
+                )
+            })
+            .collect();
+        e.put_batch(&items).unwrap();
+        // 全部可见
+        assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1");
+        assert_eq!(e.get(100).unwrap().unwrap(), b"doc-100");
+        assert!(e.get(101).unwrap().is_none());
+        // 倒排可查（查询自动刷 pending）
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 50);
+        assert_eq!(e.inverted_doc_count("status=inactive").unwrap(), 50);
+        // 覆盖：同批内后写覆盖前写
+        let overwrite: Vec<(u64, Vec<u8>, Vec<String>)> =
+            vec![(1, b"doc-1-v2".to_vec(), vec![])];
+        e.put_batch(&overwrite).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"doc-1-v2");
+    }
+
+    #[test]
+    fn inverted_batch_pending_flush() {
+        // Ex-5.3：put 攒批缓冲——未达阈值时 term 留在 pending，查询自动刷入（一致性）；
+        // inverted_mem_docids 统计含 pending；flush_inverted 后落盘、统计归零。
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        for i in 0..100u64 {
+            e.put(i, b"v".to_vec(), &["status=active"]).unwrap();
+        }
+        // 未达阈值（8192）→ pending 未刷入，但统计应含 pending
+        assert_eq!(e.inverted_mem_docids(), 100, "统计应含攒批缓冲");
+        // 查询自动刷入 → 立即可见
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 100);
+        // 查询后 pending 已清空
+        assert_eq!(e.pending_inverted.lock().unwrap().len(), 0, "查询后缓冲应清空");
+        // flush_inverted 落盘：内存归零、计数仍正确
+        e.flush_inverted().unwrap();
+        assert_eq!(e.inverted_mem_docids(), 0, "落盘后内存统计归零");
+        assert_eq!(e.inverted_doc_count("status=active").unwrap(), 100);
+    }
+
+    #[test]
     fn delete_hides_doc() {
         let mut e = Engine::open(&tmp(), &cfg()).unwrap();
         e.put(7, b"x".to_vec(), &["k"]).unwrap();
@@ -1337,15 +3087,26 @@ mod tests {
 
     #[test]
     fn get_at_returns_none_after_delete_before_snapshot() {
+        // Ex-5.6 语义拆分：
+        // ① 删除位图开启（默认）：删除为立即/全局语义——已删 docid 在任何快照点均不可见
         let mut e = Engine::open(&tmp(), &cfg()).unwrap();
         e.put(1, b"v1".to_vec(), &["k"]).unwrap();
         let s_before_delete = e.begin_snapshot();
         e.flush_primary().unwrap();
-        e.delete(1).unwrap(); // Tombstone seq > s_before_delete
-                              // 删除前快照 → v1 仍可见
-        assert_eq!(e.get_at(1, s_before_delete).unwrap().unwrap(), b"v1");
-        // 删除后最新读 → 不存在
+        e.delete(1).unwrap(); // 位图置位（快照点前后均不可见）
+        assert!(e.get_at(1, s_before_delete).unwrap().is_none(), "位图删除对旧快照同样隐藏");
         assert!(e.get(1).unwrap().is_none());
+
+        // ② 删除位图关闭：回退传统 Tombstone + MVCC 语义——删除前快照仍可见 v1
+        let mut c = cfg();
+        c.storage.deletion_bitmap_enabled = false;
+        let mut e2 = Engine::open(&tmp(), &c).unwrap();
+        e2.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        let s2 = e2.begin_snapshot();
+        e2.flush_primary().unwrap();
+        e2.delete(1).unwrap(); // Tombstone seq > s2
+        assert_eq!(e2.get_at(1, s2).unwrap().unwrap(), b"v1", "关闭位图保留 Tombstone 快照语义");
+        assert!(e2.get(1).unwrap().is_none(), "删除后最新读 → 不存在");
     }
 
     // ---------- 增量备份（design 20，M6-5） ----------
@@ -1433,7 +3194,7 @@ mod tests {
         // 重启后位图从段重建，COUNT 仍正确（drop 前刷盘倒排，保证段自包含）
         e.flush_inverted().unwrap();
         drop(e);
-        let e2 = Engine::open(dir.path(), &cfg).unwrap();
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
         assert_eq!(e2.inverted_doc_count("status=active").unwrap(), 2);
     }
 
@@ -1571,6 +3332,301 @@ mod tests {
         e.patch(1, &[("note", serde_json::json!("x"))]).unwrap();
         e.delete(1).unwrap();
         assert!(e.get(1).unwrap().is_none(), "删除后 Delta 不应复活文档");
+    }
+
+    // ---------- Ex-5.6 删除位图 ----------
+
+    #[test]
+    fn multi_ssd_striping_places_files() {
+        // Ex-5.10 多 SSD 条带化：wal_dir/sst_dir/inverted_dir 分盘——WAL/SST/倒排文件
+        // 落位正确 + 数据跨重启恢复（默认单盘布局由既有测试覆盖）
+        let data_dir = tempfile::tempdir().unwrap();
+        let wal_dir = tempfile::tempdir().unwrap();
+        let sst_dir = tempfile::tempdir().unwrap();
+        let inv_dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.storage.wal_dir = Some(wal_dir.path().to_string_lossy().to_string());
+        cfg.storage.sst_dir = Some(sst_dir.path().to_string_lossy().to_string());
+        cfg.storage.inverted_dir = Some(inv_dir.path().to_string_lossy().to_string());
+        {
+            let mut e = Engine::open(data_dir.path(), &cfg).unwrap();
+            e.put(1, b"doc1".to_vec(), &["rust"]).unwrap();
+            e.put(2, b"doc2".to_vec(), &["go"]).unwrap();
+            e.flush_primary().unwrap();
+            e.flush_inverted().unwrap();
+            assert_eq!(e.get(1).unwrap().unwrap(), b"doc1");
+        }
+        // 落位验证：WAL / SST / 倒排各在其盘
+        assert!(
+            wal_dir.path().join("primary").join("wal.log").exists(),
+            "primary WAL 应落在 wal_dir"
+        );
+        let sst_files: Vec<_> = std::fs::read_dir(sst_dir.path().join("primary"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!sst_files.is_empty(), "SST 应落在 sst_dir");
+        assert!(
+            inv_dir.path().join("inverted").join("inverted-manifest.json").exists(),
+            "倒排应在 inverted_dir"
+        );
+        assert!(!data_dir.path().join("primary").exists(), "列族目录已外移 sst_dir");
+        // 跨重启恢复（多盘布局持久）
+        let mut e2 = Engine::open(data_dir.path(), &cfg).unwrap();
+        assert_eq!(e2.get(1).unwrap().unwrap(), b"doc1");
+        assert_eq!(e2.get(2).unwrap().unwrap(), b"doc2");
+        assert!(e2.search_term("rust").unwrap().len() == 1);
+    }
+
+    #[test]
+    fn dynamic_io_rate_backs_off_with_write_pressure() {
+        // Ex-7.4：MemTable 水位（写压力代理）升高 → Compaction 限速下调让路
+        // （压力 p → base×(1-0.5p)，最低 50% 基准）
+        let mut c = cfg();
+        c.storage.io_rate_limit_mb = 100; // 100MB/s 基准
+        c.memtable.max_size_mb = 1; // 1MB 小 MemTable → 快速产生写压力
+        let mut e = Engine::open(&tmp(), &c).unwrap();
+        let base = 100u64 * 1024 * 1024;
+        assert_eq!(e.primary.io_rate(), base, "空 MemTable 压力 0 全速");
+        // 写入 8 个 64KB 文档 ≈ 512KB（memtable 50% 水位）
+        let big = vec![b'x'; 64 * 1024];
+        for i in 0..8u64 {
+            e.put(i, big.clone(), &[]).unwrap();
+        }
+        let rate = e.primary.io_rate();
+        assert!(rate < base, "写压力下限速应下调: {rate} < {base}");
+        assert!(rate >= base / 2, "不低于 50% 基准: {rate}");
+        // flush 后水位回落 → 限速回升
+        e.flush_primary().unwrap();
+        let rate2 = e.primary.io_rate();
+        assert!(rate2 >= rate, "flush 后水位降、限速回升: {rate2} >= {rate}");
+    }
+
+    #[test]
+    fn outbox_e2e_enqueue_dispatch_drain() {
+        // Ex-1 端到端：enqueue（与业务写同 seq 空间）→ 重启保留 → 幂等投递 → 排空
+        let mut c = cfg();
+        c.outbox.enabled = true;
+        let dir = tmp();
+        let mut consumer = crate::outbox::IdempotentConsumer::new();
+        {
+            let mut e = Engine::open(&dir, &c).unwrap();
+            e.put(1, b"doc1".to_vec(), &["k"]).unwrap();
+            e.enqueue_outbox(1, b"msg-1").unwrap();
+            e.enqueue_outbox(2, b"msg-2").unwrap();
+            e.flush_wal().unwrap();
+            assert_eq!(e.outbox_pending().unwrap(), 2);
+            // 幂等投递
+            let n = e
+                .dispatch_outbox(|k, p| {
+                    assert!(p.starts_with(b"msg-"));
+                    consumer.apply(k)
+                })
+                .unwrap();
+            assert_eq!(n, 2);
+            assert!(e.outbox_drained().unwrap(), "投递后排空");
+        }
+        // 重启：pending 保持 0（done 状态持久）
+        let mut e2 = Engine::open(&dir, &c).unwrap();
+        assert!(e2.outbox_drained().unwrap());
+        assert_eq!(consumer.received(), 2);
+    }
+
+    #[test]
+    fn outbox_disabled_by_default() {
+        // outbox 默认关闭（零开销）：enqueue 返回 Unsupported、pending=0
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        assert!(e.enqueue_outbox(1, b"x").is_err(), "未启用应拒绝入队");
+        assert_eq!(e.outbox_pending().unwrap(), 0);
+        assert!(e.outbox_drained().unwrap());
+    }
+
+    #[test]
+    fn outbox_pending_survives_restart() {
+        // 崩溃恢复：enqueue 未投递 → 重开 pending 保留（WAL 回放重建）
+        let mut c = cfg();
+        c.outbox.enabled = true;
+        let dir = tmp();
+        {
+            let mut e = Engine::open(&dir, &c).unwrap();
+            e.enqueue_outbox(7, b"keep").unwrap();
+            e.flush_wal().unwrap();
+        }
+        let mut e2 = Engine::open(&dir, &c).unwrap();
+        assert_eq!(e2.outbox_pending().unwrap(), 1, "重开 pending 保留");
+    }
+
+    #[test]
+    fn scale_out_coordinator_e2e_with_outbox() {
+        // Ex-1.5 端到端：扩容协调器（状态机 + 路由切换）衔接 engine outbox——
+        // 写主（业务+outbox 本地原子）→ 追平投递到新节点 → 排空校验 → 切换 → 新节点接管
+        use crate::scale_out::{Phase, ScaleOutCoordinator};
+        use std::sync::Mutex;
+        let da = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.outbox.enabled = true;
+        let a = Mutex::new(Engine::open(da.path(), &c).unwrap());
+        let b = Mutex::new(Engine::open(db.path(), &c).unwrap());
+        // 写主节点 + outbox 入队（本地原子：业务写与消息同 fsync 点）
+        for i in 0..20u64 {
+            let val = format!("doc-{i}").into_bytes();
+            let mut a = a.lock().unwrap();
+            a.put(i, val.clone(), &["status=active"]).unwrap();
+            a.enqueue_outbox(i, &val).unwrap();
+        }
+        // 扩容编排开始（新节点注册为 slave）
+        let mut meta = crate::meta::MetaCenter::new(4);
+        meta.register("node-a", "127.0.0.1:9001", "master").unwrap();
+        let mut coord = ScaleOutCoordinator::begin(
+            &da.path().join("scale-out.json"),
+            meta,
+            "node-a",
+            "node-b",
+            "127.0.0.1:9002",
+        )
+        .unwrap();
+        assert_eq!(coord.phase(), Phase::Adding);
+        coord.begin_catch_up().unwrap();
+        // 追平：dispatch_outbox 投递到新节点（put 覆盖 = 幂等 apply）
+        {
+            let mut a = a.lock().unwrap();
+            let mut b = b.lock().unwrap();
+            let n = a
+                .dispatch_outbox(|key, payload| {
+                    let docid = u64::from_be_bytes(key[..8].try_into().unwrap());
+                    b.put(docid, payload.to_vec(), &[]).unwrap();
+                    true
+                })
+                .unwrap();
+            assert_eq!(n, 20, "20 条 outbox 全部投递");
+            assert!(a.outbox_drained().unwrap(), "排空校验通过");
+        }
+        coord.mark_drained().unwrap();
+        coord.switch().unwrap();
+        assert_eq!(coord.phase(), Phase::Done);
+        assert_eq!(coord.master_node().as_deref(), Some("node-b"), "路由切到新节点");
+        // 新节点数据完整（与主节点一致）
+        let b = b.lock().unwrap();
+        for i in 0..20u64 {
+            assert_eq!(
+                b.get(i).unwrap().as_deref(),
+                Some(format!("doc-{i}").as_bytes()),
+                "docid {i} 追平一致"
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_bitmap_persists_across_restart() {
+        // 删除 → flush_wal（位图落盘）→ 重启 → 位图文件加载，已删 docid 仍不可见
+        let dir = tmp();
+        let cfg = cfg();
+        let bitmap_path = dir.join("deletion.bitmap");
+        {
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+            e.put(2, b"v2".to_vec(), &["k"]).unwrap();
+            e.flush_wal().unwrap();
+            e.delete(1).unwrap();
+            e.flush_wal().unwrap(); // 位图脏页落盘
+        }
+        let meta = std::fs::metadata(&bitmap_path).unwrap();
+        assert_eq!(meta.len() % 4096, 0, "位图文件 4KB 页对齐");
+        let mut e2 = Engine::open(&dir, &cfg).unwrap();
+        assert!(e2.get(1).unwrap().is_none(), "重启后位图加载，删除持久");
+        assert!(e2.get(2).unwrap().is_some(), "未删文档不受影响");
+    }
+
+    #[test]
+    fn deletion_bitmap_put_resurrects() {
+        // delete → put 复活：put 清位，文档重新可见
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        e.delete(1).unwrap();
+        assert!(e.get(1).unwrap().is_none());
+        e.put(1, b"v2".to_vec(), &["k"]).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v2", "put 复活后可见新值");
+    }
+
+    #[test]
+    fn deletion_bitmap_compaction_drops_deleted_data() {
+        // 位图开启：delete 不写 LSM 墓碑 → compaction 按位图物理丢弃已删 docid 旧数据；
+        // 重启后位图 + 压实结果均一致（已删不可见、存活可见）
+        let dir = tmp();
+        let cfg = cfg();
+        {
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            for d in 1..=4u64 {
+                e.put(d, format!("doc{d}").into_bytes(), &["k"]).unwrap();
+            }
+            e.flush_primary().unwrap(); // L0 第 1 段
+            e.put(5, b"doc5".to_vec(), &["k"]).unwrap();
+            e.flush_primary().unwrap(); // L0 第 2 段 → 触发 compaction 条件
+            e.delete(2).unwrap();
+            e.delete(4).unwrap();
+            let rep = e.compact().unwrap();
+            assert!(rep.merged_ssts >= 2, "L0 压实应合并多段");
+            assert!(e.get(2).unwrap().is_none());
+            assert!(e.get(4).unwrap().is_none());
+            assert!(e.get(1).unwrap().is_some());
+            assert!(e.get(5).unwrap().is_some());
+        }
+        let mut e2 = Engine::open(&dir, &cfg).unwrap();
+        for d in 1..=5u64 {
+            let deleted = matches!(d, 2 | 4);
+            assert_eq!(e2.get(d).unwrap().is_none(), deleted, "重启后 docid {d} 状态一致");
+        }
+    }
+
+    #[test]
+    fn deletion_bitmap_disabled_uses_tombstone_path() {
+        // 位图关闭：delete 走传统 Tombstone（primary.delete + 逐条 fsync），get 仍返回 None
+        let mut c = cfg();
+        c.storage.deletion_bitmap_enabled = false;
+        let dir = tmp();
+        {
+            let mut e = Engine::open(&dir, &c).unwrap();
+            e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+            e.delete(1).unwrap();
+            assert!(e.get(1).unwrap().is_none());
+        }
+        assert!(
+            !dir.join("deletion.bitmap").exists(),
+            "位图关闭时不应生成位图文件"
+        );
+        let mut e2 = Engine::open(&dir, &c).unwrap();
+        assert!(e2.get(1).unwrap().is_none(), "Tombstone 路径跨重启删除一致");
+    }
+
+    #[test]
+    fn deletion_bitmap_incremental_backup_captures_delete() {
+        // 位图开启：delete 写 primary WAL 删除记录 → 增量备份导出含删除 → 恢复后删除保持
+        let dir = tmp();
+        let cfg = cfg();
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, v: &str| {
+            e.put(docid, v.as_bytes().to_vec(), &["k"]).unwrap();
+        };
+        put_doc(&mut e, 1, "v1");
+        put_doc(&mut e, 2, "v2");
+        let since = e.current_seq();
+        e.delete(1).unwrap();
+        let bak_dir = tempfile::tempdir().unwrap();
+        let bak = bak_dir.path().join("incr.json");
+        let rep = e.backup_incremental(since, &bak).unwrap();
+        assert!(rep.records >= 1, "增量备份应包含删除记录");
+        drop(e);
+
+        // 恢复到全新引擎（位图开启）：删除记录回放 → 重新置位 → doc 1 不可见
+        let dir2 = tmp();
+        let mut e2 = Engine::open(&dir2, &cfg).unwrap();
+        put_doc(&mut e2, 1, "v1");
+        put_doc(&mut e2, 2, "v2");
+        let n = e2.restore_incremental(&bak).unwrap();
+        assert!(n >= 1);
+        assert!(e2.get(1).unwrap().is_none(), "增量恢复后删除保持");
+        assert!(e2.get(2).unwrap().is_some());
     }
 
     #[test]
