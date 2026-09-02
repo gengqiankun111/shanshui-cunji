@@ -1,4 +1,4 @@
-﻿//! 类 SQL 解析器（design 157/1358 行：SELECT ... WHERE AND/OR 子集，走倒排/组合索引）。
+//! 类 SQL 解析器（design 157/1358 行：SELECT ... WHERE AND/OR 子集，走倒排/组合索引）。
 //!
 //! 语法子集（递归下降，零外部依赖——不引入 sqlparser-rs 大依赖）：
 //!   SELECT [*|col1,col2] FROM <表名> [WHERE <expr>] [LIMIT n [OFFSET m]]
@@ -515,6 +515,57 @@ fn scan_all(
     post_filter(engine, full, leaf, limit, guard)
 }
 
+/// 谓词下推（7.93）：WHERE 为**裸比较/BETWEEN**（无倒排等值可收敛）时，单遍流式扫描 +
+/// LIMIT/OFFSET 早停直接产出命中行（含 doc 值）——替代旧路径「scan 全量收集 docid →
+/// 逐 docid 二次回表 get」，消除两遍 IO 与全量枚举（千万级库 `amount>90000 LIMIT 10`
+/// 由全表熔断降至命中即停的毫秒级，对齐 MySQL 顺序扫表早停语义）。
+/// 行级判定用扫描读出的主文档值（与引擎 scan / 倒排词条一致基于主文档）；
+/// delta 字段 patch 场景与 scan 值语义一致（SQL 过滤基于主文档）。
+fn scan_pushdown(
+    engine: &Engine,
+    leaf: &Leaf,
+    limit: u64,
+    offset: u64,
+    guard: &crate::watchdog::QueryGuard,
+) -> Result<Vec<QueryRow>> {
+    let mut out: Vec<QueryRow> = Vec::new();
+    let mut skipped = 0u64;
+    let mut scanned = 0u64;
+    engine.scan_stream(None, None, |docid, doc| {
+        scanned += 1;
+        if scanned % 4096 == 0 && guard.is_expired() {
+            return Err(Error::QueryTooExpensive(format!(
+                "类 SQL 流式过滤超时（已扫 {scanned} 条，熔断中止），建议用倒排等值条件收敛范围"
+            )));
+        }
+        let val = match serde_json::from_slice::<Value>(doc) {
+            Ok(v) => v,
+            Err(_) => return Ok(true),
+        };
+        let hit = match leaf {
+            Leaf::Cmp(c) => field_of(&val, &c.field)
+                .map(|v| cmp_value(v, &c.op, &c.value))
+                .unwrap_or(false),
+            Leaf::Between { field, low, high } => field_of(&val, field)
+                .map(|v| between_value(v, low, high))
+                .unwrap_or(false),
+        };
+        if !hit {
+            return Ok(true);
+        }
+        if skipped < offset {
+            skipped += 1;
+            return Ok(true);
+        }
+        out.push((docid, doc.to_vec()));
+        if out.len() as u64 >= limit {
+            return Ok(false); // LIMIT 命中即停
+        }
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
 /// 单条件求值：`=` 走倒排 posting（docid 特例点查）；`!=` 全量 − posting；比较/BETWEEN 扫描。
 fn eval_cond(
     engine: &Engine,
@@ -600,6 +651,11 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
+    // 谓词下推（7.93）：WHERE 为裸比较/BETWEEN（无倒排等值可收敛）→ 单遍流式扫描 +
+    // LIMIT/OFFSET 早停直接产出命中行（不再全量收集 docid 再逐行回表 get）。
+    if let Some(leaf) = sel.where_expr.as_ref().and_then(scan_leaf) {
+        return scan_pushdown(engine, &leaf, limit, sel.offset, &guard);
+    }
     let bitmap = match &sel.where_expr {
         Some(e) => eval(engine, e, limit, &guard)?,
         None => full_docids(engine, &guard)?,
@@ -672,6 +728,34 @@ mod tests {
         let rows2 = execute(&mut e, "SELECT * FROM t WHERE docid=42", 1000).unwrap();
         assert_eq!(rows2.len(), 1, "docid 点查单例");
         assert_eq!(rows2[0].0, 42);
+    }
+
+    #[test]
+    fn sql_comparison_pushdown_single_pass_early_stop() {
+        // 7.93：裸比较/BETWEEN 下推——单遍流式扫描 + LIMIT 早停，结果与旧 eval 路径一致
+        let mut e = engine_with_docs(); // docid i：amount = i*10
+        // 下推（裸比较 amount>900）vs 旧路径（AND 包一层使走 eval+post_filter）：同为 91..99
+        let rows = execute(&mut e, "SELECT * FROM t WHERE amount>900", 1000).unwrap();
+        assert_eq!(rows.len(), 9, "amount>900 → docid 91..99");
+        assert_eq!(rows[0].0, 91);
+        let rows_ref = execute(&mut e, "SELECT * FROM t WHERE amount>900 AND docid>0", 1000).unwrap();
+        assert_eq!(rows, rows_ref, "下推结果应与旧 eval 路径一致");
+        // LIMIT 早停：只取前 2 命中
+        let rows2 = execute(&mut e, "SELECT * FROM t WHERE amount>900 LIMIT 2", 1000).unwrap();
+        assert_eq!(rows2.len(), 2);
+        assert_eq!(rows2[0].0, 91);
+        // BETWEEN 下推（amount = i*10 ∈ [500,530] 闭区间 → i∈[50,53] 共 4 行）
+        let rows3 = execute(&mut e, "SELECT * FROM t WHERE amount BETWEEN 500 AND 530", 1000).unwrap();
+        assert_eq!(rows3.len(), 4);
+        assert_eq!(rows3[0].0, 50);
+        assert_eq!(rows3[3].0, 53);
+        // OFFSET：跳过前 2 个命中（91,92 → 从 93 起）
+        let rows4 = execute(&mut e, "SELECT * FROM t WHERE amount>900 LIMIT 2 OFFSET 2", 1000).unwrap();
+        assert_eq!(rows4.len(), 2);
+        assert_eq!(rows4[0].0, 93);
+        // 返回行含完整 doc（后续投影免二次回表）
+        let v: serde_json::Value = serde_json::from_slice(&rows2[0].1).unwrap();
+        assert_eq!(v["amount"], 910);
     }
 
     #[test]

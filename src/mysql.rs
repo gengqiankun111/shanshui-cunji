@@ -64,6 +64,10 @@ const MYSQL_TYPE_LONG: u8 = 3;
 const MYSQL_TYPE_STRING: u8 = 254;
 const MYSQL_TYPE_DOUBLE: u8 = 5;
 
+/// 倒排内存 term 落盘阈值（条，7.93）：mysql-server 写路径 term 攒内存不落盘，
+/// 达此阈值强制 `flush_inverted` 落段（重启后字段等值仍可查；段数由 GC worker 收敛）。
+const INVERTED_MEM_FLUSH_THRESHOLD: u64 = 1_000_000;
+
 // ============ 报文编解码 ============
 
 fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> std::io::Result<()> {
@@ -460,6 +464,39 @@ impl MySqlServer {
         });
     }
 
+    /// 7.93：倒排**落盘**后台 worker——把内存 term 落段持久化（重启后字段等值查询不丢）。
+    /// 背景：引擎写路径只把 term 攒入内存（pending_inverted/mem），落段依赖显式
+    /// `flush_inverted`；mysql_server 场景无显式落盘 → 进程重启内存 term 即失，
+    /// 字段等值过滤查空（7.93 实测 `status='active'` 0 行）。本线程周期落盘：
+    /// 内存 term 超阈值实时刷 + 30s 非空兜底（段文件持久，重启后经 FST 可查）。
+    /// 段数增长由 GC worker（7.73 信号 + 10 分钟兜底）收敛。
+    fn spawn_inverted_flush_worker(&self) {
+        let engine = self.engine.clone();
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let mem = engine
+                    .read()
+                    .ok()
+                    .map(|g| g.inverted_mem_docids())
+                    .unwrap_or(0);
+                if mem == 0 {
+                    continue;
+                }
+                // 攒批涨得快 → 达阈值立即落盘；否则 30s 兜底周期落盘
+                let force = mem >= INVERTED_MEM_FLUSH_THRESHOLD;
+                let interval = last.elapsed() >= std::time::Duration::from_secs(30);
+                if force || interval {
+                    if let Ok(g) = engine.read() {
+                        let _ = g.flush_inverted();
+                    }
+                    last = std::time::Instant::now();
+                }
+            }
+        });
+    }
+
     /// 绑定并接受连接（阻塞）。每连接 spawn 线程处理。返回**实际绑定地址**
     /// （addr 为 `127.0.0.1:0` 时返回 OS 分配的随机端口——并发测试/动态端口场景）。
     pub fn serve(self, addr: &str) -> Result<std::net::SocketAddr> {
@@ -468,6 +505,8 @@ impl MySqlServer {
         self.spawn_compaction_worker();
         // J 项（7.73）：倒排段 GC 后台 worker（信号 + 10 分钟兜底）
         self.spawn_inverted_gc_worker();
+        // 7.93：倒排落盘 worker（内存 term → 段文件持久，重启后等值可查）
+        self.spawn_inverted_flush_worker();
         let listener = TcpListener::bind(addr)?;
         let local = listener.local_addr()?;
         tracing::info!("MySQL 协议服务已启动: mysql://{addr}（库 {DEFAULT_DB}，表 {DEFAULT_TABLE}）");
@@ -518,6 +557,8 @@ impl MySqlServer {
         self.spawn_compaction_worker();
         // J 项（7.73）：倒排段 GC 后台 worker
         self.spawn_inverted_gc_worker();
+        // 7.93：倒排落盘 worker（内存 term → 段文件持久，重启后等值可查）
+        self.spawn_inverted_flush_worker();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local = listener.local_addr()?;
         tracing::info!(
@@ -1186,9 +1227,9 @@ fn extract_target_ids(sql: &str) -> Option<Vec<u64>> {
             return Some(vec![num.parse().ok()?]);
         }
     }
-    // id BETWEEN A AND B
-    if let Some(bp) = rest.find("between") {
-        let after = &rest[bp + 7..];
+    // id BETWEEN A AND B（仅限 id 字段——否则 amount/其他列 BETWEEN 会被误当 docid 窗口，7.93 定位）
+    if let Some(bp) = rest.find("id between") {
+        let after = &rest[bp + "id between".len()..];
         let and = after.find("and")?;
         let a: u64 = after[..and].trim().parse().ok()?;
         let b: u64 = after[and + 3..].trim().parse().ok()?;
@@ -2807,6 +2848,14 @@ mod tests {
         assert_eq!(extract_limit("SELECT c FROM sbtest WHERE id BETWEEN 1 AND 5 ORDER BY c LIMIT 10"), Some(10));
         // 不支持 → None
         assert!(extract_target_ids("SELECT * FROM sbtest WHERE status='a'").is_none());
+        // 7.93 回归：非 id 字段 BETWEEN 不得被当 docid 窗口（旧实现 find("between") 吞掉 amount/其他列）
+        assert!(
+            extract_target_ids("SELECT id FROM orders WHERE amount BETWEEN 50000 AND 50005").is_none(),
+            "amount BETWEEN 应落到 sqlish 字段过滤，而非 docid 窗口"
+        );
+        assert!(
+            extract_target_ids("SELECT id FROM orders WHERE status='a' AND amount BETWEEN 1 AND 2").is_none()
+        );
     }
 
     // ---------- 单元：SET TRANSACTION ISOLATION LEVEL ----------

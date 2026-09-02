@@ -2610,6 +2610,38 @@ impl RuntimePools {
 3. **实测**（1000 万库 release，pymysql）：`SELECT name, addr.city` → 列头 [name, city]，
    city='bj'；`addr.geo.lat/lng` → DOUBLE float 39.9/116.4；`addr.zip` 缺失 → None。
 
+### 7.93 WHERE 字段条件过滤下推（单遍扫描 + LIMIT 早停）+ 等值可见性 + BETWEEN 窗口 bug
+
+> 2026-09-02。探针（1000万 库）暴露字段过滤三问题：① `amount>90000 LIMIT 10` 全表
+> **17.2s 熔断**（MySQL 无索引顺序扫 2ms）；② 等值 `status='active'` **0 行**（倒排 term 不
+> 落盘，进程重启即失）；③ `amount BETWEEN` 被**误当 docid 窗口**（既有 bug）。
+
+1. **谓词下推（src/sqlish.rs）**：`scan_pushdown`——WHERE 为裸比较/BETWEEN 时
+   `engine.scan_stream` 单遍流式扫描，行级判定直接用扫描主文档值（免二次回表 get），
+   LIMIT/OFFSET 命中即停（`Ok(false)` 提前终止）；`execute` 顶层分支跳过
+   「scan 全量收集 docid → 逐行回表 get」两遍 IO 路径；AND/OR/NOT/等值组合保留
+   eval+post_filter（倒排收敛 + 后过滤）。
+2. **等值可见性（src/mysql.rs）**：新增 `spawn_inverted_flush_worker`——写路径 term 只攒
+   内存不落段 → 内存 term ≥ 100 万强制落盘 + 30s 非空兜底 `flush_inverted`；段文件持久，
+   **重启后字段等值查询仍命中**（FST 加载段）；段数由 GC worker 收敛。
+3. **BETWEEN 窗口 bug（src/mysql.rs）**：`extract_target_ids` 的 BETWEEN 分支用
+   `find("between")` 匹配**任意字段** → `amount BETWEEN` 被展开成 docid 窗口（返回 docid
+   50000..50005 而 amount 过滤失效）。改为仅 `id between`（对齐 `extract_between_range`），
+   非 id 字段 BETWEEN 正确落 sqlish 字段过滤。
+4. **回归**：全量 **543 全绿**（+1 sqlish 下推：结果与旧 eval 一致/LIMIT 早停/OFFSET/
+   BETWEEN 闭区间/返回行含 doc；extract_target_ids 增 amount BETWEEN → None 回归断言）。
+5. **实测**（1000 万库 release，3307 vs MySQL 3306 无索引基线）：
+
+   | 查询 | 优化前 SCC | 优化后 SCC | MySQL |
+   |---|---|---|---|
+   | `amount>90000 LIMIT 10` | 17.2s 熔断 | **0.6ms** | 0.4ms |
+   | `amount BETWEEN 50000..50005 LIMIT 3` | 误当 docid 窗口 | 8ms（**与 MySQL 同 3 行**） | 1.9ms |
+   | `status='active' AND amount BETWEEN 80000..90000 LIMIT 10` | 等值空/错 | 0.8ms（倒排收敛） | 1ms |
+   | 重启后 `status='active'`（倒排落盘） | 0 行 | 命中（段 2/2） | — |
+
+   返回行与 MySQL 逐行一致（docid 3533/4810/6456 等）；剩余差距在 JSON 全文档反序列化
+   vs InnoDB 列式扫描（低命中率窗口 LIMIT 大值场景仍受看门狗保护，属于文档型语义差异）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
