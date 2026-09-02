@@ -80,7 +80,15 @@ fn main() {
         cfg.storage.group_commit_us = 2000;
         println!("[mysql-server] 默认开启组提交（group_commit_us=2000µs，config 可覆盖）");
     }
-    let engine = Engine::open(&data_dir, &cfg).expect("打开引擎失败");
+    let engine = Engine::open_with_timeout(
+        &data_dir,
+        &cfg,
+        // 7.94：字段过滤/数字等值回退/比较扫描为无索引全表类负载，默认看门狗 500ms
+        // 只够扫 ~40 万行 JSON（MySQL 无索引等值/全扫 2.5s+）；放宽到 30s 让这类查询
+        // 能完成（对齐语义），防真挂起仍有效。
+        std::time::Duration::from_secs(30),
+    )
+    .expect("打开引擎失败");
     println!(
         "[mysql-server] 数据目录 {} 打开完成，启动 MySQL 协议服务{}: {bind}",
         data_dir.display(),

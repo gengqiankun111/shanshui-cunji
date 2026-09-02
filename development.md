@@ -2642,6 +2642,35 @@ impl RuntimePools {
    返回行与 MySQL 逐行一致（docid 3533/4810/6456 等）；剩余差距在 JSON 全文档反序列化
    vs InnoDB 列式扫描（低命中率窗口 LIMIT 大值场景仍受看门狗保护，属于文档型语义差异）。
 
+### 7.94 数字等值回退扫描（amount=xxx 不再查空）+ AND 收敛 + mysql-server 查询预算放宽
+
+> 2026-09-02。7.93 探针遗留：数字字段等值 `amount=67539` 返回空——倒排 term 只由字符串
+> 叶子生成（collect_strings 跳过 Number/Bool），数字等值 inverted_posting 必空 → 误判 0 行。
+> 同理数字 `!=` 倒排取反错误返回全表。
+
+1. **等值回退（src/sqlish.rs）**：
+   - `scan_row_matches`：扫描行主文档值直接判定（下推/回退共用，免 engine.get 二次回表）；
+   - `scan_backfill_bitmap`：单遍流式扫描收集**全部**命中 docid（AND/OR/NOT 组合需完整集，
+     看门狗熔断保护）；`eval_cond` Eq/Ne 倒排 posting 空（数字/未索引字段）→ 回退扫描确认，
+     不再把空 posting 当 0 行；
+   - execute 裸 `field=value`（posting 空）→ `scan_pushdown` 单遍 + LIMIT 早停；
+   - `as_eq_cond` + eval And 快路径：空 posting 等值视作扫描叶，在另一分支位图上 post_filter
+     （active ∩ amount=xxx 从「回退全扫 1000 万 再交」降为「候选集逐查」）。
+2. **mysql-server 查询预算（src/bin/mysql_server.rs）**：`Engine::open_with_timeout` 30s
+   （默认看门狗 500ms 只够扫 ~40 万行 JSON；无索引全表类字段过滤需更大预算，防挂起仍有效）。
+3. **回归**：全量 **544 全绿**（+1 sql_numeric_eq_backfill：裸等值命中/不存在 0 行/AND 组合
+   交/数字 Ne 排除/字符串等值倒排路径不变）。
+4. **实测**（1000 万库 release vs MySQL 3306 无索引）：
+
+   | 查询 | 修复前 | 修复后 | MySQL |
+   |---|---|---|---|
+   | `amount=67539 LIMIT 5` | 0 行（错） | **5 行 1.1s** | 158ms |
+   | `status='active' AND amount=67539` | 0 行/12.4s（回退全扫） | **16.7ms**（候选收敛） | — |
+   | `status='active'`（倒排） | — | 0.5ms | — |
+
+   数字等值命中语义对齐 MySQL；剩余差距 = JSON 全文档反序列化 vs InnoDB 列式扫描
+   （文档型无索引全扫成本，命中后早停仍快）。
+
 ## 8. 编码规范
 
 - **注释与文档语言**：中文（与仓库一致），关键算法必须写注释说明「为什么」；
