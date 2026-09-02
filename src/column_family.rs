@@ -719,8 +719,12 @@ impl ColumnFamily {
             merge_candidate_bytes(&mut merged, key.to_vec(), e.seq, e.value.clone());
         });
 
-        // SST 范围扫描（Zone Map 剪枝已内置在 scan_range）
+        // SST 范围扫描（Zone Map 剪枝已内置在 scan_range；Ex-8.2 先按段 key 范围跳过不相交段，
+        // 免调 sst.scan_range 的线性索引走查开销）
         for sst in self.ssts.load().ssts.iter() {
+            if !sst_intersects_window(sst, start, end) {
+                continue;
+            }
             sst.scan_range(start, end, |k, v, seq| {
                 merge_candidate_bytes(&mut merged, k.to_vec(), seq, v.map(|x| x.to_vec()));
             })?;
@@ -764,6 +768,11 @@ impl ColumnFamily {
             let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
             let snap = self.ssts.load();
             for sst in snap.ssts.iter() {
+                // Ex-8.2：scan 路径段级 key 范围剪枝——窗口不相交的段免建迭代器
+                // （此前无条件对快照全部 SST 建迭代器，无层/文件粗筛）
+                if !sst_intersects_window(sst, start, end) {
+                    continue;
+                }
                 sst_iters.push(crate::sstable::SstRangeIter::new(sst, start, end)?);
             }
             let mem_count = mem_iters.len();
@@ -939,6 +948,10 @@ impl ColumnFamily {
             let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
             let snap = self.ssts.load();
             for sst in snap.ssts.iter() {
+                // Ex-8.2：同 scan_stream_at，窗口不相交的段免建 keys-only 迭代器
+                if !sst_intersects_window(sst, start, end) {
+                    continue;
+                }
                 sst_iters.push(crate::sstable::SstRangeIter::new_keys(sst, start, end)?);
             }
             let mem_count = mem_iters.len();
@@ -1813,6 +1826,31 @@ fn merge_candidate_bytes(
             merged.insert(key, (seq, value));
         }
     }
+}
+
+/// Ex-8.2：扫描窗口与段 key 范围相交判定（闭区间，None 端无边界）。
+/// 段范围未知（key_range=None：空段/缺侧）→ 保守返回 true 不跳过；精确判定，零假阴性。
+/// 复用于 scan_stream_at / count_keys_range_filtered / scan_raw_range 的逐 SST 迭代器
+/// 构建前——窗口只与相交段交互，非相交段免建 SstRangeIter（免 L2 定位/索引读）。
+fn sst_intersects_window(
+    sst: &SstReader,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> bool {
+    let Some((min, max)) = sst.key_range() else {
+        return true;
+    };
+    if let Some(s) = start {
+        if max < s {
+            return false;
+        }
+    }
+    if let Some(e) = end {
+        if min > e {
+            return false;
+        }
+    }
+    true
 }
 
 /// 单 SST 等值查询（布隆剪枝 → 二分定位块 → 块缓存/读盘 → 块内扫描）。

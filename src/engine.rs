@@ -2285,6 +2285,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_prunes_disjoint_ssts_windows() {
+        // Ex-8.2：scan 路径段级 key 范围剪枝——3 个不相交文件下，窗口只命中相交文件，
+        // 结果与全建迭代器一致（收集 == 流式），全扫与边界窗口正确。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for (lo, hi) in [(1u64, 4000u64), (4001, 8000), (8001, 12000)] {
+            for i in lo..=hi {
+                e.put(i, format!("d{i}").into_bytes(), &["t"]).unwrap();
+            }
+            e.flush_primary().unwrap(); // 三个不相交 docid 范围的 SST
+        }
+        let wins: Vec<(Option<u64>, Option<u64>)> = vec![
+            (None, None),
+            (Some(3990), Some(4010)),   // 跨文件边界
+            (Some(7000), Some(7200)),   // 只命中中段
+            (Some(11000), Some(12000)), // 尾段含端点
+            (Some(1), Some(1)),
+            (Some(12001), Some(13000)), // 越界空
+            (None, Some(4000)),
+            (Some(8001), None),
+        ];
+        for &(a, b) in &wins {
+            let c = e.scan_range(a, b).unwrap();
+            let mut s: Vec<(u64, Vec<u8>)> = Vec::new();
+            e.scan_stream(a, b, |d, v| {
+                s.push((d, v.to_vec()));
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(c.len(), s.len(), "窗口 {a:?}..{b:?} 行数不一致 {} vs {}", c.len(), s.len());
+            for (i, (cr, sr)) in c.iter().zip(s.iter()).enumerate() {
+                assert_eq!(cr, sr, "窗口 {a:?}..{b:?} 第 {i} 行不一致");
+            }
+        }
+        assert_eq!(e.scan_range(None, None).unwrap().len(), 12000, "全扫应 12000 行");
+        assert_eq!(e.count_all_docs().unwrap(), 12000, "全库计数应 12000");
+        assert_eq!(
+            e.scan_range(Some(7000), Some(7200)).unwrap().len(),
+            201,
+            "中段窗口应 201 行（7000..=7200）"
+        );
+        // 剪枝不丢跨文件边界行
+        let cross = e.scan_range(Some(3998), Some(4003)).unwrap();
+        assert_eq!(cross.len(), 6, "跨文件窗口应 6 行");
+    }
+
+    #[test]
     fn batch_get_matches_get_with_delta_and_deletion_bitmap() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &cfg()).unwrap();
