@@ -116,6 +116,71 @@
 - **阶段 A~D 全部完成**；剩余：10 分片 10 亿构建验收（硬件）+ raft TCP 传输/扩容编排联动（部署推进）
 - **触发**：阶段 A 立即（10 亿库前提）；B/C/D 随节点规模/硬件推进
 
+## 11. LSM 读路径范围查询优化（Ex-8 系列，✅ 已排期 2026-09-03）
+
+- **来源**：design_remain §7 / 5000 万 MySQL 对照（范围 10m 18.8× → 50m ~102×）
+- **前置分析**：根因 = 收集路径线性索引税 + 流式路径无层/文件剪枝 + 全值解码/无块缓存
+  （非缺 B+Tree；3308 实验：非事务收集 67~101ms 位置单调劣化 vs 事务流式恒 ~5ms）
+- **Ex-8.1（P0）非事务 id BETWEEN 改走流式窗口扫描**：
+  - [ ] mysql.rs 非事务 `id BETWEEN` 拦截点（1856-1878）由 `engine.scan_range`（收集路径：
+    逐 SST `sst.scan_range` 线性走块索引 + `index()` 全量 clone + HashMap 合并排序）改走
+    `engine.scan_stream` 窗口（SstRangeIter 二分定位起始块 + Zone Map 只读相交块 + 逐条回调收集）
+  - [ ] **前置正确性修复（demo range-window 发现，切换前提）**：
+    ① 流式 merge 折叠**同源同 key 旧版本**（覆盖写未收敛刷盘：收集 100 行 vs 流式 110 行，
+    demo `finding_multi_version_within_source_not_collapsed` #[ignore] 待修复后启用）；
+    ② 删除位图消费语义：scan 收集/流式两路径均不查位图（get 不可见但扫描返回已删 docid），
+    需定语义（对齐位图过滤 或 文档注明），demo `equiv_delete_multi_sst` 已记录观察
+  - [ ] 语义对齐：与收集路径同结果（窗口闭区间、无快照实时语义一致）+ SUM/COUNT/ORDER BY 分支保持
+  - [ ] 边界：空窗口 / 窗口跨 SST 文件边界 / 单文件内多块组 / 与删除位图/tombstone 交互
+  - [ ] demo ✅ 完成（src/demo/range-window，2026-09-03：6 passed + 1 #[ignore] 记录分歧；
+    memtable-only/单 SST/多段压实/删除/重开两路径全等价 + perf 对照观测）
+  - [ ] 预期：50m 范围 p50 86ms → ~5ms（与事务流式持平）；1 亿/更大库线性税消除
+- **Ex-8.2（P0）scan 路径层 + 文件 key 范围剪枝**：
+  - [ ] `scan_stream_at` / `scan_range` 复用 `layer_ranges/layer_indices`（现仅点查路径消费）：
+    窗口 [start,end] 只构造相交 SST 的 SstRangeIter；memtable 按 docid 窗口 with_iter_range 已具备
+  - [ ] 全扫（无窗口）语义不变（全部文件照旧）
+  - [ ] demo + 单测（剪枝 vs 全建迭代器同结果；多段/跨层窗口正确）
+- **Ex-8.3（P1）扫描路径块缓存 + keys-only 投影**：
+  - [ ] SstRangeIter/scan_range 读块挂既有 blockcache（当前只点查 get_from_sst 挂载）
+  - [ ] 纯 `SELECT id` 窗口扫描走 keys-only 解码（7.100 `decode_data_block_keys` 模式扩展到
+    有界窗口 + 行式格式值跳过；PAX 回退）
+  - [ ] demo + 单测（keys-only 窗口 vs 全解码同结果；热点窗口重复读块缓存命中）
+- **Ex-8.4（远期，不主动排期）**：L1/L2 B+Tree 存储替换（触发条件见 design_remain §7.2）
+- **验收**：Ex-8.1~8.3 落地后 50m 范围查询对照复测（tmp_bench_mysql_vs_scc_50m.py + probe），
+  目标 MySQL 差距 100× → 个位数×；全量回归全绿后按工作流提交 + 回填 feature_remain / development.md 7.x
+
+## 12. MemTable/写侧与倒排提案采纳候选（design_remain §8，2026-09-03 排期）
+
+> 分片跳表 / L1+B+Tree 存储 / 16KB 默认块 / TRIM / 大页 NUMA / 倒排回表 B+Tree 化等已否决或平台远期，
+> 见 design_remain §8.1。本清单 = 采纳候选（每项 demo-first 验证后实施）。
+
+- **Ex-8.5（P2）并行 Flush**：
+  - [ ] demo：单线程 vs 分片并行写 SST fragment（imm memtable 按 key 段切分，多 worker zstd + 写段，
+    顺序合并 fragment）对照（复用 Ex-7.2 绑核思路）
+  - [ ] 与合并背压（P 项 auto_compact）/ io_uring 队列关系评估；memtable 256MB 上限下频次实测
+- **Ex-8.6（P2）段级 min/max seq 元数据 + 快照读整段跳过**：
+  - [ ] 段元数据加 min_seq/max_seq（manifest/SST footer 版本兼容）；get_at / scan_range_at 剪枝
+    （快照 seq ≤ 段 min_seq → 整段跳过，仅读历史快照时生效）
+  - [ ] demo + 单测（快照读与全读一致；多段混合 seq 正确性；对 RR 长事务读放大收益）
+  - [ ] 与 Ex-8.2 文件范围剪枝互补（key 范围 + seq 范围双维剪枝）
+- **Ex-8.7（P3）删除密度 urgency**：
+  - [ ] compaction_urgency 增加删除密度维度（位图置位率/段内删除比例加权），删除密集段优先合并释放空间
+  - [ ] demo：删除密集 vs 均匀负载下空间回收/读路径段数收敛对照
+- **Ex-8.8（P2）posting LRU 双区热点化 + 参数化**：
+  - [ ] 现有 posting LRU 256 项（c380792）仿 HotCache 双区（普通 + promote 保护区）热点化 + 容量配置化
+  - [ ] demo：热点/冷 term 交替负载命中率与内存预算对照（无需新缓存结构）
+- **Ex-8.1 前置正确性修复**（流式 merge 折叠同源同 key + scan 删除位图语义）→ 见 §11 Ex-8.1 前置项，
+  随 Ex-8.1 内核实现一起落地（demo range-window 已记录）
+
+## 13. 全局纪元 + 多文件 WAL（评估结论：不立项，design_remain §9）
+
+- **判定**：❌ 当前不立项（单 NVMe 并发 fsync 无增益；组提交/flushed_seq/manifest 已覆盖序号+水位语义；
+  因果风险因单 docid 本地事务天然不存在；真多设备场景由 Ex-5.10 条带化承担）
+- **远期触发项（满足后复评）**：无锁多写者 + 每写者独立 WAL + NVMe 多队列/多设备——前置 = 解除引擎写侧
+  串行（O 项仅读并行，写仍单锁）+ 实测吞吐先定位写锁/倒排/合并瓶颈（A 项写放大）确证 WAL fsync 为天花板
+- **验收口径（若复评）**：manifest 持久化各文件 max_flushed_epoch + 恢复按水位（禁止逐号扫缺口）；
+  与删除位图 flush 序（先位图后 WAL）保持；增量备份/环形 WAL 截断交互回归
+
 ## 已完成基线（勿重复）
 
 - 排期大项 A~Y 全完成（development_process_order.md 第 2 章）

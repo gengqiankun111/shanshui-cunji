@@ -13,6 +13,12 @@
 
 | 功能 | 模块 | 说明 |
 |---|---|---|
+| 全局纪元 + 多文件 WAL（已评估，2026-09-03） | 写路径/WAL | ❌ 不立项：单 NVMe 并发 fsync 无增益（设备串行）；序号（per-CF seq + WAL 头 next_seq）与水位语义（组提交 + flushed_seq/manifest）已覆盖且更简单；单 docid 本地事务无跨文件因果；真多设备由 Ex-5.10 条带化承担。远期触发 = 无锁多写者 + 独立 WAL + NVMe 多队列（design_remain §9 / development_remain §13） |
+| 范围查询优化（Ex-8.1~8.3，已排期 2026-09-03） | 引擎读路径/性能 | 根因：非事务 `id BETWEEN` 走收集路径（逐 SST 线性走块索引 + L2 全量 clone + 收集排序）→ 50m 范围 86ms 且位置依赖；事务流式仅 ~5ms。**Ex-8.1 内核 ✅（e63603a，553 全绿）**：流式 merge 折叠同源同 key 多版本 + scan/count 删除位图过滤（put 复活）+ 非事务 id BETWEEN 流式化；demo range-window 6 passed。Ex-8.2 scan 层/文件剪枝 → Ex-8.3 块缓存 + keys-only；详见 design_remain §7 / development_remain §11 |
+| 并行 Flush（Ex-8.5，P2 候选） | 写路径/性能 | demo-first：imm memtable 分片并行写 SST fragment；与合并背压/io_uring 队列关系实测（design_remain §8.1） |
+| 段级 min/max seq 快照剪枝（Ex-8.6，P2 候选） | 引擎读路径 | 段元数据加 seq 范围，get_at/scan_range_at 整段跳过历史；与 Ex-8.2 key 范围剪枝互补 |
+| 删除密度 urgency（Ex-8.7，P3 候选） | Compaction | urgency 加位图置位率加权，删除密集段优先合并释放空间 |
+| posting LRU 双区热点化（Ex-8.8，P2 候选） | 倒排检索 | 现有 posting LRU 256（c380792）仿 HotCache 双区 promote + 容量参数化，不新增缓存结构 |
 | 高并发查询优化（design 9.5 目标） | I（P3） | ✅ 完成：同步预处理读锁 + 小栈（97e3586）+ 异步协程运行时（2802885，连接 idle 不占线程，500 连接仅 15 线程）；10k 连接吞吐达成需目标硬件基准复测 |
 | io_uring Linux 部署实测 | io_queue（V） | ✅ 完成（7.71）：热路径接入（SSTable 块读 + WAL fsync 走 SQPOLL）+ 阿里云 Debian 12 实测（池初始化成功、核隔离生效、A/B：2 核小机器写 -13%、读持平）→ 默认关，多核 NVMe 开启 |
 | 导出管道资源控制 | E | ✅ 完成（--io-rate-limit-mb 40e8abb） |
