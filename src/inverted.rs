@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -93,11 +92,12 @@ pub struct InvertedIndex {
     bitmaps: Vec<std::sync::Mutex<
         std::collections::HashMap<String, std::collections::HashMap<String, RoaringBitmap>>,
     >>,
-    /// G 项（design_extension 9.6）：term → posting 位图缓存（LRU 有界）。
+    /// G 项 + Ex-8.8（design_extension 9.6）：term → posting 位图缓存（**双区 LRU**，
+    /// protected 60% + probation 40%；POSTING_CACHE_CAP 总量 256）。
     /// 非白名单 term（fulltext 词等）查询首次反序列化后缓存，重复查询直接返回——
     /// posting 随规模线性（5000 万库单次反序列化 ~10-200ms），缓存后 O(1)。
     /// 写路径（add/add_batch/flush_segment/gc/with_bitmap_fields）清空保证一致性。
-    posting_cache: std::sync::Mutex<LruCache<String, Arc<RoaringBitmap>>>,
+    posting_cache: std::sync::Mutex<PostingLru>,
     /// G 补充（design_extension 9.6 候选② / K 项落地）：段数据文件 mmap 化——查询按 FST
     /// offset 直接切片反序列化，免 `fs::read` 全文件读取 + 堆复制（大段文件未命中查询的
     /// 主要 IO 成本），物理页按需缺页加载（P23 只读映射白名单，与 dicts 同模式）。
@@ -110,6 +110,54 @@ const BITMAP_SHARDS: usize = 256;
 
 /// G 项：posting 位图缓存容量（LRU 项数；按 term 池规模取 256——覆盖倒排枚举 + fulltext 词条）。
 const POSTING_CACHE_CAP: usize = 256;
+
+/// Ex-8.8：posting 位图**双区 LRU**（Segmented/2Q，仿 HotCache 双区）——
+/// 高频 term 命中后提升进 `protected` 保护区，免受低频 term 突发（流式/扫词负载）逐出；
+/// 新 term 只入 `probation`（普通区）。命中：protected 直返 / probation 命中 → 提升保护。
+/// 写路径清空两区（一致性同前）。容量 = protected 60% + probation 40%（参数化）。
+struct PostingLru {
+    protected: LruCache<String, Arc<RoaringBitmap>>,
+    probation: LruCache<String, Arc<RoaringBitmap>>,
+}
+
+impl PostingLru {
+    fn new(total: usize) -> Self {
+        let pcap = (total * 3) / 5;
+        Self {
+            protected: LruCache::new(std::num::NonZeroUsize::new(pcap).unwrap()),
+            probation: LruCache::new(std::num::NonZeroUsize::new((total - pcap).max(1)).unwrap()),
+        }
+    }
+
+    /// 命中返回缓存位图；probation 命中 → 提升进 protected（下次同 term 直返）。
+    fn get(&mut self, term: &str) -> Option<Arc<RoaringBitmap>> {
+        if let Some(v) = self.protected.get(term) {
+            return Some(v.clone());
+        }
+        if let Some(v) = self.probation.pop(term) {
+            self.protected.put(term.to_string(), v.clone());
+            return Some(v);
+        }
+        None
+    }
+
+    /// 入缓存：protected 已在 → no-op（刷新）；否则入 probation（满则逐出其 LRU=低频冷 term）。
+    fn put(&mut self, term: String, v: Arc<RoaringBitmap>) {
+        if self.protected.contains(term.as_str()) {
+            return;
+        }
+        self.probation.put(term, v);
+    }
+
+    fn clear(&mut self) {
+        self.protected.clear();
+        self.probation.clear();
+    }
+
+    fn contains(&self, term: &str) -> bool {
+        self.protected.contains(term) || self.probation.contains(term)
+    }
+}
 
 /// FNV-1a 字段分片：field → 分片下标（确定性，同 field 恒同片）。
 fn bitmap_shard(field: &str) -> usize {
@@ -200,9 +248,7 @@ impl InvertedIndex {
             bitmaps: (0..BITMAP_SHARDS)
                 .map(|_| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .collect(),
-            posting_cache: std::sync::Mutex::new(LruCache::new(
-                NonZeroUsize::new(POSTING_CACHE_CAP).expect("非零缓存容量"),
-            )),
+            posting_cache: std::sync::Mutex::new(PostingLru::new(POSTING_CACHE_CAP)),
             data_files: ArcSwap::from(Arc::new(HashMap::new())),
         })
     }
@@ -505,9 +551,9 @@ impl InvertedIndex {
                 }
             }
         }
-        // ② LRU 缓存命中（RoaringBitmap 容器 Arc 共享，clone 为浅拷贝 O(1)）
+        // ② LRU 缓存命中（Ex-8.8 双区；RoaringBitmap 浅拷贝返回）
         if let Some(cached) = self.posting_cache.lock().unwrap().get(term) {
-            return Ok((**cached).clone());
+            return Ok(cached.as_ref().clone());
         }
         let mut result = RoaringBitmap::new();
         // 内存（最新）
@@ -1185,6 +1231,38 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+
+    #[test]
+    fn posting_lru_dual_zone_protects_hot_terms() {
+        // Ex-8.8：双区 LRU——命中提升进 protected 后，低频 term 突发不再逐出热点；
+        // 冷 term 的缓存仍被有界约束（总量不超预算）
+        let mut lru = PostingLru::new(20); // protected 12 + probation 8
+        let bm = |n: u32| {
+            let mut b = RoaringBitmap::new();
+            b.insert(n);
+            b
+        };
+        // 热点 term：入缓存并命中一次 → 提升 protected
+        lru.put("hot".to_string(), Arc::new(bm(1)));
+        assert!(lru.get("hot").is_some(), "首次 probation 命中应提升");
+        assert!(lru.get("hot").is_some(), "protected 直返");
+        // 低频突发 40 个冷 term（总量远超预算，均为 miss 入缓存不命中）→ 只驱逐 probation 冷项
+        for i in 0..40u32 {
+            let t = format!("cold-{i}");
+            lru.put(t, Arc::new(bm(i + 10)));
+        }
+        assert!(
+            lru.get("hot").is_some(),
+            "protected 热点不应被冷 term 突发逐出"
+        );
+        // 有界性：protected ≤ 12 且 probation ≤ 8（总项数受 20 预算约束）
+        assert!(lru.protected.len() <= 12);
+        assert!(lru.probation.len() <= 8);
+        // 最老冷项已被逐出（缓存有界生效）
+        assert!(lru.get("cold-0").is_none() || lru.get("cold-39").is_none());
+        lru.clear();
+        assert!(lru.get("hot").is_none(), "写路径清空应双区全清");
+    }
 
     fn tmp() -> std::path::PathBuf {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
