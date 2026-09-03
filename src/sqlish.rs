@@ -2049,6 +2049,56 @@ mod tests {
         assert_eq!(s2.order_by, vec![("note".into(), false)], "小写 order by 亦可");
     }
 
+    // ---------- ORDER BY 多字段（开发顺序 AF#3：多键 comparator 终验） ----------
+
+    #[test]
+    fn order_by_multi_field_first_key_then_second() {
+        // 首键 city 升序，beijing 组内按 amount 降序打破并列
+        // （若只看单键 amount DESC，全局前三应为 99/98/97——多键语义须回到 beijing 组内）。
+        let mut e = engine_with_docs();
+        let rows = execute(
+            &mut e,
+            "SELECT * FROM t ORDER BY city ASC, amount DESC LIMIT 3",
+            1000,
+        )
+        .unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![99, 96, 93], "city 升序并列由 amount 降序打破");
+        // 反向：amount 升序主键、city 升序次键——amount 全表唯一 → 退化为纯 amount 序
+        let rows2 = execute(
+            &mut e,
+            "SELECT * FROM t ORDER BY amount ASC, city ASC LIMIT 3",
+            1000,
+        )
+        .unwrap();
+        let ids2: Vec<u64> = rows2.iter().map(|r| r.0).collect();
+        assert_eq!(ids2, vec![0, 1, 2], "amount 无并列，city 次键不影响结果");
+    }
+
+    #[test]
+    fn order_by_multi_field_desc_with_where_and_limit() {
+        // WHERE 收敛（amount∈[500,600) → docid 50..59）后：city DESC（shenzhen 组最前）
+        // 且组内 amount DESC → shenzhen(59/56/53/50) 前三 59,56,53。
+        let mut e = engine_with_docs();
+        let rows = execute(
+            &mut e,
+            "SELECT * FROM t WHERE amount>=500 AND amount<600 ORDER BY city DESC, amount DESC LIMIT 3",
+            1000,
+        )
+        .unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![59, 56, 53], "shenzhen 组 amount 降序前 3");
+        // OFFSET 在排序后切片（跳过 59/56 → 53 起）
+        let rows2 = execute(
+            &mut e,
+            "SELECT * FROM t WHERE amount>=500 AND amount<600 ORDER BY city DESC, amount DESC LIMIT 2 OFFSET 2",
+            1000,
+        )
+        .unwrap();
+        let ids2: Vec<u64> = rows2.iter().map(|r| r.0).collect();
+        assert_eq!(ids2, vec![53, 50], "OFFSET 2 跳过 59/56");
+    }
+
     // ---------- GROUP BY（开发顺序 AF#2：单字段 + COUNT/SUM） ----------
     // fixture：docid 0..99；city 循环 beijing/shanghai/shenzhen；status active 当 i%3==0；
     // amount = i*10（全表 0..990，总和 49500）；note = note-{i}。

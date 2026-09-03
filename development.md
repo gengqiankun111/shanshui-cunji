@@ -2881,6 +2881,22 @@ impl RuntimePools {
 6. **后续**：ORDER BY 多字段终验（AF #3，多键 comparator 已就绪）→ GROUP BY 多字段
    （AF #4）→ HAVING（AF #5）→ 倒排加速 GROUP BY（AF #6 / Ex-9.3）。
 
+### 7.103 ORDER BY 多字段终验（开发顺序 AF #3）— ✅ 已完成
+
+> 2026-09-03。多字段语法与多键 comparator 已在 #1 落地（`Select.order_by` 多项、
+> 逐键 ASC/DESC 反转、OFFSET/LIMIT 排序后切片），#3 为执行层**语义终验**收尾
+> （此前仅 parse 层测试覆盖多字段）。
+
+1. **语义验证点**：① 首键并列 → 次键打破——`ORDER BY city ASC, amount DESC` 前三为
+   beijing 组内 99/96/93（若单键 amount DESC 应为全局 99/98/97，多键语义区别于单键）；
+   ② 主键全表唯一时次键不影响结果；③ WHERE 收敛 + 双 DESC——`amount∈[500,600)`
+   （docid 50..59）`ORDER BY city DESC, amount DESC` 前三 59/56/53（shenzhen 组内降序）；
+   ④ 排序后 OFFSET 切片（跳过 59/56 → 53/50）。
+2. **回归**：+2 测试（`order_by_multi_field_first_key_then_second`、
+   `order_by_multi_field_desc_with_where_and_limit`），全量 **584 全绿**。
+3. **后续**：GROUP BY 多字段 + 常用聚合（AF #4）→ HAVING（AF #5）→ 倒排加速
+   GROUP BY（AF #6 / Ex-9.3）；排期见 development_process_order.md AF 行。
+
 ## Ex 系列扩展（归档自 development_extension.md，2026-09-03 合并）
 
 > 2026-09-03 归档合并：development_extension.md（v0.1 分布式事务落地计划 L1~L3 + Ex-4~7

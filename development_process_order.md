@@ -47,7 +47,7 @@
 | AC | 导出增强：与 Compaction 共享后台 IO 优先级（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 收尾（40e8abb）：CF scan_limiter Token Bucket（扫描路径专用，前台点查不受影响）+ export --io-rate-limit-mb（默认 storage.io_rate_limit_mb 同 Compaction 后台预算语义）；+1 测试 477 全绿；**导出功能全部完成**；详见 development.md 7.68 |
 | AD | 10 亿库扩展阶段 A~D：全局 docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片级可观测 | P0 | ✅ 完成 | `src/docid_alloc.rs`（AtomicU64 无锁分配 + 水位续跑 + 扩容归属不变 + 溢出保护）；`src/shard_build.rs` + shanshui-cunji-shard-build（行号取模/前缀路由/--shard-id 并行/BOM 修复）；`src/shard_inverted.rs`（分片内 local 位图 + 前缀组合 + 跨分片分页窗口 + 真实 Engine 集成）；`src/raft_rpc.rs`（RaftMsg serde + RaftTransport + RaftNodeRuntime 选举/复制/failover/多数派）；`src/shard_metrics.rs`（分片水位 gauge + 读写计数 + 80%/90% 预警 + /metrics 集成）；demo 24 测试 + kernel 30 单测，530 全绿；详见 development.md 7.81~7.86（10b 设计已并入 design_remain §19 归档） |
 | AE | LSM 读路径范围查询优化（Ex-8 系列） | P0 | ✅ 完成 2026-09-03 | Ex-8.1~8.3（e63603a/49469f6/0d8fdcf+bbb1c7a）+ 50m release 复测：非事务 id BETWEEN p50 86ms→**2.48ms**、vs MySQL 差距 **~102×→3.6×**（窗口位置无关）；Ex-8.4~8.14 后续项（8.5/8.9/8.11 A/B/8.12/8.13）与 Ex-9 系列见 development_remain §11/§12/§14~§16/§18/§19 |
-| AF | SQL 能力补全：ORDER BY / GROUP BY 系列 | P0 | 🚧 #1~#2 完成（2026-09-03） | 用户给定开发顺序（按价值/成本）：① ORDER BY 单字段+LIMIT（✅ da4c08a）→ ② GROUP BY 单字段+COUNT/SUM（✅ 本期）→ ③ ORDER BY 多字段 → ④ GROUP BY 多字段+常用聚合 → ⑤ GROUP BY+HAVING → ⑥ 倒排索引加速 GROUP BY（Ex-9.3）；每项配套 demo/单测/文档后推进下一项 |
+| AF | SQL 能力补全：ORDER BY / GROUP BY 系列 | P0 | 🚧 #1~#3 完成（2026-09-03） | 用户给定开发顺序（按价值/成本）：① ORDER BY 单字段+LIMIT（✅ da4c08a）→ ② GROUP BY 单字段+COUNT/SUM（✅ 9f81ec4）→ ③ ORDER BY 多字段（✅ 本期终验）→ ④ GROUP BY 多字段+常用聚合 → ⑤ GROUP BY+HAVING → ⑥ 倒排索引加速 GROUP BY（Ex-9.3）；每项配套 demo/单测/文档后推进下一项 |
 
 ## 3. 大项详情
 
@@ -240,7 +240,12 @@
   LONGLONG/DOUBLE/VAR_STRING，聚合列 SUM 有小数 → DOUBLE；NULL 组键 0xfb 单元格）；
   - 测试 +7（count 分组/多聚合 SUM 对照手算值/WHERE 过滤分组/缺省字段 NULL 组+空 SUM/
     LIMIT 组切片/parse 拒绝矩阵/协议层多行结果集），581 全绿；
-- **待推进 #3~#6**：ORDER BY 多字段终验 → GROUP BY 多字段 → HAVING → 倒排加速
+- **#3 ORDER BY 多字段终验（✅ 已完成 2026-09-03）**：多字段语法与多键 comparator 随 #1
+  落地（`Select.order_by` 多项、逐键 ASC/DESC 反转、OFFSET/LIMIT 排序后切片），本项补
+  执行层语义测试收尾：① city 升序并列 → amount 降序打破（beijing 组内 99/96/93，非全局
+  单键序 99/98/97）② 主键全表唯一时次键不影响结果 ③ WHERE 收敛 + 双 DESC（city DESC →
+  shenzhen 组 amount 降序 59/56/53）④ 排序后 OFFSET 切片（53/50）；584 全绿；
+- **待推进 #4~#6**：GROUP BY 多字段 + 常用聚合（AVG/MIN/MAX）→ HAVING → 倒排加速
   GROUP BY（Ex-9.3）。
 
 ## 4. 已完成大项（最近）
