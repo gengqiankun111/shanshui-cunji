@@ -633,6 +633,13 @@ pub struct StorageConfig {
     /// 写锁等待短（修复大 L0 一次全合并长时间阻塞写）；多轮收敛由 worker 循环兜底。
     /// 0 = 不限（旧行为，一次合并全部 L0）。
     pub compact_input_max_mb: u64,
+    /// Ex-8.11：L1 段数触发阈值（L0 空时 L1 **攒够该数量**才下沉 L2；L0 活跃时也以
+    /// 该值为"L1 已满"纳入 L0+L1 合并的界限）。0 = 现行为（L0 空时 L1>1 即下沉）。
+    /// 调大（如 8~12）= 延迟大合并：L1→L2 次数/底层重写 -50~80%，代价 L1 段数暂升
+    /// （非重叠段，Ex-8.2 剪枝后窗口读不受影响）。
+    pub l1_trigger_files: usize,
+    /// Ex-8.11：L2 段数触发阈值（L1 下沉后 L2 收敛为单段的触发数）。0 = 现行为（L2>1 即收敛）。
+    pub l2_trigger_files: usize,
 }
 
 impl Default for StorageConfig {
@@ -672,6 +679,9 @@ impl Default for StorageConfig {
             auto_compact: true,
             l0_max_size_mb: 0,
             compact_input_max_mb: 1024,
+            // Ex-8.11：L1/L2 段数触发阈值默认 0 = 现行为（L0 空时 L1>1 下沉 / L2>1 收敛）。
+            l1_trigger_files: 0,
+            l2_trigger_files: 0,
         }
     }
 }

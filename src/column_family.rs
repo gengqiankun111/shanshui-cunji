@@ -1,4 +1,4 @@
-//! 列族框架 + 主数据 CRUD（design 4.1 / development 步骤 7）。
+﻿//! 列族框架 + 主数据 CRUD（design 4.1 / development 步骤 7）。
 //!
 //! 物理目录布局：
 //! ```text
@@ -107,6 +107,11 @@ pub struct ColumnFamily {
     write_pressure: AtomicU64,
     /// P 项：L0 大小软阈值（字节；`storage.l0_max_size_mb`；0 = 禁用，仅用段数阈值）。
     l0_max_size_bytes: u64,
+    /// Ex-8.11：L1 段数触发阈值（0 = 现行为：L0 空时 L1>1 即下沉 L2）。>0 = 延迟大合并，
+    /// L1 攒够该段数（或 L0 活跃纳入 L0+L1 合并的"已满"界限）才收敛。
+    l1_trigger_files: usize,
+    /// Ex-8.11：L2 段数触发阈值（0 = 现行为：L2>1 即收敛为单段）。
+    l2_trigger_files: usize,
     /// 单次合并输入大小上限（字节；`storage.compact_input_max_mb`；0 = 不限）——
     /// L0 分批合并防大输入一次合并长时间阻塞写。
     compact_input_max_bytes: u64,
@@ -337,6 +342,9 @@ impl ColumnFamily {
             write_pressure: AtomicU64::new(0.0f64.to_bits()),
             l0_max_size_bytes: cfg.storage.l0_max_size_mb * 1024 * 1024,
             compact_input_max_bytes: cfg.storage.compact_input_max_mb * 1024 * 1024,
+            // Ex-8.11：L1/L2 段数触发阈值（0 = 现行为）
+            l1_trigger_files: cfg.storage.l1_trigger_files,
+            l2_trigger_files: cfg.storage.l2_trigger_files,
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
@@ -1394,9 +1402,17 @@ impl ColumnFamily {
     pub fn compact(&self) -> Result<CompactReport> {
         let snap = self.ssts.load();
         let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
-        let (sel, out_level) = select_compaction_inputs(
+        // Ex-8.11：L1 段数上限（L0 活跃时纳入 L0+L1 合并的"已满"界限）——>0 时用 l1_trigger_files
+        let cap = if self.l1_trigger_files > 0 {
+            self.l1_trigger_files
+        } else {
+            self.effective_l0_threshold()
+        };
+        let (sel, out_level) = select_compaction_inputs_ex(
             &snap.levels,
-            self.effective_l0_threshold(),
+            cap,
+            self.l1_trigger_files,
+            self.l2_trigger_files,
             &heat,
             &self.cooling_indices(),
             &snap.sizes,
@@ -1432,9 +1448,17 @@ impl ColumnFamily {
     pub fn compact_filtered(&self, drop_key: &dyn Fn(&[u8]) -> bool) -> Result<CompactReport> {
         let snap = self.ssts.load();
         let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
-        let (sel, out_level) = select_compaction_inputs(
+        // Ex-8.11：同 compact()，L1 段数上限 = l1_trigger_files（>0 时）
+        let cap = if self.l1_trigger_files > 0 {
+            self.l1_trigger_files
+        } else {
+            self.effective_l0_threshold()
+        };
+        let (sel, out_level) = select_compaction_inputs_ex(
             &snap.levels,
-            self.effective_l0_threshold(),
+            cap,
+            self.l1_trigger_files,
+            self.l2_trigger_files,
             &heat,
             &self.cooling_indices(),
             &snap.sizes,
@@ -1695,7 +1719,31 @@ impl ColumnFamily {
         l0 > self.effective_l0_threshold()
             // P 项：大小阈值需 ≥2 段（单段为已排序文件，合并是纯无收益重写）
             || (l0 >= 2 && self.l0_max_size_bytes > 0 && self.l0_bytes() > self.l0_max_size_bytes)
-            || (l0 == 0 && (l1 > 1 || l2 > 1))
+            || (l0 == 0 && self.bottom_needs_compact(l1, l2))
+    }
+
+    /// Ex-8.11：L0 空时的底层合并触发（L1→L2 下沉 / L2 收敛）。
+    /// `l1_trigger_files>0`：L1 **攒够阈值**才下沉 L2（延迟大合并），且 L1 未达阈值期间
+    /// 不提前收敛 L2（等批次到齐一起下沉，减底层重写）；0 = 现行为（L1>1 或 L2>1 即触发）。
+    /// `l2_trigger_files>0`：L2 攒够阈值才收敛为单段；0 = 现行为（L2>1 即收敛）。
+    fn bottom_needs_compact(&self, l1: usize, l2: usize) -> bool {
+        let l1_gate = if self.l1_trigger_files > 0 {
+            l1 >= self.l1_trigger_files
+        } else {
+            l1 > 1
+        };
+        if l1_gate {
+            return true;
+        }
+        if self.l1_trigger_files > 0 && l1 > 0 {
+            return false; // 延迟模式：L1 未达阈值，等批次到齐
+        }
+        let l2_gate = if self.l2_trigger_files > 0 {
+            l2 >= self.l2_trigger_files
+        } else {
+            l2 > 1
+        };
+        l2_gate
     }
 
     /// 当前 L0 段数（层号 == 0）。
@@ -2176,6 +2224,7 @@ fn imm_scan_max_seq(imm: &MemTable) -> u64 {
 /// L 项：`cooling` = 冷却期段下标集合（合并冷却，新段 N 轮内**优先**不参与合并）。
 /// 冷却为「软约束」：若冷却导致无可合并候选（候选 < 2），回退含冷却段——
 /// 防止冷却挡住收敛（needs_compact 用原始计数触发时，硬排除会造成合并空转死循环）。
+/// 既有测试/调用入口：6 参（Ex-8.11 触发器 0 = 现行为）。
 fn select_compaction_inputs(
     levels: &[u32],
     level_limit: usize,
@@ -2184,7 +2233,21 @@ fn select_compaction_inputs(
     sizes: &[u64],
     max_input_bytes: u64,
 ) -> (Vec<usize>, u32) {
-    let (mut sel, out) = select_inner(levels, level_limit, heat, cooling);
+    select_compaction_inputs_ex(levels, level_limit, 0, 0, heat, cooling, sizes, max_input_bytes)
+}
+
+/// Ex-8.11：带 L1/L2 触发阈值的选段（l1/l2_trigger=0 = 现行为）。
+fn select_compaction_inputs_ex(
+    levels: &[u32],
+    level_limit: usize,
+    l1_trigger: usize,
+    l2_trigger: usize,
+    heat: &[u64],
+    cooling: &std::collections::HashSet<usize>,
+    sizes: &[u64],
+    max_input_bytes: u64,
+) -> (Vec<usize>, u32) {
+    let (mut sel, out) = select_inner(levels, level_limit, l1_trigger, l2_trigger, heat, cooling);
     // 单次合并输入大小上限（仅 L0→L1：L0 允许重叠，分批安全；L1→L2 全选保证层内不重叠）
     if sel.len() >= 2 && out == 1 && max_input_bytes > 0 {
         sel = cap_by_size(sel, sizes, max_input_bytes);
@@ -2193,7 +2256,14 @@ fn select_compaction_inputs(
         return (sel, out);
     }
     // L 项回退：候选不足（冷却挡住收敛）→ 忽略冷却再选（保证收敛 / 防写 Stall）
-    select_inner(levels, level_limit, heat, &std::collections::HashSet::new())
+    select_inner(
+        levels,
+        level_limit,
+        l1_trigger,
+        l2_trigger,
+        heat,
+        &std::collections::HashSet::new(),
+    )
 }
 
 /// 分批合并：输入总大小超 `max` 时，从尾部（排序后 = 最冷/最大）移除段直到 ≤ max；
@@ -2225,6 +2295,8 @@ fn cap_by_size(mut sel: Vec<usize>, sizes: &[u64], max: u64) -> Vec<usize> {
 fn select_inner(
     levels: &[u32],
     level_limit: usize,
+    l1_trigger: usize,
+    l2_trigger: usize,
     heat: &[u64],
     cooling: &std::collections::HashSet<usize>,
 ) -> (Vec<usize>, u32) {
@@ -2268,10 +2340,17 @@ fn select_inner(
             sel.extend(l1);
             (sel, 1)
         }
-    } else if l1.len() > 1 {
+    } else if l1_trigger == 0 && l1.len() > 1 {
         (l1, 2)
-    } else if l2.len() > 1 {
+    } else if l1_trigger > 0 && l1.len() >= l1_trigger {
+        // Ex-8.11：延迟大合并——L0 空且 L1 攒够阈值 → 一次下沉 L2
+        (l1, 2)
+    } else if l1_trigger > 0 && !l1.is_empty() {
+        (Vec::new(), 0) // 延迟模式：L1 未达阈值，等批次到齐（不提前收敛 L2）
+    } else if l2_trigger == 0 && l2.len() > 1 {
         (l2, 2)
+    } else if l2_trigger > 0 && l2.len() >= l2_trigger {
+        (l2, 2) // Ex-8.11：L2 攒够阈值才收敛为单段
     } else {
         (Vec::new(), 0)
     }
@@ -2784,32 +2863,47 @@ mod tests {
         let no_sizes = &[0u64; 8];
         // 2 个 L0 + L1 未满 → 仅 L0
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1], 8, no_heat, no_cooling, no_sizes, 0),
+            select_compaction_inputs_ex(&[0, 0, 1], 8, 0, 0, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1], 1)
         );
         // 单个 L0 → 暂不压实
         assert_eq!(
-            select_compaction_inputs(&[0, 1], 8, no_heat, no_cooling, no_sizes, 0),
+            select_compaction_inputs_ex(&[0, 1], 8, 0, 0, no_heat, no_cooling, no_sizes, 0),
             (Vec::new(), 0)
         );
         // L0 ≥ 2 且 L1 已满 → L0 + 全部 L1 收敛
         assert_eq!(
-            select_compaction_inputs(&[0, 0, 1, 1, 1, 1], 2, no_heat, no_cooling, no_sizes, 0),
+            select_compaction_inputs_ex(&[0, 0, 1, 1, 1, 1], 2, 0, 0, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1, 2, 3, 4, 5], 1)
         );
         // L0 空、L1 > 1 → L1 → L2
         assert_eq!(
-            select_compaction_inputs(&[1, 1], 8, no_heat, no_cooling, no_sizes, 0),
+            select_compaction_inputs_ex(&[1, 1], 8, 0, 0, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1], 2)
         );
         // L0 空、L1 单段 → 无压实
         assert_eq!(
-            select_compaction_inputs(&[1], 8, no_heat, no_cooling, no_sizes, 0),
+            select_compaction_inputs_ex(&[1], 8, 0, 0, no_heat, no_cooling, no_sizes, 0),
             (Vec::new(), 0)
         );
         // L0/L1 空、L2 > 1 → 收敛 L2
         assert_eq!(
-            select_compaction_inputs(&[2, 2], 8, no_heat, no_cooling, no_sizes, 0),
+            select_compaction_inputs_ex(&[2, 2], 8, 0, 0, no_heat, no_cooling, no_sizes, 0),
+            (vec![0, 1], 2)
+        );
+        // Ex-8.11：延迟大合并——L0 空、L1=3 < l1_trigger=4 → 暂不下沉
+        assert_eq!(
+            select_compaction_inputs_ex(&[1, 1, 1], 4, 4, 0, no_heat, no_cooling, no_sizes, 0),
+            (Vec::new(), 0)
+        );
+        // Ex-8.11：L1 攒够 4 → 一次下沉 L2
+        assert_eq!(
+            select_compaction_inputs_ex(&[1, 1, 1, 1], 4, 4, 0, no_heat, no_cooling, no_sizes, 0),
+            (vec![0, 1, 2, 3], 2)
+        );
+        // Ex-8.11：L2 攒够 l2_trigger=2 → 收敛
+        assert_eq!(
+            select_compaction_inputs_ex(&[2, 2], 8, 0, 2, no_heat, no_cooling, no_sizes, 0),
             (vec![0, 1], 2)
         );
     }

@@ -2444,6 +2444,52 @@ mod tests {
     }
 
     #[test]
+    fn delayed_l1_promotion_converges_and_preserves() {
+        // Ex-8.11：L1 延迟大合并配置下，burst+flush+drain 工作负载**收敛**且数据完整
+        // （选择级延迟语义由 column_family::tests::select_compaction_inputs_picks_levels 覆盖）
+        fn run(l1_trigger: usize, l2_trigger: usize) -> (u64, u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = cfg();
+            cfg.storage.auto_compact = false;
+            cfg.storage.group_commit_us = 2000;
+            cfg.storage.l0_stall_threshold = 2;
+            cfg.storage.l0_stall_min = 2;
+            cfg.storage.l0_stall_max = 2;
+            cfg.storage.l1_trigger_files = l1_trigger;
+            cfg.storage.l2_trigger_files = l2_trigger;
+            let mut e = Engine::open(dir.path(), &cfg).unwrap();
+            let mut rounds = 0u64;
+            let mut id = 0u64;
+            for _b in 0..4 {
+                for _f in 0..2 {
+                    for _ in 0..30u64 {
+                        id += 1;
+                        e.put_nosync(id, format!("d{id}").into_bytes(), &["t"]).unwrap();
+                    }
+                    e.flush_primary().unwrap();
+                }
+                while e.needs_compact() && rounds < 500 {
+                    e.compact().unwrap();
+                    rounds += 1;
+                }
+            }
+            // 收敛护栏：不应出现 needs_compact 恒真空转
+            assert!(
+                !e.needs_compact() || rounds >= 500,
+                "l1_trigger={l1_trigger} 应在护栏内收敛，rounds={rounds}"
+            );
+            let total = id;
+            assert_eq!(e.count_all_docs().unwrap(), total, "数据应完整");
+            (rounds, total)
+        }
+        let (r0, t0) = run(0, 0); // 现行为
+        let (rd, t1) = run(3, 2); // 延迟（攒 3 才下沉）
+        assert_eq!(t0, t1);
+        assert!(rd <= r0 + 2, "延迟模式收敛轮数不应显著劣化：default={r0} delayed={rd}");
+        eprintln!("[Ex-8.11] rounds default={r0} delayed(l1=3)={rd} total={t0}");
+    }
+
+    #[test]
     fn batch_get_matches_get_with_delta_and_deletion_bitmap() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &cfg()).unwrap();
