@@ -514,6 +514,9 @@ impl MySqlServer {
             let Ok(mut stream) = stream else {
                 continue;
             };
+            // 协议低延迟：禁 Nagle（Linux loopback 延迟 ACK 会给小请求加 ~40ms 往返；
+            // MySQL 服务端同此设置）。benchmark/sysbench 每语句一个往返，此项必需。
+            let _ = stream.set_nodelay(true);
             let engine = self.engine.clone();
             let user = self.user.clone();
             let password = self.password.clone();
@@ -572,6 +575,8 @@ impl MySqlServer {
                     continue;
                 }
             };
+            // 协议低延迟：禁 Nagle（见同步 serve 注释）——每语句一个往返，must。
+            let _ = stream.set_nodelay(true);
             let engine = self.engine.clone();
             let user = self.user.clone();
             let password = self.password.clone();
@@ -780,9 +785,9 @@ fn handle_command(
             }
             let sql = String::from_utf8_lossy(&cmd[1..]).to_string();
             // O 项第②步：读语句走 RwLock 读锁（多连接 SELECT 并行）；写语句走写锁互斥
+            // Ex-9.1：读分发统一入口（含倒排计数快路径，见 dispatch_query_read_opt）
             let resp = if is_read_statement(&sql) {
-                let guard = engine.read().unwrap();
-                dispatch_query_read(&guard, &sql, session)
+                dispatch_query_read_opt(engine, &sql, session)
             } else {
                 let mut guard = engine.write().unwrap();
                 dispatch_query(&mut guard, &sql, session)
@@ -799,9 +804,9 @@ fn handle_command(
             // point_select 等 PREPARE/EXECUTE 负载多连接并行；写语句保持写锁互斥
             match stmt_execute_sql(session, cmd) {
                 Ok(sql) => {
+                    // Ex-9.1：读分发统一入口（含倒排计数快路径，见 dispatch_query_read_opt）
                     let resp = if is_read_statement(&sql) {
-                        let guard = engine.read().unwrap();
-                        dispatch_query_read(&guard, &sql, session)
+                        dispatch_query_read_opt(engine, &sql, session)
                     } else {
                         let mut guard = engine.write().unwrap();
                         dispatch_query(&mut guard, &sql, session)
@@ -1051,6 +1056,28 @@ fn is_read_statement(sql: &str) -> bool {
         || upper.starts_with("SHOW")
         || upper.starts_with("SET")
         || upper.starts_with("USE")
+}
+
+/// Ex-9.1：读语句统一分发——非事务 `SELECT COUNT(*) WHERE f='v'`（f 已建倒排）走**写锁**执行
+/// `inverted_doc_count`（需 flush pending 缓冲保证已提交写入可见，亚毫秒返回）；其余维持
+/// 读锁读读并行（`dispatch_query_read`）。事务内读走原事务路径（快照语义不变）。
+fn dispatch_query_read_opt(
+    engine: &Arc<RwLock<Engine>>,
+    sql: &str,
+    session: &mut Session,
+) -> QueryResponse {
+    if session.txn.is_none() {
+        if let Some((field, _)) = single_eq_count_field(sql) {
+            let mut guard = engine.write().unwrap();
+            if guard.inverted_count_eligible(&field) {
+                if let Some(resp) = try_count_fast(&mut guard, sql) {
+                    return resp;
+                }
+            }
+        }
+    }
+    let guard = engine.read().unwrap();
+    dispatch_query_read(&guard, sql, session)
 }
 
 /// O 项第②步：读锁分发（`&Engine`）——仅处理纯读语句（SELECT/SHOW/SET/USE/空）。
@@ -1826,6 +1853,73 @@ fn sort_limit_by_docid(
         rows.truncate(l.min(rows.len()));
     }
     rows.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Ex-9.1：解析 `SELECT COUNT... FROM ... WHERE <f>='<v>'` 单字段等值模板 → (field, value)。
+/// 多条件 / 比较 / BETWEEN / IN / 非 COUNT 聚合 / ORDER|GROUP / 主键 id|k / 非引号值 → None。
+fn single_eq_count_field(sql: &str) -> Option<(String, String)> {
+    let u = sql.to_uppercase();
+    if !u.contains("COUNT(") {
+        return None;
+    }
+    for bad in ["SUM(", "AVG(", "MIN(", "MAX(", "DISTINCT", "GROUP BY", "ORDER BY", "LIMIT"] {
+        if u.contains(bad) {
+            return None;
+        }
+    }
+    if u.contains(" AND ") || u.contains(" OR ") {
+        return None;
+    }
+    let lower = sql.to_lowercase();
+    let w = lower.find("where")?;
+    let rest = sql[w + 5..].trim();
+    let (lhs, rhs) = rest.split_once('=')?;
+    let field = lhs.trim().trim_matches('`').trim().to_string();
+    if field.is_empty()
+        || field.eq_ignore_ascii_case("id")
+        || field.eq_ignore_ascii_case("docid")
+        || field.eq_ignore_ascii_case("k")
+    {
+        return None;
+    }
+    let rhs = rhs.trim();
+    if !rhs.starts_with('\'') {
+        return None; // 仅支持字符串等值（status='active' 形态）；数字/裸值维持全扫
+    }
+    let mut out = String::new();
+    let mut it = rhs[1..].chars();
+    while let Some(c) = it.next() {
+        if c == '\'' {
+            if it.clone().next() == Some('\'') {
+                out.push('\'');
+                it.next();
+                continue;
+            }
+            break;
+        }
+        out.push(c);
+    }
+    Some((field, out))
+}
+
+/// Ex-9.1：单字段等值 COUNT 倒排快路径——`engine.inverted_doc_count("f=v")`
+/// （白名单内存位图 / 倒排段 doc_count + flush pending），亚毫秒级返回；Err 回落全扫。
+fn try_count_fast(engine: &mut Engine, sql: &str) -> Option<QueryResponse> {
+    let (field, value) = single_eq_count_field(sql)?;
+    if !engine.inverted_count_eligible(&field) {
+        return None;
+    }
+    let term = format!("{field}={value}");
+    match engine.inverted_doc_count(&term) {
+        Ok(n) => {
+            let agg_col = column_payload("COUNT(*)", MYSQL_TYPE_LONGLONG, 63);
+            Some(QueryResponse::Set {
+                columns: vec![agg_col],
+                rows: vec![vec![n.to_string().into_bytes()]],
+            })
+        }
+        Err(_) => None,
+    }
 }
 
 /// SELECT：VERSION() / @@ 系统值 → 单行结果；`WHERE id=N` → 主键点查；
@@ -2872,6 +2966,96 @@ mod tests {
         let v3: serde_json::Value = serde_json::from_str(&rows3[0].1).unwrap();
         assert_eq!(v3["k"], 1);
         assert_eq!(v3["c"], "a");
+    }
+
+    #[test]
+    fn ex91_single_eq_count_field_parses() {
+        // 模板命中
+        assert_eq!(
+            single_eq_count_field("SELECT COUNT(*) FROM orders WHERE status='active'"),
+            Some(("status".into(), "active".into()))
+        );
+        assert_eq!(
+            single_eq_count_field("SELECT COUNT(*) FROM orders WHERE city = 'beijing'"),
+            Some(("city".into(), "beijing".into()))
+        );
+        // 引号转义（'' → '）
+        assert_eq!(
+            single_eq_count_field("SELECT COUNT(*) FROM t WHERE name='o''brien'")
+                .unwrap()
+                .1,
+            "o'brien"
+        );
+        // 边界否定 → None（回落全扫，语义不变）
+        assert!(single_eq_count_field("SELECT COUNT(*) FROM orders").is_none(), "无 WHERE");
+        assert!(single_eq_count_field("SELECT COUNT(*) FROM orders WHERE id=5").is_none(), "主键");
+        assert!(single_eq_count_field("SELECT COUNT(*) FROM orders WHERE amount>90000").is_none(), "比较");
+        assert!(single_eq_count_field("SELECT COUNT(*) FROM orders WHERE status='active' AND amount>1").is_none(), "多条件");
+        assert!(single_eq_count_field("SELECT SUM(amount) FROM orders WHERE status='active'").is_none(), "非 COUNT");
+        assert!(single_eq_count_field("SELECT COUNT(*) FROM orders WHERE status=active").is_none(), "无引号值");
+    }
+
+    #[test]
+    fn ex91_inverted_count_fast_matches_full_scan() {
+        // Ex-9.1：单字段等值 COUNT 走倒排计数（flush pending + doc_count，亚毫秒）
+        // 数值与 7.95 全扫聚合一致；未声明字段不可路由（防把"未建索引"误报为 0）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.sstable.compression = "none".into();
+        cfg.inverted.inverted_fields = vec!["status".to_string(), "city".to_string()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let statuses = ["active", "pending", "active", "closed", "active", "pending"];
+        for (i, s) in statuses.iter().enumerate() {
+            let doc = format!(r#"{{"status":"{s}","city":"beijing","amount":{}}}"#, i * 10);
+            let terms = vec![format!("status={s}")];
+            let refs: Vec<&str> = terms.iter().map(|t| t.as_str()).collect();
+            e.put(i as u64 + 1, doc.into_bytes(), &refs).unwrap();
+        }
+        let q = "SELECT COUNT(*) FROM orders WHERE status='active'";
+        let resp = try_count_fast(&mut e, q).expect("白名单字段应命中快路径");
+        let n_fast = match resp {
+            QueryResponse::Set { rows, .. } => {
+                String::from_utf8(rows[0][0].clone()).unwrap().parse::<u64>().unwrap()
+            }
+            _ => panic!("快路径应返回结果集"),
+        };
+        assert_eq!(n_fast, 3, "active 计数 = 3");
+        // eligible 判定：声明字段可路由、未声明不可
+        assert!(e.inverted_count_eligible("status"));
+        assert!(e.inverted_count_eligible("city"));
+        assert!(!e.inverted_count_eligible("title"), "未声明字段不可路由");
+        // 与全扫聚合一致（7.95 路径）
+        let agg = crate::sqlish::execute_aggregate(&e, q)
+            .unwrap()
+            .expect("全扫聚合");
+        assert_eq!(agg.text, "3", "快路径与全扫数值一致");
+    }
+
+    #[test]
+    fn ex91_bitmap_field_route_precise_small_values() {
+        // Ex-9.1：bitmap_fields 字段走内存位图（写路径同步维护）——多值各自精确、未建字段不路由。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.sstable.compression = "none".into();
+        cfg.inverted.bitmap_fields = vec!["status".to_string()];
+        cfg.inverted.inverted_fields = vec!["status".to_string(), "city".to_string()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        for (i, s) in ["active", "active", "pending", "active"].iter().enumerate() {
+            let doc = format!(r#"{{"status":"{s}"}}"#);
+            let terms = vec![format!("status={s}")];
+            let refs: Vec<&str> = terms.iter().map(|t| t.as_str()).collect();
+            e.put(i as u64 + 1, doc.into_bytes(), &refs).unwrap();
+        }
+        assert!(e.inverted_count_eligible("status"), "bitmap 字段可路由");
+        let q = "SELECT COUNT(*) FROM orders WHERE status='active'";
+        let resp = try_count_fast(&mut e, q).expect("bitmap 字段命中快路径");
+        let n = match resp {
+            QueryResponse::Set { rows, .. } => {
+                String::from_utf8(rows[0][0].clone()).unwrap().parse::<u64>().unwrap()
+            }
+            _ => panic!("结果集"),
+        };
+        assert_eq!(n, 3, "bitmap 计数 = active 3（写入即精确，无 pending 延迟）");
     }
 
     #[test]

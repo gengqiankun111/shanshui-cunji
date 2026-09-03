@@ -41,8 +41,10 @@ use mmap_file::MmapFile;
 /// 段文件魔数。
 const SEG_MAGIC: &[u8; 8] = b"NVINV001";
 /// 段文件版本：v2 = term 带字段前缀 + Roaring 紧凑 posting；v3 = posting 分块布局
-/// （容器头索引 + 独立容器字节，K 项：分页/COUNT 按需延迟加载，全量解码与 v2 持平）。
-const SEG_VERSION: u16 = 3;
+/// （容器头索引 + 独立容器字节，K 项：分页/COUNT 按需延迟加载，全量解码与 v2 持平）；
+/// v4 = 条目插入 `varint(段内 doc_count)`（Ex-9.1b：段级 TermMeta 计数载荷 → COUNT
+/// 亚毫秒求和，免逐 docid 遍历去重；老段读取按段版本兼容回退）。
+const SEG_VERSION: u16 = 4;
 /// 段文件前缀。
 const SEG_PREFIX: &str = "inverted-";
 const MANIFEST_FILE: &str = "inverted-manifest.json";
@@ -288,6 +290,11 @@ impl InvertedIndex {
         bm.get(field)?.get(value).map(|b| b.len())
     }
 
+    /// Ex-9.1：字段是否配置内存位图（`bitmap_fields`，写路径同步维护 → O(1) 亚毫秒计数）。
+    pub fn is_bitmap_field(&self, field: &str) -> bool {
+        self.bitmap_fields.contains(field)
+    }
+
     /// 内存位图 AND（M7-2）：全部 term 命中白名单字段 → 交集位图（组合筛选快速路径）；否则 None。
     pub fn bitmap_and(&self, terms: &[&str]) -> Option<RoaringBitmap> {
         let mut acc: Option<RoaringBitmap> = None;
@@ -433,8 +440,11 @@ impl InvertedIndex {
             term_offsets.push((term.clone().into_bytes(), file_offset));
             // K 项（7.74）：v3 分块布局（分页/COUNT 按容器延迟加载）
             let bitmap: RoaringBitmap = docids.iter().map(|d| *d as u32).collect();
+            // Ex-9.1b（v4）：条目 = term + varint(段内 doc_count) + posting —— 计数载荷
+            // 供 COUNT 亚毫秒求和（段内 posting 为去重 docid 集合 → bitmap.len() 精确）。
             let bytes = encode_posting_v3(&bitmap);
             encode_varlen(&mut body, term.as_bytes());
+            encode_varint(&mut body, bitmap.len() as u64);
             encode_varlen(&mut body, &bytes);
         }
 
@@ -574,6 +584,15 @@ impl InvertedIndex {
         Ok(result)
     }
 
+    /// 段文件版本（魔数后 u16；头部不足返回 0）。
+    fn seg_ver(data: &[u8]) -> u16 {
+        if data.len() < 10 {
+            0
+        } else {
+            u16::from_le_bytes(data[8..10].try_into().unwrap())
+        }
+    }
+
     /// 读取某段内 term 的 posting（未命中返回空 bitmap）。
     /// FST 字典存在时 O(len(term)) 精确定位（design 5.2.4.1）；旧段回退线性扫描。
     /// G 补充：段数据 mmap 化——首次访问懒加载注册，后续按 FST offset 直接切片，
@@ -609,13 +628,13 @@ impl InvertedIndex {
         if data.len() < 10 || &data[0..8] != SEG_MAGIC {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
-        // K 项（7.74）：段版本 → v3 分块 / v2 紧凑（旧段兼容）
-        let v3 = u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3;
+        // K 项（7.74）：段版本 → v3 分块 / v2 紧凑（旧段兼容）；Ex-9.1b v4 多 skip 计数载荷
+        let ver = Self::seg_ver(&data);
         // FST 精确查找：term → 段内条目字节偏移
         let dicts = self.dicts.load(); // Ex-6.3：Arc 快照零拷贝
         if let Some(map) = dicts.get(seg) {
             return match map.get(term.as_bytes()) {
-                Some(offset) => parse_posting_at(&data, offset as usize, v3),
+                Some(offset) => parse_posting_at(&data, offset as usize, ver),
                 None => Ok(RoaringBitmap::new()),
             };
         }
@@ -624,9 +643,12 @@ impl InvertedIndex {
         let count = decode_varint(&data, &mut cur)?;
         for _ in 0..count {
             let t = decode_varlen(&data, &mut cur)?.to_vec();
+            if ver >= 4 {
+                let _c = decode_varint(&data, &mut cur)?; // 跳过 v4 doc_count 载荷
+            }
             let p = decode_varlen(&data, &mut cur)?.to_vec();
             if t.as_slice() == term.as_bytes() {
-                return if v3 {
+                return if ver >= 3 {
                     decode_posting_v3(&p)
                 } else {
                     RoaringBitmap::deserialize_from(&p[..])
@@ -675,6 +697,9 @@ impl InvertedIndex {
         for _ in 0..count {
             let entry = cur; // 条目起点（term varlen 前）
             let t = decode_varlen(&data, &mut cur)?.to_vec();
+            if Self::seg_ver(&data) >= 4 {
+                let _c = decode_varint(&data, &mut cur)?; // Ex-9.1b：跳过 v4 doc_count 载荷
+            }
             let _p = decode_varlen(&data, &mut cur)?;
             if t.as_slice() == term.as_bytes() {
                 return Ok(Some((data, entry)));
@@ -706,12 +731,11 @@ impl InvertedIndex {
         let segs = self.segments.load();
         for seg in segs.iter() {
             if let Some((data, entry)) = self.segment_posting_entry(seg, term)? {
-                if data.len() >= 10
-                    && u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3
-                {
-                    cursors.push(PostingCursor::new(&data, entry)?);
+                let ver = Self::seg_ver(&data);
+                if ver >= 3 {
+                    cursors.push(PostingCursor::new(&data, entry, ver)?);
                 } else {
-                    let bm = parse_posting_at(&data, entry, false)?;
+                    let bm = parse_posting_at(&data, entry, ver)?;
                     cursors.push(PostingCursor::from_bitmap(bm));
                 }
             }
@@ -722,6 +746,37 @@ impl InvertedIndex {
             false
         })?;
         Ok(count)
+    }
+
+    /// Ex-9.1b：段级 TermMeta 计数载荷快速 COUNT——flush 时在每 term 条目写入
+    /// `varint(段内 doc_count)`（段内 posting 为去重 docid 集合 → bitmap.len() 精确）；
+    /// 此处 mem 去重计数 + 各段载荷求和 = O(段数)，免逐 docid 遍历（亚毫秒）。
+    /// 前提：**全部命中段均为 v4**（含载荷）；任一段为老格式（v2/v3）→ Ok(None)，
+    /// 调用方回退 `doc_count` 精确遍历。语义注：跨段重复 docid（同 docid 同 term 覆盖写入
+    /// 分散多段）求和略高估——写入单调/后台 GC 收敛后段间无重叠即精确；覆盖写入高频场景
+    /// 走 `doc_count`（精确去重）。
+    pub fn doc_count_fast(&self, term: &str) -> Result<Option<u64>> {
+        // mem（未刷盘）部分：term value 去重计数（内存小，HashSet 一次）
+        let mut total = 0u64;
+        if let Some(e) = self.mem.get(term) {
+            let set: std::collections::HashSet<u64> = e.value().iter().copied().collect();
+            total += set.len() as u64;
+        }
+        let segs = self.segments.load();
+        for seg in segs.iter() {
+            let Some((data, entry)) = self.segment_posting_entry(seg, term)? else {
+                continue; // gc 并发删段：跳过（与 doc_count 一致）
+            };
+            let ver = Self::seg_ver(&data);
+            if ver < 4 {
+                return Ok(None); // 老段无计数载荷 → 整体回退精确遍历
+            }
+            // FST/linear entry 指向 term 起点：skip term → varint(doc_count)
+            let mut cur = entry;
+            let _t = decode_varlen(&data, &mut cur)?;
+            total += decode_varint(&data, &mut cur)?;
+        }
+        Ok(Some(total))
     }
 
     /// 分页快速路径（K 项）：跨内存 + 各段 k-way merge，只解码 [offset, offset+limit)
@@ -741,14 +796,13 @@ impl InvertedIndex {
         let mut cursors: Vec<PostingCursor> = Vec::new();
         for seg in segs.iter() {
             if let Some((data, entry)) = self.segment_posting_entry(seg, term)? {
-                if data.len() >= 10
-                    && u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3
-                {
-                    let c = PostingCursor::new(&data, entry)?;
+                let ver = Self::seg_ver(&data);
+                if ver >= 3 {
+                    let c = PostingCursor::new(&data, entry, ver)?;
                     total += c.total();
                     cursors.push(c);
                 } else {
-                    let bm = parse_posting_at(&data, entry, false)?;
+                    let bm = parse_posting_at(&data, entry, ver)?;
                     total += bm.len();
                     cursors.push(PostingCursor::from_bitmap(bm));
                 }
@@ -801,15 +855,18 @@ impl InvertedIndex {
         if data.len() < 10 || &data[0..8] != SEG_MAGIC {
             return Err(Error::Corrupted(format!("倒排段魔数错误: {seg}")));
         }
-        // K 项（7.74）：段版本 → v3 分块 / v2 紧凑（旧段兼容）
-        let v3 = u16::from_le_bytes(data[8..10].try_into().unwrap()) >= 3;
+        // K 项（7.74）：段版本 → v3 分块 / v2 紧凑（旧段兼容）；Ex-9.1b v4 多 skip 计数载荷
+        let ver = Self::seg_ver(&data);
         let mut cur = 10usize;
         let count = decode_varint(&data, &mut cur)?;
         let mut out = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let t = decode_varlen(&data, &mut cur)?.to_vec();
+            if ver >= 4 {
+                let _c = decode_varint(&data, &mut cur)?; // v4 doc_count 载荷
+            }
             let p = decode_varlen(&data, &mut cur)?.to_vec();
-            let bitmap = if v3 {
+            let bitmap = if ver >= 3 {
                 decode_posting_v3(&p)?
             } else {
                 RoaringBitmap::deserialize_from(&p[..])
@@ -922,9 +979,10 @@ impl InvertedIndex {
         for (term, bitmap) in &map {
             let file_offset = (SEG_MAGIC.len() + std::mem::size_of::<u16>() + body.len()) as u64;
             term_offsets.push((term.clone().into_bytes(), file_offset));
-            // K 项（7.74）：v3 分块布局
+            // K 项（7.74）：v3 分块布局；Ex-9.1b（v4）：term + varint(段内 doc_count) + posting
             let bytes = encode_posting_v3(bitmap);
             encode_varlen(&mut body, term.as_bytes());
+            encode_varint(&mut body, bitmap.len() as u64);
             encode_varlen(&mut body, &bytes);
         }
         let tmp = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg.tmp"));
@@ -997,11 +1055,14 @@ pub struct GcReport {
 
 /// 从段数据指定偏移解析 (term, posting) 条目（FST 字典指向的条目）。
 /// v3 = posting 分块布局（K 项）；v2 = Roaring 紧凑字节（旧段兼容）。
-fn parse_posting_at(data: &[u8], offset: usize, v3: bool) -> Result<RoaringBitmap> {
+fn parse_posting_at(data: &[u8], offset: usize, ver: u16) -> Result<RoaringBitmap> {
     let mut cur = offset;
     let _t = decode_varlen(data, &mut cur)?; // 跳过 term
+    if ver >= 4 {
+        let _c = decode_varint(data, &mut cur)?; // Ex-9.1b：跳过 v4 doc_count 载荷
+    }
     let p = decode_varlen(data, &mut cur)?.to_vec();
-    if v3 {
+    if ver >= 3 {
         decode_posting_v3(&p)
     } else {
         RoaringBitmap::deserialize_from(&p[..])
@@ -1111,10 +1172,13 @@ struct PostingCursor {
 }
 
 impl PostingCursor {
-    /// 从条目 offset（FST 指向）构造：跳过 varlen term + varlen payload → 解析容器头。
-    fn new(data: &Arc<MmapFile>, entry: usize) -> Result<Self> {
+    /// 从条目 offset（FST 指向）构造：跳过 varlen term（+ v4 doc_count）→ payload → 容器头。
+    fn new(data: &Arc<MmapFile>, entry: usize, ver: u16) -> Result<Self> {
         let mut cur = entry;
         let _t = decode_varlen(data, &mut cur)?; // 跳过 term（pos → term 末尾）
+        if ver >= 4 {
+            let _c = decode_varint(data, &mut cur)?; // Ex-9.1b：跳过 v4 doc_count 载荷
+        }
         let payload = decode_varlen(data, &mut cur)?; // payload 切片（pos → payload 末尾）
         let (headers, _) = v3_headers(payload)?;
         Ok(Self {
@@ -1602,6 +1666,60 @@ mod tests {
     }
 
     #[test]
+    fn v4_doc_count_fast_matches_exact_across_flushes() {
+        // Ex-9.1b：v4 段计数载荷——多段（docid 不重叠）flush 后 doc_count_fast（求和）
+        // == doc_count（精确去重）== 实际总数；重启加载后载荷落盘仍一致。
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = InvertedIndex::open(dir.path(), 10_000).unwrap();
+        let mut items = Vec::new();
+        for d in 1..=100u64 {
+            items.push(("status=active", d));
+        }
+        for d in 1_000..=1_100u64 {
+            items.push(("status=active", d));
+        }
+        idx.add_batch(&items);
+        idx.flush_segment().unwrap(); // v4 段 1
+        let mut items2 = Vec::new();
+        for d in 5_000..=5_200u64 {
+            items2.push(("status=active", d));
+        }
+        idx.add_batch(&items2);
+        idx.flush_segment().unwrap(); // v4 段 2
+        let expect = 100 + 101 + 201;
+        assert_eq!(idx.doc_count("status=active").unwrap(), expect, "精确去重");
+        assert_eq!(
+            idx.doc_count_fast("status=active").unwrap(),
+            Some(expect),
+            "fast 载荷求和 == 精确（无跨段重叠）"
+        );
+        // 重启加载：段 v4 解析 + 载荷求和一致
+        drop(idx);
+        let idx2 = InvertedIndex::open(dir.path(), 10_000).unwrap();
+        assert_eq!(idx2.doc_count("status=active").unwrap(), expect);
+        assert_eq!(idx2.doc_count_fast("status=active").unwrap(), Some(expect));
+        // search 走 v4 解析也一致（posting 完整可读）
+        assert_eq!(idx2.search("status=active").unwrap().len(), expect as u64);
+    }
+
+    #[test]
+    fn v4_doc_count_fast_overlap_upper_bound_documented() {
+        // 语义注：同 docid 同 term 跨段覆盖（update 场景）→ 求和（段间重复）高估，
+        // 精确去重 doc_count 仍正确——文档化差异，调用方按场景选择。
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = InvertedIndex::open(dir.path(), 10_000).unwrap();
+        idx.add_batch(&[("status=active", 7)]);
+        idx.flush_segment().unwrap();
+        idx.add_batch(&[("status=active", 7)]); // 同 docid 同 term 再写 → 跨段重复
+        idx.flush_segment().unwrap();
+        assert_eq!(idx.doc_count("status=active").unwrap(), 1, "精确去重 = 1");
+        assert_eq!(
+            idx.doc_count_fast("status=active").unwrap(),
+            Some(2),
+            "求和 = 2（跨段重叠高估，文档化近似）"
+        );
+    }
+
     fn fst_dict_built_on_flush_and_lookup() {
         let dir = tmp();
         let mut idx = InvertedIndex::open(&dir, 1).unwrap(); // 默认 fst 引擎

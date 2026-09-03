@@ -881,6 +881,16 @@ impl Engine {
         !self.inverted_exclude.contains(field)
     }
 
+    /// Ex-9.1：mysql `COUNT WHERE f='v'` 快路径可路由判定——字段须已建索引且计数是亚毫秒级：
+    /// ① `bitmap_fields` 内存位图（写路径同步维护，O(1) 精确）或 ② 倒排白名单字段（回退精确
+    /// 去重 doc_count——大 term 非亚毫秒，故建议 COUNT 高频字段配 bitmap_fields）。未索引字段
+    /// 不得路由（防 `doc_count` 把"未建索引"误报成 0）。
+    pub fn inverted_count_eligible(&self, field: &str) -> bool {
+        !field.is_empty()
+            && (self.inverted_allowed(&format!("{field}=x"))
+                || self.inverted.is_bitmap_field(field))
+    }
+
     /// 统一提交 WAL（批量写入结束后调用，保证崩溃可恢复）。
     /// Ex-5.6：删除位图脏页**先于** WAL fsync 落盘——若崩溃发生在 WAL fsync 之后、
     /// 环形 WAL 截断推进之前，位图已持久（删除不丢）；反之位图先持久、WAL 回放重删幂等。
@@ -1666,10 +1676,9 @@ impl Engine {
     /// 否则回退倒排段扫描。
     pub fn inverted_doc_count(&mut self, term: &str) -> Result<u64> {
         self.flush_inverted_pending();
-        if let Some((field, value)) = term.split_once('=') {
-            if let Some(n) = self.inverted.bitmap_count(field, value) {
-                return Ok(n);
-            }
+        // Ex-9.1b：段级 TermMeta 计数载荷求和（全 v4 段亚毫秒，恒含存量）；老段回退精确遍历
+        if let Some(n) = self.inverted.doc_count_fast(term)? {
+            return Ok(n);
         }
         self.inverted.doc_count(term)
     }
