@@ -93,6 +93,11 @@ pub struct ColumnFamily {
     ttl_field: String,
     /// 两级索引粒度（`sstable.index_granularity`，每 N 块一条 Level 1 摘要）。
     index_granularity: usize,
+    /// M3（§26 多表）：按表切分 SST 输出——flush/compaction 按 docid 高 16 位（table_id）
+    /// 边界把输出切为**每表一个文件**（docid 区间含表 → 查询窗口剪枝自动跳过其它表文件、
+    /// DROP TABLE 可整文件回收）。仅 docid 定长 8 字节键的列族（主数据 primary）开启；
+    /// 单表（table_id=0）输出仍单文件，与旧行为一致。
+    split_by_table: bool,
     /// 后台 IO 限速器（design 4.5 阶段 3；`storage.io_rate_limit_mb`，None = 不限速）。
     /// O 项第③步：内部 `Mutex`——compact `&self` 读路径并发 acquire。
     io_limiter: Option<Mutex<crate::io_scheduler::IoRateLimiter>>,
@@ -347,6 +352,7 @@ impl ColumnFamily {
             ttl_days: cfg.storage.ttl_days,
             ttl_field: cfg.storage.ttl_field.clone(),
             index_granularity: cfg.sstable.index_granularity as usize,
+            split_by_table: false,
             io_limiter: if cfg.storage.io_rate_limit_mb > 0 {
                 Some(Mutex::new(crate::io_scheduler::IoRateLimiter::new(
                     cfg.storage.io_rate_limit_mb * 1024 * 1024,
@@ -1248,7 +1254,12 @@ impl ColumnFamily {
         // 环形 WAL 覆盖安全：Flush 完成后上报 imm 内最大 seq（<= 该 seq 的记录已刷盘可覆盖）
         let flushed_max = imm_scan_max_seq(&imm);
         if self.ttl_days.is_none() {
-            self.flush_single(&imm)?;
+            // M3：主数据列族（多表）按表切分输出；其余单文件（行为不变）
+            if self.split_by_table {
+                self.flush_by_table(&imm)?;
+            } else {
+                self.flush_single(&imm)?;
+            }
         } else {
             self.flush_buckets(&imm)?;
         }
@@ -1336,6 +1347,68 @@ impl ColumnFamily {
             "列族 [{}] 刷盘完成: {} ({} 条)",
             self.name,
             fname,
+            imm.len()
+        );
+        Ok(())
+    }
+
+    /// M3（§26 多表，实施清单①）：Immutable **按表切分**落盘——遍历升序键流，
+    /// 检测 `docid >> 48`（table_id）变化即 Finish 当前 writer、开新 writer（每表一个 SST）。
+    /// 前提：docid 高位编码 → 同表键在扫描序中连续，表边界检测即文件边界；
+    /// 键非 8 字节定长（理论上不会出现在开启切分的列族）保守并入 table 0。
+    /// 单表（table_id=0，含旧库全量）→ 仅开一个 writer = 单文件，与 flush_single 一致。
+    /// 空 Immutable：无键可切分，直接返回（不产出空文件，无副作用）。
+    fn flush_by_table(&self, imm: &MemTable) -> Result<()> {
+        if imm.len() == 0 {
+            // 空 Immutable：无键可切分，直接返回（不产出空文件）
+            return Ok(());
+        }
+        let _g = self.sst_mutate.lock().unwrap();
+        let mut writer: Option<SstWriter> = None;
+        let mut cur_tbl: u16 = 0;
+        let mut outputs: Vec<std::path::PathBuf> = Vec::new();
+        imm.scan(|k, e| {
+            let tbl = key_table_id(k).unwrap_or(0);
+            if writer.is_none() || tbl != cur_tbl {
+                if let Some(mut w) = writer.take() {
+                    w.finish().expect("SST finish 失败");
+                }
+                let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
+                let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
+                let w = SstWriter::new_with_pax(
+                    &path,
+                    self.compression,
+                    self.compression_level,
+                    self.block_size,
+                    imm.len(),
+                    &self.pax_hot_fields,
+                    self.bloom_fpr,
+                )
+                .expect("SST 创建失败");
+                writer = Some(w);
+                cur_tbl = tbl;
+                outputs.push(path);
+            }
+            let w = writer.as_mut().unwrap();
+            match &e.value {
+                Some(v) => w.add(k, v, e.seq).expect("SST 写入失败"),
+                None => w.add_tombstone(k, e.seq).expect("SST Tombstone 写入失败"),
+            }
+        });
+        if let Some(mut w) = writer.take() {
+            w.finish().expect("SST finish 失败");
+        }
+        for p in &outputs {
+            self.io_acquire(p)?;
+            let reader = SstReader::open_with_granularity(p, self.index_granularity)?;
+            self.snapshot_insert(reader);
+        }
+        self.persist_manifest()?;
+        drop(_g);
+        info!(
+            "列族 [{}] 按表切分刷盘完成: {} 个文件（{} 条）",
+            self.name,
+            outputs.len(),
             imm.len()
         );
         Ok(())
@@ -1496,6 +1569,17 @@ impl ColumnFamily {
                 dropped_keys: 0,
             });
         }
+        // M3（表切分）：底层（L1→L2 / L2）合并仅当存在**同表多段或混表段**才有价值——
+        // 跨表每表各 1 段的收敛态直接跳过（防多表库底层反复全量重写空转）。
+        if self.split_by_table && out_level >= 2 && !self.sel_has_merge_work(&sel) {
+            return Ok(CompactReport {
+                merged_ssts: 0,
+                kept_keys: 0,
+                freed_bytes: 0,
+                out_level: 0,
+                dropped_keys: 0,
+            });
+        }
         if let Some(rep) = self.try_meta_only_compact(&sel, out_level)? {
             return Ok(rep);
         }
@@ -1582,7 +1666,11 @@ impl ColumnFamily {
             self.compact_input_max_bytes,
         );
         if sel.len() >= 2 {
-            return self.compact_merge(&sel, out_level, drop_key);
+            // M3（表切分）：底层跨表不相交段（每表各 1 段）已按表收敛，多段全量合并无
+            // 额外回收 → 落到单段 GC 重写（删除空间仍可按段回收，防多表库 GC 反复合并空转）
+            if !(self.split_by_table && out_level >= 2 && !self.sel_has_merge_work(&sel)) {
+                return self.compact_merge(&sel, out_level, drop_key);
+            }
         }
         if !allow_single {
             return Ok(empty);
@@ -1662,32 +1750,54 @@ impl ColumnFamily {
         rows.retain(|(k, _, _)| !drop_key(k));
         let dropped_keys = dropped_keys - rows.len();
 
-        // ③ 写新段（读路径新文件插最前）
-        let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
-        let path = self.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
-        {
-            let mut w = SstWriter::new_with_pax(
-                &path,
-                self.compression,
-                self.compression_level_for(out_level),
-                self.block_size,
-                rows.len(),
-                &self.pax_hot_fields,
-                self.bloom_fpr,
-            )?;
-            for (key, _seq, value) in &rows {
-                match value {
-                    Some(v) => w.add(key, v, *_seq)?,
-                    None => w.add_tombstone(key, *_seq)?,
+        // ③ 写输出段（读路径新文件插最前）。
+        // M3（§26 多表，实施清单②）：归并后 key 升序、同表键天然连续 → 按 `docid >> 48`
+        // 检测表边界切分输出，每表一个文件（输出段互不重叠，符合 L1/L2 层内不重叠语义；
+        // 单表 / 表切分关闭 → 单文件输出，与旧行为一致）。
+        let mut out_paths: Vec<std::path::PathBuf> = Vec::new();
+        let write_one = |self_: &Self, rows: &[(Vec<u8>, u64, Option<Vec<u8>>)]| -> Result<PathBuf> {
+            let sst_id = self_.next_sst_id.fetch_add(1, Ordering::Relaxed);
+            let path = self_.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
+            {
+                let mut w = SstWriter::new_with_pax(
+                    &path,
+                    self_.compression,
+                    self_.compression_level_for(out_level),
+                    self_.block_size,
+                    rows.len(),
+                    &self_.pax_hot_fields,
+                    self_.bloom_fpr,
+                )?;
+                for (key, _seq, value) in rows {
+                    match value {
+                        Some(v) => w.add(key, v, *_seq)?,
+                        None => w.add_tombstone(key, *_seq)?,
+                    }
                 }
+                w.finish()?;
             }
-            w.finish()?;
+            self_.io_acquire(&path)?;
+            Ok(path)
+        };
+        if self.split_by_table && rows.len() > 1 {
+            let mut start = 0usize;
+            while start < rows.len() {
+                let tbl = key_table_id(&rows[start].0).unwrap_or(0);
+                let mut end = start + 1;
+                while end < rows.len() && key_table_id(&rows[end].0).unwrap_or(0) == tbl {
+                    end += 1;
+                }
+                out_paths.push(write_one(self, &rows[start..end])?);
+                start = end;
+            }
+        } else {
+            // 全量单输出（含全部键被位图物理丢弃后 rows 为空 → 写空段，保持旧语义）
+            out_paths.push(write_one(self, &rows)?);
         }
-        self.io_acquire(&path)?;
 
         self.finalize_compact(
             sel,
-            &path,
+            &out_paths,
             out_level,
             old_count,
             rows.len(),
@@ -1737,6 +1847,21 @@ impl ColumnFamily {
                 .unwrap_or_default();
             ranges.push((i, min, max));
         }
+        // M3（§26 多表）：表切分列族**仅同表段可块级复用**——块级复用把输入块原样拼进
+        // **单个**输出文件；若输入跨表（或老格式混表段，段内 min/max 跨表），单文件输出
+        // 会把多表混进一个文件，破坏"每文件单表"的文件路由前提 → 回退全量合并按表切分。
+        if self.split_by_table {
+            let mut common: Option<u16> = None;
+            for &(_, ref mn, ref mx) in &ranges {
+                match (key_table_id(mn), key_table_id(mx)) {
+                    (Some(a), Some(b)) if a == b => match common {
+                        Some(t) if t != a => return Ok(None),
+                        _ => common = Some(a),
+                    },
+                    _ => return Ok(None), // 非 8 字节键 / 段内跨表 → 禁复用
+                }
+            }
+        }
         // 按 min 排序，检查相邻段无重叠（重叠需全量合并保证覆盖/去重语义）
         ranges.sort_by(|a, b| a.1.cmp(&b.1));
         for w in ranges.windows(2) {
@@ -1770,7 +1895,8 @@ impl ColumnFamily {
             w.finish()?;
         }
         self.io_acquire(&path)?;
-        let rep = self.finalize_compact(sel, &path, out_level, old_count, kept as usize, 0, 0)?;
+        let rep =
+            self.finalize_compact(sel, &[path], out_level, old_count, kept as usize, 0, 0)?;
         info!(
             "列族 [{}] 块级复用 Compaction 完成（Ex-5.8，零解压只重建元数据）: →L{out_level} 合并 {} 段，释放 {} 字节",
             self.name,
@@ -1782,12 +1908,13 @@ impl ColumnFamily {
 
     /// 压实收尾（④⑤）：原子发布新快照（旧段移除 + 新段插最前）→ 更新 Manifest →
     /// 删除旧段（换快照后再删，并发读持 Arc 句柄有效）→ 报告。
+    /// M3：`paths` 支持多输出（表切分每表一个文件），全部按 `out_level` 插到快照最前。
     /// O 项第③步：`&self`（snapshot store 原子切换 + merge_round/cooldown 内部可变）。
     #[allow(clippy::too_many_arguments)]
     fn finalize_compact(
         &self,
         sel: &[usize],
-        path: &Path,
+        paths: &[PathBuf],
         out_level: u32,
         old_count: usize,
         kept: usize,
@@ -1821,11 +1948,14 @@ impl ColumnFamily {
                 kept_levels.push(cur.levels[i]);
             }
         }
-        kept_ssts.insert(
-            0,
-            Arc::new(SstReader::open_with_granularity(path, self.index_granularity)?),
-        );
-        kept_levels.insert(0, out_level);
+        // M3：多输出全部置前（同层、段间不重叠 → 相对顺序无版本语义影响）
+        for p in paths {
+            kept_ssts.insert(
+                0,
+                Arc::new(SstReader::open_with_granularity(p, self.index_granularity)?),
+            );
+            kept_levels.insert(0, out_level);
+        }
         let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
         let sizes: Vec<u64> = kept_ssts.iter().map(|r| r.file_len()).collect();
         self.ssts.store(Arc::new(SstSnapshot {
@@ -1846,9 +1976,10 @@ impl ColumnFamily {
         }
         drop(_g);
         let freed_bytes = old_bytes.saturating_sub(self.sst_bytes());
+        let n_out = paths.len();
         if dropped > 0 {
             info!(
-                "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → 1（保留 {} 键，位图物理丢弃 {dropped} 键，释放 {} 字节）",
+                "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → {n_out} 文件（保留 {} 键，位图物理丢弃 {dropped} 键，释放 {} 字节）",
                 self.name,
                 old_count,
                 kept,
@@ -1856,7 +1987,7 @@ impl ColumnFamily {
             );
         } else {
             info!(
-                "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → 1（保留 {} 键，释放 {} 字节）",
+                "列族 [{}] Compaction 完成: →L{out_level} 合并 {} 段 → {n_out} 文件（保留 {} 键，释放 {} 字节）",
                 self.name,
                 old_count,
                 kept,
@@ -1868,7 +1999,9 @@ impl ColumnFamily {
         if self.compaction_cooldown > 0 {
             let round = self.merge_round.fetch_add(1, Ordering::Relaxed) + 1;
             let mut cd = self.cooldown.lock().unwrap();
-            cd.insert(path.to_path_buf(), round + self.compaction_cooldown as u64);
+            for p in paths {
+                cd.insert(p.to_path_buf(), round + self.compaction_cooldown as u64);
+            }
             cd.retain(|_, exp| *exp > round);
         }
         Ok(CompactReport {
@@ -1878,6 +2011,55 @@ impl ColumnFamily {
             out_level,
             dropped_keys: dropped,
         })
+    }
+
+    /// M3（§26 多表）：段归属表 id（快照内 sst 下标 → Some(table_id)）。
+    /// 仅 min/max 同属一表视为单表段；混表（老格式）段 / 空段 / 非 8 字节键 → None。
+    fn sst_table_of(&self, i: usize) -> Option<u16> {
+        let snap = self.ssts.load();
+        match snap.ssts[i].key_range() {
+            Some((mn, mx)) => match (key_table_id(mn), key_table_id(mx)) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// M3：选定段集是否含**合并价值**——存在同表 ≥2 段（跨段有重叠/需下沉去重）
+    /// 或混表段（老格式，需全量合并按表切分）。跨表每表各 1 段 = 已按表收敛，无需重写。
+    fn sel_has_merge_work(&self, sel: &[usize]) -> bool {
+        if sel.len() < 2 {
+            return false;
+        }
+        let mut counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+        for &i in sel {
+            match self.sst_table_of(i) {
+                Some(t) => *counts.entry(t).or_insert(0) += 1,
+                None => return true, // 混表段 / 无范围：保守认为需全量合并
+            }
+        }
+        counts.values().any(|&c| c >= 2)
+    }
+
+    /// M3：表切分列族底部（L0 空时的 L1/L2）是否需合并——按表、按层口径：
+    /// L1 或 L2 **某一层内**存在**同表 ≥2 段**（有去重/下沉收益）或混表老段即触发；
+    /// 跨表每层每表各 1 段视为已收敛 → 不触发（防多表库底层反复重写空转）。
+    fn split_bottom_merge_work(&self) -> bool {
+        let snap = self.ssts.load();
+        let mut l1: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+        let mut l2: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+        for (i, lv) in snap.levels.iter().enumerate() {
+            if *lv == 0 {
+                continue;
+            }
+            let counts = if *lv == 1 { &mut l1 } else { &mut l2 };
+            match self.sst_table_of(i) {
+                Some(t) => *counts.entry(t).or_insert(0) += 1,
+                None => return true, // 底部混表老段：需合并切分
+            }
+        }
+        l1.values().any(|&c| c >= 2) || l2.values().any(|&c| c >= 2)
     }
 
     /// 是否需要 Compaction（design 4.5 二期）：
@@ -1900,7 +2082,12 @@ impl ColumnFamily {
     /// `l1_trigger_files>0`：L1 **攒够阈值**才下沉 L2（延迟大合并），且 L1 未达阈值期间
     /// 不提前收敛 L2（等批次到齐一起下沉，减底层重写）；0 = 现行为（L1>1 或 L2>1 即触发）。
     /// `l2_trigger_files>0`：L2 攒够阈值才收敛为单段；0 = 现行为（L2>1 即收敛）。
+    /// M3（表切分列族）：改按表口径——同表 ≥2 段 / 混表老段才触发（见 `split_bottom_merge_work`）；
+    /// L1→L2 下沉仅在 L1 存在同表 ≥2 段（或混表）时进行，跨表每表 1 段停在当前层即收敛。
     fn bottom_needs_compact(&self, l1: usize, l2: usize) -> bool {
+        if self.split_by_table {
+            return self.split_bottom_merge_work();
+        }
         let l1_gate = if self.l1_trigger_files > 0 {
             l1 >= self.l1_trigger_files
         } else {
@@ -2074,6 +2261,60 @@ impl ColumnFamily {
         self.ssts.load().ssts.len()
     }
 
+    /// M3（§26 多表，实施清单④）：物理删除**完全落在指定表 docid 区间**内的 SST 文件
+    /// （表切分后每文件单表，min/max 同属该表即可整文件删；混表老文件 / 空段保守保留，
+    /// 其表数据随逻辑删墓碑在后续压缩中回收）。返回删除文件数。
+    /// 调用前提：表区间已先完成**逻辑删除**（multitable::drop_table_range 逐 docid 墓碑，
+    /// 位图/MemTable/WAL 均含删除标记）——本函数只做磁盘文件级回收，不改变可见性语义。
+    pub fn drop_table_range_files(&self, tid: u16) -> Result<usize> {
+        let _g = self.sst_mutate.lock().unwrap();
+        let cur = self.ssts.load();
+        let in_table = |k: &[u8]| -> bool {
+            crate::keys::decode_docid(k)
+                .map(|d| ((d >> 48) as u16) == tid)
+                .unwrap_or(false)
+        };
+        let mut removed: Vec<std::path::PathBuf> = Vec::new();
+        let mut kept_ssts = Vec::new();
+        let mut kept_levels = Vec::new();
+        for (i, sst) in cur.ssts.iter().enumerate() {
+            let whole = match sst.key_range() {
+                Some((mn, mx)) => in_table(mn) && in_table(mx),
+                None => false, // 空段 / 无范围 → 保守保留
+            };
+            if whole {
+                removed.push(sst.path().to_path_buf());
+            } else {
+                kept_ssts.push(sst.clone());
+                kept_levels.push(cur.levels[i]);
+            }
+        }
+        if removed.is_empty() {
+            return Ok(0);
+        }
+        // 原子发布（store → persist → remove，同 finalize_compact / purge_data）
+        let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
+        let sizes: Vec<u64> = kept_ssts.iter().map(|r| r.file_len()).collect();
+        self.ssts.store(Arc::new(SstSnapshot {
+            ssts: kept_ssts,
+            levels: kept_levels,
+            layer_ranges,
+            layer_indices,
+            sizes,
+        }));
+        self.persist_manifest()?;
+        for p in &removed {
+            let _ = std::fs::remove_file(p);
+        }
+        drop(_g);
+        info!(
+            "列族 [{}] DROP TABLE 表文件回收: 删除 {} 个表内 SST（table_id={tid}，全键属该表区间）",
+            self.name,
+            removed.len()
+        );
+        Ok(removed.len())
+    }
+
     /// Ex-5.9：指定 SST 的读热度（冷热感知 Compaction 监控/策略数据源）。
     pub fn sst_heat(&self, idx: usize) -> u64 {
         self.ssts.load().ssts.get(idx).map_or(0, |s| s.heat())
@@ -2088,6 +2329,12 @@ impl ColumnFamily {
     /// 在 WAL 回放完成（内部 seq 已推进）后调用，此后写入走外部计数，跨列族一致。
     pub fn set_external_seq(&mut self, seq: Arc<AtomicU64>) {
         self.external_seq = Some(seq);
+    }
+
+    /// M3（§26 多表）：开启按表切分输出（仅主数据列族调用——全键为 docid 定长 8 字节，
+    /// 高位 table_id 边界即文件边界；cidx 组合键 / outbox 等不定长键列族必须保持关闭）。
+    pub fn enable_table_split(&mut self) {
+        self.split_by_table = true;
     }
 
     /// 分配 seq 并追加 WAL 记录：外部全局 seq 优先（engine MVCC），否则内部自增。
@@ -2414,6 +2661,14 @@ fn imm_scan_max_seq(imm: &MemTable) -> u64 {
         }
     });
     max_seq
+}
+
+/// M3（§26 多表）：docid 定长键 → table_id（`docid >> 48`）。
+/// 仅 8 字节定长 docid 键可解析（主数据列族）；组合键等不定长键返回 None（不切分）。
+/// 字节序 == 数值序（keys 大端规范）→ 同表键在扫描序中天然连续，表边界即切分点。
+fn key_table_id(key: &[u8]) -> Option<u16> {
+    let docid = crate::keys::decode_docid(key).ok()?;
+    Some((docid >> 48) as u16)
 }
 
 /// 选择本轮压实输入（design 4.5 二期 Leveled，M6-2）：
@@ -4025,5 +4280,186 @@ mod tests {
         }
         hits.sort();
         assert_eq!(hits, vec![1, 5, 9, 20]);
+    }
+
+    // ---------- M3（§26 多表）：Flush / Compaction 按表切分（同表合并） ----------
+
+    /// 表内 docid：docid = table<<48 | row
+    fn tdoc(table: u16, row: u64) -> u64 {
+        ((table as u64) << 48) | row
+    }
+    /// 单表 row 容量 2^48：表内最大 row_id（窗口上界用，勿用 u64::MAX——OR 全 1 会越出本表区间）
+    const TROW_MAX: u64 = (1u64 << 48) - 1;
+
+    /// 快照内各 SST 归属表 id（单表段 → Some(tid)；混表/空段 → None），保持快照顺序。
+    fn sst_tables(cf: &ColumnFamily) -> Vec<Option<u16>> {
+        let snap = cf.ssts.load();
+        snap.ssts
+            .iter()
+            .map(|s| match s.key_range() {
+                Some((mn, mx)) => match (key_table_id(mn), key_table_id(mx)) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    _ => None,
+                },
+                None => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn m3_flush_splits_imm_by_table() {
+        // 实施清单①：单次 flush 内多表 docid 同落 Immutable → 按表边界切多个 SST
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.enable_table_split();
+        // 默认表 0 / 表 1 / 表 7 各 3 行（row 同号共存）
+        for row in [1u64, 2, 3] {
+            cf.put(tdoc(0, row), format!("t0-r{row}").into_bytes()).unwrap();
+            cf.put(tdoc(1, row), format!("t1-r{row}").into_bytes()).unwrap();
+            cf.put(tdoc(7, row), format!("t7-r{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_count(), 3, "3 张表应切 3 个 SST，实际 {}", cf.sst_count());
+        // 每个 SST 均为单表段，且三表齐全
+        let mut ts: Vec<u16> = sst_tables(&cf).into_iter().map(|t| t.unwrap()).collect();
+        ts.sort();
+        assert_eq!(ts, vec![0, 1, 7], "切分后每文件单表，实际 {ts:?}");
+        // 全部行读回
+        for row in [1u64, 2, 3] {
+            for t in [0u16, 1, 7] {
+                let got = cf.get(tdoc(t, row)).unwrap().expect("行应可读");
+                assert_eq!(got.0, format!("t{t}-r{row}").into_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn m3_compact_merges_per_table_and_converges() {
+        // 实施清单② + 同表合并：flush 按表切分后，压缩只合并同表段；
+        // 跨表每表 1 段即"按表收敛"——不反复重写（needs_compact 归零、重复 compact 无空转）
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.enable_table_split();
+        // 表 1：两批 flush（L0 同表 2 段 → 需合并去重）
+        for row in 1..=3u64 {
+            cf.put(tdoc(1, row), format!("t1-a{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        for row in 2..=4u64 {
+            cf.put(tdoc(1, row), format!("t1-b{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        // 表 2：一批 flush（L0 单段）
+        for row in 1..=4u64 {
+            cf.put(tdoc(2, row), format!("t2-r{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        // L0 = 表1×2 + 表2×1
+        assert_eq!(cf.sst_count(), 3);
+        // 压缩至收敛（直接驱动：默认 L0 阈值较高，逐轮 compact 直至 no-op）
+        let mut guard = 0;
+        loop {
+            let rep = cf.compact().unwrap();
+            if rep.merged_ssts == 0 {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 8, "压缩应快速收敛（当前 {} 轮）", guard);
+        }
+        // 收敛：跨表每表 1 段（表1 去重为 1 段、表2 1 段），不再需要压缩
+        assert!(!cf.needs_compact(), "按表收敛后不应再触发压缩");
+        let mut ts: Vec<u16> = sst_tables(&cf).into_iter().map(|t| t.unwrap()).collect();
+        ts.sort();
+        assert_eq!(ts, vec![1, 2], "收敛后每表 1 段，实际 {ts:?}");
+        assert_eq!(cf.sst_count(), 2, "收敛后文件数 = 表数");
+        // 重复 compact 不应空转重写（无新工作 → merged=0）
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.merged_ssts, 0, "收敛态重复 compact 应为 no-op");
+        // 语义：表 1 后写覆盖先写、行 1..4 各 1 条；表 2 独立不受影响
+        let t1 = cf.scan_range(Some(tdoc(1, 0)), Some(tdoc(1, TROW_MAX))).unwrap();
+        assert_eq!(t1.len(), 4);
+        let b4 = cf.get(tdoc(1, 4)).unwrap().unwrap();
+        assert_eq!(b4.0, b"t1-b4");
+        let a1 = cf.get(tdoc(1, 1)).unwrap().unwrap();
+        assert_eq!(a1.0, b"t1-a1"); // 未覆盖的行保持 a 批次
+        let b2 = cf.get(tdoc(1, 2)).unwrap().unwrap();
+        assert_eq!(b2.0, b"t1-b2"); // 覆盖生效
+        let t2 = cf.scan_range(Some(tdoc(2, 0)), Some(tdoc(2, TROW_MAX))).unwrap();
+        assert_eq!(t2.len(), 4);
+    }
+
+    #[test]
+    fn m3_single_table_regression_stays_single_file() {
+        // 实施清单⑤：table_id=0（含旧库全量）flush/compact 均单文件输出，行为与旧一致
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.enable_table_split();
+        for i in 1..=500u64 {
+            cf.put(i, format!("doc-{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_count(), 1, "单表 flush 应 1 个 SST，实际 {}", cf.sst_count());
+        // 多批 flush → L0 多段 → 压缩收敛单段
+        for i in 501..=1000u64 {
+            cf.put(i, format!("doc-{i}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        let mut guard = 0;
+        loop {
+            let rep = cf.compact().unwrap();
+            if rep.merged_ssts == 0 {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 8, "单表压缩应快速收敛（{} 轮）", guard);
+        }
+        assert_eq!(cf.sst_count(), 1, "单表压缩后应收敛为 1 段，实际 {}", cf.sst_count());
+        assert_eq!(cf.scan_range(None, None).unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn m3_drop_table_range_files_physically_removes_table_ssts() {
+        // 实施清单④：表切分后 DROP TABLE 物理删该表区间专属文件，manifest 同步、他表不受影响
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let sst_dir = dir.clone();
+        {
+            let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+            cf.enable_table_split();
+            for row in 1..=3u64 {
+                cf.put(tdoc(1, row), format!("t1-r{row}").into_bytes()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+            for row in 1..=3u64 {
+                cf.put(tdoc(2, row), format!("t2-r{row}").into_bytes()).unwrap();
+            }
+            cf.switch_and_flush().unwrap();
+            assert_eq!(cf.sst_count(), 2);
+            // 模拟"先逻辑删再物理回收"（引擎 drop_table_range 先逐 docid 墓碑）
+            for row in 1..=3u64 {
+                cf.delete(tdoc(1, row)).unwrap();
+            }
+            cf.sync_wal().unwrap();
+            let n = cf.drop_table_range_files(1).unwrap();
+            assert_eq!(n, 1, "表 1 专属 SST 应被物理删除 1 个");
+            assert_eq!(cf.sst_count(), 1, "表 2 SST 保留");
+            assert!(cf.get(tdoc(2, 1)).unwrap().is_some(), "他表数据不受影响");
+            assert!(cf.get(tdoc(1, 1)).unwrap().is_none(), "被删表行不可见");
+        }
+        // 重启：manifest 不悬空（被删文件不加载），表 2 数据仍在
+        let mut cf2 = ColumnFamily::open("primary", &sst_dir, &cfg).unwrap();
+        assert_eq!(cf2.sst_count(), 1);
+        assert!(cf2.get(tdoc(2, 2)).unwrap().is_some());
+        // 磁盘上表 1 的 SST 已消失
+        let names: Vec<String> = std::fs::read_dir(&sst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|f| f.starts_with(SST_PREFIX))
+            .collect();
+        assert_eq!(names.len(), 1, "磁盘应只剩表 2 的 SST，实际 {names:?}");
     }
 }

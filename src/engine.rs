@@ -391,20 +391,30 @@ impl Engine {
             }
         };
         #[cfg(target_os = "linux")]
-        let primary = Arc::new(ColumnFamily::open_with_io_uring(
-            "primary",
-            &sst_root.join("primary"),
-            Some(wal_root),
-            cfg,
-            iou.clone(),
-        )?);
+        let primary = {
+            let mut cf = ColumnFamily::open_with_io_uring(
+                "primary",
+                &sst_root.join("primary"),
+                Some(wal_root),
+                cfg,
+                iou.clone(),
+            )?;
+            // M3（§26 多表）：主数据列族 flush/compaction 输出按表切分（docid 高位含表）
+            cf.enable_table_split();
+            Arc::new(cf)
+        };
         #[cfg(not(target_os = "linux"))]
-        let primary = Arc::new(ColumnFamily::open_with_wal_dir(
-            "primary",
-            &sst_root.join("primary"),
-            Some(wal_root),
-            cfg,
-        )?);
+        let primary = {
+            let mut cf = ColumnFamily::open_with_wal_dir(
+                "primary",
+                &sst_root.join("primary"),
+                Some(wal_root),
+                cfg,
+            )?;
+            // M3（§26 多表）：主数据列族 flush/compaction 输出按表切分（docid 高位含表）
+            cf.enable_table_split();
+            Arc::new(cf)
+        };
         let mut inverted = InvertedIndex::open_with_gc(
             &inverted_root.join("inverted"),
             // L 项：倒排刷盘阈值可配（config.inverted.flush_threshold；0 = 默认 100 万 term 对）
@@ -1062,6 +1072,14 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// M3（§26 多表，实施清单④）：DROP TABLE 磁盘文件级回收——物理删除主列族内
+    /// **完全落在指定表 docid 区间**的 SST（表切分后每文件单表，可整文件删）。
+    /// 须在 `multitable::drop_table_range`（逐 docid 逻辑删除：墓碑已覆盖全部该表键）之后调用，
+    /// 此时删文件不改变可见性（墓碑保证无复活），仅提前释放磁盘。
+    pub fn drop_table_sst_files(&self, tid: u16) -> crate::error::Result<usize> {
+        self.primary.drop_table_range_files(tid)
     }
 
     /// 部分更新（阶段 1.5，design 4.7）：仅写入变更字段到 Delta CF（几十字节小记录），

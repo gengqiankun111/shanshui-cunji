@@ -3037,6 +3037,14 @@ fn table_name_of(sql: &str) -> String {
         lower
             .find(" from ")
             .map(|p| &lower[p + " from ".len()..])
+    } else if lower.starts_with("drop table") {
+        lower
+            .find("drop table")
+            .map(|p| &lower[p + "drop table".len()..])
+    } else if lower.starts_with("truncate table") {
+        lower
+            .find("truncate table")
+            .map(|p| &lower[p + "truncate table".len()..])
     } else {
         None
     };
@@ -4398,8 +4406,10 @@ mod tests {
             super::QueryResponse::Ok(0, 0) => {}
             _ => panic!("CREATE 应返回 Ok(0,0) 空操作"),
         }
-        // DROP TABLE → 整库清空（行 + 倒排）
-        match super::dispatch_query(&mut e, "DROP TABLE t1", &mut s) {
+        // DROP TABLE（默认表 documents）→ 整库清空（行 + 倒排）
+        // M3：表名路由已按 DROP/TRUNCATE 真实表名解析——documents 才 purge 全库；
+        // 非默认表 DROP 走本表区间删除（见 m3_multitable_flush_compact_drop）
+        match super::dispatch_query(&mut e, "DROP TABLE documents", &mut s) {
             super::QueryResponse::Ok(0, 0) => {}
             _ => panic!("DROP 应返回 Ok(0,0)"),
         }
@@ -4416,8 +4426,8 @@ mod tests {
             super::QueryResponse::Err(1062, m) => panic!("DROP 后残留主键 → 1062: {m}"),
             _ => panic!("再插入失败"),
         }
-        // TRUNCATE TABLE → 同样清空
-        match super::dispatch_query(&mut e, "TRUNCATE TABLE t1", &mut s) {
+        // TRUNCATE TABLE（默认表 documents）→ 同样清空
+        match super::dispatch_query(&mut e, "TRUNCATE TABLE documents", &mut s) {
             super::QueryResponse::Ok(0, 0) => {}
             _ => panic!("TRUNCATE 应返回 Ok(0,0)"),
         }
@@ -5428,6 +5438,85 @@ mod tests {
         // 表级范围窗口不跨表：t_a BETWEEN 不含 t_b 行
         let win = rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10");
         assert_eq!(win.len(), 2, "t_b 区间窗口仅本表 2 行（7、8）");
+    }
+    #[test]
+    fn m3_multitable_flush_compact_drop() {
+        // M3 e2e：主数据列族 flush/compaction 按表切分后，双表同 id 仍隔离；
+        // 强制落盘 + 收敛压缩后读回一致；DROP 单表（逻辑删 + 表文件物理回收）不影响他表
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        // 删除位图按 docid 稠密寻址——多表高位 docid（table<<48）下不可用（爆内存）；
+        // 该 e2e 聚焦表切分/同表合并/DROP 语义，用传统 Tombstone 路径（生产多表单删同此前提）
+        cfg.storage.deletion_bitmap_enabled = false;
+        let mut engine = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = AtomicU64::new(1);
+        let rows_of = |e: &Engine, sql: &str| -> Vec<Vec<Vec<u8>>> {
+            match select_response(e, sql) {
+                QueryResponse::Set { rows, .. } => rows,
+                _ => panic!("应为 ResultSet: {sql}"),
+            }
+        };
+        // 两表各 400 行（row 号对齐，验证跨表同 id 共存与表级切分落盘）
+        for i in 1..=400u64 {
+            let ra = insert_response(
+                &mut engine,
+                &format!("INSERT INTO t_a(id, doc) VALUES({i}, '{{\"v\":\"a{i}\"}}')"),
+                &auto,
+            );
+            let rb = insert_response(
+                &mut engine,
+                &format!("INSERT INTO t_b(id, doc) VALUES({i}, '{{\"v\":\"b{i}\"}}')"),
+                &auto,
+            );
+            assert!(matches!(ra, QueryResponse::Ok(1, _)) && matches!(rb, QueryResponse::Ok(1, _)));
+        }
+        // 覆盖 50 行（压缩跨版本合并需去重）
+        for i in 1..=50u64 {
+            let u = update_response(
+                &mut engine,
+                &format!("UPDATE t_a SET doc='{{\"v\":\"a{i}x\"}}' WHERE id={i}"),
+            );
+            assert!(matches!(u, QueryResponse::Ok(1, _)));
+        }
+        // 强制 flush（按表切分落盘）→ 压缩收敛（同表合并）
+        engine.flush_primary().unwrap();
+        let mut guard = 0;
+        while engine.needs_compact() && guard < 50 {
+            let _ = engine.compact().unwrap();
+            guard += 1;
+        }
+        // 双表数据完整且隔离：同 id 各自归属
+        let ta = rows_of(&engine, "SELECT id, v FROM t_a WHERE id BETWEEN 1 AND 400");
+        let tb = rows_of(&engine, "SELECT id, v FROM t_b WHERE id BETWEEN 1 AND 400");
+        assert_eq!(ta.len(), 400, "t_a 全量读回");
+        assert_eq!(tb.len(), 400, "t_b 全量读回");
+        assert_eq!(ta[0], vec![b"1".to_vec(), b"a1x".to_vec()], "覆盖生效");
+        assert_eq!(ta[51], vec![b"52".to_vec(), b"a52".to_vec()], "未覆盖行保持原值");
+        assert_eq!(tb[0], vec![b"1".to_vec(), b"b1".to_vec()], "t_b 不受 t_a 覆盖影响");
+        assert_eq!(ta[399], vec![b"400".to_vec(), b"a400".to_vec()]);
+        // DROP 单表：仅 t_b 清空，t_a 完好（逻辑删 + 该表文件物理回收）
+        let s_auto = Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(Arc::clone(&s_auto));
+        match super::dispatch_query(&mut engine, "DROP TABLE t_b", &mut s) {
+            QueryResponse::Ok(0, 0) => {}
+            _ => panic!("DROP TABLE t_b 应成功"),
+        }
+        assert!(
+            rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 400").is_empty(),
+            "t_b 行应清空"
+        );
+        assert_eq!(
+            rows_of(&engine, "SELECT id FROM t_a WHERE id BETWEEN 1 AND 400").len(),
+            400,
+            "t_a 行不受 DROP t_b 影响"
+        );
+        // flush 后仍一致（表文件回收后重启级一致性由 CF 单测覆盖）
+        engine.flush_primary().unwrap();
+        assert_eq!(
+            rows_of(&engine, "SELECT id FROM t_a WHERE id BETWEEN 1 AND 400").len(),
+            400
+        );
+        assert!(rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 400").is_empty());
     }
     #[test]
     fn m1_p0_replace_and_null_auto() {
