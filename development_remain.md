@@ -100,8 +100,8 @@
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| Ex-8.9 空闲感知维护调度（P3） | 低负载窗口收紧合并阈值/触发倒排 GC/深度合并/位图脏页回收；高负载退避（与 Ex-7.4 联动）；demo 交变负载对照 | 待做（原 development_remain §14） |
-| Ex-8.13 倒排后台 IO 预算共享（P3） | 倒排 flush_segment/GC 写纳入后台 io_limiter 或并入 Ex-8.9 空闲窗口；demo 并发窗口对照 | 待做（原 §14） |
+| Ex-8.9 空闲感知维护调度（P3） | **设计已出（research/ex8.9-ex8.13-idle-maintenance-io-budget.md）+ 概念 demo 已跑通（src/demo/idle-maintenance：写突发后空闲，A 现行为残留 L0×6/倒排 pending 23.7 万不落段；B 空闲窗口维护队列→L0=0/L1=1 单文件、pending 落段 seg=1，数据一致）**；内核实现切片（io_budget → 维护线程 → 接入四项）待排期 | 设计 ✅ / demo ✅ / 内核待做 |
+| Ex-8.13 倒排后台 IO 预算共享（P3） | **设计已出（同上 research 文档 §2/§5-step1）：抽 io_budget 共享模块 + 倒排 seg 写记账（紧急刷段不受限、GC/空闲刷段记账节流）；demo A/B（前台写 + inverted_gc，p99 退化≤5%）随内核切片实现** | 设计 ✅ / 内核待做 |
 | Ex-8.11 A/B 写放大实测（P2 受控实验） | 内核已回填（8ec3a70）；**A/B demo 已建（src/demo/wa-ab，12.8 万 ×512B 关压缩实测：默认收敛 WA 5.62 vs L1 攒 8 WA 3.21，写放大 -42.9%，点查 p50 0.8→1.1µs、范围 p50 2600→2120µs 无回退）→ 采纳默认 l1_trigger_files=8（2026-09-04）**；顺带修复：①Engine compact 无 L0 压力时底部（L1→L2/L2 收敛）合并空转饿死 → 底层 needs 直接压实对应列族；②M3 表切分 bottom 触发忽略 l1_trigger_files → 已尊重攒批配置；③新增 sst_written_bytes 累计写指标 | ✅ 已采纳（50m 复测可选） |
 | Ex-8.12 分层压缩 50m A/B（P2 受控实验） | 内核已回填（b25b86d）；**A/B demo 已建（src/demo/compression-ab，12.8 万 ×低重复 JSON 实测：L2 冷档 zstd19 vs 不分层 空间 -4.7%（未达 -10% 验收线）、范围 p50 330→305µs 无回退）→ 不采纳默认（保持 level_l2=0），50m 真实库复测后重评** | ✅ demo（未采纳，50m 复测可重评） |
 | Ex-9.3 倒排统计载荷 ⑤（AF #6） | ①mem 累积（5a792cc）→②段格式 v5（e52941a）→③引擎+s qlish SUM/AVG/MIN/MAX 路由（03d38dd）→④GROUP BY 词典枚举快路径（fe0e045/a4d37c2/4fb6e7f）已回填 development.md §14；**⑤ A/B demo 已建（src/demo/groupby-inverted，30 万实测：COUNT 53.8ms vs 全扫 92.3ms=1.7×，SUM 76.3ms vs 167.9ms=2.2×）**；50m 规模验收与全量回归挂起（需先建 50m 库） | demo 已建 / 50m 验证待做（原 §19） |
