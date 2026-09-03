@@ -1,0 +1,12 @@
+# sysbench v0.7.0 重建 5000 万库配置（从 0 插入测试）
+# 用法：shanshui-cunji-import --parquet D:\shanshui-data\ds-50m.parquet --config config.sysbench-50m.toml
+
+[storage]
+data_dir = "D:/shanshui-data/db-50m-v070"
+
+[inverted]
+engine = "fst"
+inverted_fields = ["status", "city", "tag_a", "tag_b", "region", "device", "channel"]
+fulltext_fields = []
+exclude_fields = ["note"]
+max_term_len = 96

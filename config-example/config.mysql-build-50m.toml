@@ -1,0 +1,15 @@
+# v0.7.0 标准 MySQL 语句构建 5000 万库配置（sysbench sbtest 表：id,k,c,pad）
+# k/c/pad 为高基数随机值（每 term 单 posting），排除倒排防字典膨胀；点查走主键。
+# 用法：shanshui-cunji-mysql-server --data-dir D:/shanshui-data/db-50m-v070 --config config.mysql-build-50m.toml
+
+[storage]
+data_dir = "D:/shanshui-data/db-50m-v070"
+# 组提交窗口 2ms：sysbench 批量 INSERT 攒批 fsync（WAL 一次覆盖多行，构建吞吐数万/s）
+group_commit_us = 2000
+
+[inverted]
+engine = "fst"
+inverted_fields = []
+exclude_fields = ["k", "c", "pad"]
+fulltext_fields = []
+max_term_len = 96
