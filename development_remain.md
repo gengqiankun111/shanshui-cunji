@@ -242,11 +242,11 @@
 ## 16. 分层压缩实验（Ex-8.12，design_remain §12，2026-09-03 排期）
 
 - **Ex-8.12（P2，受控实验）分层压缩（L0/L1 热档 ↔ L2+ 冷档）**：
-  - [ ] 新增配置（沿用现有 compression/compression_level 语义）：
-    `sstable.compression_level_l2`（或 level→档位映射），CF 按 compaction `out_level` 选档
-    （flush→L0 与 L1 输出用热档 zstd3/lz4；L2 输出用冷档 zstd 6~15）
-  - [ ] 风险核查：Ex-5.8 数据块级复用对跨层等级变化失效（L1→L2 需重压缩）——量化重压缩写放大；
-    L0/L1 切 lz4/none 的中间层体积放大对照（档位 A：L0/L1=zstd3+L2=zstd6/15；档位 B：L0/L1=lz4）
+  - [x] 新增配置（沿用现有 compression/compression_level 语义）：`sstable.compression_level_l2`
+    （0 = 不分层；>0 即 L2+ 冷档），CF `compression_level_for(out_level)` 按输出层选档
+    （flush→L0 与 L0/L1 输出热档；L2 输出 = L1→L2 下沉 / L2 内合并 / L2 单段重写 用冷档）——✅ 内核完成（b25b86d）
+  - [x] 风险核查：Ex-5.8 数据块级复用跨层失效 → meta_only 跨档门控（分层启用且 L0/L1↔L2
+    跨档合并回退全量重压缩，保层档语义）——✅ 已处理（b25b86d，测试覆盖跨档回退路径）
   - [ ] demo/50m 库 A/B：空间（数据目录字节）、写放大（合并次数/重写字节）、范围 p50/点查 p99、
     压缩 CPU；验收：L2 zstd 高等级不劣化范围读（解压近等级无关）且空间 -10%+ 即采纳默认
 - **已标注不新立项**：共享字典压缩（远期触发：Ex-8.12 后空间仍瓶颈再评估，ScyllaDB 式基建）
@@ -467,3 +467,44 @@
 - 验证：环境 MySQL 3306（db rr）、SCC 3309（db-s3-3a）；命令
   `rr-conformance --rr-cases --out <dir> --mysql-url … --my-url …`（新增 `--rr-case <N>` 单用例、
   `--rr-reinit` 重建表）；用例源码 `rr-conformance/src/rr_cases.rs`（+main.rs 入口）。
+
+## 26. 真多表支持（表级主键空间隔离，用户 2026-09-03 确认语义并排期）
+
+### 语义确认（用户）
+
+> 支持**真多表**：不同表允许相同主键 id（表级主键空间隔离，对齐 MySQL）。当前 SCC "表"只是
+> SQL 层别名，全部落到同一 documents 集合 + 全局 docid —— t_test / t_combo 各自 id=1..2000
+> 互相撞键：a 修复（1062 预校验）前静默覆盖、修复后 `--init` 直接 1062。
+
+### 现状与缺口
+
+- 存储模型：单文档集合（内存/磁盘/WAL/倒排/位图/事务/引擎 API 全部围绕**全局 docid**）；
+  mysql server 固定"库 scc、表 documents"（README 明示），语句表名解析后被忽略/不校验。
+- 触发：rr-conformance `--init` 双表（t_test + t_combo）种子各 id=1..2000 → SCC 同 docid 互撞；
+  已用 `--single` 单表化绕开（工具口径，未修引擎）。真实多表业务/迁移同样会互踩。
+
+### 方案选项（排期评估用）
+
+| 方案 | 做法 | 改动面 | 备注 |
+|---|---|---|---|
+| A. 表级 docid 命名空间（架构级） | 存储/API key 带表维度：docid 分配按表分段（表 id 高位）或 key 编码加表名前缀 | 引擎 key 编码（encode_docid 8B 固定）、扫描/组合索引、倒排 posting docid、删除位图、事务 write_set、hotcache、mysql 层表名解析全链路 | 完整对齐 MySQL 多表；需迁移既有单表资产（db-s3-3a 等）与段格式兼容策略 |
+| B. 每表独立引擎/列族集 | 建表 = 新 Engine（子目录）或 CF 对；mysql 层按表路由 | mysql 会话层 + 多实例生命周期；引擎内改动小 | 无跨表查询则成本可控；与"单引擎多 CF"架构（primary/delta/inverted 三 CF）叠加需重设计 |
+| C. 口径单表化（已做 --single） | 测试只在单表跑 | rr-conformance 工具 | 不修引擎；产品多表仍不支持 |
+
+### 影响面清单（方案 A 前置调研要点）
+
+- docid 语义：`encode_docid`（8B 大端 u64）贯穿 keys/CF/Engine API；表维度需入 key（长度/布局变化 →
+  段格式/键范围剪枝/seq_min 快照剪枝/删除位图页索引受影响）。
+- 倒排：posting docid → 需区分表（term 现无表维度）；位图索引 term 亦同。
+- 删除位图/删除密度/垃圾回收：按 docid 位图需表粒度或表 id 并入 docid。
+- 事务：write_set/锁表/snapshot seq 均全局 —— 多表同 seq 空间无冲突（seq 与表无关），
+  仅 docid 需带表。**若走"表 id 高位 + 全局 docid"**（表编号高位占用 docid 空间）改动最小：
+  docid = table_id << 48 | row_id —— 现有 8B 编码不动、倒排/位图/事务零改，仅 mysql 层按表
+  分配 id 段 + docid 到 SQL id 的编解码。优先评估该子方案。
+- 兼容：既有单表库数据（docid 0..N）视为默认表（table_id=0），零迁移。
+
+### 排期状态
+
+- **待排**（P？）：先做方案 A 的"表 id 高位 + 全局 docid"可行性细化（上条子方案），
+  产出 key/API/协议改动清单与既有数据兼容策略后再立项；rr-conformance `--init` 双表即验收场景。
+- 当前不阻塞：`--single` 已绕开对照；现有单表功能与 RR 收敛目标（C1~C6 全绿）已达成。
