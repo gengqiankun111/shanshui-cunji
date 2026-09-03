@@ -399,10 +399,10 @@
 | a | INSERT 不校验主键重复 | MySQL 1062 vs SCC 成功（DUP 取消 ~40%、覆盖=潜在覆盖语义） | ✅ 已实现（a5b4171，非事务+事务路径预校验 1062、无部分写入） |
 | b | 事务内 SELECT 仅 WHERE id=/BETWEEN/IN | 非主键列谓词直接 1064 | ✅ 已实现（f78290b，主库候选 ∪ 同事务写集 txn_get 覆盖 + 谓词复检） |
 | c | DROP TABLE 不 purge 数据 | --init 后残留上轮行 | ✅ 已实现（10c946c，DROP/TRUNCATE 走 Engine::purge_all 清内存+磁盘段+倒排+位图；重启空库；600 lib 全绿） |
-| d | UPDATE/DELETE WHERE id IN(…) 不支持 | 仅支持 id=（批量写通道废） | ✅ 已实现（3d4ac30，非 txn 路径） |
+| d | UPDATE/DELETE WHERE id IN(…) 不支持 | 仅支持 id=（批量写通道废） | ✅ 已实现（3d4ac30 非 txn；本提交扩展 txn 路径：事务内 UPDATE/DELETE … WHERE id IN / 字段条件，攒批可见 + 回滚原子） |
 | e | DIFF=21 / DEADLOCK=2 语义分歧 | RR Stage3 核心产出被 a/c 污染 | 已由权威 rr-cases C1~C6 收敛为缺陷 A/B（FOR UPDATE 当前读、BETWEEN 幻读）→ 见 §25 排期 |
 
-> 注：d 的 txn 路径（事务内 UPDATE/DELETE … IN）需同步扩展；e 已细化入 §25（缺陷 A/B），修后按 §25 环境复验 C1~C6 全绿即收敛。
+> 注：d 的 txn 路径已扩展完成（事务内 UPDATE/DELETE … WHERE IN / 字段条件）；e 已细化入 §25（缺陷 A/B，均已修）——修后按 §25 环境复验 C1~C6 全绿即收敛。
 
 ## 25. RR 一致性权威结果与缺陷排期（rr-cases C1~C6，用户 2026-09-03）
 
@@ -413,12 +413,15 @@
 
 | 用例 | 结论 | 失败步骤 |
 |---|---|---|
-| C1 快照稳定 | FAIL | 仅最后一步：FOR UPDATE 当前读 |
+| C1 快照稳定 | ✅ PASS | —（A 修复后转绿） |
 | C2 自写可见 | PASS | — |
-| C3 已删行在快照 | FAIL | 仅最后一步：FOR UPDATE 当前读 |
-| C4 防幻读 | FAIL | 步骤3：范围一致读出现幻影 |
+| C3 已删行在快照 | ✅ PASS | —（A 修复后转绿） |
+| C4 防幻读 | ✅ PASS | —（B 修复后转绿） |
 | C5 COMMIT 持久 | PASS | —（时序伪差，非引擎问题） |
 | C6 ROLLBACK 丢弃 | PASS | — |
+| C7 主键重复 INSERT→1062 | PASS | —（缺口 a） |
+| C8 事务内非主键列谓词 | PASS | —（缺口 b） |
+| C9 非事务 UPDATE/DELETE id IN | PASS | —（缺口 d） |
 
 ### 缺陷 A：事务内 SELECT … FOR UPDATE 不是当前读（C1、C3 失败）——✅ 已修复（4818ecb）
 
@@ -455,8 +458,9 @@
 
 ### 排期与验证
 
-- 实现顺序：缺陷 A ✅（4818ecb，C1/C3 转绿）→ 缺陷 B ✅（本提交，位图 delete 版本化 Tombstone；
-  本地 rr 累计三轮 9/9 全绿，C4 转绿 → C1~C6 收敛目标达成，待权威 3309 全档复核）。
+- 实现顺序：缺陷 A ✅（4818ecb，C1/C3 转绿）→ 缺陷 B ✅（位图 delete 版本化 Tombstone；
+  本地 rr 累计三轮 9/9 全绿，C4 转绿）。**权威复核完成**：MySQL 3306 ↔ SCC 3309（db-s3-3a
+  累计库）`results-rrcases7` **9/9 全绿**（C1~C9，conn_err=0）→ C1~C6 收敛目标达成。
 - 验证：环境 MySQL 3306（db rr）、SCC 3309（db-s3-3a）；命令
   `rr-conformance --rr-cases --out <dir> --mysql-url … --my-url …`（新增 `--rr-case <N>` 单用例、
   `--rr-reinit` 重建表）；用例源码 `rr-conformance/src/rr_cases.rs`（+main.rs 入口）。

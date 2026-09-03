@@ -1045,7 +1045,7 @@ fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> Quer
             return txn_update(engine, session, sql);
         }
         if upper.starts_with("DELETE") {
-            return txn_delete(session, sql);
+            return txn_delete(engine, session, sql);
         }
         if upper.starts_with("SET") {
             return QueryResponse::Ok(0, 0);
@@ -1583,61 +1583,146 @@ fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
     }
 }
 
-/// 事务内 UPDATE：攒批覆盖。
-/// 事务内 UPDATE：字段级（`SET k=k+1` 自增 / `SET c='str'` 字符串赋值）或
-/// 整体替换（`SET doc='{json}'`）。读当前文档（快照 + 同事务写）→ 修改 → 攒批写回。
-fn txn_update(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryResponse {
-    match parse_update(sql) {
-        Ok((id, field, expr)) => {
-            let txn = session.txn.as_mut().unwrap();
-            // 整体替换（field=doc）→ 兼容旧语义直接 put
-            if field.eq_ignore_ascii_case("doc") {
-                let raw = unquote(&expr);
-                return match put_doc_txn(txn, id, &raw) {
-                    Ok(_) => QueryResponse::Ok(1, 0),
-                    Err(e) => QueryResponse::Err(1064, format!("update error: {e}")),
-                };
-            }
-            // 读当前文档（快照 + 同事务写可见；不存在则空对象）
-            let mut doc: serde_json::Value = match engine.txn_get(txn, id) {
-                Ok(Some(v)) => serde_json::from_slice(&v)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                Ok(None) => serde_json::Value::Object(serde_json::Map::new()),
-                Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
-            };
-            // 字段级修改（确保是对象）
-            if !doc.is_object() {
-                doc = serde_json::Value::Object(serde_json::Map::new());
-            }
-            let obj = doc.as_object_mut().unwrap();
-            if let Some(inc) = parse_increment_expr(&field, &expr) {
-                // 自增：k=k+N → 读当前值 + N（sysbench UPDATE k=k+1）
-                let cur = obj.get(&field).and_then(|v| v.as_i64()).unwrap_or(0);
-                obj.insert(field.clone(), serde_json::Value::from(cur + inc));
-            } else {
-                // 字符串赋值：c='value'
-                obj.insert(field.clone(), serde_json::Value::String(unquote(&expr)));
-            }
-            let new_doc = serde_json::to_string(&doc).unwrap_or_default();
-            match put_doc_txn(txn, id, &new_doc) {
-                Ok(_) => QueryResponse::Ok(1, 0),
-                Err(e) => QueryResponse::Err(1064, format!("update error: {e}")),
-            }
-        }
-        Err(e) => QueryResponse::Err(1064, format!("update syntax: {e}")),
+/// 事务内单行字段更新（id 已解析）：整体替换（field=doc）/ 自增 / 字符串赋值。
+/// 读事务视图（`txn_get`：快照 + 同事务写可见）；不存在 → 空文档（与单 id 旧语义一致）。
+fn txn_apply_update_one(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    id: u64,
+    field: &str,
+    expr: &str,
+) -> Result<()> {
+    // 整体替换（field=doc）→ 直接 put
+    if field.eq_ignore_ascii_case("doc") {
+        let raw = unquote(expr);
+        return put_doc_txn(txn, id, &raw);
     }
+    // 读事务视图当前文档（快照 + 同事务写可见；不存在则空对象）
+    let mut doc: serde_json::Value = match engine.txn_get(txn, id)? {
+        Some(v) => serde_json::from_slice(&v)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    if !doc.is_object() {
+        doc = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = doc.as_object_mut().unwrap();
+    if let Some(inc) = parse_increment_expr(field, expr) {
+        // 自增：k=k+N → 读当前值 + N（sysbench UPDATE k=k+1）
+        let cur = obj.get(field).and_then(|v| v.as_i64()).unwrap_or(0);
+        obj.insert(field.to_string(), serde_json::Value::from(cur + inc));
+    } else {
+        // 字符串赋值：c='value'
+        obj.insert(field.to_string(), serde_json::Value::String(unquote(expr)));
+    }
+    let new_doc = serde_json::to_string(&doc)
+        .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
+    put_doc_txn(txn, id, &new_doc)
 }
 
-/// 事务内 DELETE：攒批删除。
-fn txn_delete(session: &mut Session, sql: &str) -> QueryResponse {
-    match parse_delete(sql) {
-        Ok(id) => {
-            let txn = session.txn.as_mut().unwrap();
-            txn.delete(id);
-            QueryResponse::Ok(1, 0)
+/// 事务内 WHERE 段 → 作用 docid 集合（d 的 txn 路径扩展，对齐非事务 `resolve_where_ids`）：
+/// - `id IN (..)` / `docid IN (..)`：目标即 docid（直解，不检查存在性——与单 id 语义一致）
+/// - 其余（字段条件 / 复合 and/or）：候选 = 引擎当前视图命中（sqlish）∪ 同事务 write_set，
+///   逐候选 `txn_get` 取**事务视图**值 + `doc_matches_where` 谓词复检（快照不可见/已删行
+///   排除）——与事务 SELECT 谓词路径（b）同口径。
+fn txn_resolve_where_ids(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    where_part: &str,
+) -> Result<Vec<u64>> {
+    let w = where_part.trim().trim_end_matches(';').trim();
+    let lower = w.to_lowercase();
+    if lower.starts_with("id in") || lower.starts_with("docid in") {
+        let open = w
+            .find('(')
+            .ok_or_else(|| Error::Cluster("id IN 缺 (".into()))?;
+        let close = w.rfind(')').unwrap_or(w.len());
+        let mut ids = Vec::new();
+        for p in split_values(&w[open + 1..close]) {
+            let t = p.trim().trim_matches(|c| c == '\'' || c == '"');
+            ids.push(t.parse::<u64>().map_err(|_| Error::Cluster("id IN 数值非法".into()))?);
         }
-        Err(e) => QueryResponse::Err(1064, format!("delete syntax: {e}")),
+        return Ok(ids);
     }
+    // 字段条件 / 复合：引擎视图命中 ∪ 同事务写集 → 事务视图 + 谓词复检
+    let cond_sql = format!("SELECT docid FROM t WHERE {w}");
+    let base = crate::sqlish::execute(engine, &cond_sql, 200_000)?;
+    let mut set: std::collections::HashSet<u64> = base.into_iter().map(|r| r.0).collect();
+    set.extend(txn.write_set().iter().copied());
+    let mut ids: Vec<u64> = set.into_iter().collect();
+    ids.sort_unstable();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        match engine.txn_get(txn, id)? {
+            Some(v) => {
+                if crate::sqlish::doc_matches_where(&cond_sql, &v) {
+                    out.push(id);
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
+/// 事务内 UPDATE：单 id= 或 WHERE id IN / 字段条件（d txn 路径扩展）——攒批覆盖写。
+/// 字段级（`SET k=k+1` 自增 / `SET c='str'` 赋值）或整体替换（`SET doc='{json}'`）。
+/// 逐目标读事务视图（快照 + 同事务写）→ 修改 → 攒批写回；commit 原子应用。
+fn txn_update(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryResponse {
+    // 单 id= 快路径（parse_update 语义不变）；其余（WHERE id IN / 字段条件）走扩展解析
+    let (ids, field, expr) = match parse_update(sql) {
+        Ok((id, f, e)) => (vec![id], f, e),
+        Err(_) => {
+            let (wp, f, e) = match parse_update_where(sql) {
+                Ok(v) => v,
+                Err(err) => return QueryResponse::Err(1064, format!("update syntax: {err}")),
+            };
+            let txn = session.txn.as_mut().unwrap();
+            let ids = match txn_resolve_where_ids(engine, txn, &wp) {
+                Ok(v) => v,
+                Err(err) => return QueryResponse::Err(1064, format!("update where: {err}")),
+            };
+            (ids, f, e)
+        }
+    };
+    if ids.is_empty() {
+        return QueryResponse::Ok(0, 0); // MySQL：无匹配 → 0 影响
+    }
+    let txn = session.txn.as_mut().unwrap();
+    let mut n = 0u64;
+    for id in ids {
+        match txn_apply_update_one(engine, txn, id, &field, &expr) {
+            Ok(_) => n += 1,
+            Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+        }
+    }
+    QueryResponse::Ok(n, 0)
+}
+
+/// 事务内 DELETE：攒批删除（d txn 路径扩展：WHERE id IN / 字段条件；单 id= 语义不变）。
+fn txn_delete(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryResponse {
+    let ids: Vec<u64> = match parse_delete(sql) {
+        Ok(id) => vec![id],
+        Err(_) => {
+            let wp = match parse_delete_where(sql) {
+                Ok(v) => v,
+                Err(e) => return QueryResponse::Err(1064, format!("delete syntax: {e}")),
+            };
+            let txn = session.txn.as_mut().unwrap();
+            match txn_resolve_where_ids(engine, txn, &wp) {
+                Ok(v) => v,
+                Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+            }
+        }
+    };
+    if ids.is_empty() {
+        return QueryResponse::Ok(0, 0);
+    }
+    let txn = session.txn.as_mut().unwrap();
+    for id in &ids {
+        txn.delete(*id);
+    }
+    QueryResponse::Ok(ids.len() as u64, 0)
 }
 
 /// H-5：COM_STMT_PREPARE。分配 stmt_id 存 SQL，返回 PREPARE_OK + [参数定义 + EOF] + 列定义 + EOF。
@@ -4482,6 +4567,77 @@ mod tests {
         // 重复一致读：快照不得见幻影 900400
         assert_eq!(row_ids(&main.query(sql)), vec!["900401"], "RR 快照隔离：列式插入幻影不可见");
         assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
+    fn txn_update_delete_where_in_and_predicate() {
+        // d txn 路径：事务内 UPDATE/DELETE … WHERE id IN(...) 与字段条件——攒批可见 + 回滚原子
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+        let mut base = |id: u64, k: i64, s: &str| {
+            let doc = format!("{{\"k\":{k},\"s\":\"{s}\"}}");
+            let sql = format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')");
+            assert_eq!(c.query(&sql)[0][0], OK_PACKET);
+        };
+        base(1, 1, "a");
+        base(2, 2, "b");
+        base(3, 3, "a");
+        base(4, 4, "b");
+        let sum = |c: &mut TestClient, sql: &str| -> String {
+            let r = c.query(sql);
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        // WHERE id IN (2,3)：k+1 → doc2 3、doc3 4（事务内立即可见）
+        assert_eq!(
+            c.query("UPDATE documents SET k=k+1 WHERE id IN (2, 3)")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='b'"), "7"); // 2→3 + 4
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='a'"), "5"); // 1 + 3→4
+        // 字段条件 UPDATE：s='a' 全部 +1 → doc1 2、doc3 5（含上一步自增后的自写值）
+        assert_eq!(
+            c.query("UPDATE documents SET k=k+1 WHERE s='a'")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='a'"), "7");
+        // DELETE WHERE id IN (1,4)（含字段自写 doc1）：事务视图排除
+        assert_eq!(
+            c.query("DELETE FROM documents WHERE id IN (1, 4)")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='b'"), "3"); // 仅 doc2
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='a'"), "5"); // 仅 doc3
+        // 字段条件 DELETE：s='b' 剩余 → doc2 删除
+        assert_eq!(
+            c.query("DELETE FROM documents WHERE s='b'")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='b'"), "0");
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+        // 回滚原子：全部恢复原值
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='a'"), "4");
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='b'"), "6");
     }
 
     #[test]
