@@ -70,9 +70,10 @@ pub struct Select {
     pub agg: Option<(String, Option<String>)>,
     /// ORDER BY 排序项（开发顺序 #1/#3）：`(字段, 是否 DESC)`。
     pub order_by: Vec<(String, bool)>,
-    /// GROUP BY 分组字段（AF#2 单字段；None = 无分组）。聚合列见 `group_aggs`。
-    pub group_by: Option<String>,
-    /// GROUP BY 聚合列（AF#2：#2 起支持多个；每个 `(函数名小写, 参数字段)`，
+    /// GROUP BY 分组字段（AF#2 单字段 → AF#4 多字段；空 = 无分组）。聚合列见
+    /// `group_aggs`；顺序即分组层级（排序/去重键）。
+    pub group_by: Vec<String>,
+    /// GROUP BY 聚合列（AF#2~#4 支持 COUNT/SUM/AVG/MIN/MAX；每个 `(函数名小写, 参数字段)`，
     /// `COUNT(*)` 字段为 None）。无 GROUP BY 时为空，标量聚合走 `agg`。
     pub group_aggs: Vec<(String, Option<String>)>,
 }
@@ -306,7 +307,7 @@ impl Parser {
         let mut limit = None;
         let mut offset = 0;
         let mut order_by = Vec::new();
-        let mut group_by = None;
+        let mut group_by: Vec<String> = Vec::new();
         loop {
             match self.peek()? {
                 Tok::Kw(k) if k == "WHERE" => {
@@ -314,20 +315,29 @@ impl Parser {
                     where_expr = Some(self.parse_expr()?);
                 }
                 Tok::Ident(k) if k.eq_ignore_ascii_case("group") => {
-                    // AF#2：GROUP BY 单字段（多字段排期 AF#4）
+                    // AF#2 单字段 → AF#4 多字段：GROUP BY f1, f2, ...（顺序即层级）
                     self.next()?; // 消费 group
                     match self.next()? {
                         Tok::Ident(k) if k.eq_ignore_ascii_case("by") => {}
                         t => return Err(format!("GROUP 后期望 BY，实际 {t:?}")),
                     }
-                    if group_by.is_some() {
+                    if !group_by.is_empty() {
                         return Err("重复 GROUP BY".into());
                     }
-                    let f = self.ident()?;
-                    if matches!(self.peek()?, Tok::Comma) {
-                        return Err("暂只支持单字段 GROUP BY（多字段排期 AF#4）".into());
+                    loop {
+                        let f = self.ident()?;
+                        if group_by.iter().any(|x| x == &f) {
+                            return Err(format!("GROUP BY 字段重复: {f}"));
+                        }
+                        group_by.push(f);
+                        match self.next()? {
+                            Tok::Comma => continue,
+                            t => {
+                                self.push_back(t);
+                                break;
+                            }
+                        }
                     }
-                    group_by = Some(f);
                 }
                 Tok::Ident(k) if k.eq_ignore_ascii_case("order") => {
                     // ORDER BY f1 [ASC|DESC], f2 [ASC|DESC], ...
@@ -378,21 +388,22 @@ impl Parser {
         // 组装：无 GROUP BY → 单标量聚合（7.95 兼容）；有 GROUP BY → 组聚合列清单。
         let mut agg = None;
         let group_aggs = aggs.clone();
-        if let Some(g) = &group_by {
+        if !group_by.is_empty() {
             if star_seen {
                 return Err("SELECT * 与 GROUP BY 混用不支持（须显式分组字段）".into());
             }
             for p in &plain {
-                if p != g {
+                if !group_by.iter().any(|g| g == p) {
                     return Err(format!(
-                        "非分组列 {p} 须等于 GROUP BY 字段 {g}（或只选聚合列）"
+                        "非分组列 {p} 须属于 GROUP BY 字段（{}）或只选聚合列",
+                        group_by.join(", ")
                     ));
                 }
             }
             for (n, f) in &aggs {
                 let up = n.to_uppercase();
-                if !matches!(up.as_str(), "COUNT" | "SUM") {
-                    return Err(format!("GROUP BY 聚合暂只支持 COUNT/SUM（{n} 排期 AF#4）"));
+                if !matches!(up.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                    return Err(format!("GROUP BY 不支持的聚合: {n}"));
                 }
                 if f.is_none() && up != "COUNT" {
                     return Err(format!("{n}(*) 不支持（仅 COUNT(*)）"));
@@ -1252,7 +1263,7 @@ struct SortRow {
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
-    if sel.group_by.is_some() {
+    if !sel.group_by.is_empty() {
         // GROUP BY 结果非 (docid, doc) 行模型 → 显式拒绝（走 mysql 协议分组接口），
         // 防普通执行入口静默返回未分组文档。
         return Err(Error::Config(
@@ -1367,7 +1378,7 @@ pub struct AggScalar {
 /// （非数值行跳过；数值按 f64 累加——大整数超 2^53 精度受限，标注限制）。
 pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>> {
     let sel = parse_select(sql)?;
-    if sel.group_by.is_some() {
+    if !sel.group_by.is_empty() {
         // GROUP BY 走 execute_group_by（多行分组），非本标量入口。
         return Err(Error::Config(
             "GROUP BY 查询须经分组执行入口 execute_group_by".into(),
@@ -1497,28 +1508,30 @@ fn fmt_num(x: f64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// GROUP BY（开发顺序 AF#2：单字段 + COUNT/SUM）
+// GROUP BY（开发顺序 AF#2 单字段 COUNT/SUM → AF#4 多字段 + 常用聚合）
 // ---------------------------------------------------------------------------
 
-/// GROUP BY 结果集：组字段列 + 每聚合列一列（headers 与 rows[].cells 对齐）。
+/// GROUP BY 结果集：选中分组列 + 聚合列（AF#2 单字段 → AF#4 多字段/AVG/MIN/MAX）。
 #[derive(Debug, Clone)]
 pub struct GroupResult {
-    /// GROUP BY 字段名（结果集首列列头）。
-    pub group_field: String,
-    /// 聚合列头（如 `COUNT(*)` / `SUM(amount)`）。
+    /// 全部分组字段（层级顺序；`ORDER BY`/键位映射按此下标）。
+    pub group_fields: Vec<String>,
+    /// 结果集分组列头（选中普通列，select 顺序；值位序 = 在 `group_fields` 中的下标）。
+    pub group_cols: Vec<String>,
+    /// 聚合列头（如 `COUNT(*)` / `AVG(amount)`）。
     pub headers: Vec<String>,
-    /// 分组行（按组键升序：Null < Num < Str，对齐 MySQL ASC）。
+    /// 分组行（组键升序：Null < Num < Str；ORDER BY 决定键序）。
     pub rows: Vec<GroupRow>,
 }
 
 /// 单个分组结果行。
 #[derive(Debug, Clone)]
 pub struct GroupRow {
-    /// 组键显示文本（None = NULL 组：字段缺省 / JSON null / 嵌套结构）。
-    pub key_text: Option<String>,
-    /// 组键是否为数值（决定结果集首列类型 LONGLONG/DOUBLE vs VAR_STRING）。
-    pub key_is_num: bool,
-    /// 各聚合值（None = SQL NULL，如空数值集 SUM）；与 `GroupResult::headers` 对齐。
+    /// 各分组 level（与 `group_fields` 对齐）键文本（None = NULL：字段缺省/null/嵌套）。
+    pub keys: Vec<Option<String>>,
+    /// `keys` 各 level 是否数值（结果集列类型 LONGLONG/DOUBLE vs VAR_STRING）。
+    pub key_is_num: Vec<bool>,
+    /// 各聚合值（None = SQL NULL，如空数值集 SUM/AVG/MIN/MAX）；与 `headers` 对齐。
     pub cells: Vec<Option<String>>,
 }
 
@@ -1592,14 +1605,28 @@ fn cmp_group_key(a: &GroupKey, b: &GroupKey) -> std::cmp::Ordering {
     }
 }
 
-/// 组内聚合累积器（每组一份；name/field 由 specs 顺序对应，见调用处 zip）。
+/// 单聚合列累积器（每组每列一份，下标与 specs 对齐——杜绝多聚合串扰）。
 #[derive(Debug, Clone)]
-struct AggAcc {
-    /// COUNT(*) / COUNT(f) 计入行数。
+struct AggState {
+    /// COUNT(*) / COUNT(f) 计入行数（非 null 任意类型都计入 COUNT(f)）。
     count: u64,
-    /// SUM 累加与数值行数（n_num==0 → 组 SUM 为 NULL）。
-    sum: f64,
+    /// 数值行数（SUM/AVG/MIN/MAX 的存在性与均值分母；0 → 数值聚合 NULL）。
     n_num: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl AggState {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            n_num: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        }
+    }
 }
 
 /// 从文档取组键：顶层字段优先字节级取值（免整文档反序列化）；点路径/其余值
@@ -1648,7 +1675,7 @@ fn field_non_null(doc: &[u8], f: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 取数值字段（SUM(f) 只统计 JSON number；非数值/缺省 → None）。
+/// 取数值字段（SUM/AVG/MIN/MAX 只统计 JSON number；非数值/缺省 → None）。
 fn numeric_field(doc: &[u8], f: &str) -> Option<f64> {
     if !f.contains('.') {
         if let Some(LightVal::Num(b)) = light_top_field(doc, f) {
@@ -1662,23 +1689,38 @@ fn numeric_field(doc: &[u8], f: &str) -> Option<f64> {
         .and_then(|v| field_of(&v, f).and_then(|fv| fv.as_f64()))
 }
 
-/// GROUP BY 执行（AF#2）：`SELECT <g>, COUNT(*)/COUNT(f)/SUM(f) ... GROUP BY <g>` →
-/// 全量单遍扫描分组（与无索引聚合同语义，不依赖倒排完整性；WHERE 行级过滤），
-/// 组键升序输出（Null < Num < Str），LIMIT/OFFSET 对**组行**切片；`cap` = 分组数
-/// 上限（超限 QueryTooExpensive）兼 LIMIT 缺省值。
+/// 单聚合列输出：COUNT → 计数值；SUM/AVG/MIN/MAX 无数值行 → NULL（SQL 语义）。
+fn agg_cell(name: &str, st: &AggState) -> Option<String> {
+    match name {
+        "count" => Some(st.count.to_string()),
+        "sum" if st.n_num > 0 => Some(fmt_num(st.sum)),
+        "avg" if st.n_num > 0 => Some(fmt_num(st.sum / st.n_num as f64)),
+        "min" if st.n_num > 0 => Some(fmt_num(st.min)),
+        "max" if st.n_num > 0 => Some(fmt_num(st.max)),
+        _ => None,
+    }
+}
+
+/// GROUP BY 执行（AF#2~#4）：`SELECT <cols>, COUNT/SUM/AVG/MIN/MAX ... GROUP BY f1, f2...` →
+/// 全量单遍扫描分组（与无索引聚合同语义，不依赖倒排完整性；WHERE 行级过滤），组键升序
+/// 输出（Null < Num < Str；`ORDER BY` 决定键序——仅限分组字段），LIMIT/OFFSET 对**组行**
+/// 切片；`cap` = 分组数上限（超限 QueryTooExpensive）兼 LIMIT 缺省值。
 ///
 /// 非 GROUP BY SQL 返回 `Ok(None)`（调用方继续走标量聚合/普通查询）。
 pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<GroupResult>> {
     let sel = parse_select(sql)?;
-    let Some(g) = sel.group_by.clone() else {
+    let fields = sel.group_by.clone();
+    if fields.is_empty() {
         return Ok(None);
-    };
+    }
     let specs = sel.group_aggs.clone();
     if specs.is_empty() {
-        return Err(Error::Config("GROUP BY 需至少一个聚合列（COUNT/SUM）".into()));
+        return Err(Error::Config("GROUP BY 需至少一个聚合列".into()));
     }
     let guard = engine.query_guard();
-    let mut groups: std::collections::HashMap<GroupKey, AggAcc> = std::collections::HashMap::new();
+    // 复合组键 = 各分组 level 键向量；每组持每聚合列一个累积器（与 specs 对齐）。
+    let mut groups: std::collections::HashMap<Vec<GroupKey>, Vec<AggState>> =
+        std::collections::HashMap::new();
     let mut scanned = 0u64;
     engine.scan_stream(None, None, |_docid, doc| {
         scanned += 1;
@@ -1698,24 +1740,30 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
                 return Ok(true);
             }
         }
-        let key = group_key_of(doc, &g);
-        let acc = groups
-            .entry(key)
-            .or_insert_with(|| AggAcc { count: 0, sum: 0.0, n_num: 0 });
-        for (name, fld) in &specs {
+        let key: Vec<GroupKey> = fields.iter().map(|f| group_key_of(doc, f)).collect();
+        let states = groups.entry(key).or_insert_with(|| {
+            (0..specs.len()).map(|_| AggState::new()).collect()
+        });
+        for (idx, (name, fld)) in specs.iter().enumerate() {
+            let st = &mut states[idx];
             match name.as_str() {
                 "count" => {
                     if fld.is_none() || field_non_null(doc, fld.as_ref().unwrap()) {
-                        acc.count += 1;
+                        st.count += 1;
                     }
                 }
-                "sum" => {
+                _ => {
                     if let Some(x) = numeric_field(doc, fld.as_ref().unwrap()) {
-                        acc.sum += x;
-                        acc.n_num += 1;
+                        st.n_num += 1;
+                        st.sum += x;
+                        if x < st.min {
+                            st.min = x;
+                        }
+                        if x > st.max {
+                            st.max = x;
+                        }
                     }
                 }
-                _ => {}
             }
         }
         if groups.len() as u64 > cap {
@@ -1726,20 +1774,29 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         }
         Ok(true)
     })?;
-    let mut list: Vec<(GroupKey, AggAcc)> = groups.into_iter().collect();
-    // 组行排序：无 ORDER BY → 组键升序（Null 最前，对齐 MySQL ASC）；
-    // 有 ORDER BY → 仅支持按**分组字段**排序（本期），DESC 时键序反转
-    //（Null 随之排到组末，对齐 MySQL DESC）。
-    for (f, _) in &sel.order_by {
-        if f != &g {
+    let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = groups.into_iter().collect();
+    // 组行排序：优先级 = ORDER BY 序列（每项须为分组字段）→ 剩余分组 level 升序补尾。
+    // DESC 反转该 level（Null 随之移末，对齐 MySQL DESC）。
+    let mut order_seq: Vec<(usize, bool)> = Vec::new();
+    for (f, desc) in &sel.order_by {
+        let Some(idx) = fields.iter().position(|x| x == f) else {
             return Err(Error::Config(format!(
-                "GROUP BY 结果排序仅支持分组字段 {g}（暂不支持 {f}；排期 AF#5）"
+                "GROUP BY 结果排序字段 {f} 须属于分组字段（{}）",
+                fields.join(", ")
             )));
+        };
+        if !order_seq.iter().any(|(i, _)| i == &idx) {
+            order_seq.push((idx, *desc));
+        }
+    }
+    for (i, _) in fields.iter().enumerate() {
+        if !order_seq.iter().any(|(j, _)| j == &i) {
+            order_seq.push((i, false));
         }
     }
     list.sort_by(|a, b| {
-        let mut ord = cmp_group_key(&a.0, &b.0);
-        for (_, desc) in &sel.order_by {
+        for (idx, desc) in &order_seq {
+            let mut ord = cmp_group_key(&a.0[*idx], &b.0[*idx]);
             if *desc {
                 ord = ord.reverse();
             }
@@ -1747,7 +1804,7 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
                 return ord;
             }
         }
-        ord
+        std::cmp::Ordering::Equal
     });
     let offset = sel.offset as usize;
     let limit = sel.limit.unwrap_or(cap).min(cap) as usize;
@@ -1755,27 +1812,28 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|(k, a)| {
+        .map(|(k, sts)| {
+            let keys = k.iter().map(|gk| gk.text()).collect();
+            let key_is_num = k.iter().map(|gk| gk.is_num()).collect();
             let cells = specs
                 .iter()
-                .map(|(name, _)| match name.as_str() {
-                    "count" => Some(a.count.to_string()),
-                    "sum" => {
-                        if a.n_num > 0 {
-                            Some(fmt_num(a.sum))
-                        } else {
-                            None // 空数值集 SUM → SQL NULL
-                        }
-                    }
-                    _ => None,
-                })
+                .zip(sts.iter())
+                .map(|((name, _), st)| agg_cell(name, st))
                 .collect();
             GroupRow {
-                key_text: k.text(),
-                key_is_num: k.is_num(),
+                keys,
+                key_is_num,
                 cells,
             }
         })
+        .collect();
+    // 结果集分组列 = 选中普通列（select 顺序；聚合函数名剔除——保留字限定的已知取舍）。
+    let funcs: Vec<&str> = specs.iter().map(|(n, _)| n.as_str()).collect();
+    let group_cols: Vec<String> = sel
+        .columns
+        .iter()
+        .filter(|c| !funcs.contains(&c.to_lowercase().as_str()))
+        .cloned()
         .collect();
     let headers: Vec<String> = specs
         .iter()
@@ -1785,7 +1843,8 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         })
         .collect();
     Ok(Some(GroupResult {
-        group_field: g,
+        group_fields: fields,
+        group_cols,
         headers,
         rows,
     }))
@@ -2109,9 +2168,9 @@ mod tests {
         let gr = execute_group_by(&mut e, "SELECT city, COUNT(*) FROM t GROUP BY city", 1000)
             .unwrap()
             .unwrap();
-        assert_eq!(gr.group_field, "city");
+        assert_eq!(gr.group_cols, vec!["city"]);
         assert_eq!(gr.headers, vec!["COUNT(*)"]);
-        let keys: Vec<Option<String>> = gr.rows.iter().map(|r| r.key_text.clone()).collect();
+        let keys: Vec<Option<String>> = gr.rows.iter().map(|r| r.keys[0].clone()).collect();
         assert_eq!(
             keys,
             vec![Some("beijing".into()), Some("shanghai".into()), Some("shenzhen".into())],
@@ -2136,7 +2195,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(gr.headers, vec!["COUNT(*)", "SUM(amount)"]);
-        let keys: Vec<&str> = gr.rows.iter().map(|r| r.key_text.as_deref().unwrap()).collect();
+        let keys: Vec<&str> = gr.rows.iter().map(|r| r.keys[0].as_deref().unwrap()).collect();
         assert_eq!(keys, vec!["active", "inactive"]);
         // active：i%3==0 共 34 行，amount 和 = 30×(0+1+…+33) = 16830
         let a = &gr.rows[0];
@@ -2182,7 +2241,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(gr.rows.len(), 1, "全 NULL 键并为一组");
-        assert!(gr.rows[0].key_text.is_none(), "NULL 组键文本为 None");
+        assert!(gr.rows[0].keys[0].is_none(), "NULL 组键文本为 None");
         assert_eq!(gr.rows[0].cells[0].as_deref(), Some("100"), "COUNT(*) 计 100 行");
         assert!(gr.rows[0].cells[1].is_none(), "空数值集 SUM → SQL NULL");
     }
@@ -2194,8 +2253,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(gr.rows.len(), 2, "LIMIT 对组行切片");
-        assert_eq!(gr.rows[0].key_text.as_deref(), Some("beijing"));
-        assert_eq!(gr.rows[1].key_text.as_deref(), Some("shanghai"));
+        assert_eq!(gr.rows[0].keys[0].as_deref(), Some("beijing"));
+        assert_eq!(gr.rows[1].keys[0].as_deref(), Some("shanghai"));
     }
 
     #[test]
@@ -2208,7 +2267,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let keys: Vec<&str> = gr.rows.iter().map(|r| r.key_text.as_deref().unwrap()).collect();
+        let keys: Vec<&str> = gr.rows.iter().map(|r| r.keys[0].as_deref().unwrap()).collect();
         assert_eq!(keys, vec!["shenzhen", "shanghai", "beijing"], "组键 DESC");
         // 排序字段 ≠ 分组字段 → 拒绝（组结果仅支持按分组字段排序，AF#5 扩展）
         let mut e2 = engine_with_docs();
@@ -2221,18 +2280,121 @@ mod tests {
     }
 
     #[test]
+    fn group_by_multi_field_all_aggregates() {
+        // AF#4：双字段分组 + COUNT/SUM/AVG/MIN/MAX 常用聚合（组内按 region,tier 组合切分）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // (region, tier, amount)：north/south × a/b
+        let docs = [
+            ("north", "a", 10.0),
+            ("north", "a", 20.0),
+            ("north", "b", 5.0),
+            ("north", "b", 15.0),
+            ("south", "a", 7.0),
+            ("south", "a", 9.0),
+            ("south", "b", 3.0),
+            ("south", "b", 1.0),
+        ];
+        for (i, (r, t, amt)) in docs.iter().enumerate() {
+            let doc = format!(r#"{{"region":"{r}","tier":"{t}","amount":{amt}}}"#);
+            let refs: Vec<&str> = Vec::new();
+            e.put(i as u64 + 1, doc.into_bytes(), &refs).unwrap();
+        }
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT region, tier, COUNT(*), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM t GROUP BY region, tier",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gr.group_fields, vec!["region", "tier"]);
+        assert_eq!(
+            gr.group_cols,
+            vec!["region", "tier"],
+            "结果集分组列 = 选中普通列"
+        );
+        assert_eq!(
+            gr.headers,
+            vec!["COUNT(*)", "SUM(amount)", "AVG(amount)", "MIN(amount)", "MAX(amount)"]
+        );
+        // 组键升序：north-a/b → south-a/b
+        let combos: Vec<String> = gr
+            .rows
+            .iter()
+            .map(|r| format!("{}-{}", r.keys[0].as_deref().unwrap(), r.keys[1].as_deref().unwrap()))
+            .collect();
+        assert_eq!(combos, vec!["north-a", "north-b", "south-a", "south-b"]);
+        let cell = |row: usize, col: usize| gr.rows[row].cells[col].as_deref().unwrap().to_string();
+        assert_eq!(cell(0, 0), "2");
+        assert_eq!(cell(0, 1), "30");
+        assert_eq!(cell(0, 2), "15"); // AVG(10,20)
+        assert_eq!(cell(0, 3), "10"); // MIN
+        assert_eq!(cell(0, 4), "20"); // MAX
+        assert_eq!(cell(3, 0), "2");
+        assert_eq!(cell(3, 1), "4"); // south-b SUM(3,1)
+        assert_eq!(cell(3, 2), "2"); // AVG(3,1)
+        assert_eq!(cell(3, 3), "1"); // MIN
+        assert_eq!(cell(3, 4), "3"); // MAX
+    }
+
+    #[test]
+    fn group_by_multi_field_order_on_secondary_level_and_subset_cols() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        for (i, r) in [("north", "a"), ("north", "b"), ("south", "a"), ("south", "b")]
+            .iter()
+            .enumerate()
+        {
+            let doc = format!(r#"{{"region":"{}","tier":"{}"}}"#, r.0, r.1);
+            let refs: Vec<&str> = Vec::new();
+            e.put(i as u64 + 1, doc.into_bytes(), &refs).unwrap();
+        }
+        // ORDER BY tier DESC：优先级 = 次层键降序 → 同 tier 内 region 升序补尾
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT region, tier, COUNT(*) FROM t GROUP BY region, tier ORDER BY tier DESC",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        let combos: Vec<String> = gr
+            .rows
+            .iter()
+            .map(|r| format!("{}-{}", r.keys[0].as_deref().unwrap(), r.keys[1].as_deref().unwrap()))
+            .collect();
+        assert_eq!(combos, vec!["north-b", "south-b", "north-a", "south-a"]);
+        // 只选中一个分组列：region 仍参与分组（区隔行），但不在结果集出现
+        let gr2 = execute_group_by(
+            &mut e,
+            "SELECT tier, COUNT(*) FROM t GROUP BY region, tier",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gr2.group_cols, vec!["tier"], "仅选中列出现在结果集");
+        let tiers: Vec<&str> = gr2.rows.iter().map(|r| r.keys[1].as_deref().unwrap()).collect();
+        assert_eq!(tiers, vec!["a", "b", "a", "b"], "region×tier 各成组（默认复合键升序）");
+        assert_eq!(gr2.rows.len(), 4, "region×tier 仍 4 组（region 未选中仍参与分组）");
+    }
+
+    #[test]
     fn group_by_parse_rejections() {
         // 无 GROUP BY 多聚合仍拒绝（标量路径旧语义）
         assert!(parse_select("SELECT COUNT(*), SUM(amount) FROM t").is_err());
-        // 非分组列 ≠ GROUP BY 字段 → 拒绝
+        // 非分组列 ≠ 任一 GROUP BY 字段 → 拒绝
         assert!(parse_select("SELECT status, COUNT(*) FROM t GROUP BY city").is_err());
-        // 多字段 GROUP BY 排期 AF#4 → 拒绝
-        assert!(parse_select("SELECT COUNT(*) FROM t GROUP BY city, status").is_err());
+        // 多字段 GROUP BY（AF#4 合法）→ 解析通过
+        assert!(parse_select("SELECT city, status, COUNT(*) FROM t GROUP BY city, status").is_ok());
+        // GROUP BY 字段重复 → 拒绝
+        assert!(parse_select("SELECT COUNT(*) FROM t GROUP BY city, city").is_err());
         // SELECT * 与 GROUP BY 混用 → 拒绝
         assert!(parse_select("SELECT * FROM t GROUP BY city").is_err());
-        // GROUP BY 聚合暂限 COUNT/SUM（AVG/MIN/MAX 属 AF#4）→ 拒绝
-        assert!(parse_select("SELECT city, AVG(amount) FROM t GROUP BY city").is_err());
-        // 无聚合列的 GROUP BY → 拒绝
+        // AVG/MIN/MAX 聚合（AF#4 合法）→ 解析通过
+        assert!(parse_select("SELECT city, AVG(amount), MIN(amount), MAX(amount) FROM t GROUP BY city")
+            .is_ok());
+        // 无聚合列的 GROUP BY → 执行拒绝（须至少一个聚合列）
         let mut e = engine_with_docs();
         assert!(execute_group_by(&mut e, "SELECT city FROM t GROUP BY city", 1000).is_err());
     }

@@ -2897,6 +2897,28 @@ impl RuntimePools {
 3. **后续**：GROUP BY 多字段 + 常用聚合（AF #4）→ HAVING（AF #5）→ 倒排加速
    GROUP BY（AF #6 / Ex-9.3）；排期见 development_process_order.md AF 行。
 
+### 7.104 GROUP BY 多字段 + 常用聚合（开发顺序 AF #4）— ✅ 已完成
+
+> 2026-09-03。用户开发顺序 #4（扩展聚合能力）。AF#2 仅单字段 + COUNT/SUM；
+> 本项升级多字段分组并放开 AVG/MIN/MAX。
+
+1. **解析**：`Select.group_by` `Option<String>` → `Vec<String>`（逗号列表、重复字段拒绝、
+   SELECT * 拒绝、普通列须 ∈ 分组字段）；聚合白名单放开 AVG/MIN/MAX（`f(*)` 仍仅 COUNT）。
+2. **执行（execute_group_by）**：复合组键 `Vec<GroupKey>`（level 序）HashMap 分组；
+   **每组每聚合列独立 AggState**（count/n_num/sum/min/max）——修复 AF#2 多聚合共享
+   单一累积器的潜在串扰（如 `SUM(a), SUM(b)` 混算）；`agg_cell` 输出 COUNT/SUM/AVG/
+   MIN/MAX（空数值集 → SQL NULL）。
+3. **结果集列语义（对齐 MySQL）**：分组列 = **选中普通列**（select 顺序）；未选中的
+   分组字段仍参与分组与排序、但不出现在结果集；组行排序优先级 = ORDER BY 序列
+   （每键须 ∈ 分组字段，支持次层键 DESC）→ 其余 level 升序补尾。
+4. **协议（mysql.rs）**：渲染多分组列（各 level 列型按实际值 LONGLONG/DOUBLE/
+   VAR_STRING），聚合列含小数（AVG 如 12.5）→ DOUBLE；NULL 组键 0xfb 单元格。
+5. **回归**：+2 测试（多字段全聚合对照手算值、次层 DESC 排序 + 子集列分组）+ 改写
+   拒绝矩阵，全量 **586 全绿**；wire 冒烟（region×tier 双字段 + AVG/MIN/MAX 含小数
+   DOUBLE、`ORDER BY tier DESC, region ASC`、`SELECT tier ... GROUP BY region,tier`
+   未选中列仍区隔行）pymysql 断言通过。
+6. **后续**：GROUP BY + HAVING（AF #5）→ 倒排加速 GROUP BY（AF #6 / Ex-9.3）。
+
 ## Ex 系列扩展（归档自 development_extension.md，2026-09-03 合并）
 
 > 2026-09-03 归档合并：development_extension.md（v0.1 分布式事务落地计划 L1~L3 + Ex-4~7

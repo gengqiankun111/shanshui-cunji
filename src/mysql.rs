@@ -2087,28 +2087,34 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             rows: Vec::new(),
         };
     }
-    // AF#2：GROUP BY 单字段 + COUNT/SUM → 多行分组结果集（组字段列 + 每聚合一列）。
-    // 置于标量聚合前（分组 SQL 含聚合列，须先路由到多行分组执行器）。
+    // AF#2~#4：GROUP BY（单/多字段 + COUNT/SUM/AVG/MIN/MAX）→ 多行分组结果集
+    //（选中分组列 + 每聚合一列）。置于标量聚合前（分组 SQL 含聚合列，须先路由到多行分组执行器）。
     match crate::sqlish::execute_group_by(engine, sql, 10_000) {
         Ok(Some(gr)) => {
-            // 首列（组字段）类型按实际值：整型 LONGLONG / 浮点 DOUBLE / 字符串 VAR_STRING。
-            let mut key_type = MYSQL_TYPE_VAR_STRING;
-            for r in &gr.rows {
-                if let Some(t) = &r.key_text {
-                    key_type = if !r.key_is_num {
-                        MYSQL_TYPE_VAR_STRING
-                    } else if t.contains('.') || t.contains('e') || t.contains('E') {
-                        MYSQL_TYPE_DOUBLE
-                    } else {
-                        MYSQL_TYPE_LONGLONG
-                    };
-                    break;
+            // 分组列：列为选中的分组字段（select 顺序）；level = 该字段在全部组字段中的位序。
+            let mut columns: Vec<Vec<u8>> = Vec::new();
+            for name in &gr.group_cols {
+                let Some(level) = gr.group_fields.iter().position(|f| f == name) else {
+                    return QueryResponse::Err(1064, format!("group col {name} 非分组字段"));
+                };
+                // 该 level 列类型按实际值：整型 LONGLONG / 浮点 DOUBLE / 字符串 VAR_STRING。
+                let mut col_type = MYSQL_TYPE_VAR_STRING;
+                for r in &gr.rows {
+                    if let Some(t) = r.keys.get(level).and_then(|k| k.as_ref()) {
+                        col_type = if !r.key_is_num[level] {
+                            MYSQL_TYPE_VAR_STRING
+                        } else if t.contains('.') || t.contains('e') || t.contains('E') {
+                            MYSQL_TYPE_DOUBLE
+                        } else {
+                            MYSQL_TYPE_LONGLONG
+                        };
+                        break;
+                    }
                 }
+                let charset = if col_type == MYSQL_TYPE_VAR_STRING { 45 } else { 63 };
+                columns.push(column_payload(name, col_type, charset));
             }
-            let key_charset = if key_type == MYSQL_TYPE_VAR_STRING { 45 } else { 63 };
-            let mut columns =
-                vec![column_payload(&gr.group_field, key_type, key_charset)];
-            // 聚合列：COUNT(*) 整型；SUM 有小数（. / e）→ DOUBLE，否则整型。
+            // 聚合列：整值（COUNT/整值 SUM/MIN/MAX）LONGLONG；含小数（. / e）→ DOUBLE。
             for (i, h) in gr.headers.iter().enumerate() {
                 let frac = gr.rows.iter().any(|r| {
                     r.cells
@@ -2129,9 +2135,12 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(gr.rows.len());
             for r in &gr.rows {
                 let mut row = Vec::with_capacity(columns.len());
-                match &r.key_text {
-                    Some(t) => row.push(t.clone().into_bytes()),
-                    None => row.push(vec![MYSQL_NULL_CELL]),
+                for name in &gr.group_cols {
+                    let level = gr.group_fields.iter().position(|f| f == name).unwrap_or(0);
+                    match r.keys.get(level).and_then(|k| k.as_ref()) {
+                        Some(t) => row.push(t.clone().into_bytes()),
+                        None => row.push(vec![MYSQL_NULL_CELL]),
+                    }
                 }
                 for c in &r.cells {
                     match c {
