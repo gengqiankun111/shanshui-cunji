@@ -1033,6 +1033,98 @@ impl ColumnFamily {
         })
     }
 
+    /// Ex-8.3 Part B：keys-only 流式扫描（最新视图）——merge 版本语义同 `count_keys_range`
+    /// （同源同 key 折叠、Tombstone 跳过），但**输出可见 key 序列**而非计数：SST 端走
+    /// `SstRangeIter::new_keys_cached` 免值解码（+块缓存）；回调返回 false 提前终止
+    /// （mysql 纯 id 窗口 / LIMIT 截断，内存 O(输出)）。
+    pub fn scan_stream_keys<F: FnMut(&[u8]) -> Result<bool>>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()> {
+        let snapshot_seq = u64::MAX; // 最新视图
+        self.memtable.with_iter_range(start, end, |mut mem_iters| {
+            let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
+            let snap = self.ssts.load();
+            for sst in snap.ssts.iter() {
+                if !sst_intersects_window(sst, start, end) {
+                    continue;
+                }
+                sst_iters.push(crate::sstable::SstRangeIter::new_keys_cached(
+                    sst,
+                    start,
+                    end,
+                    std::sync::Arc::clone(&self.block_cache),
+                )?);
+            }
+            let mem_count = mem_iters.len();
+            let total = mem_count + sst_iters.len();
+            if total == 0 {
+                return Ok(());
+            }
+            let mut cur: Vec<Option<(Vec<u8>, Option<Vec<u8>>, u64)>> = Vec::with_capacity(total);
+            for it in mem_iters.iter_mut() {
+                cur.push(it.next().transpose()?);
+            }
+            for it in sst_iters.iter_mut() {
+                cur.push(it.next().transpose()?);
+            }
+            loop {
+                let mut min_src: Option<usize> = None;
+                for (i, c) in cur.iter().enumerate() {
+                    if let Some((k, _, _)) = c {
+                        match min_src {
+                            None => min_src = Some(i),
+                            Some(mi) => {
+                                if k < &cur[mi].as_ref().unwrap().0 {
+                                    min_src = Some(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                let Some(i0) = min_src else { break };
+                let min_key = cur[i0].as_ref().unwrap().0.clone();
+                let mut best_seq = 0u64;
+                let mut best_put = false;
+                // 同 count：frontier 吞并同源连续同 key 多版本行（Ex-8.1 折叠）
+                let mut frontier: Vec<usize> = (0..total)
+                    .filter(|i| matches!(&cur[*i], Some((k, _, _)) if *k == min_key))
+                    .collect();
+                loop {
+                    let mut nxt: Vec<usize> = Vec::new();
+                    for i in frontier {
+                        let (k, v, seq) = cur[i].take().unwrap();
+                        debug_assert!(k == min_key, "同 key 归并");
+                        if v.is_some() && seq <= snapshot_seq && seq >= best_seq {
+                            best_seq = seq;
+                            best_put = true;
+                        }
+                        cur[i] = if i < mem_count {
+                            mem_iters[i].next().transpose()?
+                        } else {
+                            sst_iters[i - mem_count].next().transpose()?
+                        };
+                        if matches!(&cur[i], Some((nk, _, _)) if *nk == min_key) {
+                            nxt.push(i);
+                        }
+                    }
+                    if nxt.is_empty() {
+                        break;
+                    }
+                    frontier = nxt;
+                }
+                if best_put {
+                    if !f(min_key.as_slice())? {
+                        return Ok(()); // 提前终止（LIMIT 截断）
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// 范围扫描并保留 seq 与 Tombstone（MVCC 快照 Delta 隔离用，M7-1）：
     /// 返回升序 `(key, seq, value)`，value=None 表示删除标记；每 key 仅保留最大 seq 版本。
     pub fn scan_raw_range_with_seq(

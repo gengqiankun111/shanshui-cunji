@@ -1859,6 +1859,27 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     // （SstRangeIter 二分定位起始块 + Zone Map 只读相交块 + k-way merge；删除位图已过滤），
     // 语义与收集路径等价（demo range-window 验证）。
     if let Some((a, b)) = extract_between_range(sql) {
+        // Ex-8.3 Part B：纯 `SELECT id`（无聚合/无 ORDER BY）走 keys-only 流式——
+        // 免整文档值解码/拷贝（SST 端 new_keys_cached 值跳过 + 块缓存 + 位图过滤 + LIMIT 早停）
+        let upper0 = sql.to_uppercase();
+        let pure_id = !upper0.contains("SUM(")
+            && !upper0.contains("COUNT(")
+            && !upper0.contains("ORDER BY")
+            && matches!(
+                proj.as_deref(),
+                Some(v) if v.len() == 1 && matches!(v[0], ProjCol::Id)
+            );
+        if pure_id {
+            let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
+            let res = engine.scan_stream_ids(Some(a), Some(b), |docid| {
+                rows.push((docid, Vec::new())); // 纯 id 结果 doc 值不参与输出
+                Ok(true)
+            });
+            if res.is_err() {
+                rows.clear();
+            }
+            return build_result_set(proj.as_deref(), rows, false, limit);
+        }
         let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
         let res = engine.scan_stream(Some(a), Some(b), |docid, val| {
             rows.push((docid, val.to_vec()));

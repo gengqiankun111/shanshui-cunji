@@ -1297,6 +1297,31 @@ impl Engine {
         })
     }
 
+    /// Ex-8.3 Part B：keys-only 流式 id 扫描（最新视图，免整文档值解码）——纯 `SELECT id` /
+    /// COUNT 类只关心 docid 存在性的路径；merge 版本折叠 + Tombstone 跳过 + 删除位图过滤，
+    /// 回调返回 false 提前终止。语义与 `scan_stream` 输出 docid 集一致。
+    pub fn scan_stream_ids<F: FnMut(u64) -> Result<bool>>(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        mut f: F,
+    ) -> Result<()> {
+        let sk = start.map(|s| encode_docid(s).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        self.primary
+            .scan_stream_keys(sk.as_deref(), ek.as_deref(), |key| {
+                let docid = decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan keys key 非 docid 编码".into())
+                })?;
+                if let Some(bm) = &self.deletion_bitmap {
+                    if bm.is_deleted(docid) {
+                        return Ok(true);
+                    }
+                }
+                f(docid)
+            })
+    }
+
     /// 7.100 全库可见行计数（COUNT(*) 无 WHERE 快路径）：主数据 key-only 流式计数——
     /// SST keys-only 解码免文档值反序列化/clone；merge 版本语义（同 key 最新、Tombstone
     /// 跳过）与 `scan_stream` 全表扫描一致。
@@ -2359,6 +2384,63 @@ mod tests {
         let c2 = e.count_all_docs().unwrap();
         assert_eq!(c1, c2);
         assert_eq!(c1, 20_000);
+    }
+
+    #[test]
+    fn scan_stream_ids_matches_scan_stream() {
+        // Ex-8.3 Part B：keys-only id 流式与全值 scan_stream 的 docid 集一致
+        // （覆盖折叠 / 删除位图 / 多文件 / 越界空窗口）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=5000u64 {
+            e.put(i, format!("v0-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        for i in 10..=20u64 {
+            e.put(i, format!("v1-{i}").into_bytes(), &["t"]).unwrap(); // 覆盖（折叠验证）
+        }
+        e.flush_primary().unwrap();
+        for i in 5001..=10_000u64 {
+            e.put(i, format!("d{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        for i in 3000..=3005u64 {
+            e.delete(i).unwrap(); // 位图删除（6 个）
+        }
+        let wins: Vec<(Option<u64>, Option<u64>)> = vec![
+            (None, None),
+            (Some(1), Some(100)),
+            (Some(2990), Some(3010)), // 覆盖段 + 删除段混合
+            (Some(6000), Some(7000)),
+            (Some(9990), Some(10010)), // 端点 + 越界
+            (Some(20000), Some(30000)),
+        ];
+        for &(a, b) in &wins {
+            let mut full: Vec<u64> = Vec::new();
+            e.scan_stream(a, b, |d, _v| {
+                full.push(d);
+                Ok(true)
+            })
+            .unwrap();
+            let mut ids: Vec<u64> = Vec::new();
+            e.scan_stream_ids(a, b, |d| {
+                ids.push(d);
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(ids, full, "窗口 {a:?}..{b:?} keys-only 与全值 docid 集不一致");
+        }
+        let all: Vec<u64> = {
+            let mut v = Vec::new();
+            e.scan_stream_ids(None, None, |d| {
+                v.push(d);
+                Ok(true)
+            })
+            .unwrap();
+            v
+        };
+        assert_eq!(all.len(), 9994, "删除 6 个后应有 9994 行");
+        assert!(!all.contains(&3000));
+        assert!(all.contains(&10));
     }
 
     #[test]
