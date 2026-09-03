@@ -60,7 +60,7 @@ struct SegmentManifest {
 }
 
 /// Ex-9.3：单个 stats 字段在某个 term 文档子集上的数值聚合。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FieldAgg {
     /// 计入条数（数值有效文档数）。
     pub n: u64,
@@ -397,6 +397,49 @@ impl InvertedIndex {
                 a.acc(*x);
             }
         }
+    }
+
+    /// 第④步基础：按字段前缀枚举 distinct term 值（mem keys + 各段条目），返回
+    /// 值升序（确定性）。仅用于**倒排 GROUP BY 词典枚举**类查询。
+    fn field_term_values(&self, field: &str) -> Result<Vec<String>> {
+        let prefix = format!("{field}=");
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for e in self.mem.iter() {
+            let k = e.key();
+            if let Some(rest) = k.strip_prefix(&prefix) {
+                set.insert(rest.to_string());
+            }
+        }
+        let segs = self.segments.load();
+        for seg in segs.iter() {
+            for (t, _) in self.read_segment_terms(seg)? {
+                if let Some(rest) = t.strip_prefix(&prefix) {
+                    set.insert(rest.to_string());
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    /// 第④步：`GROUP BY <field>` 词典枚举聚合——对每个不同值给出该组 posting 行数
+    /// 与（若声明 stats_fields）数值统计。不做任何文档值回表。缺该字段的文档（NULL 组）
+    /// 不在此集合内（调用方按语义约束决定是否补偿/路由）。
+    pub fn group_stats(
+        &self,
+        field: &str,
+    ) -> Result<Vec<(String, u64, Vec<FieldAgg>)>> {
+        let mut out = Vec::new();
+        for value in self.field_term_values(field)? {
+            let term = format!("{field}={value}");
+            // 组行数：v4+ 段 doc_count 载荷求和优先；含老段(None) → 精确合并 posting 计数
+            let count = match self.doc_count_fast(&term)? {
+                Some(n) => n,
+                None => self.search(&term)?.len() as u64,
+            };
+            let stats = self.term_stats(&term)?.unwrap_or_default();
+            out.push((value, count, stats));
+        }
+        Ok(out)
     }
 
     /// 读取某 term 的数值统计（与 `stats_fields` 对齐）：内存累积 + 各 v5 段载荷合并。
@@ -1639,6 +1682,38 @@ mod tests {
         assert_eq!(after.min, before.min);
         assert_eq!(after.max, before.max);
         assert_eq!(idx.search("gc-a").unwrap().len(), 10, "GC 后 posting 完整");
+    }
+
+    #[test]
+    fn group_stats_enumerates_field_values_with_counts_and_stats() {
+        // Ex-9.3 第④步：词典枚举 GROUP BY 行（值, 组行数, 数值统计），mem 与落盘段结果一致。
+        let dir = tmp();
+        let mut idx = InvertedIndex::open(&dir, 10_000).unwrap();
+        for (term, d) in [
+            ("status=active", 1u64),
+            ("status=active", 2),
+            ("status=active", 3),
+            ("status=inactive", 4),
+        ] {
+            idx.add(term, d);
+            let v = if term.ends_with("active") { d as f64 } else { 5.0 };
+            idx.add_stats(term, &[Some(v)]);
+        }
+        let gs = idx.group_stats("status").unwrap();
+        assert_eq!(gs.len(), 2, "active/inactive 两组");
+        assert_eq!(gs[0].0, "active");
+        assert_eq!(gs[0].1, 3, "active 组行数");
+        assert_eq!(gs[0].2[0].n, 3);
+        assert_eq!(gs[0].2[0].sum, 6.0); // 1+2+3
+        assert_eq!(gs[0].2[0].min, 1.0);
+        assert_eq!(gs[0].2[0].max, 3.0);
+        assert_eq!(gs[1].0, "inactive");
+        assert_eq!(gs[1].1, 1);
+        assert_eq!(gs[1].2[0].sum, 4.0); // inactive 文档 d=4（ends_with("active") 亦真）
+        // flush 落盘后：结果一致（段枚举路径）
+        idx.flush_segment().unwrap();
+        let gs2 = idx.group_stats("status").unwrap();
+        assert_eq!(gs2, gs, "flush 后组枚举不变");
     }
 
     // ---------- G 项：posting 检索优化（term→bitmap 缓存） ----------

@@ -1308,6 +1308,15 @@ impl Engine {
         self.stats_fields.iter().position(|x| x == field)
     }
 
+    /// Ex-9.3 第④步：倒排词典枚举 `GROUP BY <field>` 聚合行（值, 组行数, 数值统计）。
+    /// 仅含已索引的组值；缺字段文档（NULL 组）由调用方按语义约束处理。
+    pub fn inverted_group_stats(
+        &self,
+        field: &str,
+    ) -> crate::error::Result<Vec<(String, u64, Vec<crate::inverted::FieldAgg>)>> {
+        self.inverted.group_stats(field)
+    }
+
     /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
     /// 不随扫描总量膨胀（旧实现先全量收集 O(total) 再截断）；`total` = 范围行数
     /// （全扫计数，limit 取满页后仅计数不回表，语义与全量一致）。
