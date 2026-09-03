@@ -498,6 +498,39 @@ impl Parser {
     }
     fn parse_cond(&mut self) -> PRes<WhereExpr> {
         let field = self.ident()?;
+        // `f IN (v1, v2, …)`：解析期展开为 OR 等值链（复用既有 Cond 求值/分组路径，
+        // 含倒排收敛/下推/聚合/HAVING/ORDER BY；数值与字符串等值语义同 `f = v`）。
+        let is_in = matches!(
+            self.peek()?,
+            Tok::Ident(k) if k.eq_ignore_ascii_case("in")
+        );
+        if is_in {
+            self.next()?; // in
+            if !matches!(self.next()?, Tok::LParen) {
+                return Err("IN 后期望 (".into());
+            }
+            let mut conds: Vec<WhereExpr> = Vec::new();
+            loop {
+                let v = self.value()?;
+                conds.push(WhereExpr::Cond(Cond {
+                    field: field.clone(),
+                    op: CmpOp::Eq,
+                    value: v,
+                }));
+                match self.next()? {
+                    Tok::Comma => continue,
+                    Tok::RParen => break,
+                    t => return Err(format!("IN 列表期望 , 或 )，实际 {t:?}")),
+                }
+            }
+            let mut it = conds.into_iter();
+            let first = it.next().ok_or_else(|| "IN 列表不能为空".to_string())?;
+            let mut acc = first;
+            for c in it {
+                acc = WhereExpr::Or(Box::new(acc), Box::new(c));
+            }
+            return Ok(acc);
+        }
         // BETWEEN：`field BETWEEN low AND high`（闭区间）
         if matches!(self.peek()?, Tok::Kw(k) if k == "BETWEEN") {
             self.next()?;
@@ -2185,6 +2218,45 @@ mod tests {
         );
         // 普通 SELECT → None（走普通查询路径）
         assert!(execute_aggregate(&e, "SELECT * FROM t WHERE amount>900").unwrap().is_none());
+    }
+
+    #[test]
+    fn sql_in_clause_filter_group_and() {
+        // SQL `WHERE f IN (…)`：过滤（含 AND 交集、数值）、与 GROUP BY 组合。
+        let mut e = engine_with_docs();
+        let rows = execute(&mut e, "SELECT * FROM t WHERE city IN ('beijing','shanghai') LIMIT 1000", 1000)
+            .unwrap();
+        assert_eq!(rows.len(), 67, "beijing(34)+shanghai(33)");
+        let r2 = execute(
+            &mut e,
+            "SELECT * FROM t WHERE status='active' AND city IN ('beijing','shenzhen') LIMIT 1000",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(r2.len(), 34, "active∩beijing（shenzhen 无 active）");
+        let r3 = execute(&mut e, "SELECT * FROM t WHERE amount IN (500, 900)", 1000).unwrap();
+        let mut ids: Vec<u64> = r3.iter().map(|x| x.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![50, 90], "数值 IN");
+        // GROUP BY + IN（分组查询 WHERE 集合过滤）
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT city, COUNT(*) FROM t WHERE city IN ('shanghai','shenzhen') GROUP BY city",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        let keys: Vec<&str> = gr.rows.iter().map(|r| r.keys[0].as_deref().unwrap()).collect();
+        assert_eq!(keys, vec!["shanghai", "shenzhen"]);
+        let cnts: Vec<u64> = gr
+            .rows
+            .iter()
+            .map(|r| r.cells[0].as_ref().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(cnts, vec![33, 33]);
+        // 语法错误：空列表 / 缺右括号
+        assert!(parse_select("SELECT * FROM t WHERE city IN ()").is_err());
+        assert!(parse_select("SELECT * FROM t WHERE city IN ('a'").is_err());
     }
 
     #[test]

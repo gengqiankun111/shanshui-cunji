@@ -56,7 +56,8 @@
 ### 4.1 已支持（经 mysql-server 的 MySQL wire 协议）
 
 - DDL 放行、INSERT/UPDATE/DELETE、事务语句 BEGIN/COMMIT/ROLLBACK、预处理语句（PREPARE/EXECUTE）；
-- SELECT：主键点查、`id BETWEEN / id IN` 范围、字段条件过滤（倒排/下推）、`COUNT/SUM/AVG/MIN/MAX`、
+- SELECT：主键点查、`id BETWEEN / id IN` 范围、`WHERE f IN (…)` 值集合过滤、
+  字段条件过滤（倒排/下推）、`COUNT/SUM/AVG/MIN/MAX`、
   `ORDER BY f [ASC|DESC]（多字段）`、`GROUP BY f1,f2 + COUNT/SUM/AVG/MIN/MAX`、`HAVING`、`LIMIT/OFFSET`。
 
 ### 4.2 已知限制 / 不支持（对照 feature_remain 边界）
