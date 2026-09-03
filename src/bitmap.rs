@@ -168,6 +168,17 @@ impl DeletionBitmap {
         Ok(())
     }
 
+    /// DROP TABLE purge：清空位图内存态并删除持久化文件（等价从未删除；重启后重建为空）。
+    pub fn purge(&self) {
+        let _w = self.write.lock().unwrap();
+        self.bytes
+            .store(std::sync::Arc::new(Box::new([] as [AtomicU8; 0])));
+        self.dirty.lock().unwrap().clear();
+        if self.path.exists() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     /// 置位/清位公共路径（写者串行 + 必要时扩容换代）。
     fn mutate(&self, docid: u64, set: bool) {
         let _g = self.write.lock().unwrap(); // 引擎单写者；锁护扩容换代与位翻转的自健全

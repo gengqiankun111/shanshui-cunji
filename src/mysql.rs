@@ -1079,16 +1079,23 @@ fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> Quer
     if upper.starts_with("SET") || upper.starts_with("USE") {
         return QueryResponse::Ok(0, 0);
     }
-    // H-6：DDL 放行（文档库无 schema——CREATE/DROP/TRUNCATE TABLE 映射为 OK 空操作，
+    // H-6：DDL 放行（文档库无 schema——CREATE/ALTER/INDEX 映射为 OK 空操作，
     // 使 sysbench prepare/cleanup 可跑通；表统一映射 documents）
     if upper.starts_with("CREATE TABLE")
-        || upper.starts_with("DROP TABLE")
-        || upper.starts_with("TRUNCATE TABLE")
         || upper.starts_with("ALTER TABLE")
         || upper.starts_with("CREATE INDEX")
         || upper.starts_with("DROP INDEX")
     {
         return QueryResponse::Ok(0, 0);
+    }
+    // 缺口 c：DROP/TRUNCATE TABLE 真正清库（内存+磁盘段+倒排），对齐 MySQL 整表删除语义——
+    // 修 sysbench cleanup / 反复 --init 后残留上轮行（基线不可比）。事务内 DROP 仍走
+    // 上方"事务内暂不支持"1064（MySQL 隐式提交语义暂不实现）。
+    if upper.starts_with("DROP TABLE") || upper.starts_with("TRUNCATE TABLE") {
+        return match engine.purge_all() {
+            Ok(()) => QueryResponse::Ok(0, 0),
+            Err(e) => QueryResponse::Err(3500, format!("清库失败（表数据未变）: {e}")),
+        };
     }
     QueryResponse::Err(1064, format!("syntax error: unsupported statement: {sql}"))
 }
@@ -3650,6 +3657,63 @@ mod tests {
             super::QueryResponse::Ok(1, last) => assert_eq!(last, 100),
             _ => panic!("auto 插入失败"),
         }
+    }
+
+    #[test]
+    fn drop_table_purges_data_and_restart_empty() {
+        // c：DROP/TRUNCATE TABLE 真正清库（内存行 + 磁盘段 + 倒排），重启后目录为空库；
+        // 同主键再插不再 1062 —— 对齐 MySQL 整表删除语义（cleanup / 反复 --init 基线可比）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut s = super::new_session(std::sync::Arc::clone(&auto));
+        // 引擎直写 3 行（显式倒排 term）+ 强制落盘覆盖持久态（SST / WAL / 倒排段）
+        for id in 1u64..=3 {
+            let doc = format!("{{\"a\":{id}}}");
+            let term = format!("a={id}");
+            e.put(id, doc.as_bytes().to_vec(), &[term.as_str()]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        e.flush_wal().unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), 3);
+        assert_eq!(e.inverted_doc_count("a=1").unwrap(), 1);
+        // CREATE TABLE 仍为空操作
+        match super::dispatch_query(&mut e, "CREATE TABLE t1(id INT, a INT)", &mut s) {
+            super::QueryResponse::Ok(0, 0) => {}
+            _ => panic!("CREATE 应返回 Ok(0,0) 空操作"),
+        }
+        // DROP TABLE → 整库清空（行 + 倒排）
+        match super::dispatch_query(&mut e, "DROP TABLE t1", &mut s) {
+            super::QueryResponse::Ok(0, 0) => {}
+            _ => panic!("DROP 应返回 Ok(0,0)"),
+        }
+        assert_eq!(e.count_all_docs().unwrap(), 0, "DROP 后行应清零");
+        assert!(e.scan_range(None, None).unwrap().is_empty());
+        assert_eq!(e.inverted_doc_count("a=1").unwrap(), 0, "DROP 后倒排应清零");
+        // 同主键再插（mysql insert 路径）→ 不再 1062（无残留主键）
+        match super::insert_response(
+            &mut e,
+            "INSERT INTO documents VALUES (1,'{\"a\":1}')",
+            &auto,
+        ) {
+            super::QueryResponse::Ok(1, _) => {}
+            super::QueryResponse::Err(1062, m) => panic!("DROP 后残留主键 → 1062: {m}"),
+            _ => panic!("再插入失败"),
+        }
+        // TRUNCATE TABLE → 同样清空
+        match super::dispatch_query(&mut e, "TRUNCATE TABLE t1", &mut s) {
+            super::QueryResponse::Ok(0, 0) => {}
+            _ => panic!("TRUNCATE 应返回 Ok(0,0)"),
+        }
+        assert_eq!(e.count_all_docs().unwrap(), 0);
+        // 磁盘持久态：重启 open 同目录 → 空库（Manifest/SST/WAL 一致，open 不报错）
+        drop(e);
+        drop(s);
+        let e2 = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(e2.count_all_docs().unwrap(), 0, "重启后仍为空库");
+        assert!(e2.scan_range(None, None).unwrap().is_empty());
     }
 
     #[test]

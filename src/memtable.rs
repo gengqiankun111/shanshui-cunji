@@ -300,6 +300,14 @@ impl MemTableBuffer {
         self.inner.write().unwrap().immutable.take()
     }
 
+    /// 清空双缓冲全部键（DROP TABLE purge）：Mutable/Immutable 直接丢弃、不刷盘——
+    /// WAL 已由上层截断，数据语义为整表删除。
+    pub fn reset(&self) {
+        let mut g = self.inner.write().unwrap();
+        g.mutable = MemTable::new();
+        g.immutable = None;
+    }
+
     /// 双缓冲范围流式迭代（M8-P10）：immutable + mutable 各一个 `MemRangeIter`
     /// （同 key 以 seq 去重由 k-way merge 调用方负责）。
     /// P72：迭代器借用 RwLock 读锁内数据——改为 HRTB 闭包式（`f` 在锁作用域内消费迭代器，

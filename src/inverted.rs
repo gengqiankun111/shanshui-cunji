@@ -682,6 +682,31 @@ impl InvertedIndex {
         Ok(())
     }
 
+    /// DROP TABLE purge：清空倒排全部状态（内存字典/位图/posting 缓存 + 磁盘段/FST + Manifest）。
+    /// 与 flush_segment/gc 经 `mutate` 互斥（后台 GC 并发安全）；先换空快照再删段文件
+    /// （Windows 已 mmap 文件不可删——删除失败忽略 → 孤儿段不被空 Manifest 加载，重启安全）。
+    pub fn purge_all(&self) -> Result<()> {
+        let _g = self.mutate.lock().unwrap();
+        let old: Vec<String> = self.segments.load().as_ref().clone();
+        self.mem.clear();
+        self.stats_mem.clear();
+        self.mem_docids.reset();
+        self.segments.store(Arc::new(Vec::new()));
+        self.dicts.store(Arc::new(HashMap::new()));
+        self.data_files.store(Arc::new(HashMap::new()));
+        for b in &self.bitmaps {
+            b.lock().unwrap().clear();
+        }
+        self.posting_cache.lock().unwrap().clear();
+        self.next_seg_id.store(1, Ordering::Relaxed);
+        self.persist_manifest()?;
+        for seg in &old {
+            let _ = std::fs::remove_file(self.dir.join(seg));
+            let _ = std::fs::remove_file(self.dir.join(seg.replace(".seg", ".fst")));
+        }
+        Ok(())
+    }
+
     /// 查询 term：合并内存 posting 与各段 posting，返回 RoaringBitmap（docid 按 u32 语义）。
     /// G 项优化（design_extension 9.6）：① 白名单字段 term 直接返回全量内存位图（O(1)）；
     /// ② 非白名单 term 查 LRU 缓存（重复查询免段遍历 + posting 反序列化）。

@@ -933,6 +933,36 @@ impl Engine {
         self.primary.switch_and_flush()
     }
 
+    /// DROP TABLE / TRUNCATE（文档库唯一表统一映射 documents）purge：清空引擎全部数据并对齐
+    /// MySQL 整表删除语义——主数据/组合索引/Delta 三列族（MemTable+SST+WAL）、倒排（内存+段）、
+    /// 删除位图、HotCache、倒排攒批缓冲与全局 seq/删除密度状态全部归零；数据目录清空
+    /// （此后重启打开为空库，反复 --init / cleanup 基线可比）。
+    /// 须在引擎写锁（`&mut self`）内调用：与 flush/写路径互斥；后台 compact / inverted gc 并发
+    /// 安全（列族 `sst_mutate` / 倒排 `mutate` 互斥）。outbox 业务消息表不受影响（独立于表数据）。
+    pub fn purge_all(&mut self) -> Result<()> {
+        info!("引擎整库 purge 开始（DROP TABLE / TRUNCATE TABLE）");
+        self.primary.purge_data()?;
+        if let Some(c) = &self.cidx {
+            c.purge_data()?;
+        }
+        self.delta.purge_data()?;
+        self.inverted.purge_all()?;
+        self.hotcache.clear();
+        if let Some(bm) = &self.deletion_bitmap {
+            bm.purge();
+        }
+        self.pending_inverted.lock().unwrap().clear();
+        self.global_seq.store(0, Ordering::Relaxed);
+        self.max_docid.store(0, Ordering::Relaxed);
+        self.garbage_marked.store(0, Ordering::Relaxed);
+        self.garbage_done.store(0, Ordering::Relaxed);
+        self.garbage_draining.store(false, Ordering::Relaxed);
+        self.compact_pending.store(false, Ordering::Relaxed);
+        self.inverted_gc_pending.store(false, Ordering::Relaxed);
+        info!("引擎整库 purge 完成");
+        Ok(())
+    }
+
     /// 当前已分配的最大 seq（全量备份点 / 增量备份游标基础）。
     pub fn current_seq(&self) -> u64 {
         self.global_seq.load(Ordering::Relaxed).saturating_sub(1)

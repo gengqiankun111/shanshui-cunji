@@ -1993,6 +1993,38 @@ impl ColumnFamily {
         self.memtable.mutable_bytes() + self.memtable.immutable_bytes()
     }
 
+    /// DROP TABLE purge：清空本列族全部数据（MemTable + SST + WAL），重写空 Manifest。
+    /// 调用方须持有引擎级写锁（与 flush/写路径互斥）；与无锁后台 compact 经 `sst_mutate`
+    /// 互斥（store→persist→remove 原子一致，同 finalize_compact）。删除失败的旧段文件
+    /// （Windows 读句柄未释放）成为孤儿——Manifest 已空，重启不会加载。
+    pub fn purge_data(&self) -> Result<()> {
+        // ① 清空内存双缓冲（不刷盘：WAL 随后截断，整表删除语义）
+        self.memtable.reset();
+        // ② 段快照清空 + Manifest 空写 + 删旧段文件（P73 顺序：先 store 后删，持 sst_mutate）
+        let _g = self.sst_mutate.lock().unwrap();
+        let cur = self.ssts.load();
+        let old: Vec<std::path::PathBuf> =
+            cur.ssts.iter().map(|s| s.path().to_path_buf()).collect();
+        self.ssts.store(Arc::new(SstSnapshot {
+            ssts: Vec::new(),
+            levels: Vec::new(),
+            layer_ranges: Vec::new(),
+            layer_indices: Vec::new(),
+            sizes: Vec::new(),
+        }));
+        self.seq_min.write().unwrap().clear();
+        self.persist_manifest()?;
+        for p in &old {
+            let _ = std::fs::remove_file(p);
+        }
+        drop(_g);
+        // ③ WAL 截断重建（内存 next_seq 保留递增；引擎级 global_seq 归零由 Engine::purge_all 负责）
+        self.wal.lock().unwrap().truncate_and_reset()?;
+        // ④ 段块缓存清空（本 CF 独立 BlockCache 实例，清空避免旧段块残留）
+        self.block_cache.clear();
+        Ok(())
+    }
+
     pub fn sst_count(&self) -> usize {
         self.ssts.load().ssts.len()
     }
