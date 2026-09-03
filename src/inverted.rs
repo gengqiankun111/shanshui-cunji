@@ -57,6 +57,32 @@ struct SegmentManifest {
     next_seg_id: u64,
 }
 
+/// Ex-9.3：单个 stats 字段在某个 term 文档子集上的数值聚合。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FieldAgg {
+    /// 计入条数（数值有效文档数）。
+    pub n: u64,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl FieldAgg {
+    fn new() -> Self {
+        Self { n: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY }
+    }
+    fn acc(&mut self, v: f64) {
+        self.n += 1;
+        self.sum += v;
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+    }
+}
+
 /// 倒排索引：内存字典 + 磁盘段集合 + FST 术语字典。
 pub struct InvertedIndex {
     dir: PathBuf,
@@ -64,6 +90,9 @@ pub struct InvertedIndex {
     engine: String,
     /// term → 内存收集的 docid 列表。
     mem: DashMap<String, Vec<u64>>,
+    /// Ex-9.3 第①步：term → 各声明 stats 字段聚合（写路径随 term 累积；独立于 mem，
+    /// 不影响既有 flush/检索路径）。仅当配置 stats_fields 非空时由 Engine 调用。
+    stats_mem: DashMap<String, Vec<FieldAgg>>,
     /// 内存累计 docid 数（触发刷盘阈值判断）。Ex-7.1：PerCpuCounter 按核拆分——
     /// 多核并发写 posting 时消除原子计数器伪共享（demo 实测 2.1×）。
     mem_docids: PerCpuCounter,
@@ -238,6 +267,7 @@ impl InvertedIndex {
             // 4 shard 下大量碰撞串行，256 shard 分散（demo 实测 1.39× 加速）；
             // dashmap 要求 shard 数为 2 的幂（256 = 2^8）。
             mem: DashMap::with_capacity_and_shard_amount(0, 256),
+            stats_mem: DashMap::with_capacity_and_shard_amount(0, 256),
             mem_docids: PerCpuCounter::new(),
             // Ex-6.2/6.3：ArcSwap 原子发布（读路径 load 拿 Arc 快照无锁）
             segments: ArcSwap::new(Arc::new(segments)),
@@ -347,6 +377,30 @@ impl InvertedIndex {
         }
         self.mem.entry(term.to_string()).or_default().push(docid);
         self.mem_docids.add(1);
+    }
+
+    /// Ex-9.3 第①步：随 term 累积一个文档的数值贡献。`stats` 与配置 `stats_fields` 对齐，
+    /// `None` = 该文档缺字段/非数值（跳过，不计入 n）。统计仅进内存 `stats_mem`（段格式
+    /// v5 载荷为第②步）；term 集合与 mem posting 一致（Engine 在 allowed 过滤后同批调用）。
+    pub fn add_stats(&self, term: &str, stats: &[Option<f64>]) {
+        if stats.is_empty() {
+            return;
+        }
+        let mut agg = self.stats_mem.entry(term.to_string()).or_default();
+        if agg.len() < stats.len() {
+            agg.resize(stats.len(), FieldAgg::new());
+        }
+        for (a, s) in agg.iter_mut().zip(stats.iter()) {
+            if let Some(x) = s {
+                a.acc(*x);
+            }
+        }
+    }
+
+    /// 读取某 term 内存段统计（与 `stats_fields` 对齐；段部分待第②步 v5 载荷）。
+    /// 无该 term/未配置 → None。
+    pub fn term_stats(&self, term: &str) -> Option<Vec<FieldAgg>> {
+        self.stats_mem.get(term).map(|e| e.value().clone())
     }
 
     /// 批量追加 (term, docid) 集合（Ex-5.3 倒排更新批处理）：

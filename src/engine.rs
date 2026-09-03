@@ -25,6 +25,15 @@ use crate::optimizer::{route, AccessPath, QuerySpec};
 use crate::outbox::Outbox;
 use crate::watchdog::{Watchdog, DEFAULT_QUERY_TIMEOUT};
 
+/// Ex-9.3 第①步：解析文档 JSON 中声明 stats 字段的数值（与 `stats_fields` 对齐；
+/// 缺字段 / JSON null / 非数值 → None 跳过；文档不可解析 → 全 None）。
+fn engine_doc_stats(fields: &[String], value: &[u8]) -> Vec<Option<f64>> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(value) else {
+        return vec![None; fields.len()];
+    };
+    fields.iter().map(|f| v.get(f).and_then(|x| x.as_f64())).collect()
+}
+
 /// 引擎：组合主数据 + 组合索引 + Delta 增量 + 倒排 + HotCache。
 pub struct Engine {
     /// 主数据列族（value = 序列化文档字节）。
@@ -66,6 +75,8 @@ pub struct Engine {
     /// 中文分词器（M8-P13）：true = jieba 完整词典分词（需 cjk-jieba feature）；
     /// false = bigram（M8-P9）。来自 `[inverted] cjk_segmenter`。
     use_jieba: bool,
+    /// Ex-9.3：倒排统计载荷声明字段（`cfg.inverted.stats_fields`，空 = 关闭）。
+    stats_fields: Vec<String>,
     /// 写入 Enrich（design 19 / development 5.21）：Some((fail_policy, from_field, to_field)) =
     /// 启用 local 数据源预连接（server /put 走 join::put_with_enrich）；None = 关闭（零开销）。
     enrich: Option<(String, String, String)>,
@@ -502,6 +513,7 @@ impl Engine {
             max_term_len: cfg.inverted.max_term_len,
             fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
             use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
+            stats_fields: cfg.inverted.stats_fields.clone(),
             // 写入 Enrich（design 19 / development 5.21）：`[enrich] enabled && source=local` 启用
             enrich: if cfg.enrich.enabled && cfg.enrich.source == "local" {
                 Some((
@@ -674,9 +686,18 @@ impl Engine {
         }
         // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
         //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
+        //    Ex-9.3 第①步：配置 stats_fields 时解析本文档数值并随 allowed term 累积
+        let stats = if self.stats_fields.is_empty() {
+            Vec::new()
+        } else {
+            engine_doc_stats(&self.stats_fields, &value)
+        };
         for t in terms {
             if self.inverted_allowed(t) {
                 self.pending_inverted.lock().unwrap().push((t.to_string(), docid));
+                if !stats.is_empty() {
+                    self.inverted.add_stats(t, &stats);
+                }
             }
         }
         if self.pending_inverted.lock().unwrap().len() >= INVERTED_PENDING_CAP {
@@ -1273,6 +1294,12 @@ impl Engine {
     /// 中文分词器开关（M8-P13）：true = jieba 完整词典分词，false = bigram。
     pub fn use_jieba(&self) -> bool {
         self.use_jieba
+    }
+
+    /// Ex-9.3 第①步：读取某 term 内存段数值统计（与 `stats_fields` 对齐）。
+    /// 未配置 stats_fields / 无该 term → None。段部分待第②步 v5 载荷。
+    pub fn inverted_term_stats(&self, term: &str) -> Option<Vec<crate::inverted::FieldAgg>> {
+        self.inverted.term_stats(term)
     }
 
     /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
@@ -3745,6 +3772,45 @@ mod tests {
             rep.records, 1,
             "since=0 导出当前 WAL 全部记录（截断后 = 未刷盘记录 2；记录 1 已入 SST 由全量备份覆盖）"
         );
+    }
+
+    // ---------- Ex-9.3 第①步：写路径随 term 累积 stats（内存段） ----------
+
+    #[test]
+    fn inverted_stats_fields_accumulate_per_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.stats_fields = vec!["amount".to_string()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put = |e: &mut Engine, docid: u64, status: &str, amount: Option<f64>| {
+            let mut doc = serde_json::json!({"status": status});
+            if let Some(a) = amount {
+                doc["amount"] = serde_json::json!(a);
+            }
+            let bytes = serde_json::to_vec(&doc).unwrap();
+            let term: &[&str] = &[if status == "active" { "status=active" } else { "status=inactive" }];
+            e.put_nosync(docid, bytes, term).unwrap();
+        };
+        put(&mut e, 1, "active", Some(10.0));
+        put(&mut e, 2, "active", Some(20.0));
+        put(&mut e, 3, "active", None); // 缺 amount → 跳过不计入
+        put(&mut e, 4, "inactive", Some(5.0));
+        // active：数值文档 10/20 → n2 sum30 min10 max20
+        let a = e.inverted_term_stats("status=active").expect("active 应有统计");
+        assert_eq!(a.len(), 1, "stats_fields 单字段");
+        assert_eq!(a[0].n, 2, "缺字段文档不计入");
+        assert_eq!(a[0].sum, 30.0);
+        assert_eq!(a[0].min, 10.0);
+        assert_eq!(a[0].max, 20.0);
+        let b = e.inverted_term_stats("status=inactive").unwrap();
+        assert_eq!(b[0].n, 1);
+        assert_eq!(b[0].sum, 5.0);
+        // 未声明 stats_fields（空）→ 不产生统计
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut e2 = Engine::open(dir2.path(), &crate::config::Config::default()).unwrap();
+        e2.put_nosync(1, br#"{"status":"active","amount":10}"#.to_vec(), &["status=active"])
+            .unwrap();
+        assert!(e2.inverted_term_stats("status=active").is_none(), "未配置则无统计");
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------

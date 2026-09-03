@@ -737,6 +737,11 @@ pub struct InvertedConfig {
     /// 中文分词器（M8-P13）：`bigram`（默认，M8-P9 字符碎片，零依赖）/ `jieba`（完整中文
     /// 词典分词——语义词精确命中、索引词数更少；需 `cjk-jieba` feature，关闭时回退 bigram）。
     pub cjk_segmenter: String,
+    /// 倒排统计载荷字段（Ex-9.3）：声明数字字段后，写路径随 term 累积该字段
+    /// sum/min/max/avg（term → 文档子集聚合）——支撑 `SUM(amount) WHERE status='x'` /
+    /// `GROUP BY status` 聚合免全扫（配合 v5 段载荷；第①步仅内存段累积）。
+    /// 空 = 关闭（默认，零额外写开销）；多数字字段全开失控——对齐 Ex-4 成本控制准则。
+    pub stats_fields: Vec<String>,
 }
 
 impl Default for InvertedConfig {
@@ -754,6 +759,7 @@ impl Default for InvertedConfig {
             max_term_len: 96,
             fulltext_fields: Vec::new(),
             cjk_segmenter: "bigram".into(),
+            stats_fields: Vec::new(),
         }
     }
 }
