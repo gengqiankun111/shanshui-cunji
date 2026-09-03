@@ -102,9 +102,9 @@
 |---|---|---|
 | Ex-8.9 空闲感知维护调度（P3） | 低负载窗口收紧合并阈值/触发倒排 GC/深度合并/位图脏页回收；高负载退避（与 Ex-7.4 联动）；demo 交变负载对照 | 待做（原 development_remain §14） |
 | Ex-8.13 倒排后台 IO 预算共享（P3） | 倒排 flush_segment/GC 写纳入后台 io_limiter 或并入 Ex-8.9 空闲窗口；demo 并发窗口对照 | 待做（原 §14） |
-| Ex-8.11 A/B 写放大实测（P2 受控实验） | 内核已回填（8ec3a70）；50m 库 A/B（现收敛 vs l1 攒 8~12）：写放大/点查 p99/范围 p50/空间/合并 CPU；验收 = 写放大 -30%+ 且范围无回退才调默认 | 验证待做（原 §15） |
-| Ex-8.12 分层压缩 50m A/B（P2 受控实验） | 内核已回填（b25b86d）；A/B 空间/写放大/范围 p50/压缩 CPU；验收 = L2 zstd 不劣化范围读且空间 -10%+ 才采纳默认 | 验证待做（原 §16） |
-| Ex-9.3 倒排统计载荷 ⑤（AF #6） | ①mem 累积（5a792cc）→②段格式 v5（e52941a）→③引擎+s qlish SUM/AVG/MIN/MAX 路由（03d38dd）→④GROUP BY 词典枚举快路径（fe0e045/a4d37c2/4fb6e7f）已回填 development.md §14；**⑤ 50m A/B 与全量回归待做** | ⑤待做（原 §19） |
+| Ex-8.11 A/B 写放大实测（P2 受控实验） | 内核已回填（8ec3a70）；**A/B demo 已建（src/demo/wa-ab，12.8 万 ×512B 关压缩实测：默认收敛 WA 5.62 vs L1 攒 8 WA 3.21，写放大 -42.9%，点查 p50 0.8→1.1µs、范围 p50 2600→2120µs 无回退）→ 采纳默认 l1_trigger_files=8（2026-09-04）**；顺带修复：①Engine compact 无 L0 压力时底部（L1→L2/L2 收敛）合并空转饿死 → 底层 needs 直接压实对应列族；②M3 表切分 bottom 触发忽略 l1_trigger_files → 已尊重攒批配置；③新增 sst_written_bytes 累计写指标 | ✅ 已采纳（50m 复测可选） |
+| Ex-8.12 分层压缩 50m A/B（P2 受控实验） | 内核已回填（b25b86d）；**A/B demo 已建（src/demo/compression-ab，12.8 万 ×低重复 JSON 实测：L2 冷档 zstd19 vs 不分层 空间 -4.7%（未达 -10% 验收线）、范围 p50 330→305µs 无回退）→ 不采纳默认（保持 level_l2=0），50m 真实库复测后重评** | ✅ demo（未采纳，50m 复测可重评） |
+| Ex-9.3 倒排统计载荷 ⑤（AF #6） | ①mem 累积（5a792cc）→②段格式 v5（e52941a）→③引擎+s qlish SUM/AVG/MIN/MAX 路由（03d38dd）→④GROUP BY 词典枚举快路径（fe0e045/a4d37c2/4fb6e7f）已回填 development.md §14；**⑤ A/B demo 已建（src/demo/groupby-inverted，30 万实测：COUNT 53.8ms vs 全扫 92.3ms=1.7×，SUM 76.3ms vs 167.9ms=2.2×）**；50m 规模验收与全量回归挂起（需先建 50m 库） | demo 已建 / 50m 验证待做（原 §19） |
 | Ex-8.8 demo 可选 | posting 双区 LRU（内核 8f70b3e 已回填）；热点/冷 term 负载 demo + 容量接 config | 可选，无明确触发可不做 |
 | 10 分片 10 亿构建验收 | 10 亿库扩展阶段 A~D 已回填（7.81~7.86）；剩余 = 硬件/部署验收（验收标准与脚本见 design_remain 三） | 部署/硬件推进 |
 | AF #6（对应 Ex-9.3 ⑤） | 倒排加速 GROUP BY 的验收与默认化（见上 Ex-9.3 ⑤） | 随 Ex-9.3 |

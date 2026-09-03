@@ -138,6 +138,9 @@ pub struct ColumnFamily {
     cooldown: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
     /// X 项：累计刷盘次数（switch_and_flush 成功 +1；/metrics 指标）。
     flush_counter: AtomicU64,
+    /// Ex-8.11 A/B：累计**写入磁盘的 SST 字节**（flush/compact 每新建一个文件计一次该文件
+    /// 字节；覆盖被合并删除的旧文件——总写入 = 数据量 × 写放大；/metrics 与写放大实验数据源）。
+    sst_written: AtomicU64,
     /// 双缓冲 MemTable。
     memtable: MemTableBuffer,
     /// SST 快照（O 项第③步：ArcSwap 原子发布——读路径 load 无锁，写路径 store 切换）。
@@ -375,6 +378,7 @@ impl ColumnFamily {
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
             flush_counter: AtomicU64::new(0),
+            sst_written: AtomicU64::new(0),
             memtable: MemTableBuffer::new(),
             ssts: {
                 let loaded: Vec<Arc<SstReader>> = ssts.into_iter().map(Arc::new).collect();
@@ -1278,6 +1282,25 @@ impl ColumnFamily {
         self.flush_counter.load(Ordering::Relaxed)
     }
 
+    /// Ex-8.11：累计写入 SST 字节（flush/compact 新建文件字节和；写放大实验数据源）。
+    pub fn sst_written_bytes(&self) -> u64 {
+        self.sst_written.load(Ordering::Relaxed)
+    }
+
+    /// Ex-8.11：L0/L1/L2 段数分布（写放大 A/B 观察合并节奏）。
+    pub fn layer_counts(&self) -> (usize, usize, usize) {
+        let snap = self.ssts.load();
+        let mut c = (0usize, 0usize, 0usize);
+        for lv in snap.levels.iter() {
+            match *lv {
+                0 => c.0 += 1,
+                1 => c.1 += 1,
+                _ => c.2 += 1,
+            }
+        }
+        c
+    }
+
     /// R 项：快照构建时计算层聚合元数据（O(段数)）——每层 key 范围 + 每层段下标。
     /// 层范围 = 层内各段范围并集；层内存在"无范围段"（无约束）→ 该层 None（不可跳过，
     /// 防假阴性——布隆/范围粗筛只允许假阳性，不允许假阴性）。
@@ -1313,7 +1336,10 @@ impl ColumnFamily {
     }
 
     /// O 项第③步：原子插入新 SST（快照 `store()`）——新文件插最前（读路径优先命中），层号 L0。
+    /// Ex-8.11：每次 flush 落一个新文件 → 累计写入字节（写放大实验数据源）。
     fn snapshot_insert(&self, reader: SstReader) {
+        self.sst_written
+            .fetch_add(reader.file_len(), Ordering::Relaxed);
         let cur = self.ssts.load();
         let mut ssts = cur.ssts.clone();
         ssts.insert(0, Arc::new(reader));
@@ -1952,11 +1978,11 @@ impl ColumnFamily {
             }
         }
         // M3：多输出全部置前（同层、段间不重叠 → 相对顺序无版本语义影响）
+        // Ex-8.11：compaction 每写一个新输出文件 → 累计写入字节（写放大实验数据源）
         for p in paths {
-            kept_ssts.insert(
-                0,
-                Arc::new(SstReader::open_with_granularity(p, self.index_granularity)?),
-            );
+            let reader = SstReader::open_with_granularity(p, self.index_granularity)?;
+            self.sst_written.fetch_add(reader.file_len(), Ordering::Relaxed);
+            kept_ssts.insert(0, Arc::new(reader));
             kept_levels.insert(0, out_level);
         }
         let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
@@ -2045,24 +2071,50 @@ impl ColumnFamily {
         counts.values().any(|&c| c >= 2)
     }
 
-    /// M3：表切分列族底部（L0 空时的 L1/L2）是否需合并——按表、按层口径：
-    /// L1 或 L2 **某一层内**存在**同表 ≥2 段**（有去重/下沉收益）或混表老段即触发；
-    /// 跨表每层每表各 1 段视为已收敛 → 不触发（防多表库底层反复重写空转）。
+    /// M3：表切分列族底部（L0 空时的 L1/L2）是否需合并——按表、按层口径，且**尊重
+    /// Ex-8.11 攒批配置**（l1/l2_trigger_files>0 时按层文件总数攒批一次下沉/收敛，0 = 按
+    /// 同表 ≥2 段即触发）：
+    /// - L1 或 L2 **某一层内**存在**同表 ≥2 段**（有去重/下沉收益）或混表老段即触发；
+    /// - 跨表每层每表各 1 段视为已收敛 → 不触发（防多表库底层反复重写空转）。
     fn split_bottom_merge_work(&self) -> bool {
         let snap = self.ssts.load();
         let mut l1: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
         let mut l2: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+        let (mut l1n, mut l2n) = (0usize, 0usize);
         for (i, lv) in snap.levels.iter().enumerate() {
             if *lv == 0 {
                 continue;
             }
-            let counts = if *lv == 1 { &mut l1 } else { &mut l2 };
             match self.sst_table_of(i) {
-                Some(t) => *counts.entry(t).or_insert(0) += 1,
+                Some(t) => {
+                    let counts = if *lv == 1 { &mut l1 } else { &mut l2 };
+                    *counts.entry(t).or_insert(0) += 1;
+                    if *lv == 1 {
+                        l1n += 1;
+                    } else {
+                        l2n += 1;
+                    }
+                }
                 None => return true, // 底部混表老段：需合并切分
             }
         }
-        l1.values().any(|&c| c >= 2) || l2.values().any(|&c| c >= 2)
+        let l1_gate = if self.l1_trigger_files > 0 {
+            l1n >= self.l1_trigger_files // Ex-8.11：L1 攒批一次下沉（防频繁底层重写）
+        } else {
+            l1.values().any(|&c| c >= 2)
+        };
+        if l1_gate {
+            return true;
+        }
+        if self.l1_trigger_files > 0 && l1n > 0 {
+            return false; // 延迟模式：L1 未达阈值，等批次到齐（不提前收敛 L2）
+        }
+        let l2_gate = if self.l2_trigger_files > 0 {
+            l2n >= self.l2_trigger_files
+        } else {
+            l2.values().any(|&c| c >= 2)
+        };
+        l2_gate
     }
 
     /// 是否需要 Compaction（design 4.5 二期）：
@@ -3322,7 +3374,8 @@ mod tests {
     #[test]
     fn leveled_compact_sinks_l1_to_l2() {
         let dir = tmp();
-        let cfg = small_cfg(256);
+        let mut cfg = small_cfg(256);
+        cfg.storage.l1_trigger_files = 0; // 本测针对 L1→L2 下沉语义（不受 Ex-8.11 默认 8 延迟影响）
         let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
         // 每轮刷 2 个 L0 段并压实 → L0 合并下沉为 1 个 L1 段；4 轮后 L1 累计 4 个文件
         for round in 0..4u64 {

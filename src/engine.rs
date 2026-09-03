@@ -1875,6 +1875,27 @@ impl Engine {
             dropped_keys: 0,
         };
         if max == 0 {
+            // 无 L0 压力（urgency 只计 L0 段数/大小）——但底层仍可能需要合并（L1→L2 /
+            // L2 收敛 / Ex-8.11 L1 攒批下沉）。防空闲饿死：直接压实 needs_compact 的列族
+            // （优先级 primary > delta > cidx），否则空返回。
+            let pn = self.primary.needs_compact();
+            let dn = self.delta.needs_compact();
+            let cn = self.cidx.as_ref().map_or(false, |c| c.needs_compact());
+            if pn || dn || cn {
+                let mut rep = empty;
+                if pn {
+                    let r = self.primary.compact()?;
+                    merge_report(&mut rep, &r);
+                } else if dn {
+                    let r = self.delta.compact()?;
+                    merge_report(&mut rep, &r);
+                } else {
+                    let r = self.cidx.as_ref().unwrap().compact()?;
+                    merge_report(&mut rep, &r);
+                }
+                self.metrics.compact_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(rep);
+            }
             return Ok(empty); // 无压力（调用方应在 needs_compact 下进入）
         }
         let do_p = pu == max;
@@ -2132,6 +2153,22 @@ impl Engine {
             cpu_active_queries: self.watchdog.cpu_active(),
             cpu_query_limit: self.watchdog.cpu().limit(),
         }
+    }
+
+    /// Ex-8.11：累计写入 SST 字节（主数据 + delta + cidx 三列族 flush/compact 新文件字节和）——
+    /// 写放大实验数据源（写放大 ≈ 该值 / 写入数据字节）。
+    pub fn sst_written_bytes(&self) -> u64 {
+        let mut w = self.primary.sst_written_bytes();
+        w += self.delta.sst_written_bytes();
+        if let Some(c) = &self.cidx {
+            w += c.sst_written_bytes();
+        }
+        w
+    }
+
+    /// Ex-8.11：主列族 L0/L1/L2 段数分布（写放大 A/B 观察合并节奏）。
+    pub fn lsm_layer_counts(&self) -> (usize, usize, usize) {
+        self.primary.layer_counts()
     }
 
     /// 备份前一致性准备（development 5.11 冷备份第 1-2 步）：

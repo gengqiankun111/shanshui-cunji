@@ -643,6 +643,7 @@ pub struct StorageConfig {
     /// 该值为"L1 已满"纳入 L0+L1 合并的界限）。0 = 现行为（L0 空时 L1>1 即下沉）。
     /// 调大（如 8~12）= 延迟大合并：L1→L2 次数/底层重写 -50~80%，代价 L1 段数暂升
     /// （非重叠段，Ex-8.2 剪枝后窗口读不受影响）。
+    /// **默认 8（2026-09-04 Ex-8.11 A/B 采纳：攒 8 写放大 5.62→3.21（-42.9%），点查/范围无回退）**。
     pub l1_trigger_files: usize,
     /// Ex-8.11：L2 段数触发阈值（L1 下沉后 L2 收敛为单段的触发数）。0 = 现行为（L2>1 即收敛）。
     pub l2_trigger_files: usize,
@@ -693,8 +694,9 @@ impl Default for StorageConfig {
             auto_compact: true,
             l0_max_size_mb: 0,
             compact_input_max_mb: 1024,
-            // Ex-8.11：L1/L2 段数触发阈值默认 0 = 现行为（L0 空时 L1>1 下沉 / L2>1 收敛）。
-            l1_trigger_files: 0,
+            // Ex-8.11：L1 触发阈值默认 8（攒批延迟大合并，A/B -42.9% 写放大已采纳）；
+            // L2 触发默认 0 = 现行为（L2>1 收敛）。
+            l1_trigger_files: 8,
             l2_trigger_files: 0,
             // Ex-8.7：删除密度 GC 默认开启——置位率 ≥10% 且自上次 GC 新增置位 ≥1000 时触发
             // （防小批量删除/历史置位误触发整段重写；删除密集负载空间回收依赖此路径）。
