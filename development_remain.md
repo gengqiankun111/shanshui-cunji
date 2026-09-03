@@ -171,9 +171,12 @@
 - **Ex-8.7（P3）删除密度 urgency**：
   - [ ] compaction_urgency 增加删除密度维度（位图置位率/段内删除比例加权），删除密集段优先合并释放空间
   - [ ] demo：删除密集 vs 均匀负载下空间回收/读路径段数收敛对照
-- **Ex-8.8（P2）posting LRU 双区热点化 + 参数化**：
-  - [ ] 现有 posting LRU 256 项（c380792）仿 HotCache 双区（普通 + promote 保护区）热点化 + 容量配置化
-  - [ ] demo：热点/冷 term 交替负载命中率与内存预算对照（无需新缓存结构）
+- **Ex-8.8（P2）posting LRU 双区热点化 + 参数化** — ✅ 内核完成（8f70b3e，561 全绿）
+  - [x] 单 LRU(256) → PostingLru 双区（Segmented/2Q：protected 60% + probation 40%，
+    POSTING_CACHE_CAP 总量参数化）：命中提升保护区免被低频突发逐出；新 term 只入普通区（满逐冷）；
+    写路径清空两区语义不变
+  - [x] 单测 posting_lru_dual_zone_protects_hot_terms（热点冷突发存活 + 有界性 + 清空）
+  - [ ] demo（可选）：热点/冷 term 交替负载命中率与内存预算对照；容量接 config 文件（当前 const 参数化）
 - **Ex-8.1 前置正确性修复**（流式 merge 折叠同源同 key + scan 删除位图语义）→ 见 §11 Ex-8.1 前置项，
   随 Ex-8.1 内核实现一起落地（demo range-window 已记录）
 
