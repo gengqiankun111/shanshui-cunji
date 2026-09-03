@@ -568,8 +568,12 @@
 | docid 水位续接 | auto_id 分配器起点 = max_docid+1（首次分配经 `Engine::auto_watermark` 惰性全库 keys-only 恢复，重启续接不撞库）；显式 id 经 put fetch_max 同步抬水位 | ✅ 已完成（623726e：`Engine::auto_watermark` + `auto_alloc_block`；测试 `auto_watermark_resumes_after_reopen` / `auto_insert_resumes_above_explicit_ids`） |
 | 段预分配 | 多行 INSERT 语句级**块分配**：`auto_alloc_block`（fetch_max(水位)+fetch_add(行数)）一次取段、逐行零原子，与显式 id 混插按行序分配 | ✅ 已完成（本提交：insert_response/txn_insert 多行 auto 块预分配；测试 `auto_multirow_block_allocation`（混合行序 + 下语句水位续接 301），lib 612 全绿） |
 | 表内 row_id 分配器 | §26 多表落地时：每表 `(table_id, row_id 水位)` 分配器（持久化水位存哪：系统键/列族）；与显式 id 冲突 1062 保持 | 随 §26 立项 |
-| AUTO_INCREMENT 列属性 | CREATE TABLE `id INT AUTO_INCREMENT` 解析（属性忽略→接受）→ 该表插入无 id 走自动 docid | 随 mysql 兼容增强（可与水位续接并行） |
+| AUTO_INCREMENT 列属性 | CREATE TABLE `id INT AUTO_INCREMENT` 解析（属性忽略→接受）→ 该表插入无 id 走自动 docid | ✅ 已完成（功能已具备：CREATE TABLE 空操作容忍列属性 + 无 id 列 INSERT 已解析为 auto（parse_insert_multi）；补端到端验证 `auto_increment_ddl_and_idless_insert`（列属性建表 + 单/多行无 id 插入 auto 1..4 + 事务内 SUM 验证），lib 613 全绿） |
 | Snowflake（远期备选） | 仅当真分布式多写者无协调分配出现时复评（现有 docid_alloc 已覆盖分片场景） | 远期，不主动排期 |
+
+> 新发现（2026-09-03，待查）：非事务 `SELECT SUM(k) FROM t WHERE id=N` 返回异常
+> （返回 id 而非字段和；事务内 txn_select 同 SQL 正确）——疑似非事务 select_response 标量
+> 聚合 id= 快路径取值问题，与 §27 无关，另行排期定位。
 
 ### 验收口径
 

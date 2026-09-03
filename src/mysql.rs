@@ -3959,6 +3959,64 @@ mod tests {
     }
 
     #[test]
+    fn auto_increment_ddl_and_idless_insert() {
+        // §27：AUTO_INCREMENT 列属性接受（CREATE TABLE 空操作，属性解析容忍）+
+        // 无 id 列 INSERT（id 列省略 → auto 分配连续）端到端
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+        let sum = |c: &mut TestClient, sql: &str| -> String {
+            let r = c.query(sql);
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        // CREATE TABLE 含 AUTO_INCREMENT/PRIMARY KEY 列属性 → 空操作接受（不报错）
+        assert_eq!(
+            c.query("CREATE TABLE t_test(id INT AUTO_INCREMENT PRIMARY KEY, k INT, c CHAR(50))")[0][0],
+            OK_PACKET
+        );
+        // 无 id 列 INSERT（id 省略 → auto 分配）；事务内一致读验证内容（txn_select 聚合路径）
+        assert_eq!(c.query("INSERT INTO t_test(k, c) VALUES(7, 'x')")[0][0], OK_PACKET);
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM t_test WHERE id=1"), "7", "auto id=1 行可见");
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+        assert_eq!(c.query("INSERT INTO t_test(k) VALUES(8)")[0][0], OK_PACKET);
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM t_test WHERE id=2"), "8", "auto id=2 行可见");
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+        // 多行无 id → 语句级块分配 3,4
+        assert_eq!(
+            c.query("INSERT INTO t_test(k) VALUES(9),(10)")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(
+            sum(&mut c, "SELECT SUM(k) FROM t_test WHERE id BETWEEN 3 AND 4"),
+            "19",
+            "多行无 id 连续分配 id=3,4"
+        );
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
     fn drop_table_purges_data_and_restart_empty() {
         // c：DROP/TRUNCATE TABLE 真正清库（内存行 + 磁盘段 + 倒排），重启后目录为空库；
         // 同主键再插不再 1062 —— 对齐 MySQL 整表删除语义（cleanup / 反复 --init 基线可比）
