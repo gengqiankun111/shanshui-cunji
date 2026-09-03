@@ -80,6 +80,8 @@ pub struct ColumnFamily {
     cfg: MemtableConfig,
     compression: Compression,
     compression_level: i32,
+    /// Ex-8.12：L2+ 冷档 zstd 级别（0 = 不分层）；见 `compression_level_for`。
+    compression_level_l2: i32,
     block_size: usize,
     /// 布隆假阳性率（`sstable.bloom_fpr`，分区布隆每块构建用）。
     bloom_fpr: f64,
@@ -302,6 +304,8 @@ impl ColumnFamily {
         ));
         let compression = Compression::from_str(&cfg.sstable.compression)?;
         let compression_level = cfg.sstable.compression_level as i32;
+        // Ex-8.12：L2+ 冷档 zstd 级别（0 = 不分层）
+        let compression_level_l2 = cfg.sstable.compression_level_l2 as i32;
 
         let wal_path = match wal_dir {
             // 独立 WAL 盘按列族分子目录（多列族同名 wal.log 隔离；Ex-5.10 条带化）
@@ -336,6 +340,7 @@ impl ColumnFamily {
             cfg: cfg.memtable.clone(),
             compression,
             compression_level,
+            compression_level_l2,
             block_size: cfg.blockcache.block_size_kb * 1024,
             bloom_fpr: cfg.sstable.bloom_fpr,
             pax_hot_fields: cfg.storage.hot_fields.clone(),
@@ -1620,6 +1625,17 @@ impl ColumnFamily {
         }
     }
 
+    /// Ex-8.12：按输出层选压缩级别——分层启用（`compression_level_l2`>0）时 L2+ 输出用
+    /// 冷档高压缩率（L1→L2 下沉 / L2 内合并 / L2 单段重写），L0/L1 输出用热档（避免
+    /// 中间层放大）；未启用恒热档（现行为）。flush 固定 L0（热档，不走本函数）。
+    fn compression_level_for(&self, out_level: u32) -> i32 {
+        if self.compression_level_l2 > 0 && out_level >= 2 {
+            self.compression_level_l2
+        } else {
+            self.compression_level
+        }
+    }
+
     /// 全量合并压实主体（sel 已由调用方选出）：读全部输入行 → 排序去重 → 位图过滤 → 重写。
     /// O 项第③步：`&self`（输入走快照 Arc，写输出独立文件，提交走 snapshot store）。
     fn compact_merge(
@@ -1653,7 +1669,7 @@ impl ColumnFamily {
             let mut w = SstWriter::new_with_pax(
                 &path,
                 self.compression,
-                self.compression_level,
+                self.compression_level_for(out_level),
                 self.block_size,
                 rows.len(),
                 &self.pax_hot_fields,
@@ -1695,6 +1711,18 @@ impl ColumnFamily {
             return Ok(None); // PAX 列族：块内字段 Zone Map 无法重建，回退全量
         }
         let snap = self.ssts.load();
+        // Ex-8.12：分层启用时**跨档合并禁块级复用**——块级复用原样保留输入块压缩档；
+        // L0/L1 热档段下沉 L2（或 L2 冷档段回升热档层）必须全量重压缩，否则输出层档位
+        // 语义不成立。仅当所有输入段与输出层同档（同为 L2 冷档 / 同为 L0/L1 热档）可复用。
+        if self.compression_level_l2 > 0 {
+            let out_cold = out_level >= 2;
+            for &i in sel {
+                let in_lvl = snap.levels.get(i).copied().unwrap_or(0);
+                if (in_lvl >= 2) != out_cold {
+                    return Ok(None);
+                }
+            }
+        }
         // 读取每段 key 范围 [min, max]（仅解码元数据索引，不碰数据块）
         let mut ranges: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::with_capacity(sel.len());
         for &i in sel {
@@ -3076,6 +3104,60 @@ mod tests {
         let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
         assert_eq!(cf2.ssts.load().levels, vec![2]);
         assert!(cf2.get(300 + 10).unwrap().is_some());
+    }
+
+    #[test]
+    fn tiered_compression_level_for_and_l2_cold_preserves_data() {
+        // Ex-8.12：分层压缩——L2+ 用冷档 zstd level，L0/L1 用热档；跨档合并禁块级复用
+        // （L1 热档段下沉 L2 必须全量重压缩）；收敛后 L2 单段 + 数据完整 + 重启可读
+        let dir = tmp();
+        let mut cfg = Config::default(); // compression=zstd level3
+        cfg.sstable.compression_level_l2 = 19;
+        cfg.blockcache.block_size_kb = 1;
+        cfg.memtable.max_size_mb = 256;
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        // 档位选择逻辑
+        assert_eq!(cf.compression_level_for(0), 3, "L0 输出用热档");
+        assert_eq!(cf.compression_level_for(1), 3, "L1 输出用热档");
+        assert_eq!(cf.compression_level_for(2), 19, "L2 输出用冷档");
+        // 未启用分层 → 恒热档
+        let mut cfg_flat = Config::default();
+        cfg_flat.sstable.compression_level_l2 = 0;
+        let dir2 = tmp();
+        let cf2 = ColumnFamily::open("primary", &dir2, &cfg_flat).unwrap();
+        assert_eq!(cf2.compression_level_for(2), 3, "不分层：L2 也用热档");
+        // 端到端：4 轮 L0→L1 → L1×4 下沉 L2（输入 L1 热档、输出 L2 冷档 → meta_only 门控
+        // 回退全量重压缩，同时覆盖 compact_merge 冷档写路径）
+        for round in 0..4u64 {
+            for _ in 0..2u64 {
+                for i in 0..50u64 {
+                    cf.put(round * 100 + i, format!("v{round}-{i}").into_bytes())
+                        .unwrap();
+                }
+                cf.switch_and_flush().unwrap();
+            }
+            let r = cf.compact().unwrap();
+            assert_eq!(r.out_level, 1, "第 {round} 轮 L0→L1");
+        }
+        assert_eq!(cf.ssts.load().levels.iter().filter(|l| **l == 1).count(), 4);
+        assert!(cf.needs_compact(), "L1 多段应触发 L1→L2");
+        let mut guard = 0;
+        while cf.needs_compact() && guard < 8 {
+            cf.compact().unwrap();
+            guard += 1;
+        }
+        assert!(guard < 8, "冷却后多轮应收敛");
+        assert_eq!(cf.sst_count(), 1);
+        assert_eq!(cf.ssts.load().levels, vec![2], "收敛为单个 L2 冷档段");
+        for round in 0..4u64 {
+            for i in (0..50u64).step_by(9) {
+                assert!(cf.get(round * 100 + i).unwrap().is_some(), "key 丢失");
+            }
+        }
+        drop(cf);
+        let mut cf3 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf3.ssts.load().levels, vec![2]);
+        assert!(cf3.get(300 + 10).unwrap().is_some(), "重启后 L2 冷档段可读");
     }
 
     #[test]
