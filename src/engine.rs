@@ -2140,6 +2140,14 @@ impl Engine {
         }
     }
 
+    /// Ex-8.9：前台写压力代理（与 Ex-7.4 同口径——主 MemTable 水位 0..1）。只读、廉价，
+    /// 供后台维护 worker 负载感知（Busy/Normal/Idle 判定）。
+    pub fn write_pressure(&self) -> f64 {
+        let used = self.primary.memtable_bytes() as f64;
+        let max = self.memtable_max_bytes.max(1) as f64;
+        (used / max).clamp(0.0, 1.0)
+    }
+
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
         // P52：磁盘剩余空间占比（syscall 带缓存，1s 间隔）
@@ -3156,6 +3164,24 @@ mod tests {
         e2.put_nosync(999, b"{}".to_vec(), &["a=1"]).unwrap();
         e2.flush_inverted().unwrap();
         assert!(e2.inverted_written_bytes() > w0);
+    }
+
+    #[test]
+    fn ex89_write_pressure_proxy() {
+        // Ex-8.9：前台写压力代理（主 MemTable 水位）——空库 0，写入上升 >0
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.memtable.max_size_mb = 8; // 大 MemTable：写入不触发自动 flush，水位可控
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(e.write_pressure(), 0.0, "空库无压力");
+        let chunk = vec![b'x'; 512];
+        let mut d = 0u64;
+        for _ in 0..4000u64 {
+            e.put_nosync(d, chunk.clone(), &[]).unwrap();
+            d += 1;
+        }
+        assert!(e.write_pressure() > 0.0, "memtable 超水位 → 压力>0");
+        assert!(e.write_pressure() <= 1.0);
     }
 
     #[test]

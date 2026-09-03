@@ -100,7 +100,7 @@
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| Ex-8.9 空闲感知维护调度（P3） | **设计已出（research/ex8.9-ex8.13-idle-maintenance-io-budget.md）+ 概念 demo 已跑通（src/demo/idle-maintenance：写突发后空闲，A 现行为残留 L0×6/倒排 pending 23.7 万不落段；B 空闲窗口维护队列→L0=0/L1=1 单文件、pending 落段 seg=1，数据一致）**；内核实现切片（io_budget → 维护线程 → 接入四项）待排期 | 设计 ✅ / demo ✅ / 内核待做 |
+| Ex-8.9 空闲感知维护调度（P3） | **设计已出（research/ex8.9-ex8.13-idle-maintenance-io-budget.md）+ 概念 demo 已跑通（src/demo/idle-maintenance）+ 切片 2A 已落地（2026-09-04：方案 A——不改引擎锁模型，server 层 3 个后台 worker（compaction/inverted GC/inverted flush）加负载三档：Busy 退避 1s / Normal 200ms / Idle 50ms 密集 + 5s 集中执行；Engine::write_pressure 主 MemTable 水位代理 + write/read_ops 窗口判档；单测 ex89_write_pressure_proxy）**；待办：交变负载 demo A/B 对照（忙时 p99 无退化、空闲收敛积压）与全量回归 | 设计 ✅ / demo ✅ / 切片2A ✅ / 交变验收待做 |
 | Ex-8.13 倒排后台 IO 预算共享（P3） | **切片 1 已落地（2026-09-04）：倒排 seg 写盘统一记账 inverted_written_bytes（flush_segment 与 gc 段写均累计）+ IO 预算接线（Engine open rate>0 attach；adjust_compaction_io_rate 与列族同口径收窄；GC 段写 account_written_budgeted acquire 节流、前台紧急刷段仅记账不等待）+ 单测 ex813_inverted_write_accounting_and_io_budget（倒排回归 64+13 通过）**；切片 2（维护线程/调度）受 Engine 无内部 RwLock 前置约束（见 research 设计 §4），待排期 | 切片 1 ✅ / 切片 2 待做 |
 | Ex-8.11 A/B 写放大实测（P2 受控实验） | 内核已回填（8ec3a70）；**A/B demo 已建（src/demo/wa-ab，12.8 万 ×512B 关压缩实测：默认收敛 WA 5.62 vs L1 攒 8 WA 3.21，写放大 -42.9%，点查 p50 0.8→1.1µs、范围 p50 2600→2120µs 无回退）→ 采纳默认 l1_trigger_files=8（2026-09-04）**；顺带修复：①Engine compact 无 L0 压力时底部（L1→L2/L2 收敛）合并空转饿死 → 底层 needs 直接压实对应列族；②M3 表切分 bottom 触发忽略 l1_trigger_files → 已尊重攒批配置；③新增 sst_written_bytes 累计写指标 | ✅ 已采纳（50m 复测可选） |
 | Ex-8.12 分层压缩 50m A/B（P2 受控实验） | 内核已回填（b25b86d）；**A/B demo 已建（src/demo/compression-ab，12.8 万 ×低重复 JSON 实测：L2 冷档 zstd19 vs 不分层 空间 -4.7%（未达 -10% 验收线）、范围 p50 330→305µs 无回退）→ 不采纳默认（保持 level_l2=0），50m 真实库复测后重评** | ✅ demo（未采纳，50m 复测可重评） |

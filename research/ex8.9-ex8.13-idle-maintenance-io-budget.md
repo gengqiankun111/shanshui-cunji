@@ -26,10 +26,12 @@
 - 双入口（写路径 auto_compact + 维护线程）同 RwLock 写锁串行即正确；维护每 tick 先读锁快检防轮询开销。
 - 先抽 io_budget 共享模块（SST 与 seg 共用），避免两套限速。
 - 默认关闭（或仅 io_rate_limit_mb>0 启动），验收达标才默认开（P3 惯例）。
-- **切片 2 前置约束（2026-09-04 实测发现）**：Engine 自身**无内部 RwLock**（锁在 gateway/server 层）；
-  后台维护线程直接调 Engine::compact/flush_inverted 与 server 写锁并发不安全 → 切片 2 需先
-  在 Engine 内建共享 RwLock（open 时初始化，写路径/查询经读锁、维护写锁），或维护线程由
-  server 调度层在无写会话窗口触发（二者择一，切片 2 设计时定）。切片 1（io_budget 记账）已落地无此依赖。
+- **切片 2 前置约束（2026-09-04 实测发现）**：Engine 自身**无内部 RwLock**（锁在 gateway/server 层）。
+  **方案决策（用户选 A）**：不改引擎锁模型——server 层**已有** `Arc<RwLock<Engine>>` 与三个后台 worker
+  （compaction/inverted GC/inverted flush，读锁内 clone → drop 锁 → 无锁执行）。切片 2A 已在现有 worker
+  上加**负载感知**（Busy 退避 1s / Normal 200ms / Idle 50ms 密集 + 5s 集中执行；`Engine::write_pressure()`
+  主 MemTable 水位 + `metrics.write_ops/read_ops` 窗口增量判档），Engine 无需内建锁。
+- 切片 1（io_budget 记账）已落地无此依赖。
 
 ## 5. 实现顺序（demo-first）
 0. demo（src/demo/idle-maintenance）：公共 API 模拟"空闲窗口维护队列"（写突发 vs 空闲维护）验证收益 → 边界测试。

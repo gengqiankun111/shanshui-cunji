@@ -439,11 +439,38 @@ impl MySqlServer {
         worker.store(true, Ordering::Release); // 写路径此后只发信号
         std::thread::spawn(move || {
             let mut last_backstop = std::time::Instant::now();
+            let mut last_idle_run = std::time::Instant::now();
+            let mut last_ops = (0u64, 0u64);
+            let mut idle_streak = 0u32;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Ex-8.9 空闲感知：Busy → 退避 1s；Normal → 200ms；Idle → 50ms 密集检查
+                let (busy, idle) = if let Ok(g) = engine.read() {
+                    let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
+                    let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+                    let dw = w.wrapping_sub(last_ops.0);
+                    let dr = r.wrapping_sub(last_ops.1);
+                    last_ops = (w, r);
+                    (
+                        g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
+                        g.write_pressure() == 0.0 && dw == 0 && dr == 0,
+                    )
+                } else {
+                    (true, false)
+                };
+                if idle {
+                    idle_streak += 1;
+                } else {
+                    idle_streak = 0;
+                }
+                let tick_ms = if busy { 1000 } else if idle { 50 } else { 200 };
+                std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
-                if signaled || backstop {
+                // 空闲集中：连续空闲 ≥4 tick（约 ≥200ms 无读写）且距上次集中 ≥5s → 强制执行一轮
+                let idle_run = idle
+                    && idle_streak >= 4
+                    && last_idle_run.elapsed() >= std::time::Duration::from_secs(5);
+                if signaled || backstop || idle_run {
                     // 读锁内 clone 目标（Arc clone 廉价）→ drop 锁 → 无锁合并
                     let targets = engine.read().map(|g| g.compaction_targets()).unwrap_or(None);
                     if let Some(t) = targets {
@@ -451,6 +478,9 @@ impl MySqlServer {
                     }
                     if backstop {
                         last_backstop = std::time::Instant::now();
+                    }
+                    if idle_run {
+                        last_idle_run = std::time::Instant::now();
                     }
                 }
             }
@@ -467,11 +497,37 @@ impl MySqlServer {
         let pending = self.engine.read().unwrap().inverted_gc_pending.clone();
         std::thread::spawn(move || {
             let mut last_backstop = std::time::Instant::now();
+            let mut last_idle_run = std::time::Instant::now();
+            let mut last_ops = (0u64, 0u64);
+            let mut idle_streak = 0u32;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let (busy, idle) = if let Ok(g) = engine.read() {
+                    let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
+                    let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+                    let dw = w.wrapping_sub(last_ops.0);
+                    let dr = r.wrapping_sub(last_ops.1);
+                    last_ops = (w, r);
+                    (
+                        g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
+                        g.write_pressure() == 0.0 && dw == 0 && dr == 0,
+                    )
+                } else {
+                    (true, false)
+                };
+                if idle {
+                    idle_streak += 1;
+                } else {
+                    idle_streak = 0;
+                }
+                let tick_ms = if busy { 1000 } else if idle { 50 } else { 200 };
+                std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
-                if signaled || backstop {
+                // Ex-8.9：空闲集中——连续空闲且距上次集中 ≥5s → 强制检查 GC
+                let idle_run = idle
+                    && idle_streak >= 4
+                    && last_idle_run.elapsed() >= std::time::Duration::from_secs(5);
+                if signaled || backstop || idle_run {
                     // 读锁内 clone inverted Arc（廉价）→ drop 锁 → 无锁 gc
                     let inverted = engine.read().ok().map(|g| g.inverted.clone());
                     if let Some(inv) = inverted {
@@ -481,6 +537,9 @@ impl MySqlServer {
                     }
                     if backstop {
                         last_backstop = std::time::Instant::now();
+                    }
+                    if idle_run {
+                        last_idle_run = std::time::Instant::now();
                     }
                 }
             }
@@ -497,8 +556,24 @@ impl MySqlServer {
         let engine = self.engine.clone();
         std::thread::spawn(move || {
             let mut last = std::time::Instant::now();
+            let mut last_ops = (0u64, 0u64);
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                // Ex-8.9：Busy → 1s（仅硬阈值落盘）；Idle → 50ms tick + 1s 密集落盘
+                let (busy, idle) = if let Ok(g) = engine.read() {
+                    let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
+                    let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+                    let dw = w.wrapping_sub(last_ops.0);
+                    let dr = r.wrapping_sub(last_ops.1);
+                    last_ops = (w, r);
+                    (
+                        g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
+                        g.write_pressure() == 0.0 && dw == 0 && dr == 0,
+                    )
+                } else {
+                    (true, false)
+                };
+                let tick_ms = if busy { 1000 } else if idle { 50 } else { 200 };
+                std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                 let mem = engine
                     .read()
                     .ok()
@@ -507,10 +582,11 @@ impl MySqlServer {
                 if mem == 0 {
                     continue;
                 }
-                // 攒批涨得快 → 达阈值立即落盘；否则 30s 兜底周期落盘
+                // 攒批涨得快 → 达阈值立即落盘；空闲 → 1s 密集落盘；兜底 30s
                 let force = mem >= INVERTED_MEM_FLUSH_THRESHOLD;
-                let interval = last.elapsed() >= std::time::Duration::from_secs(30);
-                if force || interval {
+                let fast = idle && last.elapsed() >= std::time::Duration::from_secs(1);
+                let slow = last.elapsed() >= std::time::Duration::from_secs(30);
+                if force || fast || slow {
                     if let Ok(g) = engine.read() {
                         let _ = g.flush_inverted();
                     }
