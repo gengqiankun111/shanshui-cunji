@@ -1,4 +1,4 @@
-//! MySQL wire protocol 适配（development_process_order H 项）：让 MySQL 客户端 / 生态工具
+﻿//! MySQL wire protocol 适配（development_process_order H 项）：让 MySQL 客户端 / 生态工具
 //! （mysql cli、JDBC、Navicat、sysbench）直接接入本数据库。
 //!
 //! 实现范围（H-1~H-3）：
@@ -2258,50 +2258,75 @@ fn insert_response(
 
 /// UPDATE documents SET field=expr WHERE id=1（非事务：字段级 / 整体替换）。
 fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
-    match parse_update(sql) {
-        Ok((id, field, expr)) => {
-            // 整体替换（field=doc）
-            if field.eq_ignore_ascii_case("doc") {
-                let raw = unquote(&expr);
-                return match put_doc(engine, id, &raw) {
-                    Ok(_) => QueryResponse::Ok(1, 0),
-                    Err(e) => QueryResponse::Err(1064, format!("update error: {e}")),
-                };
-            }
-            // 读当前文档 → 字段级修改 → 覆盖写回
-            let mut doc: serde_json::Value = match engine.get(id) {
-                Ok(Some(v)) => serde_json::from_slice(&v)
-                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                Ok(None) => serde_json::Value::Object(serde_json::Map::new()),
-                Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+    match parse_update_where(sql) {
+        Ok((where_part, field, expr)) => {
+            let ids = match resolve_where_ids(engine, &where_part) {
+                Ok(v) => v,
+                Err(e) => return QueryResponse::Err(1064, format!("update where: {e}")),
             };
-            if !doc.is_object() {
-                doc = serde_json::Value::Object(serde_json::Map::new());
+            if ids.is_empty() {
+                return QueryResponse::Ok(0, 0); // MySQL：无匹配行 → 0 影响
             }
-            let obj = doc.as_object_mut().unwrap();
-            if let Some(inc) = parse_increment_expr(&field, &expr) {
-                let cur = obj.get(&field).and_then(|v| v.as_i64()).unwrap_or(0);
-                obj.insert(field.clone(), serde_json::Value::from(cur + inc));
-            } else {
-                obj.insert(field.clone(), serde_json::Value::String(unquote(&expr)));
+            let mut n = 0u64;
+            for id in ids {
+                // 整体替换（field=doc）
+                if field.eq_ignore_ascii_case("doc") {
+                    let raw = unquote(&expr);
+                    match put_doc(engine, id, &raw) {
+                        Ok(_) => n += 1,
+                        Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                    }
+                    continue;
+                }
+                // 读当前文档 → 字段级修改 → 覆盖写回（缺失 id 视为空文档：与旧单 id 语义一致）
+                let mut doc: serde_json::Value = match engine.get(id) {
+                    Ok(Some(v)) => serde_json::from_slice(&v)
+                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+                    Ok(None) => serde_json::Value::Object(serde_json::Map::new()),
+                    Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                };
+                if !doc.is_object() {
+                    doc = serde_json::Value::Object(serde_json::Map::new());
+                }
+                let obj = doc.as_object_mut().unwrap();
+                if let Some(inc) = parse_increment_expr(&field, &expr) {
+                    let cur = obj.get(&field).and_then(|v| v.as_i64()).unwrap_or(0);
+                    obj.insert(field.clone(), serde_json::Value::from(cur + inc));
+                } else {
+                    obj.insert(field.clone(), serde_json::Value::String(unquote(&expr)));
+                }
+                let new_doc = serde_json::to_string(&doc).unwrap_or_default();
+                match put_doc(engine, id, &new_doc) {
+                    Ok(_) => n += 1,
+                    Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                }
             }
-            let new_doc = serde_json::to_string(&doc).unwrap_or_default();
-            match put_doc(engine, id, &new_doc) {
-                Ok(_) => QueryResponse::Ok(1, 0),
-                Err(e) => QueryResponse::Err(1064, format!("update error: {e}")),
-            }
+            QueryResponse::Ok(n, 0)
         }
         Err(e) => QueryResponse::Err(1064, format!("update syntax: {e}")),
     }
 }
 
-/// DELETE FROM documents WHERE id=1。
+/// DELETE FROM documents WHERE id=1 / id IN (...) / <字段条件>。
 fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
-    match parse_delete(sql) {
-        Ok(id) => match engine.delete(id) {
-            Ok(_) => QueryResponse::Ok(1, 0),
-            Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
-        },
+    match parse_delete_where(sql) {
+        Ok(where_part) => {
+            let ids = match resolve_where_ids(engine, &where_part) {
+                Ok(v) => v,
+                Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+            };
+            if ids.is_empty() {
+                return QueryResponse::Ok(0, 0);
+            }
+            let mut n = 0u64;
+            for id in ids {
+                match engine.delete(id) {
+                    Ok(_) => n += 1,
+                    Err(e) => return QueryResponse::Err(1064, format!("delete error: {e}")),
+                }
+            }
+            QueryResponse::Ok(n, 0)
+        }
         Err(e) => QueryResponse::Err(1064, format!("delete syntax: {e}")),
     }
 }
@@ -2430,6 +2455,8 @@ fn parse_insert_multi(sql: &str) -> Result<Option<Vec<(u64, String)>>> {
 /// 解析 `UPDATE tbl SET field=expr WHERE id=N` → (id, field, expr)。
 /// field 可为任意列；expr 支持 `field+N`（字段自增）、`'string'`（字符串赋值）、
 /// `doc='{json}'`（整体替换，兼容旧语义）。
+/// 解析 `UPDATE documents SET field=expr WHERE id=1` → (id, field, expr)。
+#[cfg(test)]
 fn parse_update(sql: &str) -> Result<(u64, String, String)> {
     let lower = sql.to_lowercase();
     let set_pos = lower.find("set").ok_or_else(|| Error::Cluster("UPDATE 缺 SET".into()))?;
@@ -2460,6 +2487,7 @@ fn parse_increment_expr(field: &str, expr: &str) -> Option<i64> {
 }
 
 /// 解析 `DELETE FROM documents WHERE id=1` → id。
+#[cfg(test)]
 fn parse_delete(sql: &str) -> Result<u64> {
     let lower = sql.to_lowercase();
     let where_pos = lower.find("where").ok_or_else(|| {
@@ -2468,7 +2496,69 @@ fn parse_delete(sql: &str) -> Result<u64> {
     parse_where_id(&sql[where_pos + 5..])
 }
 
+/// 提取 `UPDATE … SET field=expr WHERE <cond>` 的 (WHERE 段, field, expr)。
+fn parse_update_where(sql: &str) -> Result<(String, String, String)> {
+    let lower = sql.to_lowercase();
+    let set_pos = lower.find("set").ok_or_else(|| Error::Cluster("UPDATE 缺 SET".into()))?;
+    let where_pos = lower
+        .find("where")
+        .ok_or_else(|| Error::Cluster("UPDATE 缺 WHERE".into()))?;
+    let set_part = &sql[set_pos + 3..where_pos];
+    let eq = set_part.find('=').ok_or_else(|| Error::Cluster("SET 缺 =".into()))?;
+    let field = set_part[..eq].trim().to_string();
+    let expr = set_part[eq + 1..].trim().to_string();
+    if field.is_empty() || expr.is_empty() {
+        return Err(Error::Cluster("SET 字段/值为空".into()));
+    }
+    Ok((sql[where_pos + 5..].trim().to_string(), field, expr))
+}
+
+/// 提取 `DELETE FROM … WHERE <cond>` 的 WHERE 段。
+fn parse_delete_where(sql: &str) -> Result<String> {
+    let lower = sql.to_lowercase();
+    let where_pos = lower
+        .find("where")
+        .ok_or_else(|| Error::Cluster("DELETE 缺 WHERE".into()))?;
+    Ok(sql[where_pos + 5..].trim().to_string())
+}
+
+/// WHERE 段 → 命中 docid 列表：
+/// - `id = N` → [N]（保持既有单 id 语义，不检查存在性）
+/// - `id IN (a, b)` / `docid IN (...)` → 数值集合
+/// - 其余字段条件（等值 / f IN / BETWEEN …）→ 经 sqlish 查询**已存在**文档的 docid
+///   （无匹配 → 空，UPDATE/DELETE 影响 0 行，对齐 MySQL）。
+fn resolve_where_ids(engine: &mut Engine, where_part: &str) -> Result<Vec<u64>> {
+    let w = where_part.trim().trim_end_matches(';').trim();
+    let lower = w.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("id") {
+        let after = rest.trim_start();
+        if let Some(eq) = after.strip_prefix('=') {
+            let num: String = eq.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num.is_empty() {
+                return Ok(vec![num.parse().map_err(|_| Error::Cluster("id 非法".into()))?]);
+            }
+        }
+    }
+    if lower.starts_with("id in") || lower.starts_with("docid in") {
+        let open = w
+            .find('(')
+            .ok_or_else(|| Error::Cluster("id IN 缺 (".into()))?;
+        let close = w.rfind(')').unwrap_or(w.len());
+        let mut ids = Vec::new();
+        for p in split_values(&w[open + 1..close]) {
+            let t = p.trim().trim_matches(|c| c == '\'' || c == '"');
+            ids.push(t.parse::<u64>().map_err(|_| Error::Cluster("id IN 数值非法".into()))?);
+        }
+        return Ok(ids);
+    }
+    // 其余条件 → sqlish 匹配文档（SELECT 行 = (docid, doc)）
+    let q = format!("SELECT docid FROM t WHERE {w}");
+    let rows = crate::sqlish::execute(engine, &q, 200_000)?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// 解析 `id = 123`（WHERE 子句内）。
+#[cfg(test)]
 fn parse_where_id(where_part: &str) -> Result<u64> {
     let eq = where_part
         .find('=')
@@ -3352,6 +3442,55 @@ mod tests {
         assert_eq!(extract_between_range("SELECT c FROM sbtest WHERE id=42"), None);
         assert_eq!(extract_between_range("SELECT c FROM sbtest WHERE id IN (1,2,3)"), None);
         assert_eq!(extract_between_range("SELECT c FROM sbtest WHERE k BETWEEN 1 AND 5"), None); // k 列非 id
+    }
+
+    #[test]
+    fn update_delete_where_in() {
+        // UPDATE/DELETE … WHERE id IN / <字段条件>（MySQL 命令名一致，逐行执行，返回影响行数）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let put = |e: &mut crate::engine::Engine, id: u64, status: &str| {
+            let doc = format!("{{\"status\":\"{status}\",\"v\":{id}}}");
+            let terms = super::doc_terms(&doc).unwrap();
+            let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(id, doc.as_bytes().to_vec(), &refs).unwrap();
+        };
+        for i in 1..=4u64 {
+            put(&mut e, i, &format!("a{i}"));
+        }
+        // UPDATE … WHERE id IN (…) → 影响 2 行
+        match super::update_response(&mut e, "UPDATE documents SET status='x' WHERE id IN (1, 3)") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 2),
+            super::QueryResponse::Err(_, _) => panic!("update IN 失败"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for id in [1u64, 3] {
+            let d = e.get(id).unwrap().unwrap();
+            assert!(String::from_utf8(d).unwrap().contains("\"status\":\"x\""));
+        }
+        assert!(!String::from_utf8(e.get(2).unwrap().unwrap()).unwrap().contains("\"status\":\"x\""));
+        // DELETE … WHERE <字段条件>（sqlish 解析命中 docid=1,3）→ 影响 2 行
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE status='x'") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 2),
+            super::QueryResponse::Err(_, _) => panic!("delete 字段条件失败"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        assert!(e.get(1).unwrap().is_none());
+        assert!(e.get(3).unwrap().is_none());
+        assert!(e.get(2).unwrap().is_some());
+        // DELETE … WHERE id IN (…) → 影响 2 行；无匹配字段条件 → 0 行
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE id IN (2, 4, 99)") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 3), // 直解语义：同单 id 不检查存在性
+            super::QueryResponse::Err(_, _) => panic!("delete id IN 失败"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE status='gone'") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 0),
+            super::QueryResponse::Err(_, _) => panic!("delete 空匹配失败"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        assert!(e.get(2).unwrap().is_none());
     }
 
     #[test]
