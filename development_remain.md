@@ -161,11 +161,13 @@
     停顿/L0 增长/写吞吐——双缓冲切换已不阻塞写（已有）
   - [ ] 并行 flush（多 immutable 分片写 SST fragment）**仅当**档位实验证实 flush 为瓶颈再实施
     （并行 flush 会推高 L0 数与 compaction 压力，非优先路径）
-- **Ex-8.6（P2）段级 min/max seq 元数据 + 快照读整段跳过**：
-  - [ ] 段元数据加 min_seq/max_seq（manifest/SST footer 版本兼容）；get_at / scan_range_at 剪枝
-    （快照 seq ≤ 段 min_seq → 整段跳过，仅读历史快照时生效）
-  - [ ] demo + 单测（快照读与全读一致；多段混合 seq 正确性；对 RR 长事务读放大收益）
-  - [ ] 与 Ex-8.2 文件范围剪枝互补（key 范围 + seq 范围双维剪枝）
+- **Ex-8.6（P2）段级 min/max seq 元数据 + 快照读整段跳过** — ✅ 完成（29be7b1，560 全绿）
+  - [x] CF `seq_min` 惰性记忆（path → 文件最小行 seq；keys-only 一次性推导 + 缓存）——
+    **无需 manifest/footer 扩展**：重启后首次快照读自动重建（惰性按需）
+  - [x] 剪枝点：get_bytes_at（快照点查/事务点查）+ scan_stream_at（快照范围/事务扫描）——
+    `快照 < 文件最小行 seq` 整段跳过（含 put/Tombstone 掩蔽语义，无假阴性；仅历史快照读生效）
+  - [x] 与 Ex-8.2 文件范围剪枝互补（key 范围 + seq 范围双维剪枝）
+  - [x] 单测 seq_prune_snapshot_reads_stable_across_reopen（旧快照对新文件不可见 + 重开惰性重建一致）
 - **Ex-8.7（P3）删除密度 urgency**：
   - [ ] compaction_urgency 增加删除密度维度（位图置位率/段内删除比例加权），删除密集段优先合并释放空间
   - [ ] demo：删除密集 vs 均匀负载下空间回收/读路径段数收敛对照
