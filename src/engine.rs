@@ -1033,9 +1033,10 @@ impl Engine {
     }
 
     /// 删除文档：失效 HotCache + 清空 Delta（倒排残留 docid 由回表过滤）。
-    /// Ex-5.6：删除位图开启时**仅写 1bit + WAL 删除记录**（不写 memtable Tombstone，
-    /// 不逐条 fsync——墓碑不进入 LSM 层级，-99% IO）；WAL 记录供增量备份导出/崩溃回放
-    /// （回放转本函数重新置位，幂等）。关闭时回退传统 Tombstone 路径。
+    /// Ex-5.6：删除位图开启时写 1bit（O(1) 最新态隐藏 + compaction 物理回收）+ **memtable
+    /// Tombstone（版本化，缺陷 B/C4 修复：复活清位后快照读仍能判定删除区间）** + WAL 删除记录
+    /// （供增量备份/崩溃回放）。墓碑进入版本链，快照读按 seq 过滤（快照点在删除与复活之间
+    /// → 不可见），与 MySQL RR 一致。关闭位图时回退传统 Tombstone 路径。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.hotcache.invalidate(docid);
@@ -1047,7 +1048,7 @@ impl Engine {
                     self.garbage_marked.fetch_add(1, Ordering::Relaxed);
                 }
                 self.primary
-                    .delete_record_wal(encode_docid(docid).to_vec())?;
+                    .delete_record_mem(encode_docid(docid).to_vec())?;
                 self.delta.delete_prefix(&encode_docid(docid))?;
             }
             None => {
@@ -2539,6 +2540,30 @@ mod tests {
         assert_eq!(rows.len(), 600, "快照全量扫描应仅含 6×100 行 pre 数据");
         assert!(!ids.contains(&900400), "heap 分支幻影行 900400 不可见");
         assert!(e.get(900400).unwrap().is_some(), "最新视图应含幻影行（写入在）");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_range_scan_hides_revived_row_c4() {
+        // 缺陷 B（C4 根因）：delete（位图）→ 他事务 put 复活（清位图）后，快照点位于
+        // [删除, 复活) 的主事务范围快照扫不得见复活行（回读到复活前旧版本 = 幻影）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 前轮已提交行 900400（历史版本 v1）
+        e.put(900400, b"v1".to_vec(), &[]).unwrap();
+        // 本轮 case 清理：delete 900400（位图置位 + 版本化 tombstone）
+        e.delete(900400).unwrap();
+        // pre 900401（BEGIN 前 autocommit 提交，快照可见）
+        e.put(900401, b"v0".to_vec(), &[]).unwrap();
+        // main BEGIN：快照点在删除之后、复活之前
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // aux INSERT 复活 900400（put 清位 + 新版本 seq > snapshot）
+        e.put(900400, b"v2".to_vec(), &[]).unwrap();
+        // 范围快照扫：仅 900401（900400 快照点在删除期 → 不可见）
+        let rows = e.scan_range_txn(&mut txn, Some(900400), Some(900402)).unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![900401], "复活行在快照(删除期)不可见");
+        assert!(e.get(900400).unwrap().is_some(), "最新视图应见复活行 v2");
         e.txn_rollback(txn);
     }
 

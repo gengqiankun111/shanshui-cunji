@@ -505,6 +505,23 @@ impl ColumnFamily {
         }
     }
 
+    /// Ex-5.6 位图删除路径的**版本化删除**：WAL 删除记录 + **memtable Tombstone**（不逐条
+    /// fsync，组提交统一提交）——缺陷 B/C4 修复：删除后 put 复活（清位图）时，快照读须按
+    /// 版本判定"快照点位于[删除, 复活) → 不可见"。仅位图即时隐藏会在复活清位后丢失删除
+    /// 信息，快照读回读到复活前旧版本 = 幻影。Tombstone 进版本链后该区间读恒为已删。
+    pub fn delete_record_mem(&self, key: Vec<u8>) -> Result<u64> {
+        let seq = match self.wal_append(OP_DELETE, &key, None) {
+            Ok(s) => s,
+            Err(Error::WalFull(_)) => {
+                self.ensure_wal_room()?;
+                self.wal_append(OP_DELETE, &key, None)?
+            }
+            Err(e) => return Err(e),
+        };
+        self.memtable.delete(key, seq);
+        Ok(seq)
+    }
+
     /// 删除原始字节键。
     pub fn delete_bytes(&self, key: Vec<u8>) -> Result<u64> {
         let seq = match self.wal_append(OP_DELETE, &key, None) {

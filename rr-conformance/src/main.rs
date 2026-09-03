@@ -23,6 +23,7 @@ use rand::SeedableRng;
 mod compare;
 mod init;
 mod ops;
+mod rr_cases;
 mod tx;
 
 use ops::{Table, Op};
@@ -86,6 +87,28 @@ fn main() {
     if (cfg.rows as usize) < cfg.threads * 8 {
         eprintln!("--rows {} 太小：按 worker 键分区需 --rows ≥ 8×threads={}", cfg.rows, cfg.threads * 8);
         std::process::exit(2);
+    }
+
+    // 确定性 RR 语义场景集（--rr-cases）：不跑随机矩阵，跑完即退出。
+    if has(&args, "--rr-cases") {
+        // --rr-case <N>：仅跑单个用例（重建/单跑定位缺陷 B C4 等累积态差异）；
+        // --rr-reinit：每个用例前 DROP TABLE IF EXISTS t_test 后重建（mydb 侧 DROP = 整库 purge）。
+        let only = if has(&args, "--rr-case") {
+            arg(&args, "--rr-case", "0").parse::<usize>().ok()
+        } else {
+            None
+        };
+        let reinit = has(&args, "--rr-reinit");
+        let rc = rr_cases::run_all(
+            &cfg.mysql_url,
+            &cfg.mysql_db,
+            &cfg.my_url,
+            &cfg.my_db,
+            &cfg.out,
+            only,
+            reinit,
+        );
+        std::process::exit(rc);
     }
 
     std::fs::create_dir_all(&cfg.out).expect("创建输出目录");
