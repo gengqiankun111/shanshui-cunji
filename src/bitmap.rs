@@ -19,7 +19,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+
+use arc_swap::ArcSwap;
 
 use crate::error::Result;
 
@@ -29,14 +32,19 @@ pub const PAGE_BYTES: usize = 4096;
 pub const BITS_PER_PAGE: u64 = (PAGE_BYTES * 8) as u64;
 
 /// 删除位图：稠密内存位图 + 4KB 页对齐持久化文件。
-/// P72（无锁合并）：内部 `RwLock`（bits）+ `Mutex`（dirty）——Engine 字段 `Arc<DeletionBitmap>`
-/// 共享（worker 无锁合并克隆 Arc 后读位图过滤；写路径在 Engine 写锁内，锁仅护结构内部一致性）。
+/// Ex-8.14：**读路径无锁化**——位组改 `ArcSwap<Box<[AtomicU8]>>`：`is_deleted` 取快照（ArcSwap
+/// guard，无 RwLock）后单字节原子读，删除/扫描/计数并发互不阻塞（此前逐行 RwLock 读锁在
+/// 50m 行级判定上竞争真实存在）；写路径（mark/clear）短 Mutex 串行（引擎本就单写者，锁仅护
+/// 扩容换代与 in-place 位翻转的自我健全）；扩容（新 docid 越界）时倍增复制后换代。
 #[derive(Debug, Default)]
 pub struct DeletionBitmap {
-    /// 稠密位图：docid 的 bit 位（LSB-first，byte = docid/8，bit = docid%8）。
-    bits: RwLock<Vec<u64>>,
+    /// 稠密位组（**每元素 = 1 文件字节**，值 0..=255；LSB-first，byte=docid/8，bit=docid%8）——
+    /// 读无锁快照载体；元素为 AtomicU8 支持并发原子读。
+    bytes: ArcSwap<Box<[AtomicU8]>>,
     /// 脏页索引（docid/BITS_PER_PAGE）：`flush` 时只写这些页。
     dirty: Mutex<HashSet<u64>>,
+    /// 写者串行锁（mark/clear/扩容换代）——引擎写路径本就单写者；读路径不经过此锁。
+    write: Mutex<()>,
     /// 位图文件路径（`<data_dir>/deletion.bitmap`）。
     path: PathBuf,
 }
@@ -44,20 +52,21 @@ pub struct DeletionBitmap {
 impl DeletionBitmap {
     /// 打开（或创建）删除位图：文件存在则加载已有位数组，否则为空位图。
     pub fn open(path: &Path) -> Result<Self> {
-        let mut bits = Vec::new();
+        let mut bits: Vec<AtomicU8> = Vec::new();
         if path.exists() {
             let mut f = File::open(path)?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
-            // 逐字节展开为 u64 位组（零 unsafe）；文件恒为 4KB 倍数（含尾部对齐页）
+            // 逐字节展开（文件恒为 4KB 倍数，含尾部对齐页）
             bits.reserve(buf.len());
             for byte in buf {
-                bits.push(byte as u64);
+                bits.push(AtomicU8::new(byte));
             }
         }
         Ok(Self {
-            bits: RwLock::new(bits),
+            bytes: ArcSwap::from_pointee(bits.into_boxed_slice()),
             dirty: Mutex::new(HashSet::new()),
+            write: Mutex::new(()),
             path: path.to_path_buf(),
         })
     }
@@ -65,36 +74,28 @@ impl DeletionBitmap {
     /// 删除：置位（O(1) 内存）+ 标记脏页；仅当位确实翻转才写页（重复删除零 IO）。
     pub fn mark_deleted(&self, docid: u64) {
         if !self.is_deleted(docid) {
-            let mut bits = self.bits.write().unwrap();
-            Self::ensure_capacity_bits(&mut bits, docid);
-            let byte = (docid / 8) as usize;
-            let bit = docid % 8;
-            bits[byte] |= 1 << bit;
-            self.dirty.lock().unwrap().insert(docid / BITS_PER_PAGE);
+            self.mutate(docid, true);
         }
     }
 
     /// 复活（put 重新写入）：清位（O(1)）+ 标记脏页；位本就未置时零 IO。
     pub fn clear(&self, docid: u64) {
         if self.is_deleted(docid) {
-            let mut bits = self.bits.write().unwrap();
-            Self::ensure_capacity_bits(&mut bits, docid);
-            let byte = (docid / 8) as usize;
-            let bit = docid % 8;
-            bits[byte] &= !(1 << bit);
-            self.dirty.lock().unwrap().insert(docid / BITS_PER_PAGE);
+            self.mutate(docid, false);
         }
     }
 
-    /// 查询（O(1)）：已删返回 true；越界（从未删除）返回 false。
+    /// 查询（O(1)，**无锁**）：已删返回 true；越界（从未删除）返回 false。
+    /// 每次调用取 ArcSwap 快照（~10ns，无 RwLock/无互斥），与写路径（delete/put 复活/扩容）
+    /// 及并发扫描完全并行。
     pub fn is_deleted(&self, docid: u64) -> bool {
-        let byte = docid / 8;
-        let bits = self.bits.read().unwrap();
-        if byte >= bits.len() as u64 {
+        let bytes = self.bytes.load();
+        let byte = (docid / 8) as usize;
+        if byte >= bytes.len() {
             return false;
         }
         let bit = docid % 8;
-        (bits[byte as usize] >> bit) & 1 == 1
+        (bytes[byte].load(Ordering::Acquire) >> bit) & 1 == 1
     }
 
     /// 主数据键（8 字节大端 docid）的已删判定（compaction 过滤用）。
@@ -107,11 +108,10 @@ impl DeletionBitmap {
 
     /// 当前已删 docid 总数。
     pub fn deleted_count(&self) -> u64 {
-        self.bits
-            .read()
-            .unwrap()
+        self.bytes
+            .load()
             .iter()
-            .map(|w| w.count_ones() as u64)
+            .map(|b| (b.load(Ordering::Acquire) as u64).count_ones() as u64)
             .sum()
     }
 
@@ -133,7 +133,7 @@ impl DeletionBitmap {
             .open(&self.path)?;
         let mut pages = dirty_pages;
         pages.sort_unstable();
-        let bits = self.bits.read().unwrap();
+        let bytes = self.bytes.load();
         for p in pages {
             let start = (p * BITS_PER_PAGE) as usize;
             let mut buf = vec![0u8; PAGE_BYTES];
@@ -141,8 +141,10 @@ impl DeletionBitmap {
                 let global = start + cell * 8;
                 let mut byte = 0u8;
                 for b in 0..8 {
-                    if global + b < bits.len() * 8
-                        && (bits[(global + b) / 8] >> ((global + b) % 8)) & 1 == 1
+                    let g = global + b;
+                    let cell_idx = g / 8; // 元素 = 1 字节（docid/8）
+                    if cell_idx < bytes.len()
+                        && (bytes[cell_idx].load(Ordering::Acquire) >> (g % 8)) & 1 == 1
                     {
                         byte |= 1 << b;
                     }
@@ -158,11 +160,29 @@ impl DeletionBitmap {
         Ok(())
     }
 
-    fn ensure_capacity_bits(bits: &mut Vec<u64>, docid: u64) {
-        let need = (docid / 8) as usize + 1;
-        if bits.len() < need {
-            bits.resize(need, 0);
+    /// 置位/清位公共路径（写者串行 + 必要时扩容换代）。
+    fn mutate(&self, docid: u64, set: bool) {
+        let _g = self.write.lock().unwrap(); // 引擎单写者；锁护扩容换代与位翻转的自健全
+        let byte = (docid / 8) as usize;
+        if byte >= self.bytes.load().len() {
+            let bytes = self.bytes.load();
+            let old = bytes.len();
+            let need = byte + 1;
+            let mut next: Vec<AtomicU8> = Vec::with_capacity(need.max(old.max(1) * 2));
+            for b in bytes.iter() {
+                next.push(AtomicU8::new(b.load(Ordering::Acquire)));
+            }
+            next.resize_with(need.max(old.max(1) * 2), || AtomicU8::new(0));
+            self.bytes.store(std::sync::Arc::new(next.into_boxed_slice()));
         }
+        let bit = docid % 8;
+        let cell = &self.bytes.load()[byte];
+        if set {
+            cell.fetch_or(1 << bit, Ordering::AcqRel);
+        } else {
+            cell.fetch_and(!(1 << bit), Ordering::AcqRel);
+        }
+        self.dirty.lock().unwrap().insert(docid / BITS_PER_PAGE);
     }
 }
 
@@ -219,6 +239,49 @@ mod tests {
         let bm = DeletionBitmap::open(&path).unwrap();
         assert!(bm.is_deleted(42));
         assert!(!bm.is_deleted(43));
+    }
+
+    #[test]
+    fn lock_free_reads_under_writer_growth_and_flips() {
+        // Ex-8.14：读者（is_deleted 无锁）与写者（翻转 + 扩容换代）并发——不崩溃、最终态正确
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let bm = Arc::new(DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let bm = Arc::clone(&bm);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut seen = 0u64;
+                    let mut d = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = bm.is_deleted(d % 300_000);
+                        seen += 1;
+                        d = d.wrapping_add(7);
+                    }
+                    seen
+                })
+            })
+            .collect();
+        for d in (0..300_000u64).step_by(2) {
+            bm.mark_deleted(d); // 含扩容（300k docid → 37.5KB → 倍增多次）
+        }
+        for d in (0..300_000u64).step_by(6) {
+            bm.clear(d); // 复活部分偶数
+        }
+        // 最终态：2|6 → (2|6 mod 6==0 → cleared) evens step6 cleared → 剩 2 的倍数非 6 倍数
+        for d in (0..300_000u64).step_by(6) {
+            assert!(!bm.is_deleted(d), "{d} 应被复活清除");
+        }
+        for d in 0..300_000u64 {
+            let expect = d % 2 == 0 && d % 6 != 0;
+            assert_eq!(bm.is_deleted(d), expect, "docid {d} 最终态不符");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 
     #[test]
