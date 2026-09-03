@@ -513,8 +513,13 @@
 
 ### 排期状态
 
-- **待排**（P？）：方案 A 单机子方案（table_id 高位 + 全局 docid，row_id 分配见 §27）
-  可行性细化 → 产出 key/API/协议改动清单与兼容策略后立项；rr-conformance `--init` 双表即验收。
+- **已立项（2026-09-03，用户确认三里程碑逐步实施）**：
+  - **M1 表路由可用**：表名 → table_id（**确定性 FNV-1a hash & 0xFFFF 派生**，免注册表/免持久化、
+    跨连接与重启稳定；表名 "documents" 特例 = table_id 0 = 既有单表库零迁移）+ SQL 层 id↔docid
+    编解码（docid = table_id<<48 | row_id）+ DROP TABLE 单表区间清（默认表仍 purge_all 兼容 c）；
+    验收 = rr-conformance `--init` 双表种子各自 id=1..2000 共存不撞 + 双表同 id 读写隔离。
+  - **M2 per-table row_id 分配**（§27 表内分配器落地：显式 id 直落 row_id、auto 分配按表区间水位）。
+  - **M3 Flush/Compaction 按表切分**（本小节实施清单 1-3，纯表文件）。
 - 当前不阻塞：`--single` 已绕开对照；RR 收敛目标（C1~C6 全绿）已达成。
 
 ### 实施清单（随立项，用户 2026-09-03 细化：Flush / Compaction 按表切分）

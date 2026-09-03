@@ -2722,6 +2722,85 @@ fn doc_terms(doc: &str) -> Result<Vec<String>> {
     Ok(crate::server::extract_terms(&parsed))
 }
 
+// ============ §26 M1：多表命名空间（docid = table_id<<48 | row_id）============
+
+/// row_id 位宽 48bit：单表 row 容量 2^48，SQL id 显示为 row_id。
+const ROW_ID_MASK: u64 = (1 << 48) - 1;
+
+/// 表名 → table_id：`documents`（默认表 = 既有单表库）= 0，零迁移；
+/// 其余表 = 确定性 FNV-1a 哈希 & 0xFFFF（免注册表/免持久化，跨连接与重启稳定；
+/// 哈希 0 兜底为 1，避免与默认表区间冲突）。碰撞（>~几十张表后概率上升）暂不检测，
+/// 后续可升级持久化映射（§26 注）。
+fn table_id_for(name: &str) -> u16 {
+    let n = name.trim().to_lowercase();
+    if n == DEFAULT_TABLE || n.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in n.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let t = (h & 0xFFFF) as u16;
+    if t == 0 {
+        1
+    } else {
+        t
+    }
+}
+
+/// table_id → docid 区间基址（表数据落在 [base, base + 2^48)）。
+fn table_base(tid: u16) -> u64 {
+    (tid as u64) << 48
+}
+
+/// SQL row_id → 引擎 docid（docid = base | row_id，低 48 位）。
+fn docid_for(tid: u16, row: u64) -> u64 {
+    table_base(tid) | (row & ROW_ID_MASK)
+}
+
+/// 引擎 docid → SQL row_id（输出/显示裁剪）。
+fn row_id_of(docid: u64) -> u64 {
+    docid & ROW_ID_MASK
+}
+
+/// 语句表名提取：INSERT INTO <t> / UPDATE <t> / DELETE FROM <t> / SELECT … FROM <t>；
+/// 容忍 `db.` 前缀与反引号；解析失败回退默认表（现行为）。表名不参与 SQL 语义，
+/// 仅用于 docid 高位路由。
+fn table_name_of(sql: &str) -> String {
+    let lower = sql.trim().to_lowercase();
+    let rest = if lower.starts_with("insert") {
+        lower
+            .find("insert into")
+            .map(|p| &lower[p + "insert into".len()..])
+    } else if lower.starts_with("update") {
+        lower
+            .find("update")
+            .map(|p| &lower[p + "update".len()..])
+    } else if lower.starts_with("delete") {
+        lower
+            .find("delete from")
+            .map(|p| &lower[p + "delete from".len()..])
+    } else if lower.starts_with("select") {
+        lower
+            .find(" from ")
+            .map(|p| &lower[p + " from ".len()..])
+    } else {
+        None
+    };
+    let Some(r) = rest else {
+        return DEFAULT_TABLE.to_string();
+    };
+    let tok = r.trim_start().trim_start_matches('`');
+    let name: String = tok
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '`')
+        .collect();
+    let name = name.trim_matches('`').to_string();
+    // 去 `db.` 前缀取表名末段
+    name.rsplit('.').next().unwrap_or(DEFAULT_TABLE).to_string()
+}
+
 // ============ 简易 SQL 解析（INSERT/UPDATE/DELETE 子集）============
 
 /// 解析 `INSERT INTO [db.]table [(cols)] VALUES (...)` → (id, doc)。
