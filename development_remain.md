@@ -346,7 +346,20 @@
 
 ## 已完成基线（勿重复）
 
-- 排期大项 A~Y 全完成（development_process_order.md 第 2 章）
-- development.md 7.x 至 7.63；problem_solving P1~P72
+- 排期大项 A~Y 全完成（development.md §13 排期队列 第 13.2 表）
+- development.md 7.x 至 7.105；problem_solving P1~P78
 - SAGA 内核+网关+补偿协议+拓扑并行+对账（Ex-2/2.5/13.5/13.6/13.7）
 - 1 亿库读优化（R/M/O）与写路径修复（syscall + 分批 + worker 单轮）
+
+## 22. 排期入口变更（2026-09-03，development_process_order.md 停用删除）
+
+- **原 development_process_order.md（开发排期唯一入口）已删除**，其队列/详情/已完成/环境备忘
+  并入 development.md **§13 开发排期队列与已完成大项**（流程约定 13.1 / 队列 13.2 / 详情 13.3 /
+  已完成 13.4 / 环境备忘 13.5）。开发路线入口自此 = development.md §13 + 本文件（未完成任务明细）。
+- 相关引用已同步改写（design_remain.md / development_remain.md / images 报告中的旧文件名 →
+  development.md §13 排期队列）。
+- 本文件 §19（聚合/COUNT 加速候选）持续跟踪 **AF #6 = Ex-9.3 倒排统计载荷加速 GROUP BY**：
+  现状 `GROUP BY`/聚合已支持（AF #2/#4/#5，development.md 7.102/7.104/7.105），倒排加速 =
+  Ex-9.1b 风格（v4 doc_count 亚毫秒）扩展为 posting 统计载荷（sum/min/max/avg）以支撑
+  `GROUP BY status` 与 `SUM(amount) WHERE status='x'` 聚合秒级；仅对配置声明字段启用
+  （`stats_fields`，对齐 Ex-4 成本控制）。

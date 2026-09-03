@@ -56,6 +56,24 @@ pub enum WhereExpr {
     Or(Box<WhereExpr>, Box<WhereExpr>),
 }
 
+/// HAVING 原子条件（AF#5）：左项可为**聚合列头**（如 `COUNT(*)`/`SUM(amount)`，
+/// 须与 SELECT 聚合列一致）或**分组字段名**；值为数字或字符串字面量。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HavingCond {
+    pub lhs: String,
+    pub op: CmpOp,
+    pub value: String,
+}
+
+/// HAVING 表达式（分组结果上的过滤，支持 AND/OR/NOT/括号组合）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HavingExpr {
+    Cond(HavingCond),
+    Not(Box<HavingExpr>),
+    And(Box<HavingExpr>, Box<HavingExpr>),
+    Or(Box<HavingExpr>, Box<HavingExpr>),
+}
+
 /// 解析结果（SELECT 语句）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Select {
@@ -76,6 +94,8 @@ pub struct Select {
     /// GROUP BY 聚合列（AF#2~#4 支持 COUNT/SUM/AVG/MIN/MAX；每个 `(函数名小写, 参数字段)`，
     /// `COUNT(*)` 字段为 None）。无 GROUP BY 时为空，标量聚合走 `agg`。
     pub group_aggs: Vec<(String, Option<String>)>,
+    /// GROUP BY 后的 HAVING 过滤（AF#5；None = 不过滤）。仅配合 GROUP BY。
+    pub having: Option<HavingExpr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +328,7 @@ impl Parser {
         let mut offset = 0;
         let mut order_by = Vec::new();
         let mut group_by: Vec<String> = Vec::new();
+        let mut having = None;
         loop {
             match self.peek()? {
                 Tok::Kw(k) if k == "WHERE" => {
@@ -338,6 +359,14 @@ impl Parser {
                             }
                         }
                     }
+                }
+                Tok::Ident(k) if k.eq_ignore_ascii_case("having") => {
+                    // AF#5：HAVING <expr>（分组后过滤；左项 = 聚合列头或分组字段）
+                    self.next()?; // 消费 having
+                    if having.is_some() {
+                        return Err("重复 HAVING".into());
+                    }
+                    having = Some(self.parse_having()?);
                 }
                 Tok::Ident(k) if k.eq_ignore_ascii_case("order") => {
                     // ORDER BY f1 [ASC|DESC], f2 [ASC|DESC], ...
@@ -414,6 +443,9 @@ impl Parser {
         } else {
             agg = aggs.into_iter().next();
         }
+        if having.is_some() && group_by.is_empty() {
+            return Err("HAVING 需配合 GROUP BY（本期不支持无分组的 HAVING）".into());
+        }
         Ok(Select {
             columns,
             table,
@@ -424,6 +456,7 @@ impl Parser {
             order_by,
             group_by,
             group_aggs,
+            having,
         })
     }
     fn parse_expr(&mut self) -> PRes<WhereExpr> {
@@ -486,6 +519,78 @@ impl Parser {
         };
         let value = self.value()?;
         Ok(WhereExpr::Cond(Cond { field, op, value }))
+    }
+
+    // ---------- HAVING（AF#5）：分组后过滤（左项 = 聚合列头或分组字段） ----------
+    fn parse_having(&mut self) -> PRes<HavingExpr> {
+        self.parse_having_or()
+    }
+    fn parse_having_or(&mut self) -> PRes<HavingExpr> {
+        let mut left = self.parse_having_and()?;
+        while matches!(self.peek()?, Tok::Kw(k) if k == "OR") {
+            self.next()?;
+            let right = self.parse_having_and()?;
+            left = HavingExpr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+    fn parse_having_and(&mut self) -> PRes<HavingExpr> {
+        let mut left = self.parse_having_unary()?;
+        while matches!(self.peek()?, Tok::Kw(k) if k == "AND") {
+            self.next()?;
+            let right = self.parse_having_unary()?;
+            left = HavingExpr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+    fn parse_having_unary(&mut self) -> PRes<HavingExpr> {
+        if matches!(self.peek()?, Tok::Kw(k) if k == "NOT") {
+            self.next()?;
+            let inner = self.parse_having_unary()?;
+            return Ok(HavingExpr::Not(Box::new(inner)));
+        }
+        if matches!(self.peek()?, Tok::LParen) {
+            self.next()?;
+            let e = self.parse_having()?;
+            if !matches!(self.next()?, Tok::RParen) {
+                return Err("HAVING 期望右括号 )".into());
+            }
+            return Ok(e);
+        }
+        self.parse_having_cond()
+    }
+    fn parse_having_cond(&mut self) -> PRes<HavingExpr> {
+        // 左项：聚合函数 COUNT(f)/SUM(f)/AVG(f)/MIN(f)/MAX(f) 或分组字段名。
+        let i = self.ident()?;
+        let lhs = if matches!(self.peek()?, Tok::LParen) {
+            let upper = i.to_uppercase();
+            if !matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                return Err(format!("HAVING 不支持的函数: {i}"));
+            }
+            self.next()?; // LParen
+            let arg = match self.next()? {
+                Tok::Star => "*".to_string(),
+                Tok::Ident(f) => f,
+                t => return Err(format!("HAVING 聚合参数期望 * 或字段名，实际 {t:?}")),
+            };
+            if !matches!(self.next()?, Tok::RParen) {
+                return Err("HAVING 聚合期望右括号 )".into());
+            }
+            format!("{upper}({arg})")
+        } else {
+            i
+        };
+        let op = match self.next()? {
+            Tok::Eq => CmpOp::Eq,
+            Tok::Ne => CmpOp::Ne,
+            Tok::Gt => CmpOp::Gt,
+            Tok::Lt => CmpOp::Lt,
+            Tok::Ge => CmpOp::Ge,
+            Tok::Le => CmpOp::Le,
+            t => return Err(format!("HAVING 期望比较运算符，实际 {t:?}")),
+        };
+        let value = self.value()?;
+        Ok(HavingExpr::Cond(HavingCond { lhs, op, value }))
     }
 
     fn value(&mut self) -> PRes<String> {
@@ -1701,6 +1806,69 @@ fn agg_cell(name: &str, st: &AggState) -> Option<String> {
     }
 }
 
+/// 聚合列头（`COUNT(*)` / `SUM(amount)` 形态，与 HAVING 左项/结果集列头一致）。
+fn spec_header(name: &str, field: &Option<String>) -> String {
+    let arg = field.as_deref().unwrap_or("*");
+    format!("{}({arg})", name.to_uppercase())
+}
+
+/// HAVING 条件比较：两侧皆可解析为数值 → f64 比较（对齐 MySQL 数值列/COUNT 等），
+/// 否则字节/字典序字符串比较。
+fn cmp_having_cond(op: &CmpOp, lhs: &str, rhs: &str) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let ord = match (lhs.parse::<f64>().ok(), rhs.parse::<f64>().ok()) {
+        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Equal),
+        _ => lhs.cmp(rhs),
+    };
+    match op {
+        CmpOp::Eq => ord == Equal,
+        CmpOp::Ne => ord != Equal,
+        CmpOp::Gt => ord == Greater,
+        CmpOp::Lt => ord == Less,
+        CmpOp::Ge => ord == Greater || ord == Equal,
+        CmpOp::Le => ord == Less || ord == Equal,
+    }
+}
+
+/// HAVING 过滤单个分组：左项先按聚合列头匹配（specs），再按分组字段匹配（keys）；
+/// 值 NULL（组键缺省/空数值聚合）→ 任何比较不成立（对齐 MySQL NULL → 行被过滤）；
+/// 未知左项 → 不命中（保守）。
+fn having_matches(
+    h: &HavingExpr,
+    fields: &[String],
+    keys: &[GroupKey],
+    specs: &[(String, Option<String>)],
+    states: &[AggState],
+) -> bool {
+    match h {
+        HavingExpr::Cond(c) => {
+            let val: Option<String> = match specs
+                .iter()
+                .position(|(n, f)| spec_header(n, f) == c.lhs)
+            {
+                Some(idx) => agg_cell(&specs[idx].0, &states[idx]),
+                None => match fields.iter().position(|f| f == &c.lhs) {
+                    Some(lv) => keys[lv].text(),
+                    None => return false,
+                },
+            };
+            let Some(lhs) = val else {
+                return false;
+            };
+            cmp_having_cond(&c.op, &lhs, &c.value)
+        }
+        HavingExpr::Not(e) => !having_matches(e, fields, keys, specs, states),
+        HavingExpr::And(a, b) => {
+            having_matches(a, fields, keys, specs, states)
+                && having_matches(b, fields, keys, specs, states)
+        }
+        HavingExpr::Or(a, b) => {
+            having_matches(a, fields, keys, specs, states)
+                || having_matches(b, fields, keys, specs, states)
+        }
+    }
+}
+
 /// GROUP BY 执行（AF#2~#4）：`SELECT <cols>, COUNT/SUM/AVG/MIN/MAX ... GROUP BY f1, f2...` →
 /// 全量单遍扫描分组（与无索引聚合同语义，不依赖倒排完整性；WHERE 行级过滤），组键升序
 /// 输出（Null < Num < Str；`ORDER BY` 决定键序——仅限分组字段），LIMIT/OFFSET 对**组行**
@@ -1775,6 +1943,10 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         Ok(true)
     })?;
     let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = groups.into_iter().collect();
+    // HAVING（AF#5）：分组完成后、排序/切片前过滤组行。
+    if let Some(h) = &sel.having {
+        list.retain(|(k, sts)| having_matches(h, &fields, k, &specs, sts));
+    }
     // 组行排序：优先级 = ORDER BY 序列（每项须为分组字段）→ 剩余分组 level 升序补尾。
     // DESC 反转该 level（Null 随之移末，对齐 MySQL DESC）。
     let mut order_seq: Vec<(usize, bool)> = Vec::new();
@@ -1837,10 +2009,7 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         .collect();
     let headers: Vec<String> = specs
         .iter()
-        .map(|(n, f)| {
-            let arg = f.as_deref().unwrap_or("*");
-            format!("{}({arg})", n.to_uppercase())
-        })
+        .map(|(n, f)| spec_header(n, f))
         .collect();
     Ok(Some(GroupResult {
         group_fields: fields,
@@ -2397,6 +2566,79 @@ mod tests {
         // 无聚合列的 GROUP BY → 执行拒绝（须至少一个聚合列）
         let mut e = engine_with_docs();
         assert!(execute_group_by(&mut e, "SELECT city FROM t GROUP BY city", 1000).is_err());
+    }
+
+    // ---------- HAVING（开发顺序 AF#5：分组后过滤） ----------
+
+    #[test]
+    fn group_by_having_on_aggregate() {
+        // fixture：city 34/33/33；SUM(amount) beijing 16830 / shanghai 16170 / shenzhen 16500。
+        let mut e = engine_with_docs();
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT city, COUNT(*), SUM(amount) FROM t GROUP BY city HAVING COUNT(*) > 33",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gr.rows.len(), 1, "仅 beijing（34 > 33）");
+        assert_eq!(gr.rows[0].keys[0].as_deref(), Some("beijing"));
+        assert_eq!(gr.rows[0].cells[0].as_deref(), Some("34"));
+        // 聚合 + 分组字段复合条件（AND）
+        let gr2 = execute_group_by(
+            &mut e,
+            "SELECT city, SUM(amount) FROM t GROUP BY city HAVING SUM(amount) > 16000 AND city != 'beijing'",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        let keys: Vec<&str> = gr2.rows.iter().map(|r| r.keys[0].as_deref().unwrap()).collect();
+        assert_eq!(keys, vec!["shanghai", "shenzhen"], "16170/16500 > 16000 且排除 beijing");
+    }
+
+    #[test]
+    fn group_by_having_or_and_sort_slice_after_filter() {
+        let mut e = engine_with_docs();
+        // OR：beijing（34）∪ shanghai（COUNT>33 OR city 等值）
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT city, COUNT(*) FROM t GROUP BY city HAVING COUNT(*) > 33 OR city = 'shanghai'",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        let keys: Vec<&str> = gr.rows.iter().map(|r| r.keys[0].as_deref().unwrap()).collect();
+        assert_eq!(keys, vec!["beijing", "shanghai"]);
+        // HAVING 过滤后再 LIMIT 切片（先过滤：仅 beijing/shanghai，LIMIT 1 → beijing）
+        let gr2 = execute_group_by(
+            &mut e,
+            "SELECT city, COUNT(*) FROM t GROUP BY city HAVING COUNT(*) > 33 LIMIT 1",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gr2.rows.len(), 1);
+        assert_eq!(gr2.rows[0].keys[0].as_deref(), Some("beijing"));
+        // 空结果：过滤掉全部组 → 空集
+        let gr3 = execute_group_by(
+            &mut e,
+            "SELECT city, COUNT(*) FROM t GROUP BY city HAVING SUM(amount) > 999999",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(gr3.rows.is_empty(), "无组满足 HAVING → 空结果集");
+    }
+
+    #[test]
+    fn having_parse_constraints() {
+        // HAVING 配合 GROUP BY 合法
+        let s = parse_select("SELECT city, COUNT(*) FROM t GROUP BY city HAVING COUNT(*) > 1 AND city='x'")
+            .unwrap();
+        assert!(s.having.is_some(), "HAVING 解析成功");
+        // 无 GROUP BY 的 HAVING → 拒绝（本期不支持）
+        assert!(parse_select("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1").is_err());
+        // 非聚合/非分组列左项在解析期不校验（运行期不命中 → 保守丢弃），已知取舍
     }
 }
 

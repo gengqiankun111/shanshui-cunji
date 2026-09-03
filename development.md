@@ -1805,13 +1805,13 @@ impl RuntimePools {
 - 相关修复：fulltext 词 term 与倒排白名单正交（inverted_allowed 放行 ft:）；sqlish post_filter
   LIMIT 下推（BETWEEN 后过滤免遍历全量命中集）；make_doc 增 ts 秒级时间戳（日期 BETWEEN 基准）。
 - 结论：G 项 + 白名单位图 + LIMIT 下推后查询路径不再是大数据量瓶颈；插入受写放大（磁盘 200MB/s
-  vs 逻辑 9MB/s）与 compaction 限制；1 亿数据基准（B 项）排期见 development_process_order.md。
+  vs 逻辑 9MB/s）与 compaction 限制；1 亿数据基准（B 项）排期见 development.md §13 排期队列。
 
 ---
 
 ### 7.53 LSM 事务三阶段（D/E/F）+ 倒排段数据 mmap 化（G 补充） — ✅ 已完成
 
-> 2026-08-30。development_process_order.md D/E/F/G 全部完成；393 测试全绿（+18）。
+> 2026-08-30。development.md §13 排期队列 D/E/F/G 全部完成；393 测试全绿（+18）。
 
 - **阶段一 WriteBatch 原子写（D）**：`src/txn.rs` 新增 `WriteBatch`（攒批 put/delete，`rollback` = 丢弃
   未应用批次）+ `Engine::write(&WriteBatch)` 原子提交——预校验（`validate`，失败零副作用 = "失败回滚"）
@@ -2852,7 +2852,7 @@ impl RuntimePools {
 5. **回归**：+4 测试（parse 多字段/大小写、数值 DESC、数值 ASC+WHERE+OFFSET、
    字符串 ASC/DESC + 缺省 NULL 稳定序），全量 **574 全绿**。
 6. **后续**：GROUP BY 单字段+COUNT/SUM（AF #2）→ ORDER BY 多字段终验（AF #3）→ …
-   排期见 development_process_order.md AF 行。
+   排期见 development.md §13 排期队列 AF 行。
 
 ### 7.102 sqlish GROUP BY 单字段 + COUNT/SUM（开发顺序 AF #2）— ✅ 已完成
 
@@ -2895,7 +2895,7 @@ impl RuntimePools {
 2. **回归**：+2 测试（`order_by_multi_field_first_key_then_second`、
    `order_by_multi_field_desc_with_where_and_limit`），全量 **584 全绿**。
 3. **后续**：GROUP BY 多字段 + 常用聚合（AF #4）→ HAVING（AF #5）→ 倒排加速
-   GROUP BY（AF #6 / Ex-9.3）；排期见 development_process_order.md AF 行。
+   GROUP BY（AF #6 / Ex-9.3）；排期见 development.md §13 排期队列 AF 行。
 
 ### 7.104 GROUP BY 多字段 + 常用聚合（开发顺序 AF #4）— ✅ 已完成
 
@@ -2919,6 +2919,26 @@ impl RuntimePools {
    未选中列仍区隔行）pymysql 断言通过。
 6. **后续**：GROUP BY + HAVING（AF #5）→ 倒排加速 GROUP BY（AF #6 / Ex-9.3）。
 
+### 7.105 sqlish GROUP BY + HAVING（开发顺序 AF #5）— ✅ 已完成
+
+> 2026-09-03。用户开发顺序 #5（自然延伸）。HAVING 在分组完成后过滤组行（聚合列或分组字段作左项）。
+
+1. **解析**：`Select.having: Option<HavingExpr>`；`HavingExpr{ Cond/Not/And/Or }` +
+   `HavingCond{lhs, op, value}`（AND/OR/NOT/括号递归，镜像 WHERE 优先级）。HAVING 分支在
+   GROUP BY 之后解析；**无 GROUP BY 的 HAVING 拒绝**（本期不支持整表单组形态）。
+2. **左项语义**：聚合列头（`COUNT(*)`/`SUM(amount)` 原样，须与 SELECT 聚合列一致）或分组字段；
+   未知左项运行期保守不命中（解析期不校验）。NULL 值（组键缺省/空数值聚合）任何比较不成立
+   （对齐 MySQL NULL → 行被过滤）。
+3. **比较**：两侧皆可解析为数值 → f64 比较（COUNT/SUM 等）；否则字节/字典序字符串比较。
+4. **执行顺序**：分组 → **HAVING 过滤组行** → ORDER BY（组字段）→ LIMIT/OFFSET 切片；
+   无组满足 → 空结果集。
+5. **回归**：+3 测试（聚合过滤 COUNT/SUM 手算、AND/OR + 分组字段复合、过滤后排序切片与
+   空集、parse 约束无 GROUP BY 拒绝），全量 **589 全绿**；wire 冒烟（HAVING COUNT(*)>1 /
+   AND+分组字段 / 过滤后 ORDER+LIMIT）pymysql 断言通过。
+6. **已知取舍**：组结果 ORDER BY 仍限分组字段（聚合列排序如 `ORDER BY COUNT(*)` 未支持，
+   MySQL 亦常用，留待 AF#6 倒排加速专项一并评估）；HAVING 无 GROUP BY 形态未支持。
+7. **后续**：倒排索引加速 GROUP BY（AF #6 / Ex-9.3）。
+
 ## Ex 系列扩展（归档自 development_extension.md，2026-09-03 合并）
 
 > 2026-09-03 归档合并：development_extension.md（v0.1 分布式事务落地计划 L1~L3 + Ex-4~7
@@ -2939,7 +2959,7 @@ impl RuntimePools {
 | Ex-7 | 多核优化（Ex-7.1~7.4，Shard Everything） | ✅ 已完成 | `c5fa66c`/`b294532`/`fd0b519`/`ddbc20e` | → 7.38~7.41 |
 
 > **Ex-6 状态判定注**：源文档标记 🔄（原依赖"读写分离解除 Engine 全局锁"未满足）。该前置
-> 已由排期**大项 O**（development_process_order.md：读 API `&self` 化 `df16058` → RwLock
+> 已由排期**大项 O**（development.md §13 排期队列：读 API `&self` 化 `df16058` → RwLock
 > 读读并行 `4585bb9` → ssts ArcSwap 后台合并 `e9f7d39`）满足；Ex-6.1 seqlock 原语（`1946161`，
 > 零 unsafe，7.28）与 Ex-6.2/6.3 倒排段清单/FST 字典 ArcSwap 化（`c8183cf`，7.42 /
 > problem_solving P50）均已落地 → 归档时判定 Ex-6 **已完成**；SSD 环境「22 万写 TPS +
@@ -3159,3 +3179,117 @@ ENTRYPOINT ["/shanshui-cunji", "--config", "/config.toml"]
 4. **格式兼容是红线**：SST / WAL / 字段注册表 / 倒排段清单 / 备份包一旦上线，破坏性变更必须有迁移路径；
 5. **写路径是心脏**：WAL 刷盘、双 MemTable 切换、写 Stall 的改动必须过崩溃恢复测试；
 6. **Sidecar 安全性红线**：严禁在 tokio 运行时内直接 `fork()`，必须使用 `std::process::Command` 或预启动独立进程。
+
+---
+
+## 13. 开发排期队列与已完成大项（原 development_process_order.md 并入，2026-09-03）
+
+> **原 development_process_order.md 已停用删除**（2026-09-03 用户指令）。开发路线入口自此 =
+> 本队列表（P0/P1 大项状态以本表为准）+ development_remain.md（未完成任务明细）。
+> 大项完成后回填本表状态并更新 development.md 7.x / feature.md / problem_solving.md。
+
+### 13.1 流程约定
+
+1. 每开发会话/任务第一步：读本队列定位当前 `P0/P1` 大项 → 明确本次开发内容；
+2. 大项粒度 = 可独立交付的功能/性能/质量项；子任务拆分见 development.md 里程碑；
+3. **优先级评估准则**：`影响（业务/性能收益）` × `成本（工作量）` × `依赖（前置阻塞）`，
+   得分为 P0（立即）/ P1（近期）/ P2（中期）/ P3（远期）；
+4. 完成大项 → 回填「已完成」区 + 更新 development.md / feature.md / problem_solving.md。
+
+### 13.2 大项队列（按优先级）
+
+| 编号 | 大项 | 优先级 | 状态 | 排期说明 |
+|---|---|---|---|---|
+| A | 本机 2000 万 / 5000 万性能吞吐基准（demo 13 项放大） | P0 | ✅ 完成 | 2026-08-30，13/13 全绿（images/perf-0.6.0/ 汇总报告）；查询次数：主键/HotCache/分片/删除 100 万、倒排检索 1 千+COUNT 1 万、fulltext 1 千、SQL 1 千+amount/ts BETWEEN 各 100 |
+| B | 本机 1 亿数据性能与吞吐测试 | P0 | ✅ 完成 | 2026-08-31：sysbench 标准 MySQL 语句构建 1 亿行（25.6min，~6.5 万行/s，10.8GB）+ 11 项 oltp 全套 mean/max + P0 优化复测（见 images/perf-0.7.0/sysbench-100m/构建记录.md） |
+| C | 分布式吞吐优化（机制已验证 → 性能） | P1 | ✅ 完成 | ① 网关分片并行 ② RPC 批量写入 ③ 节点组提交；本机两节点 364k w/s + 跨地域 0.5s/21.6k w/s（vs 1074s，~2100×） |
+| D | LSM 事务阶段一：WriteBatch 原子写 | P1 | ✅ 完成 | WriteBatch（攒批 put/delete）+ Engine::write 原子提交（预校验失败零副作用）+ 单次 flush_wal 崩溃原子 |
+| E | 事务阶段二：快照隔离（Snapshot/MVCC） | P2 | ✅ 完成 | Transaction（快照 seq 一致读 + 提交写写冲突检测 TxnConflict abort）；MVCC 已知局限：MemTable 不保留多版本 |
+| F | 事务阶段三：完整 ACID 与隔离级别 | P2 | ✅ 完成 | Isolation（RC/RR/SERIALIZABLE）+ docid 级锁表 + wait-for 图死锁检测（victim abort）+ 失败路径锁释放 |
+| G | 倒排 posting 检索优化 | P2 | ✅ 完成 | c380792 LRU 缓存 + 白名单内存位图；补充：段数据 mmap 化（K 项落地，P23 白名单） |
+| H | MySQL 协议适配（MySQL 生态接入） | P1 | ✅ 完成 | H-1~H-6：握手/认证/SQL 映射/事务/预处理/sysbench 接入；mysql cli 8.0 + pymysql 真实连接全链路通过（详情见原文档归档，7.69~7.70） |
+| I | 高并发查询优化（design 9.5 目标） | P3 | ✅ 完成 | 同步模型（97e3586）+ 异步协程运行时（2802885）；480 全绿；development.md 7.69/7.70 |
+| J | 倒排段 GC 后台化 | P2 | ✅ 完成 | b76dd40（7.73）：后台线程周期触发 + 查询并发安全；485 全绿 |
+| K | fulltext 大 posting 反序列化优化 | P2 | ✅ 完成 | ed2588d（7.74）：posting 分块 + k-way merge 惰性游标；实测近页 x211、COUNT x4491；488 全绿 |
+| L | Compaction 智能调度（合并冷却 + 动态窗口 + 倒排阈值） | P1 | ✅ 完成 | 28eae9d：合并冷却 + 动态窗口（l0_stall_min/max）+ flush_threshold 参数化；demo 13 项统计 |
+| M | 事务类查询优化（范围查询改一次扫描） | P0 | ✅ 完成 | d044b4c：read_only 42→71 TPS（+68%）、read_write 29.5→53 TPS（+80%） |
+| N | 倒排回表批量读（batch_get） | P0 | ✅ 完成 | SST 按块分组批量读 + Delta 单次范围扫描；万级 posting 块级顺序读 |
+| O | 读路径无锁化改造（&self 化 → RwLock → ssts ArcSwap，O/Q 合并） | P1 | ✅ 完成 | df16058 / 4585bb9 / e9f7d39；1 亿库 read_only 42→561 TPS（+13.3×）、read_write 29.5→230（+7.8×）；430 全绿 |
+| P | 事件驱动自动 Compaction（写路径自触发 + 阈值 + 背压） | P0 | ✅ 完成 | 24861c6：写路径 auto_compact + l0_max_size_mb 软阈值 + 保底定时器；422 全绿 |
+| Q | ssts ArcSwap 化（合并不阻塞读） | P1 | ⏳ 并入 O | 已并入 O 项第三阶段，不再独立排期 |
+| R | L0/层全局布隆预过滤 | P1 | ✅ 完成 | 388a916：布隆 OR 数学不可行（P62）→ 落地层/段两级 Zone Map 范围粗筛；431 全绿 |
+| S | MemTable 多版本（严格 MVCC） | P1 | ✅ 完成 | e7a413a：版本链 + SST 多版本 + get_at 快照读；428 全绿 |
+| T | 事务点查快照缓存（get_at per-txn 小缓存） | P2 | ✅ 完成 | 0eca7a5：256 项快照缓存；432 全绿 |
+| U | 4KB 块冷扫预读合并（4×4KB → 1×16KB） | P3 | ✅ 完成 | 85b9a62：read_block_group 组读；437 全绿 |
+| V | io_uring 后端落地 + SQPOLL 预留核 | P2 | ✅ 完成（Linux 部署验证） | f09e9fb：io-uring-file 独立 crate + 三队列池 + affinity；热路径接入留 Linux 验证 |
+| W | Compaction 优先级队列 | P2 | ✅ 完成 | f09e9fb：跨列族紧迫度调度；433 全绿 |
+| X | Metrics（Prometheus 风格 /metrics） | P2 | ✅ 完成 | 0257835：src/metrics.rs 分层埋点；436 全绿 |
+| Y | 分布式延伸 + 写路径收尾（2026-09-01） | 延伸 | ✅ 完成 | SAGA HTTP API + 补偿 + 拓扑并行 + 对账；syscall 风暴修复；465 全绿；7.57~7.61 / P71 |
+| Z | 合并阻塞写根治：无锁合并（2026-09-01） | 延伸 | ✅ 完成 | af24dbd（无锁合并）+ 3d58137（P73 manifest 竞态）+ 5de5ab0；469 全绿；7.65 / P72/P73 |
+| AA | 导出增强：流式管道 + JDBC 直连 | 延伸 | ✅ 完成 | c6b5417：Filter+Projection+Sink 分叉 + MysqlWireClient 批量 INSERT + --rate-limit；476 全绿；7.66 |
+| AB | 导出增强：MySQL 兼容 CSV 配套 + 建表 DDL | 延伸 | ✅ 完成 | 313bd81：--mysql-compatible + LOAD DATA + --dry-run-schema；477 全绿；7.67 |
+| AC | 导出增强：与 Compaction 共享后台 IO 优先级 | 延伸 | ✅ 完成 | 40e8abb：scan_limiter Token Bucket + --io-rate-limit-mb；477 全绿；7.68；导出功能全部完成 |
+| AD | 10 亿库扩展阶段 A~D：全局 docid 分配器 + 分片构建 + 分片化倒排 + raft RPC + 分片级可观测 | P0 | ✅ 完成 | docid_alloc/shard_build/shard_inverted/raft_rpc/shard_metrics；530 全绿；7.81~7.86 |
+| AE | LSM 读路径范围查询优化（Ex-8 系列） | P0 | ✅ 完成 2026-09-03 | Ex-8.1~8.3 + 50m release 复测：id BETWEEN p50 86ms→**2.48ms**、vs MySQL ~102×→**3.6×**；其余项见 development_remain §11/§12/§14~§16/§18/§19 |
+| AF | SQL 能力补全：ORDER BY / GROUP BY 系列 | P0 | 🚧 #1~#5 完成（2026-09-03，#6 待排期） | ① ORDER BY 单字段+LIMIT（da4c08a）→ ② GROUP BY 单字段+COUNT/SUM（9f81ec4）→ ③ ORDER BY 多字段（585cdeb）→ ④ GROUP BY 多字段+常用聚合（eebd10a）→ ⑤ GROUP BY+HAVING（本期 7.105）→ ⑥ 倒排索引加速 GROUP BY（Ex-9.3，待推进） |
+
+### 13.3 大项详情（AF 详细 + 评审对照/缺陷路线保留；其余大项单行详情见 13.2 表与 development.md 7.x）
+
+#### AF. SQL 能力补全：ORDER BY / GROUP BY 系列（P0，🚧 #1~#5 已完成 2026-09-03）
+
+- **背景**：sqlish 类 SQL 子集缺 ORDER BY / GROUP BY / JOIN / 子查询（宽表真机对比中作为
+  能力差距记录）；用户给定 6 项开发顺序（按价值/成本，见队列 AF 行）。
+- **#1 ORDER BY 单字段 + LIMIT（✅ da4c08a）**：`Select.order_by` + Parser 分支 + execute
+  排序路径（SORT_MAX_ROWS=20 万上限；排序键 Null<Num<Str 对齐 MySQL）+ OFFSET/LIMIT 切片；
+  P78 根因修复（sort_key 未 v.get(field)）；+4 测试，574 全绿；
+- **#2 GROUP BY 单字段 + COUNT/SUM（✅ 9f81ec4）**：`Select.group_by/group_aggs` +
+  `execute_group_by` 全量单遍扫描分组（WHERE light 过滤 + 看门狗熔断，O(组数) 内存）；
+  COUNT(*)/COUNT(f)/SUM(f)；mysql.rs 分组路由与列型推断；+7 测试，581 全绿；
+- **#3 ORDER BY 多字段终验（✅ 585cdeb）**：多键 comparator 语义收尾（并列次键打破/WHERE+
+  双 DESC/排序后 OFFSET）；+2 测试，584 全绿；
+- **#4 GROUP BY 多字段 + 常用聚合（✅ eebd10a）**：`group_by` 多字段 Vec + AVG/MIN/MAX；
+  复合组键 Vec<GroupKey> + 每组每聚合列独立 AggState（消除多聚合串扰隐患）；结果集分组列 =
+  选中普通列（未选中分组字段仍参与分组，对齐 MySQL）；+2 测试，586 全绿；
+- **#5 GROUP BY + HAVING（✅ 本期 7.105）**：HavingExpr 递归解析（AND/OR/NOT/括号，左项 =
+  聚合列头或分组字段，无 GROUP BY 拒绝）；分组 → HAVING 过滤组行 → ORDER BY → LIMIT 切片；
+  数值两可 f64 否则字典序；NULL 值过滤不命中；+3 测试，589 全绿；wire 冒烟断言通过；
+- **待推进 #6**：倒排索引加速 GROUP BY（Ex-9.3，development_remain §19 跟踪）。
+
+#### 架构评审 6 点对照（2026-08-31）
+| 评审点 | 现状 | 结论 |
+|---|---|---|
+| ① L0 自动触发 Compaction | 写路径零触发（仅 CLI 显式） | ✅ 已修（P 项 24861c6） |
+| ② L0 层全局布隆预过滤 | 点查逐 SST 布隆 | ✅ 已修（R 项 388a916：层/段 Zone Map 粗筛，布隆 OR 不可行 P62） |
+| ③ 倒排并发读锁 | 读路径 ArcSwap 无锁快照（Ex-6.2/6.3） | ✅ 已实现（引擎全局 Mutex 归 O 项） |
+| ④ 环形 WAL 回绕 vs 崩溃恢复 | Flush 后 set_flushed_seq；未刷盘 → WalFull 强制 Flush | ✅ 已实现 |
+| ⑤ 4KB 块 IO 放大 | 块缓存 LRU + zstd + 分区布隆 | ✅ 已修（U 项 85b9a62 组读） |
+| ⑥ io_uring SQPOLL 与绑核冲突 | io_uring 后端落地（7.71） | ✅ 已解决（io_uring_enabled 默认关） |
+
+#### 缺陷 → 优化方案路线（与 feature.md「架构评审与补充」对齐）
+| 缺陷（按严重度） | 性质 | 方案要点 | 排期项 |
+|---|---|---|---|
+| 引擎全局单 Mutex 串行 + Compaction 同步阻塞 | 性能 | 读路径无锁化合并（&self → RwLock → ArcSwap） | O（P1）✅ |
+| L0/L1 层无全局布隆 | 性能 | 层/段 Zone Map 范围粗筛（布隆 OR 不可行） | R（P1）✅ |
+| RR 事务点查冷读 | 性能 | 事务内 256 项快照缓存 | T（P2）✅ |
+| io_uring 后端未落地 | 平台 | liburing 封装 + io_uring_enabled + SQPOLL 预留核 | V（P2）✅（默认关） |
+| Compaction 优先级队列缺失 | 调度 | 跨列族紧迫度调度 | W（P2）✅ |
+| Metrics 缺失 | 运维 | /metrics + 分层埋点 | X（P2）✅ |
+| 4KB 块冷扫 IO 放大 | 性能 | 组读预读 | U（P3）✅ |
+
+> 依赖链：O 第①步（读 API &self 化）是 O 第②③步与 R 共同前置；建议顺序 O → R → T/W/X → V → U（均已落地）。
+
+### 13.4 已完成大项（最近）
+
+- S/P/N/M ✅（e7a413a / 24861c6 / d044b4c）→ O ✅（df16058/4585bb9/e9f7d39）→ R ✅（388a916）
+- H 项 MySQL 协议适配 ✅（H-1~H-6）→ D/E/F LSM 事务三阶段 ✅ → G 项倒排 posting 优化 ✅
+- A/C 大数据量基准与分布式吞吐 ✅ → put_batch ✅（6197c21）→ 阿里云强一致/服务器 YCSB ✅
+- Ex-1~4 分布式事务与倒排策略 ✅（7348acd/990bf6b/653fdc8/04aae97）→ 本机 NVMe SSD 基准 ✅（7.50）
+- AD/AE/AF(#1~#5) ✅（2026-09-03，见队列表）
+
+### 13.5 环境备忘
+
+- 本机 Rust 工具链：`D:\cargo-home\bin` + `D:\rustup-home`（RUSTUP_HOME/CARGO_HOME）；
+- release 构建：`cargo build --release --target-dir D:\shanshui-cunji-target --bin shanshui-cunji`；
+- 大数据量测试临时目录：`SHANSHUI_CUNJI_TMP=D:\shanshui-cunji-tmp`（C 盘空间不足）；
+- 服务器（阿里云 106.14.68.116，凭据不入库）：/root/scc-new + vendored offline 构建，CARGO_BUILD_JOBS=1；
+- 测试辅助脚本：`function_test/`（gitignore 排除：run_demo.ps1 / run_bigdata_bench.ps1 / screenshot_sections.py）。

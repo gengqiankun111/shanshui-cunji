@@ -380,7 +380,7 @@ Ex-8.14 deletion bitmap 读无锁化（P2）；写路径多写者维持远期（
 ## 19. design-10b-extension.md 归档汇总（归档自 design-10b-extension.md，2026-09-03 合并）
 
 > 2026-09-03 归档：10 亿库扩展方案（2026-09-02 规划）为**纯设计蓝图且已实现**——阶段 A~D
-> 机制全部落地（development.md 7.81~7.98 / development_process_order.md 大项 AD ✅），本表
+> 机制全部落地（development.md 7.81~7.98 / development.md §13 排期队列 大项 AD ✅），本表
 > 记录每阶段去向（阶段 → 模块 → 状态/commit），**不复制整章正文**；剩余 ⏳ 均为硬件/部署级
 > 验收（详见源文档 §9 验收标准与 §10"未实现"表）。
 
@@ -395,7 +395,7 @@ Ex-8.14 deletion bitmap 读无锁化（P2）；写路径多写者维持远期（
 | ⏳ 验收-1~4 | 10 分片×1 亿构建 / 亿级 posting 规模回归 / 点查≥10 万 QPS·写入≥20 万 rows/s 真机 / 真实 TCP 扩容·故障切换联调 | ⏳ 硬件/部署 | 源 §9 + §10"未实现"表；development_remain.md §10 同步跟踪 |
 | 远期 | Roaring64（docid 20 亿+）/ 存算分离彻底化 / Calvin gseq raft 联动 | 🔍 远期 | 触发条件见源 §10 与 design_remain §6 |
 
-> 关联：development_process_order.md 大项 AD（530 全绿）；development_remain.md §10
+> 关联：development.md §13 排期队列 大项 AD（530 全绿）；development_remain.md §10
 > （10 亿库扩展 A~D 完成明细）；development.md 7.81~7.98（逐阶段落地记录）。
 
 ## 设计决策边界（已定，不重复评估）
