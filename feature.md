@@ -93,7 +93,7 @@
 | Redis 冷热分层 SDK 门面（读回填 + 双删协调） | ✅ | P3-6 `4f693bd` |
 | 小表广播 JOIN（阈值判定 + 全量索引 / 回退点查） | ✅ | P3-5 `31fc054` |
 
-## G. 分布式 / 网关（阶段 2）
+## G. 分布式 / 网关 — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -109,9 +109,10 @@
 | 真机两节点分布式强一致测试（本机 NVMe + 阿里云 2核/1.6GB/高效云盘，SSH 隧道跨机） | ✅ | 7.51（`src/bin/cluster_demo.rs`：--node 分片节点 + --gateway 网关；4 线程 2000 条跨机并发写 → 逐条点查全部可见 + 广播精确命中，52.4s） |
 | 本地消息表 + 幂等消费（Outbox，Ex-1） | ✅ | `7348acd`（列族 outbox：业务写+待办同一本地事务、投递器、按 (docid,seq) 幂等 apply、排空校验；异步索引补偿/扩容衔接基础） |
 | SAGA 编排 + 补偿状态机 + 网关 HTTP API（Ex-2 + Ex-2.5） | ✅ | `990bf6b`（src/saga.rs SagaCoordinator：SagaStep trait + 状态机 + 屏障防空回滚/悬挂 + JSON 持久化续跑 + 补偿幂等）+ `781199e`（Ex-2.5 `src/server.rs` `/saga/start` `/saga/status` `/saga/compensate` + `HttpStep` HTTP 业务步骤 + `http_post` 客户端，协调器目录 `{data_dir}/saga` 崩溃恢复） |
-| Calvin 确定性事务评估（Ex-3，L3） | 🔍 | demo `src/demo/calvin`：确定性序零锁等待/无协调往返/吞吐与跨分区比例无关；**评估结论不进入 kernel**（单 docid 路由天然不分片 + L1/L2 已覆盖，远期触发再落地） |
-| 读写分离（Mutex/RwLock/COW 快照读） | ⏸ | M8-P1 `be09a07` demo 结论暂缓（组提交已解决读被写拖垮） |
-| 高并发查询优化（design 9.5 目标） | ⏳ | M6 后留待 |
+| 高并发查询优化（design 9.5 目标：同步预处理读锁 + 小栈 + 异步协程运行时） | ✅ | `97e3586` + `2802885`（连接 idle 不占线程，500 连接仅 15 线程；10k 连接吞吐达成需目标硬件基准复测） |
+
+> 附：Ex-3 Calvin 确定性事务评估（结论：**不进入 kernel**）→ 见 [feature_givenup.md](feature_givenup.md)；
+> 读写分离（⏸ 暂缓，O 项已落地等价能力；复制型阶段再启）→ 见 feature_remain.md。
 
 ## H. 运维 / 质量 / 性能工具 — ✅ 已完成
 
@@ -124,15 +125,16 @@
 | 质量文档体系（quality_system / problem_solving P1~P59） | ✅ | 持续维护 |
 | 三规模性能实测（1000万/2000万/5000万 + 截屏存档） | ✅ | v0.1.0~v0.5.0 发布系列 |
 
-## I. 前沿探索（frontier）
+## I. 前沿探索（frontier）— ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
 | 前沿调研（BVLSM/RusKey/DobLIX/TieredKV/AuraDB） | ✅ | M7-3 `d918c47` + frontier-research-2026-08.md |
 | 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） | ✅ | M8-P12（ring+gc 68,756 ops/s，2.3×） |
-| 读写分离 / 双写加速 | 🔍 评估完成（维持暂缓） | M8-P1 `be09a07` + `src/demo/rw-separation`（读 P95 3µs→2µs 1.5×、写吞吐不增——写瓶颈 fsync 非锁；组提交已解决读被写拖垮）；**O 项第①②步已落地等价能力**：读路径全量 &self 化（`df16058`）+ 引擎级 RwLock 读读并行（`4585bb9`，读语句读锁并行、写语句写锁互斥），1 亿库 read_only 42→561 TPS；**HotCache 内部锁粒度化**（`9071984`，整包 Mutex → 内部 RwLock + DashMap 无锁计数，点查热路径读读并行：demo A/B 4 读线程纯读 x4.16、混合负载 x5.42，482 全绿）；剩余：写路径（txn_commit/compaction）仍串行；复制型 read_from_replica 属分布式阶段 |
 | 倒排并发读（ArcSwap 段清单 + FST 字典指针无锁读） | ✅ | Ex-6（Ex-6.1 原语 `1946161`；Ex-6.2/6.3 ArcSwap 段清单 + FST 字典快照化 `c8183cf`——search/iter 读路径 `segments.load()`/`dicts.load()` 无锁快照，flush/gc rcu 原子发布；剩余引擎级全局 Mutex 见 O 项并发模型） |
-| 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
+
+> 附（评估结论已归档）：倒排 posting 压缩（维持 Roaring，不引入新编码）→ [feature_givenup.md](feature_givenup.md)；
+> 读写分离/双写加速（🔍 评估完成，维持暂缓；O 项第①②步 + HotCache 内部锁粒度已落地等价能力）→ feature_remain.md。
 
 ## J. SSD 原生优化（v0.7 起，Ex-5，放弃 HDD 兼容） — ✅ 已完成
 
@@ -203,9 +205,10 @@
   delta 2×（绝对差 ~0.5MB/500K docid），但 Roaring AND 查询快 20.1×（337us vs 6.7ms）且库成熟
   → **维持 Roaring，不引入新编码**
 
-## 下一候选
+## 候选/归档去向
 
-- 类 SQL 解析 / 写入 Enrich / 读写分离（⏸）
+- 未完成、待开发、待评估项 → [feature_remain.md](feature_remain.md)
+- 明确不开发/评估结论不集成项 → [feature_givenup.md](feature_givenup.md)
 
 ---
 
@@ -280,3 +283,34 @@
 - **O 项第②步 RwLock 读读并行**（4585bb9）：1 亿库 read_only **42→561 TPS（+13.3×）**、read_write **29.5→230 TPS（+7.8×）**、事务平均延迟 -87%（突破 ~1000 stmt/s 串行天花板）；剩余写侧串行 + max 尾延迟留 O 项第③步（ssts ArcSwap 后台合并）。
 - S 项严格 MVCC：RR 快照读在 MemTable 未刷盘时读到快照点旧版本（修复前读到新版本 → 余额/库存类业务
   逻辑错误风险）；SST 多版本落盘 + 版本感知读，428 测试全绿无性能回退。
+
+---
+
+## 近期归档（2026-09-03，自 feature_remain 回填，依据提交记录核对）
+
+> 以下为 feature_remain 中**已完成（✅ + commit）**项，依 2026-09-03 文档治理规则回填主档；
+> 详细排期过程与上下文见 development_remain.md 对应节。
+
+| 功能 | 模块 | 状态/提交 |
+|---|---|---|
+| 范围查询优化（Ex-8.1：流式 merge 折叠 + 删除位图过滤 + 非事务 id BETWEEN 流式化） | 读路径 | ✅ `e63603a`（Ex-8.1 单独验收 86→3.1ms；Ex-8.1~8.3 全系列复测 **2.48ms / vs MySQL 3.6×**，与 development.md §13 AE 一致） |
+| 范围查询优化（Ex-8.2 scan 层/文件剪枝；Ex-8.3 扫描块缓存 + keys-only 投影） | 读路径 | ✅ `49469f6`（8.2）+ `0d8fdcf`/`bbb1c7a`（8.3 Part A/B） |
+| 删除语义对齐（scan 位图，Ex-8.1 同批） | 删除 | ✅ `e63603a` |
+| 段级 min seq 快照剪枝（Ex-8.6） | 快照读 | ✅ `29be7b1`（整段跳过 + 记忆/重启重建） |
+| 事务扫描位图过滤（Ex-8.10） | 事务/删除 | ✅ `e1ae41b` |
+| 删除位图读无锁化（Ex-8.14） | 读路径 | ✅ `2c623d9`（ArcSwap 快照 + 原子字节读） |
+| posting LRU 双区热点化（Ex-8.8） | 倒排/缓存 | ✅ `8f70b3e`（protected+probation 双区） |
+| 删除密度 urgency（Ex-8.7） | Compaction | ✅ `a6d53c3`（urgency 加权删除密集段优先） |
+| L1/L2 延迟大合并（Ex-8.11，独立段数/大小阈值） | Compaction | ✅ `8ec3a70` |
+| 分层压缩（Ex-8.12，L2+ zstd 冷档） | 存储/压缩 | ✅ `b25b86d`（compression_level_l2） |
+| Flush 频率档位 A/B（Ex-8.5，256/512MB） | 写路径 | ✅ 实测完成：档位无收益，**维持默认**（结论 → feature_givenup） |
+| 高并发查询优化（design 9.5 目标） | I（P3） | ✅ `97e3586` + `2802885`（见 G 模块行） |
+| io_uring Linux 部署实测（V 项） | io_queue | ✅ 7.71（热路径 SQPOLL 接入 + 阿里云 Debian 实测） |
+| MySQL 收敛缺口 a（INSERT 主键重复→1062） | 事务/MySQL | ✅ `a5b4171` |
+| MySQL 收敛缺口 b（事务内 SELECT 非主键列谓词） | 事务/MySQL | ✅ `f78290b` |
+| MySQL 收敛缺口 c（DROP/TRUNCATE 真正清库） | DDL | ✅ `10c946c` |
+| SQL DML 增强（缺口 d：UPDATE/DELETE WHERE id IN 等，批处理形态） | MySQL | ✅ `3d4ac30`（非事务）+ `0675cd3`（事务内） |
+| RR 缺陷 A（事务内 FOR UPDATE 当前读） | 事务 | ✅ `4818ecb`（C1/C3 PASS） |
+| RR 缺陷 B（BETWEEN 范围一致读幻读） | 事务/位图 | ✅ `56417e4`（根因：位图删除非版本化 + 复活清位；C4 PASS） |
+| 倒排后台 IO 预算共享（Ex-8.13） | 倒排/后台 IO | ✅ `9350f44`（seg 写盘统一记账 `inverted_written_bytes` + 预算接线：Engine open rate>0 attach / `adjust_compaction_io_rate` 与列族同口径收窄 / GC 段写 budgeted 节流、前台紧急刷段仅记账不受限）；调度侧并入 Ex-8.9 方案 A |
+| 空闲感知维护调度（Ex-8.9，P3） | 后台维护 | ✅ `990229a` + `0f4a6f7`（方案 A：server 层 3 个后台 worker（compaction/inverted GC/inverted flush）负载感知三档 Busy 1s / Normal 200ms / Idle 50ms + ≥5s idle_run 集中执行；`Engine::write_pressure` 水位 + write/read_ops 窗口判档；aware 开关 B=旧固定节奏。交变负载 A/B 验收 3/3：倒排 mem 240k→0、无信号 L0 5.2s 收敛、GC 段 12→1，前台 busy 持平；627/628 回归） |

@@ -39,3 +39,40 @@
 2. 维护线程骨架（stop/join、三档判定、优先级队列）→ 单测：Busy 暂停 / Idle 追赶 / 不重复。
 3. 接入 L1 沉底、倒排 pending 刷段、inverted_gc、删除 GC → 每项单测 + 交变负载 demo A/B。
 4. 默认策略决策 + development_remain 回填 + 全量回归。
+
+---
+
+## 6. 落地与验收记录（2026-09-04）
+
+> 本节为"实现后"记录：§3 的维护调度器最终按 **方案 A** 落地（见 §4 决策），
+> §5 步骤 2~4 的"独立维护线程骨架"被方案 A 的**既有 worker 负载感知**替代。
+
+**Ex-8.13 切片 1（`9350f44`）**
+- 倒排 seg 写盘统一记账：`Engine::inverted_written_bytes()`（flush_segment 与 gc 段写均累计）；
+- IO 预算接线：Engine open `io_rate_limit_mb>0` 时 attach；`adjust_compaction_io_rate` 与列族同口径
+  收窄（`inverted.set_io_rate_bytes(rate)`）；GC 段写走 `account_written_budgeted` acquire 节流，
+  前台紧急刷段仅记账不等待（保留现语义）；
+- 单测：`ex813_inverted_write_accounting_and_io_budget`（记账正确 / 预算开启语义不变 / 单调累计）。
+
+**Ex-8.9 切片 2A（`990229a` + `0f4a6f7`）**
+- 不改引擎锁模型；server 层 3 个后台 worker（compaction / inverted GC / inverted flush）加负载感知：
+  `Engine::write_pressure()`（主 MemTable 水位）+ `metrics.write_ops/read_ops` 窗口增量判档；
+  三档 tick：**Busy → 1s 退避（低优维护暂停） / Normal → 200ms / Idle → 50ms 密集**；
+  **Idle 集中（idle_run）**：连续空闲 ≥4 tick 且距上次 ≥5s → 强制执行一轮（compaction targets.run /
+  gc should_gc 检查 / 1s 密集倒排落盘）；
+- `DbServer::set_idle_aware(bool)`：关 = 旧固定节奏（compaction/gc 100ms、flush 200ms + 30s 兜底），
+  供 A/B 对照；
+- 模块更名（同批次 `65ba3ed`）：`src/mysql.rs` → `src/db_adapter.rs`、`MySqlServer` → `DbServer`，
+  对外 MySQL 协议语义与 `shanshui_mysql_*` 指标名保留。
+
+**交变负载 A/B 验收 3/3（`--ignored`，24.75s）**
+| 场景 | B 旧固定节奏 | A 空闲感知 | 判据 |
+|---|---|---|---|
+| 倒排落盘（突发×3 + 2.5s 空闲窗交替） | mem 逐窗累积 80k→160k→240k | 每窗归零，终态 0 | A 积压不跨窗累积 ✅ |
+| compaction idle_run（无信号 L0 积压） | 6s 后积压滞留 | 5.2s idle_run 收敛 | A 空闲强制收敛 ✅ |
+| 倒排 GC idle_run（12 段无信号） | 段数滞留 12 | 12 → 1 | A 空闲回收段 ✅ |
+| 前台 busy 耗时 | ~4.0s/轮 | ~4.0s/轮 | A/B 持平，无前台退化 ✅ |
+
+全量回归 627/628（唯一失败 `seqlock` 低频写重试率统计 flaky：1.256% vs <1% 阈值，单独复跑 0.10s
+通过，属满载时序抖动，与改动无关）。验收结论：**空闲感知维护达标，默认开启（`idle_aware=true`）**；
+独立"预算开关 A/B"未做（可选项，`io_rate_limit_mb>0` 才启用）。
