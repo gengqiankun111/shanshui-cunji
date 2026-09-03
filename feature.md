@@ -6,7 +6,7 @@
 
 ---
 
-## A. 存储内核（WAL / MemTable / SSTable / Compaction）
+## A. 存储内核（WAL / MemTable / SSTable / Compaction） — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -23,14 +23,14 @@
 | IO 速率调度器（Token Bucket 限速） | ✅ | P3-2 `4884a58` |
 | **scan 范围扫描流式化**（k-way merge，内存 O(page) 不随总量膨胀） | ✅ | M8-P10（`scan_stream` + 分页接入） |
 
-## B. 写入路径 / 提交模型
+## B. 写入路径 / 提交模型 — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
 | Group Commit 组提交（提交器模式，写路径零 fsync） | ✅ | M8-P0 `648d9bd`（A 写重 45×：91,296 ops/s） |
 | 批量导入模式（HotCache 跳过回填，防内存崩溃） | ✅ | M8-P6 `bde422d`（50M 导入 WS 4.9GB→0.6GB） |
 
-## C. 倒排索引 / 全文检索
+## C. 倒排索引 / 全文检索 — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -48,7 +48,7 @@
 | 倒排字段策略落地（Ex-4：9.4 模板重建 db-50m，inverted 2231.8→144.3MB -93.5%） | ✅ | `db-50m-opt`（配置模板 `config.import-example.toml`） |
 | 倒排 posting 流式输出（大结果集已由分页解决） | ✅ 评估完成 | demo `src/demo/posting-stream`：位图惰性迭代 + 分页内存 O(limit) 已流式；深页 O(offset)（16M offset 591ms vs 近页 36µs，16,204×）；游标续扫 O(limit)/页（10 万条 37×）；**不引入全量流端点**，深页高频翻页如需再加 search_after 游标 |
 
-## D. 查询执行 / 缓存 / MVCC
+## D. 查询执行 / 缓存 / MVCC — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -71,7 +71,7 @@
 | 组合索引列族（`encode_composite_key` 前缀编码 + 前缀范围扫描回表；cidx 独立列族刷盘/合并） | ✅ | M5 起（`Engine::query_by_composite_prefix` + `/query?composite=`） |
 | MySQL 协议适配（HandshakeV10 + native_password 认证 + SHOW/SELECT/INSERT/UPDATE/DELETE + COM_STMT_PREPARE/EXECUTE + sysbench 接入 + `SET TRANSACTION ISOLATION LEVEL` 四级别解析） | ✅ | H 项 `4249869`/`99ee10e`（mysql cli 8.0 + pymysql 真实连接全链路；写冲突映射 1213） |
 
-## E. 数据管道 / 迁移 / 导入导出
+## E. 数据管道 / 迁移 / 导入导出 — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -83,7 +83,7 @@
 | mysqldump 导入（MySQL 迁移） | ✅ | M1（migrate 工具） |
 | 导出增强（design 20.5 全功能） | ✅ | Parquet `70c3b30`、增量 `2174531`、流式管道/JDBC `c6b5417`、MySQL 兼容/DDL `313bd81`、后台 IO 优先级 `40e8abb`（CSV/Parquet/JDBC/增量/Filter/Projection/LOAD DATA/ClickHouse DDL/限速全落地） |
 
-## F. 备份 / 一致性 / 外部缓存
+## F. 备份 / 一致性 / 外部缓存 — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -113,7 +113,7 @@
 | 读写分离（Mutex/RwLock/COW 快照读） | ⏸ | M8-P1 `be09a07` demo 结论暂缓（组提交已解决读被写拖垮） |
 | 高并发查询优化（design 9.5 目标） | ⏳ | M6 后留待 |
 
-## H. 运维 / 质量 / 性能工具
+## H. 运维 / 质量 / 性能工具 — ✅ 已完成
 
 | 任务 | 状态 | 里程碑 / 提交 |
 |---|---|---|
@@ -134,7 +134,7 @@
 | 倒排并发读（ArcSwap 段清单 + FST 字典指针无锁读） | ✅ | Ex-6（Ex-6.1 原语 `1946161`；Ex-6.2/6.3 ArcSwap 段清单 + FST 字典快照化 `c8183cf`——search/iter 读路径 `segments.load()`/`dicts.load()` 无锁快照，flush/gc rcu 原子发布；剩余引擎级全局 Mutex 见 O 项并发模型） |
 | 倒排 posting 压缩（Roaring 已用，Gorilla/变长探索） | ✅ | 探索验证：Roaring 已达理论下限（密集 0.13B/docid=1bit，稀疏 2B/docid 为 delta 2×，但 Roaring AND 快 20×）——维持 Roaring 不引入新编码 |
 
-## J. SSD 原生优化（v0.7 起，Ex-5，放弃 HDD 兼容）
+## J. SSD 原生优化（v0.7 起，Ex-5，放弃 HDD 兼容） — ✅ 已完成
 
 > 定位（design 1.2/4.8）：只支持 NVMe/SATA SSD；目标「写入快 + 20 倒排字段」写入 TPS 40 万+。
 > ⚠️ **开发环境用机械硬盘性能大幅下降、勿压测**（design 1.2 警告）。
@@ -152,7 +152,7 @@
 | 冷热感知 Compaction + Bloom Merge（写入量 -30%） | P2 | ✅ Ex-5.9 `ba709e2`（SST 读热度统计 + L0 超阈值热段优先合并下沉 L1 + sst_heat 监控；Bloom Merge 由 Ex-5.8 无重叠检测承担） |
 | 多 SSD 条带化（WAL 独占最快盘，多盘 +3~4×） | P2 | ✅ Ex-5.10 `e6a5610`（[storage] wal_dir/sst_dir/inverted_dir 三盘路由：WAL 独占最快盘 + SSTable 数据盘 + 倒排独立盘；未配置回退单盘） |
 
-## K. 多核优化（v0.5，Ex-7，Shard Everything）
+## K. 多核优化（v0.5，Ex-7，Shard Everything） — ✅ 已完成
 
 > 设计（design_extension v0.5 第 12 章）：锁竞争（已落地）→ 缓存伪共享 → 绑核 → io_uring 多队列 → compaction 动态限流。
 > ⚠️ 性能验证须在 SSD 环境（HDD 不压测）。

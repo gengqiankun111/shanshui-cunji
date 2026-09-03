@@ -301,11 +301,15 @@
     无重叠即精确；覆盖写入高频场景走 `doc_count`（精确去重）
   - [x] 单测 ×2（fast==exact 跨段 + 重叠上界文档化）；存量升级路径 = 倒排 GC 把全段合并为单 v4 段后
     COUNT 自动转亚毫秒（混合 v3 存量现回退 42.5s，见 Ex-9.1 实测）
-- **Ex-9.2（P2）持久 visible_count（无条件 COUNT(*) 快路径）**：先设计评审再定档——
-  精确档：put 覆盖判定不重计 + delete 减 + 计数随 flush/删除位图 checkpoint 持久、WAL 回放序一致幂等
-  （回放 = 原始提交一一对应，计数天然一致）→ 复杂度中高；
-  近似档：docid 由 auto 单调无洞分配且 delete 仅对已存在行（业务前提）→ visible ≈ max_docid − 位图净置位
-  （Engine 已有两原子），前提不满足（回灌/有洞/删不存在 id）即错——仅作讨论，倾向精确档
+- **Ex-9.2（P2→评估）持久 visible_count（无条件 COUNT(*) 快路径）— ✅ 评估：不立项（单集合口径受限，2026-09-03）**
+  - [x] 调研方案 C（exist 位图 1bit/docid + visible 原子 + 随 flush_wal 8B checkpoint；put 覆盖不重计/
+    复活补计/回放按规则重放幂等）技术上可行
+  - [x] **否决理由**：单集合无分表（表=别名，orders/users 共享 documents）——全集合可见总数对业务
+    COUNT 无意义（`COUNT(*) FROM orders` 会含 users，50m final"发现 3"口径问题；规模测试 4 亿
+    COUNT=359M<400M 即口径混乱体现）——快计数只是把歧义口径变快，不解决歧义
+  - [x] 价值仅在"单集合=单业务表"部署形态成立（配置/部署语义，非计数器可解）
+  - 触发项：引入表/集合隔离（数据模型级）后的**分域计数**再评估；当前无条件 COUNT 维持 key-only 全扫，
+    条件/字段 COUNT 走 Ex-9.1b v4 doc_count（亚毫秒）
 - **Ex-9.3（P3）倒排统计载荷（sum/min/max/avg）**：TermMeta/段格式扩展（写路径随 term 维护载荷 + 段格式
   版本 + GC/合并保持）→ 支撑 `SUM(amount) WHERE status='x'` 级聚合秒级；与 Ex-9.1 共用路由；
   仅对配置声明字段启用（`stats_fields`，防多数字字段全开失控——对齐 Ex-4 成本控制准则）

@@ -851,7 +851,7 @@ impl RuntimePools {
 6. **收尾**：✅ 性能回归快检（2026-08-28，1000万 10/10，插入 38.6 万条/s 无回归，`images/perf-0.4.0/`）；
    M6 全部 5 项功能完成、测试 279 全绿；打 v0.4.0 标签待确认（版本号 + RELEASE 说明 + 分支同步）。
 
-### 7.6 M7 深度优化二阶段（design 4.7/5.2.4/22）
+### 7.6 M7 深度优化二阶段（design 4.7/5.2.4/22） — ✅ 已完成
 
 1. ~~**MVCC 全局 seq 一致性（design 4.7 完善）**~~ ✅（2026-08-28）：`Engine` 增加**全局 seq 分配器**
    （`Arc<AtomicU64>`，primary / delta 列族共享）——`ColumnFamily::set_external_seq` 接入后所有写入
@@ -878,7 +878,7 @@ impl RuntimePools {
 4. ~~**收尾**~~ ✅（2026-08-29）：文档（development 7.6）+ demo 1000万 快检 10/10 + 打 **v0.5.0** 标签
    （RELEASE 说明/摘要/README/quality_system 对齐 285 测试）+ feature/master/release 分支同步。
 
-### 7.7 M8-P0 Group Commit 组提交（design 4.3，YCSB 实证瓶颈修复）
+### 7.7 M8-P0 Group Commit 组提交（design 4.3，YCSB 实证瓶颈修复） — ✅ 已完成
 
 > 前置：M7-3 YCSB 压测实证「fsync 单条串行」为写路径头号瓶颈（A 写重 2,077 vs 无 fsync 113,587 ops/s，55×）；
 > 方案调研见 `group-commit-design.md`（业界：InnoDB 三段组提交 / PG commit_delay / RocksDB leader-follower /
@@ -925,7 +925,7 @@ impl RuntimePools {
    默认推荐 append + 组提交（性能最优）；后续可优化点：环形头部 tail 不必每次 fsync
    （scan_ring 容忍 tail 略旧，不会读到垃圾——列入候选优化）。
 
-### 7.10 5000 万条 Parquet 数据集 + 数据库导入（数据资产，保留不删）
+### 7.10 5000 万条 Parquet 数据集 + 数据库导入（数据资产，保留不删） — ✅ 已完成
 
 1. ~~**数据集生成器（shanshui-cunji-gen-dataset）**~~ ✅（2026-08-29）：分块流式生成 Parquet
    （arrow 59 + parquet 59，Snappy 压缩），**5000 万条 × 20 字段**（9 数值型：Int64×7/Int32×2/Float64×1 +
@@ -961,7 +961,7 @@ impl RuntimePools {
    倒排字典从 ~1 亿单 posting term 降为 8 个枚举字段；重导到 `D:\shanshui-data\db-50m-clean`
    （旧半成品 db-50m 19GB 保留未删——含 big_text 膨胀索引，弃用）。
 
-### 7.12 M8-P5 WAL 截断（append 模式 flush 后回收，防无限增长）
+### 7.12 M8-P5 WAL 截断（append 模式 flush 后回收，防无限增长） — ✅ 已完成
 
 > 背景：5000 万导入发现 `wal.log` 无限增长（6.5GB）——每 100 万行 fsync 大文件极慢、导入卡顿；
 > 磁盘写入翻倍（WAL + SST 双写）。append 模式 WAL 在 SST flush 后不回收。
@@ -1023,7 +1023,7 @@ impl RuntimePools {
 4. **已知限制**：连续中文串 = 单 token（需 jieba/ngram 完整中文分词，留后续）；大结果集
    （数百万行）查询无 limit/分页，server 端全量构造 JSON 会内存爆炸（见 7.15 观察）。
 
-### 7.15 P41 HotCache 内存缺陷修复（stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴）
+### 7.15 P41 HotCache 内存缺陷修复（stats 泄漏 / used_bytes 虚增 / LFU O(N) 风暴） — ✅ 已完成
 
 > 背景：7.14 验证时 `word=rec`（命中 5M 行）把 server 卡死——暴露 HotCache 既有缺陷。
 
@@ -1040,7 +1040,7 @@ impl RuntimePools {
 4. **观察（非本项）**：大结果集查询（数百万行）server 端全量 JSON 构造仍会内存爆炸
    （`word=tag42` 命中全部 5M 行 → 10GB+）——API 无 limit/分页，后续加 `limit`/游标分页。
 
-### 7.16 M8-P8 大结果集查询分页（limit/offset/total，防全量回表内存爆炸）
+### 7.16 M8-P8 大结果集查询分页（limit/offset/total，防全量回表内存爆炸） — ✅ 已完成
 
 > 背景（7.15 观察）：倒排命中数百万行时（`word=rec` 命中 5M）server 端全量回表 +
 > 全量 JSON 构造内存爆炸（实测 10GB+ 卡死）。方案：倒排路径分页——RoaringBitmap 迭代
@@ -1060,7 +1060,7 @@ impl RuntimePools {
    total=1,666,667（精确）；**server WS 221MB**（修复前 10GB+ 卡死）；
     测试 307 全绿（+3：engine 分页语义与边界 / execute_filter_paged / parse_paging）。
 
-### 7.17 M8-P9 中文 bigram 分词（fulltext 中文可检索）
+### 7.17 M8-P9 中文 bigram 分词（fulltext 中文可检索） — ✅ 已完成
 
 > 背景（7.14 已知限制）：`tokenize` 把连续中文字符当单 token（`is_alphanumeric` 全 true）→
 > 中文文本整串进倒排，长中文文本无法检索。方案对比（demo 研究）：
@@ -1103,7 +1103,7 @@ impl RuntimePools {
 4. **已知限制**：全库 scan 的 `total` 计数需扫完全部（无 limit 提前终止的 total 语义），
    后续可加「仅需前 N 条」的无 total 模式 / 游标续扫。
 
-### 7.19 M8-P11 scan 游标续扫（after + 提前终止，全库遍历每页 O(limit)）
+### 7.19 M8-P11 scan 游标续扫（after + 提前终止，全库遍历每页 O(limit)） — ✅ 已完成
 
 > 背景（7.18 已知限制）：`/range` 的 `total` 计数需全扫（50M 库 ~70s）；offset 翻页每页
 > 累积跳过。方案：**游标续扫**——每页只扫「after 之后」部分（start=after+1 定位 + Zone Map
@@ -1122,7 +1122,7 @@ impl RuntimePools {
    深页 `after=49999990&limit=10` **164ms**（docid 49999991-49999999 共 9 条）、server WS
    696MB；测试 311 全绿（+1：scan_after 遍历一致性/边界/提前终止/上界）。
 
-### 7.20 M8-P12 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交）
+### 7.20 M8-P12 环形 WAL 头部 tail 合并 fsync（sync 单次原子提交） — ✅ 已完成
 
 > 背景（M8-P1 候选优化）：`RingWal::sync` 两阶段——写记录区 `sync_all` + 写头部 tail
 > `sync_all`（每次提交 2 次 fsync），ring+gc 2ms 仅 30,270 ops/s vs append+gc 91,296。
@@ -1139,7 +1139,7 @@ impl RuntimePools {
    ring 4MB+gc 55,570 → +24%）；wal 模块 20 测试全绿（含环形崩溃恢复/回绕/混沌）；
    测试 311 全绿（无新增单测——合并 fsync 由既有崩溃恢复测试覆盖，demo 4 测试验证语义）。
 
-### 7.21 M8-P13 jieba 完整中文词典分词（`[inverted] cjk_segmenter`）
+### 7.21 M8-P13 jieba 完整中文词典分词（`[inverted] cjk_segmenter`） — ✅ 已完成
 
 > 背景（7.17 已知限制）：bigram（M8-P9）对中文是**字符碎片**索引——"数据库" → ["数据","据库"]，
 > 查询需两个 bigram AND 交集；jieba 词典分词输出**语义词**（"数据库" → ["数据库"]），单词精确
@@ -1183,7 +1183,7 @@ impl RuntimePools {
    FST 集成；③ Roaring 库成熟（迭代/交集/并集/差集完备）。后续若出现超高频 posting 段内存
    瓶颈，可再评估 Roaring 64 位 + 密度感知（rle 容器）。
 
-### 7.23 SSD 原生存储优化定位（v0.7 起：放弃 HDD 兼容）
+### 7.23 SSD 原生存储优化定位（v0.7 起：放弃 HDD 兼容） — ✅ 已完成
 
 > 背景（2026-08-29 决策）：shanshui-cunji 定位为 **NVMe/SATA SSD Only**，不再兼容机械硬盘。
 > 目标场景「写入快 + 20 倒排字段」（1.5 亿文档、20 倒排字段、写入 TPS 最高优先级）——
@@ -1204,7 +1204,7 @@ impl RuntimePools {
    313 测试对齐 + 四分支同步 + 发布前 bug 清理：WAL `truncate(false)` 表意/删死代码 rows_payload/
    修未用变量）；测试 313 全绿。
 
-### 7.24 Ex-5.1 SSTable 4KB 块（SSD 原生，design 4.8）
+### 7.24 Ex-5.1 SSTable 4KB 块（SSD 原生，design 4.8） — ✅ 已完成
 
 > 背景：SSD-only 定位下，块大小从 16KB（对齐 HDD 扇区/寻道）改为 4KB（对齐 SSD 页）——
 > 点查读放大 16×→4×；两级索引（design 4.4.2 已有）需防"块变小 → 索引条目 ×4 → 内存膨胀"。
@@ -1220,7 +1220,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` 313 全绿；demo 6 测试全绿（见 1）；提交 `056b21d`。
    ⚠️ 性能收益需在 **SSD 环境**实测（HDD 开发环境不压测，design 1.2 警告）。
 
-### 7.25 Ex-5.2 倒排分片锁（design 4.8.3 P0-4）
+### 7.25 Ex-5.2 倒排分片锁（design 4.8.3 P0-4） — ✅ 已完成
 
 > 背景：低基数字段（status='active'）高并发写入时同一 Term 锁竞争——倒排 Term 字典按 Hash
 > 分 256 锁分区（同 Term 串行、不同 Term 并行）；位图索引（M7-2 白名单）全局单 Mutex 同改。
@@ -1236,7 +1236,7 @@ impl RuntimePools {
    按片填充；测试 313 全绿。
 3. ~~**验证**~~ ✅：`cargo test` 313 全绿；demo 3 测试全绿（见 1）；提交 `c7ebe72`。
 
-### 7.26 Ex-5.3 倒排更新批处理（design 4.8.3 P0-3）
+### 7.26 Ex-5.3 倒排更新批处理（design 4.8.3 P0-3） — ✅ 已完成
 
 > 背景：写入快 + 20 倒排字段场景，倒排更新占写入 CPU 60%+（每 docid 每字段一次 DashMap
 > entry hash + 锁 + Vec push）。批处理 = 同 Term 多 DocId 内存聚合，批量追加——减少锁操作次数。
@@ -1275,7 +1275,7 @@ impl RuntimePools {
    I 模块 ⏸）——全局锁下写与读仍串行，Seqlock 无收益；原语（Ex-6.1）可独立先行（不与全局锁
    冲突，~100 行 + 单元测试）。代码落地待读写分离评估后再启。
 
-### 7.28 Ex-6.1 Seqlock 原语（design_extension v0.4 第 11.3）
+### 7.28 Ex-6.1 Seqlock 原语（design_extension v0.4 第 11.3） — ✅ 已完成
 
 > 背景：倒排段清单/FST 字典指针需要"读不阻塞写、写不阻塞读"的无锁读。项目
 > `#![forbid(unsafe_code)]` 红线排除标准 UnsafeCell 实现 → 采用**零 unsafe 方案**：
@@ -1291,7 +1291,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **318 全绿**（+4 seqlock）；demo 4 测试全绿（见 1）；
    提交 `1946161`。倒排段清单/FST 字典接入（Ex-6.2/6.3）待读写分离解除 Engine 全局锁。
 
-### 7.29 多核优化设计（Shard Everything，design_extension v0.5）
+### 7.29 多核优化设计（Shard Everything，design_extension v0.5） — ✅ 已完成
 
 > 背景（2026-08-29 决策）：多核 CPU 下可处理点集中在锁竞争、缓存局部性、IO 并行三层。
 > 核心不是"让所有核干活"，而是**数据分片（Shard Everything）**——按核分计数器、
@@ -1310,7 +1310,7 @@ impl RuntimePools {
    （已有）；Ex-7.3 依赖 io_uring 阶段 3；Ex-7.4 依赖 Ex-5.4 compaction 调优。
    性能验证须在 **SSD 环境**（HDD 不压测，design 1.2 警告）。
 
-### 7.30 musl 目标验证锁定（mimalloc 编译时绑定确认）
+### 7.30 musl 目标验证锁定（mimalloc 编译时绑定确认） — ✅ 已完成
 
 > 背景（2026-08-29 确认锁定，非重测）：验证「编译时绑定 mimalloc」在 musl 目标下功能正常——
 > 服务器部署目标（x86_64-unknown-linux-musl 静态链接）的构建与测试全链路确认。
@@ -1332,7 +1332,7 @@ impl RuntimePools {
    读写分离收益定位：**读延迟改善，写吞吐不增**（写瓶颈磁盘 fsync）——整合决策待定
     （feature.md I 模块 ⏸，Ex-6.2/6.3 前置）。
 
-### 7.31 Ex-5.4 Compaction 参数调优（design 4.8.3 P0-4）
+### 7.31 Ex-5.4 Compaction 参数调优（design 4.8.3 P0-4） — ✅ 已完成
 
 > 背景：SSD-only 下 Compaction 从"避免空间放大"转向"允许空间放大换取写放大降低"——
 > L0→L1 触发放宽、层级跨度大、并行压实（SSD 并发 IO）。**P0 四项至此全部完成。**
@@ -1348,7 +1348,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **318 全绿**（l0 断言 8→12 更新）；demo 2 测试全绿（见 1）；
    提交 `624ce9e`。⚠️ 性能收益（写放大/压实时长）需在 **SSD 环境**实测（HDD 不压测）。
 
-### 7.32 Ex-5.5 环形大文件 WAL 规模化（design 4.8.3 P1）
+### 7.32 Ex-5.5 环形大文件 WAL 规模化（design 4.8.3 P1） — ✅ 已完成
 
 > 背景：SSD-only 下 WAL 向"大文件环形 + 环形指针"演进（省文件切换、磨损均衡）。
 > RingWal 核心（预分配单文件 + 环形指针 + tail 合并 fsync + 覆盖安全）v0.6 已就绪，
@@ -1364,7 +1364,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **319 全绿**（+1 wal 规模化回归）；demo 4 测试全绿（见 1）；
    提交 `4974ef3`。⚠️ WAL P99 收益需在 **SSD 环境**实测（HDD 不压测）。
 
-### 7.33 Ex-5.6 删除位图（design 4.6 / 4.8.3 P1 阶段二）
+### 7.33 Ex-5.6 删除位图（design 4.6 / 4.8.3 P1 阶段二） — ✅ 已完成
 
 > 背景：删除语义 MVP 走 Tombstone 写主数据——每次 delete 触发 WAL append + **逐条 fsync**
 > （`delete_bytes` 内 `sync_wal`）+ memtable 墓碑 + 后续各层级传播，删除 IO 重且墓碑污染 LSM。
@@ -1396,7 +1396,7 @@ impl RuntimePools {
    同样隐藏 / 关闭=保留 Tombstone MVCC）；demo 6 测试全绿（见 1）；clippy 新代码零警告；
    提交 `e615071`。⚠️ 删除 IO 收益需在 **SSD 环境**实测（HDD 不压测）。
 
-### 7.34 Ex-5.7 倒排 FST + Mmap 字典（design 5.2.4.1 / 4.8.3 P1 阶段二）
+### 7.34 Ex-5.7 倒排 FST + Mmap 字典（design 5.2.4.1 / 4.8.3 P1 阶段二） — ✅ 已完成
 
 > 背景：FST 术语字典（term → 段内偏移）M4 已落地但受零 unsafe 约束用 `fs::read` 全量读入
 > （P23：mmap 留待独立 crate 封装 unsafe 白名单后落地）。Ex-5.7 = 落地 mmap 按需加载——
@@ -1420,7 +1420,7 @@ impl RuntimePools {
    提交 `442981c`。⚠️ 冷启动收益需在 **SSD 环境**实测（HDD 不压测；真实 1.18 亿 term 规模
    FST 数百 MB 时 mmap 收益放大）。
 
-### 7.35 Ex-5.8 元数据-数据解耦（design 4.8.3 P1）
+### 7.35 Ex-5.8 元数据-数据解耦（design 4.8.3 P1） — ✅ 已完成
 
 > 背景：SST 文件内元数据区（Block Index/Bloom/Footer）与数据块区已物理分离，但 Compaction
 > 合并时仍读全部输入行 → 排序去重 → 重分块重压缩（写放大 + 压缩 CPU + 读放大）。
@@ -1444,7 +1444,7 @@ impl RuntimePools {
    column_family 无重叠复用 + 有重叠回退）；demo 3 测试全绿（见 1）；clippy 新代码零警告；
    提交 `cd00d85`。⚠️ 写放大收益需在 **SSD 环境**实测（HDD 不压测；无重叠 L0 段比例越高收益越大）。
 
-### 7.36 Ex-5.9 冷热感知 Compaction + Bloom Merge（design 4.8.3 P2）
+### 7.36 Ex-5.9 冷热感知 Compaction + Bloom Merge（design 4.8.3 P2） — ✅ 已完成
 
 > 背景：Compaction 无热度概念——冷热段同等对待；Bloom Merge 需"合并前布隆判断有效性"。
 
@@ -1460,7 +1460,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **335 全绿**（+2：热段优先选段 + 热度统计）；demo 3 测试全绿；
    clippy 新代码零警告；提交 `ba709e2`。⚠️ 热段下沉收益需在 **SSD 环境**实测。
 
-### 7.37 Ex-5.10 多 SSD 条带化（design 4.8.3 P2）
+### 7.37 Ex-5.10 多 SSD 条带化（design 4.8.3 P2） — ✅ 已完成
 
 > 背景：单盘布局 WAL/SST/倒排同盘竞争 IO；SSD 便宜，多盘条带化让 WAL 独占最快盘、
 > SSTable 与倒排分盘，消除 IO 争用（多盘 +3~4×）。
@@ -1477,7 +1477,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **336 全绿**（+1：multi_ssd_striping_places_files 落位 + 跨重启）；
    demo 1 测试全绿；clippy 零警告；提交 `e6a5610`。⚠️ 多盘吞吐收益需在 **SSD 多盘环境**实测。
 
-### 7.38 Ex-7.1 PerCpuCounter 缓存伪共享（design_extension v0.5 第 12 章 P0）
+### 7.38 Ex-7.1 PerCpuCounter 缓存伪共享（design_extension v0.5 第 12 章 P0） — ✅ 已完成
 
 > 背景：多核高频 `AtomicU64::fetch_add` 同一计数器 → 核间缓存行乒乓（伪共享），吞吐随核数
 > 不升反降。
@@ -1491,7 +1491,7 @@ impl RuntimePools {
 3. ~~**验证**~~ ✅：`cargo test` **339 全绿**（+3：缓存行隔离/往返/并发写）；demo 3 测试全绿；
    clippy 零警告；提交 `c5fa66c`。
 
-### 7.39 Ex-7.2 绑核默认开启（design_extension v0.5 第 12.2 P1）
+### 7.39 Ex-7.2 绑核默认开启（design_extension v0.5 第 12.2 P1） — ✅ 已完成
 
 > 背景：多核机器线程调度抖动 → P99 毛刺；三池（网络/计算/IO）绑物理核分区稳定延迟。
 
@@ -1504,7 +1504,7 @@ impl RuntimePools {
    低频写测试并行负载 flaky（写间隔 20→100µs）；提交 `b294532`。⚠️ P99 收益需 **SSD 多核
    环境**实测。
 
-### 7.40 Ex-7.3 io_uring SQPOLL + 多队列（design_extension v0.5 第 12.3 P1）
+### 7.40 Ex-7.3 io_uring SQPOLL + 多队列（design_extension v0.5 第 12.3 P1） — ✅ 已完成
 
 > 背景：NVMe 多硬件队列下 WAL 与 SSTable 分队列、WAL fsync 与刷盘并行，避免单队列拥塞。
 
@@ -1514,7 +1514,7 @@ impl RuntimePools {
    待独立 crate 封装后接入 SQPOLL 后端（接入点：`IoClass::queue_id()` 路由）。
 2. ~~**验证**~~ ✅：`cargo test` **344 全绿**（+2：队列号互异 + io_uring 平台门控）；提交 `fd0b519`。
 
-### 7.41 Ex-7.4 Compaction 动态限流（design_extension v0.5 第 12.6 P2）
+### 7.41 Ex-7.4 Compaction 动态限流（design_extension v0.5 第 12.6 P2） — ✅ 已完成
 
 > 背景：静态 `io_rate_limit_mb` 恒定限速——写压力低时浪费带宽（L0 追赶慢），写压力高时
 > Compaction 与前台抢盘。动态限流 = 按前台写压力实时调速率。
@@ -1533,7 +1533,7 @@ impl RuntimePools {
    demo 3 测试全绿；clippy 零警告；提交 `ddbc20e`。⚠️ 写 P99 收益需 **SSD 环境**实测
    （写重负载下 Compaction 让路对比静态限速）。
 
-### 7.42 Ex-6.2/6.3 倒排并发读优化（design_extension v0.4 第 11 章）
+### 7.42 Ex-6.2/6.3 倒排并发读优化（design_extension v0.4 第 11 章） — ✅ 已完成
 
 > 背景：Ex-6.1 已提供 Seqlock 原语；倒排段清单（`segments`）与 FST 字典（`dicts`）为
 > 普通容器——flush/gc 更新与 search 读无并发保障。Ex-6.2/6.3 = 原子指针发布（ArcSwap），
@@ -1554,7 +1554,7 @@ impl RuntimePools {
 
 ---
 
-### 7.43 Ex-1 本地消息表 + 幂等消费（design_extension v0.1 L1 首选方案）
+### 7.43 Ex-1 本地消息表 + 幂等消费（design_extension v0.1 L1 首选方案） — ✅ 已完成
 
 > 背景：分布式事务写路径决策 = 单分片本地事务（无需 2PC）。L1 本地消息表 + 幂等消费为
 > 首选落地（解决双写扩容衔接 / 异步索引补偿 / 跨节点异步写）。复用 ReplicationLog 的
@@ -1579,7 +1579,7 @@ impl RuntimePools {
 
 ---
 
-### 7.44 Ex-2 SAGA 编排 + 补偿状态机（design_extension v0.1 L2）
+### 7.44 Ex-2 SAGA 编排 + 补偿状态机（design_extension v0.1 L2） — ✅ 已完成
 
 > 背景：分布式事务 L2 = 跨分片业务事务（一笔操作涉及多个 docid 落在不同分片）。
 > 决策：SAGA 编排（docid 级本地事务为步骤 + 反向补偿），不做 2PC/TCC；补偿须覆盖
@@ -1632,7 +1632,7 @@ impl RuntimePools {
 
 ---
 
-### 7.46 Ex-4 倒排字段策略落地（design_extension 9.4，db-50m 重建验证 + 配置固化）
+### 7.46 Ex-4 倒排字段策略落地（design_extension 9.4，db-50m 重建验证 + 配置固化） — ✅ 已完成
 
 > 背景：9.3 三准则（枚举建倒排 / 高基数排除 / 长文本分词）与 9.4 模板已设计，本里程碑
 > 落到 50M 正式库验证 + 配置模板固化。
@@ -1657,7 +1657,7 @@ impl RuntimePools {
 
 ---
 
-### 7.47 类 SQL 解析器（design 157/1358 行：SELECT ... WHERE AND/OR 子集）
+### 7.47 类 SQL 解析器（design 157/1358 行：SELECT ... WHERE AND/OR 子集） — ✅ 已完成
 
 > 背景：降低 MySQL 迁移学习成本——类 SQL WHERE 查询，内部走倒排/组合索引；不承诺方言
 > （无 JOIN/GROUP BY/子查询/事务）。原计划基于 sqlparser-rs；落地改为**零依赖递归下降**
@@ -1682,7 +1682,7 @@ impl RuntimePools {
 
 ---
 
-### 7.48 写入 Enrich 接线（design 19.2 方案② / 19.3，development 5.21 落地）
+### 7.48 写入 Enrich 接线（design 19.2 方案② / 19.3，development 5.21 落地） — ✅ 已完成
 
 > 背景：关联关系固定、写入时已知的场景——网络层接收后、WAL 写入前展开关联字段（预连接），
 > 查询 0 增加（不做 JOIN）。库函数 `join::put_with_enrich` + `enrich_check_local` 已存在
@@ -1721,7 +1721,7 @@ impl RuntimePools {
 
 ---
 
-### 7.50 本机性能基准（NVMe SSD，组提交 2ms，200k 记录 × 4 线程）
+### 7.50 本机性能基准（NVMe SSD，组提交 2ms，200k 记录 × 4 线程） — ✅ 已完成
 
 > 环境：本机 SAMSUNG MZVLB512 NVMe SSD（design 1.2 SSD 条件满足）；release 构建；
 > `shanshui-cunji-ycsb`（负载 a/b/c × 组提交 2ms，append WAL）。
@@ -1737,7 +1737,7 @@ impl RuntimePools {
 
 ---
 
-### 7.51 两节点分布式（本机 + 阿里云）测试指引
+### 7.51 两节点分布式（本机 + 阿里云）测试指引 — ✅ 已完成
 
 > 前置：本机 NVMe SSD 基准（7.50）✅；两节点真实 TCP 高并发强一致性测试（gateway 测试，
 > `3e22f80`）✅——分布式机制（一致性哈希路由/广播检索/元数据中心/RPC）已在库内测试框架验证。
@@ -1769,7 +1769,7 @@ impl RuntimePools {
 
 ---
 
-### 7.52 本机 2000 万 / 5000 万大数据量基准（demo 13 项放大）+ 查询引擎优化
+### 7.52 本机 2000 万 / 5000 万大数据量基准（demo 13 项放大）+ 查询引擎优化 — ✅ 已完成
 
 > 2026-08-30。`shanshui-cunji demo --scale N --config config.bench.toml`（images/perf-0.6.0/ 汇总报告）。
 > 13 项测试全绿（冒烟 / 2000 万 / 5000 万）：构造数据 → 批量插入 → put_batch 批量（1000/5000 条/批）→
@@ -1809,7 +1809,7 @@ impl RuntimePools {
 
 ---
 
-### 7.53 LSM 事务三阶段（D/E/F）+ 倒排段数据 mmap 化（G 补充）
+### 7.53 LSM 事务三阶段（D/E/F）+ 倒排段数据 mmap 化（G 补充） — ✅ 已完成
 
 > 2026-08-30。development_process_order.md D/E/F/G 全部完成；393 测试全绿（+18）。
 
@@ -1836,7 +1836,7 @@ impl RuntimePools {
 
 ---
 
-### 7.54 看门狗 CPU/磁盘三级响应（P52 设计落地）
+### 7.54 看门狗 CPU/磁盘三级响应（P52 设计落地） — ✅ 已完成
 
 > 2026-08-30。401 测试全绿（+8）；`crates/disk-space` 独立 crate（P23 unsafe 白名单）。
 
@@ -1856,7 +1856,7 @@ impl RuntimePools {
 
 ---
 
-### 7.55 MySQL 协议适配（H-1~H-3：握手 + 认证 + SQL 映射）
+### 7.55 MySQL 协议适配（H-1~H-3：握手 + 认证 + SQL 映射） — ✅ 已完成
 
 > 2026-08-30。mysql cli 8.0 / pymysql 真实连接全链路通过；407 测试全绿（+6 协议级）。
 
@@ -1875,7 +1875,7 @@ impl RuntimePools {
 
 ---
 
-### 7.56 MySQL 协议适配 H-4~H-6（事务语句 + 预处理 + sysbench 接入）
+### 7.56 MySQL 协议适配 H-4~H-6（事务语句 + 预处理 + sysbench 接入） — ✅ 已完成
 
 > 2026-08-30。H 大项全部完成；411 测试全绿（+4：事务往返/空提交语义/预处理往返/未知 stmt）。
 
@@ -1893,7 +1893,7 @@ impl RuntimePools {
   BEGIN/SELECT/COMMIT 事务点查 1744 txn/s（服务器单引擎串行下合理量级）；sysbench 本体需
   Linux/WSL 安装（Windows 无预编译）；
 
-### 7.57 SAGA 网关 HTTP API + 补偿协议（design_extension 13.1/13.5，Ex-2.5 + 13.5 落地）
+### 7.57 SAGA 网关 HTTP API + 补偿协议（design_extension 13.1/13.5，Ex-2.5 + 13.5 落地） — ✅ 已完成
 
 > 2026-08-31~09-01。SAGA 分布式事务从内核（Ex-2，7.44）接出 HTTP 网关并补全补偿协议；
 > 445 → 450 测试全绿。
@@ -1907,7 +1907,7 @@ impl RuntimePools {
   续补偿/部分补偿不重复 + 缺定义保持待补偿/重试续补/跨重开持久化/终态 no-op + 超时屏障空转）；
 - 文档：design_extension 13.5 补偿协议形式化（状态机 + 不变量 I1~I4 + 崩溃恢复时序表）。
 
-### 7.58 SAGA 13.6/13.7 拓扑并行执行 + 后台对账重试（design_extension 13.6/13.7）
+### 7.58 SAGA 13.6/13.7 拓扑并行执行 + 后台对账重试（design_extension 13.6/13.7） — ✅ 已完成
 
 > 2026-09-01。SAGA 长事务正向并行化 + 未终态自动收敛；450 → 459 测试全绿（提交 `71aa712`）。
 
@@ -1919,7 +1919,7 @@ impl RuntimePools {
   Executing 挂起检测、无步骤定义跳过）；`server.rs` 协调器 `Arc<Mutex>` 共享 + 步骤定义缓存
   + 60s 对账线程；+9 测试（分层/环/依赖序/并行提速/反拓扑补偿/退避/挂起/网关环拒绝）。
 
-### 7.59 1 亿库复测 + 写路径 syscall 风暴修复（l0_bytes/sst_bytes 快照缓存化）
+### 7.59 1 亿库复测 + 写路径 syscall 风暴修复（l0_bytes/sst_bytes 快照缓存化） — ✅ 已完成
 
 > 2026-09-01。1 亿库（db-100m-v070）全套测试 + 定位并修复写路径性能崩塌；459 → 462 全绿。
 
@@ -1945,14 +1945,14 @@ impl RuntimePools {
 - **说明**：分批缓解未根治——根治需无锁合并（CF Arc 化 + 合并与写并发），留待后续；
 - 事务类复测（写修复后与 O③ 持平）：read_only 523/561、read_write 243/215 TPS。
 
-### 7.61 1 亿库构建记录与问题闭环汇总
+### 7.61 1 亿库构建记录与问题闭环汇总 — ✅ 已完成
 
 > 2026-09-01。构建记录（images/perf-0.7.0/sysbench-100m/构建记录.md）追加：插入性能复测
 > （pymysql 单条 ~2k、批量 ~4k rows/s）、sysbench 全套对比基线、写路径 A/B 定位（组提交有效
 > 18× / auto_compact 检查 syscall 风暴）、事务类复测；problem_solving P69（缺定义补偿）
 > / P70（13.6/13.7 落地）闭环。
 
-### 7.62 导出增强：export --parquet（E 模块，Parquet 导出落地）
+### 7.62 导出增强：export --parquet（E 模块，Parquet 导出落地） — ✅ 已完成
 
 > 2026-09-01。E 模块"导出增强（增量 / Parquet / JDBC）"的 Parquet 部分落地（`70c3b30`）。
 
@@ -1982,7 +1982,7 @@ impl RuntimePools {
 5. **预期**：写路径 fsync 批处理与读路径异步提交减少 syscall 上下文切换；收益在核多 / 高
    IOPS 场景显著，2 核小机器可能不显著。
 
-### 7.64 导出增强：export --incremental --checkpoint 增量导出（E 模块，docid 游标断点续传）
+### 7.64 导出增强：export --incremental --checkpoint 增量导出（E 模块，docid 游标断点续传） — ✅ 已完成
 
 > 2026-09-01。E 模块"导出增强（增量 / Parquet / JDBC）"的增量部分落地（`2174531`）。
 > 对称 P3-4 增量导入（`5085db8`）；JDBC 直连（阶段 3）与流式管道 Filter/Projection 留后续。
@@ -2000,7 +2000,7 @@ impl RuntimePools {
   无新数据 0 行不推进 → 删 cp 断档自动全量 5 行重建；
 - 全量测试 466 → **468 全绿**。
 
-### 7.65 合并阻塞写根治：无锁合并（P72 完整方案 + P73 manifest 竞态修复）
+### 7.65 合并阻塞写根治：无锁合并（P72 完整方案 + P73 manifest 竞态修复） — ✅ 已完成
 
 > 2026-09-01。P72 根治落地（`af24dbd`）——worker 合并不再持 Engine 读锁，写与合并并发；
 > 1 亿库实测暴露 P73 manifest 竞态并修复（`3d58137` + `5de5ab0`）。469 全绿。
@@ -2028,7 +2028,7 @@ impl RuntimePools {
   `sst_mutate` 锁内（store→persist→remove 原子）。回归测试 `persist_manifest_reflects_memory_snapshot_only`
   （幽灵段不入 manifest）；1 亿库原数据（79/88/89/97/98/99 六段）完整恢复，点查全命中。
 
-### 7.66 导出增强：流式管道（Filter/Projection/Sink 分叉）+ JDBC 直连（E 模块，design 20.5）
+### 7.66 导出增强：流式管道（Filter/Projection/Sink 分叉）+ JDBC 直连（E 模块，design 20.5） — ✅ 已完成
 
 > 2026-09-01。E 模块"导出增强（增量 / Parquet / JDBC）"的**流式管道**与 **JDBC 直连**落地
 > （`c6b5417`）。增量导出（7.64）+ Parquet（7.62）已完成；剩余 MySQL 兼容 CSV 配套留后续。
@@ -2053,7 +2053,7 @@ impl RuntimePools {
   JDBC 导出 5 行到本机 MySQL（3308）→ 点查数据完整；增量回归 cp 推进正常；
 - 全量测试 469 → **476 全绿**（export_pipeline 6 + 相关）。
 
-### 7.67 导出增强：MySQL 兼容 CSV 配套 + ClickHouse/MySQL 建表 DDL（E 模块，design 20.5）
+### 7.67 导出增强：MySQL 兼容 CSV 配套 + ClickHouse/MySQL 建表 DDL（E 模块，design 20.5） — ✅ 已完成
 
 > 2026-09-01。E 模块"导出增强"的 **MySQL 兼容 CSV 配套**与 **建表 DDL** 落地（`313bd81`）。
 > 至此 design 20.5 导出功能基本完整：CSV/Parquet/JDBC/增量/流式管道/MySQL 兼容/DDL。
@@ -2071,7 +2071,7 @@ impl RuntimePools {
   +4 DDL 单元测试（TEXT/VARCHAR 切换、MergeTree、LOAD DATA FIELDS 对齐、DDL+LOAD 组装）；
 - 全量 **476 全绿**。
 
-### 7.68 导出增强：与 Compaction 共享后台 IO 优先级（E 模块，design 20.5 收尾）
+### 7.68 导出增强：与 Compaction 共享后台 IO 优先级（E 模块，design 20.5 收尾） — ✅ 已完成
 
 > 2026-09-01。E 模块"导出增强"最后一项落地（`40e8abb`）——**design 20.5 导出功能全部完成**：
 > CSV/Parquet/JDBC/增量/流式管道/MySQL 兼容/建表 DDL/后台 IO 限速。
@@ -2086,7 +2086,7 @@ impl RuntimePools {
 - 测试 `scan_rate_limit_slows_stream`：限速 1MB/s 扫描 2MB 显著变慢（≥300ms）、关闭恢复快速、
   前台读不受影响；全量 **477 全绿**。
 
-### 7.69 高并发查询优化（I 项 P3，同步模型内可落地部分）
+### 7.69 高并发查询优化（I 项 P3，同步模型内可落地部分） — ✅ 已完成
 
 > 2026-09-01。design 9.5 目标（10k 连接 / 85 万 QPS 依赖异步协程运行时，`97e3586` 落地**同步模型
 > 内可做的高并发优化**）。478 全绿。
@@ -2103,7 +2103,7 @@ impl RuntimePools {
   P73 前旧 release 合并残留的 manifest 缺失引用（99/98/89 数据已并入 sst-100，重建 manifest
   后干净启动）；全量 **478 全绿**。
 
-### 7.70 异步协程运行时（I 项 P3，design 9.5 10k 连接目标）
+### 7.70 异步协程运行时（I 项 P3，design 9.5 10k 连接目标） — ✅ 已完成
 
 > 2026-09-01。tokio 异步网络层落地（`2802885`）——连接 idle 不占 OS 线程，10k 长连接可行；
 > 查询经 spawn_blocking 复用同步引擎（活跃查询才占阻塞线程）。480 全绿。
@@ -2122,7 +2122,7 @@ impl RuntimePools {
 - 测试 `async_server_protocol_roundtrip`（握手/认证/SELECT/PREPARE/INSERT 往返）+
   `async_server_concurrent_clients_all_succeed`（8 并发客户端全成功）；全量 **480 全绿**。
 
-### 7.71 io_uring Linux 部署实测（V 项收尾：热路径接入 + 阿里云 Debian 12 A/B）
+### 7.71 io_uring Linux 部署实测（V 项收尾：热路径接入 + 阿里云 Debian 12 A/B） — ✅ 已完成
 
 > 2026-09-01。V 项（design_extension v0.5 第 12.3）在 Linux 上完成**部署实测**（7.63 指引执行）。
 > 实测发现 7.63 时代 `iou` 池仅初始化、未接入读写热路径 → 本次**补齐热路径接入**后实测。
@@ -2161,7 +2161,7 @@ impl RuntimePools {
    生产环境按 7.63 指引开启 + 预留 SQPOLL 核。全量 **480 全绿**（本会话无新增测试，接入
    由既有 480 回归覆盖）。
 
-### 7.72 HotCache 内部锁粒度（读写分离收尾，feature I 模块剩余项）
+### 7.72 HotCache 内部锁粒度（读写分离收尾，feature I 模块剩余项） — ✅ 已完成
 
 > 2026-09-02。feature.md I 模块"读写分离"行的剩余项：**HotCache 内部 Mutex 粒度**——
 > 原实现整包 `Mutex<HotCache>`，点查热路径 `hotcache.lock()` 与写路径 put/invalidate 互斥，
@@ -2190,7 +2190,7 @@ impl RuntimePools {
    剩余"写路径（txn_commit/compaction）仍串行"属引擎写路径范畴（组提交已解决主瓶颈），维持
    M8-P1 暂缓结论，复制型读写分离留分布式阶段。
 
-### 7.73 倒排段 GC 后台化（J 项，P2：后台线程周期触发替代显式调用）
+### 7.73 倒排段 GC 后台化（J 项，P2：后台线程周期触发替代显式调用） — ✅ 已完成
 
 > 2026-09-02。J 项原描述"gc() 需显式调用（demo 插入后合并）；后台线程周期触发（设计已有，
 > 工程化）"。GC 后台化引入**两个并发问题**（demo inverted-gc-bg 前置研究）：
@@ -2215,7 +2215,7 @@ impl RuntimePools {
 5. **回归**：全量 **485 全绿**（+3：并发 flush/gc 无丢段完整性、gc &self（Arc 共享直接调用）、
    worker 集成收敛段数 + 合并后数据可检索）。
 
-### 7.74 fulltext 大 posting 反序列化优化（K 项，P2：段内 posting 分块延迟加载）
+### 7.74 fulltext 大 posting 反序列化优化（K 项，P2：段内 posting 分块延迟加载） — ✅ 已完成
 
 > 2026-09-02。K 项背景（db-50m 实测）：content 高频词 posting ~1600 万 docid，RoaringBitmap
 > 紧凑序列化 ~数 MB，首次反序列化 ~100ms+（mmap 缺页 + 解析）。G 项 LRU 缓存解决重复查询，
@@ -2246,7 +2246,7 @@ impl RuntimePools {
    数据几乎无膨胀——收益成立，段格式 v3 落地（v2 旧段兼容读取）。
 5. **回归**：全量 **488 全绿**（+3：分页与全量 search 窗口一致、跨段重复去重、v3 往返）。
 
-### 7.75 文档维护收尾（工作流收尾）
+### 7.75 文档维护收尾（工作流收尾） — ✅ 已完成
 
 > 2026-09-02。development_extension.md 中 Ex-5.x/6.x/7.x 的 `[ ]` checkbox 为**过时状态**
 > （实际已在 development.md 7.24~7.45 落地）。本次回填：
@@ -2257,7 +2257,7 @@ impl RuntimePools {
 - Ex-2.5 补提交号 `781199e`；development_remain.md §6 标记完成；
 - 至此排期大项 A~AC + 扩展 Ex-1~7 全部闭环，**所有任务 checkbox 均与代码一致**。
 
-### 7.76 Ex-1.5 双写扩容协议衔接（P0-1：扩容编排协调器）
+### 7.76 Ex-1.5 双写扩容协议衔接（P0-1：扩容编排协调器） — ✅ 已完成
 
 > 2026-09-02。Ex-1 落地 outbox 后（7348acd），Ex-1.5 把原 M5 "双写→追平→切换"改造为
 > **"本地事务写 + outbox 待办 + 排空校验"**（development 7.43 留待真实扩容联调；本会话
@@ -2280,7 +2280,7 @@ impl RuntimePools {
    幂等/崩溃恢复；engine e2e——写主+outbox 本地原子 → 追平 → 排空 → 切换 → 新节点数据一致）；
    demo `src/demo/scale-out` 4 测试（含漏投一致性检测、排空拒绝）。
 
-### 7.77 多副本元数据 Raft 高可用（P0-2 阶段一：元数据自动切换 + 脑裂安全）
+### 7.77 多副本元数据 Raft 高可用（P0-2 阶段一：元数据自动切换 + 脑裂安全） — ✅ 已完成
 
 > 2026-09-02。用户排期 P0-2：节点宕机**元数据自动切换**（不人工介入）+ **网络分区（脑裂）
 > 一致性**。落地最小 Raft 管理 MetaCenter 的 master 角色（design_extension 14.x 元数据
@@ -2319,7 +2319,7 @@ impl RuntimePools {
    收益未证实——**暂不引入**（避免复杂度 + 读放大风险）；若未来写放大成为瓶颈（key 级
    更新密集场景），再按 key 级模拟复评。
 
-### 7.79 Indexer Node 查询加速代理层（P1：不拆分存储，挂现有节点下）
+### 7.79 Indexer Node 查询加速代理层（P1：不拆分存储，挂现有节点下） — ✅ 已完成
 
 > 2026-09-02。用户排期 P1：存算分离/Indexer Node——先做查询代理层，不拆分存储（彻底
 > 拆分等 10 亿级规模）。落地 `src/indexer_proxy.rs`（demo indexer-node 前置验证）。
@@ -2355,7 +2355,7 @@ impl RuntimePools {
 3. **收尾**：P0/P1/P2 全排期执行完毕（P0-1 扩容编排 / P0-2 元数据 Raft / P1 Tiered 评估不引入 /
    P1 Indexer 代理层 / P2 两级索引不引入 / P2 Calvin 硬件卸载不引入）——**500 全绿**。
 
-### 7.81 AD 10 亿库阶段 A：全局 docid 分配器（分片前缀）
+### 7.81 AD 10 亿库阶段 A：全局 docid 分配器（分片前缀） — ✅ 已完成
 
 > 2026-09-02。用户排期 AD（10 亿库扩展阶段 A，P0）：全局 docid 分配器，为分片扩展提供
 > O(1) 路由 + 无集中瓶颈 + 扩容归属不变的 docid 空间。design-10b-extension.md §5.1。
@@ -2424,7 +2424,7 @@ impl RuntimePools {
 4. **回归**：520 全绿（+7 shard_inverted 单测）。
 5. **待验证（硬件）**：10 分片 10 亿构建 + 亿级 posting 规模回归（分页 sub-ms、COUNT 精确）。
 
-### 7.84 高并发 CRUD 稳定性验证（180 秒）+ MySQL 参数化转义修复
+### 7.84 高并发 CRUD 稳定性验证（180 秒）+ MySQL 参数化转义修复 — ✅ 已完成
 
 > 2026-09-02。用户要求：系统稳定运行 3 分钟，进行高并发增删改查（先写脚本，直接运行 3 分钟）。
 > 实测发现并修复 H 项遗留缺陷（P74）。
@@ -2444,7 +2444,7 @@ impl RuntimePools {
      对已删除 id 无效果），数学完全吻合；抽样点查正常。
 4. **回归**：520 全绿（+1 unquote 反转义单测）。
 
-### 7.85 AD 10 亿库阶段 C：raft 元数据 RPC 接线（raft 阶段二）
+### 7.85 AD 10 亿库阶段 C：raft 元数据 RPC 接线（raft 阶段二） — ✅ 已完成
 
 > 2026-09-02。用户排期阶段 C（design-10b-extension.md §6）：scale_out + raft_meta 接 RPC
 > 通道——把 raft 消息从单进程确定性 `deliver` 解耦为 `RaftTransport` trait（真实节点间
@@ -2488,7 +2488,7 @@ impl RuntimePools {
 5. **阶段 A~D 全部完成**：docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片可观测；
    剩余为 10 分片 10 亿构建验收（硬件）与 raft TCP 传输/扩容编排联动（部署推进）。
 
-### 7.87 山水存迹 vs MySQL 8.0 同负载基准对比（两张表）+ P75 组提交缺陷修复
+### 7.87 山水存迹 vs MySQL 8.0 同负载基准对比（两张表）+ P75 组提交缺陷修复 — ✅ 已完成
 
 > 2026-09-02。用户要求：本机 MySQL service（root/123456）建两张表测试，山水存迹同样内容
 > 测试，生成对比放 README 最前；内存均指定 8G（MySQL `innodb_buffer_pool_size=8G` 已设）。
@@ -2507,7 +2507,7 @@ impl RuntimePools {
    （落后 3.5×，JSON 文档反序列化 vs MySQL 二进制列，文档型语义差异）。
 5. **记录**：README 最前基准块（更新版）+ P75 闭环 + 对比脚本可复现。
 
-### 7.88 raft TCP 传输落地（raft 阶段二真实接线）+ 三处挂起修复（P76）
+### 7.88 raft TCP 传输落地（raft 阶段二真实接线）+ 三处挂起修复（P76） — ✅ 已完成
 
 > 2026-09-02。待开发项 #4：raft 消息走真实 TCP（复用 rpc.rs JSON-over-TCP 帧）。
 > 测试反复挂起 60s+，逐步诊断定位三处根因（P76），修复后 9 测试 0.05s 全绿。
@@ -2529,7 +2529,7 @@ impl RuntimePools {
    停机 → 节点 2 当选 → 继续提议）+ 纯传输往返；9 raft_rpc 测试 0.05s 全绿，**538 全绿**。
 6. **后续**：scale_out 编排与 raft 联动（真实节点部署联调，随部署推进）。
 
-### 7.89 mysql_server SELECT 列投影（结果集裁剪——点查不再整 doc 回包）
+### 7.89 mysql_server SELECT 列投影（结果集裁剪——点查不再整 doc 回包） — ✅ 已完成
 
 > 2026-09-02。7.87 对比 + 多量级复测（100 万~1000 万，tmp_mysql_scc_scale_summary.md）
 > 暴露点查落后 MySQL ~1.25× 且各量级稳定：瓶颈不在引擎读（HotCache 热点实测 QPS 不涨），
@@ -2555,7 +2555,7 @@ impl RuntimePools {
    随机点查落后 1.28× → 1.10×，热点近追平；剩余差距在协议往返 + 每语句固定开销
    （spawn_blocking / RwLock / ResultSet 构建），非引擎读路径。
 
-### 7.90 mysql_server 字段级投影（`SELECT status, city` 也裁剪，NULL/大小写/文本化）
+### 7.90 mysql_server 字段级投影（`SELECT status, city` 也裁剪，NULL/大小写/文本化） — ✅ 已完成
 
 > 2026-09-02。7.89 列投影只覆盖 `id`/`doc`/`*`；`SELECT status, city` 之类常用列清单
 > 仍回退 id+doc 双列。扩展：**doc 顶层 JSON 字段名也参与裁剪**（无 schema 文档库按字段提取）。
@@ -2574,7 +2574,7 @@ impl RuntimePools {
 3. **实测**（1000 万库 release）：`SELECT id,status,city,amount,ts,title WHERE id=5` 六列按序；
    `SELECT status,missing_col` → 缺失列 pymysql 返回 `None`；BETWEEN 范围 `SELECT title` 单列流式。
 
-### 7.91 mysql_server 字段列类型精确化（LONGLONG/DOUBLE/VAR_STRING 按值推断）
+### 7.91 mysql_server 字段列类型精确化（LONGLONG/DOUBLE/VAR_STRING 按值推断） — ✅ 已完成
 
 > 2026-09-02。7.90 字段投影统一 VAR_STRING 文本化——`SELECT amount` 返回字符串 '73564'，
 > 客户端拿不到数值。无 schema 文档库列类型不能静态声明，改为**按结果集整列实际值推断**。
@@ -2594,7 +2594,7 @@ impl RuntimePools {
    `SELECT price`(浮点 doc) → DOUBLE → **float**；`status,title` → VAR_STRING → 字符串；
    `flag`(bool) → LONGLONG 1/0——与 MySQL 3306 同语义对照一致。
 
-### 7.92 mysql_server 嵌套字段投影（`SELECT a.b` 点路径下钻）
+### 7.92 mysql_server 嵌套字段投影（`SELECT a.b` 点路径下钻） — ✅ 已完成
 
 > 2026-09-02。7.90/7.91 只覆盖 doc 顶层字段；文档库常存嵌套对象
 > （`{"addr":{"city":..}}`），`SELECT addr.city` 需要点路径逐层下钻。
@@ -2610,7 +2610,7 @@ impl RuntimePools {
 3. **实测**（1000 万库 release，pymysql）：`SELECT name, addr.city` → 列头 [name, city]，
    city='bj'；`addr.geo.lat/lng` → DOUBLE float 39.9/116.4；`addr.zip` 缺失 → None。
 
-### 7.93 WHERE 字段条件过滤下推（单遍扫描 + LIMIT 早停）+ 等值可见性 + BETWEEN 窗口 bug
+### 7.93 WHERE 字段条件过滤下推（单遍扫描 + LIMIT 早停）+ 等值可见性 + BETWEEN 窗口 bug — ✅ 已完成
 
 > 2026-09-02。探针（1000万 库）暴露字段过滤三问题：① `amount>90000 LIMIT 10` 全表
 > **17.2s 熔断**（MySQL 无索引顺序扫 2ms）；② 等值 `status='active'` **0 行**（倒排 term 不
@@ -2642,7 +2642,7 @@ impl RuntimePools {
    返回行与 MySQL 逐行一致（docid 3533/4810/6456 等）；剩余差距在 JSON 全文档反序列化
    vs InnoDB 列式扫描（低命中率窗口 LIMIT 大值场景仍受看门狗保护，属于文档型语义差异）。
 
-### 7.94 数字等值回退扫描（amount=xxx 不再查空）+ AND 收敛 + mysql-server 查询预算放宽
+### 7.94 数字等值回退扫描（amount=xxx 不再查空）+ AND 收敛 + mysql-server 查询预算放宽 — ✅ 已完成
 
 > 2026-09-02。7.93 探针遗留：数字字段等值 `amount=67539` 返回空——倒排 term 只由字符串
 > 叶子生成（collect_strings 跳过 Number/Bool），数字等值 inverted_posting 必空 → 误判 0 行。
@@ -2671,7 +2671,7 @@ impl RuntimePools {
    数字等值命中语义对齐 MySQL；剩余差距 = JSON 全文档反序列化 vs InnoDB 列式扫描
    （文档型无索引全扫成本，命中后早停仍快）。
 
-### 7.95 聚合函数支持（COUNT/SUM/AVG/MIN/MAX + WHERE 字段条件）
+### 7.95 聚合函数支持（COUNT/SUM/AVG/MIN/MAX + WHERE 字段条件） — ✅ 已完成
 
 > 2026-09-02。探针遗留：`SELECT COUNT(*) ... WHERE status='active'` 直接语法错误
 > （sqlish 列解析不支持函数）；SQL 对比常用 COUNT/SUM 汇总。
@@ -2705,7 +2705,7 @@ impl RuntimePools {
    12-15s（全库 JSON 判定，与 MySQL 无索引全扫同语义；逐行 parse 成本为文档型差距）。
    限制：聚合数值按 f64（大整精度受限）；SUM(*)/AVG(*) 拒绝；不支持 GROUP BY 分组聚合。
 
-### 7.96 扫描期轻量字段提取（免整文档反序列化——无索引全扫 12s → 5-6s）
+### 7.96 扫描期轻量字段提取（免整文档反序列化——无索引全扫 12s → 5-6s） — ✅ 已完成
 
 > 2026-09-02。7.93~7.95 的无索引全扫（下推/等值回退/后过滤/聚合）每行
 > `serde_json::from_slice::<Value>` 构建整树 → 1000 万行 ~12-13s（vs MySQL 列式 2s）。
@@ -2737,7 +2737,7 @@ impl RuntimePools {
    剩余 ~5-6s 为 scan_stream 读行自身成本（SST 解压 + 1100 万行回调），与 MySQL 列式
    差距 ~6× → ~3×；进一步收益需引擎 scan 层（解压并行/预读），超出本项。
 
-### 7.97 复合表达式（AND/OR/NOT）扫描判定 light 化
+### 7.97 复合表达式（AND/OR/NOT）扫描判定 light 化 — ✅ 已完成
 
 > 2026-09-02。7.96 只对单叶（Cond/Between）字节级；AND/OR/NOT 复合的过滤/聚合仍
 > serde 整行解析（聚合 `WHERE status='active' OR amount>90000` ~12s）。
@@ -2759,7 +2759,7 @@ impl RuntimePools {
    数值与 MySQL 同语义（SCC 库含 ~100 万历史协议测试残留行，计数差 ~1%）；剩余耗时
    以 scan 读行为主（SST 解压 + 逐行回调），逐行判定已字节级。
 
-### 7.98 scale_out 编排与 raft 元数据联动（RouteChannel 抽象，待开发项 #5）
+### 7.98 scale_out 编排与 raft 元数据联动（RouteChannel 抽象，待开发项 #5） — ✅ 已完成
 
 > 2026-09-02。扩容编排的路由副作用（注册 slave / 切换 master / 摘除）改为可提交到
 > **raft 复制日志**——多节点部署下集群 MetaCenter 一致，扩容切换不被单机路由掩盖。
@@ -2779,7 +2779,7 @@ impl RuntimePools {
    **550 全绿**。
 5. **剩余（随部署）**：真实 TCP 传输上跑多节点扩容编排联调（本机 3 进程 / 远程多节点）。
 
-### 7.99 引擎 scan 层优化：块组预读 4→8 + merge 线性化（并行解压实测负收益回退）
+### 7.99 引擎 scan 层优化：块组预读 4→8 + merge 线性化（并行解压实测负收益回退） — ✅ 已完成
 
 > 2026-09-02。7.96/7.97 后剩 ~5-6s 为 scan_stream 读行（SST 解压 + k-way merge +
 > 逐行回调），攻引擎 scan 层。
@@ -2806,7 +2806,7 @@ impl RuntimePools {
    剩余 ~4-5s 主要为 SST 顺序解压 + 读 IO（737 万行单段）；MySQL 无索引全扫 ~2-3.5s，
    文档型 JSON 存储的解压/IO 差距已收窄至 ~1.5-2×。
 
-### 7.100 COUNT(*) 无 WHERE 免值计数快路径（key-only 解码 + merge）
+### 7.100 COUNT(*) 无 WHERE 免值计数快路径（key-only 解码 + merge） — ✅ 已完成
 
 > 2026-09-02。对照中唯一显著项：无 WHERE `COUNT(*)` SCC 4.72s vs MySQL 0.33s（14×，
 > MySQL 只扫 8B 主键；SCC 需读/解压整文档）。方案（用户选定）：**key-only 计数扫描**——
