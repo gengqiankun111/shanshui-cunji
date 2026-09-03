@@ -1397,6 +1397,24 @@ struct SortRow {
     keys: Vec<SortKey>,
 }
 
+/// b：事务覆盖视图谓词复检——对单个文档判断其（含同事务写后的）JSON 是否命中 SQL 的
+/// WHERE 条件。sql 形如 `SELECT … FROM t WHERE <cond>`（仅使用 where_expr；无 WHERE → true）。
+/// 文档 JSON 解析失败 / 谓词解析失败 → false（对齐求值端语义：字段缺失不命中）。
+pub fn doc_matches_where(sql: &str, doc: &[u8]) -> bool {
+    let sel = match parse_select(sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let we = match sel.where_expr {
+        Some(e) => e,
+        None => return true,
+    };
+    match serde_json::from_slice::<serde_json::Value>(doc) {
+        Ok(v) => we.matches_doc(&v),
+        Err(_) => false,
+    }
+}
+
 /// 执行类 SQL：解析 + 求值 + 回表 + LIMIT/OFFSET（`cap` 为无 LIMIT 时的上限保护）。
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {

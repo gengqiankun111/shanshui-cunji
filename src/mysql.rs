@@ -1234,7 +1234,8 @@ fn txn_select(
     let ids: Vec<u64> = match extract_target_ids(sql) {
         Some(v) => v,
         None => {
-            return QueryResponse::Err(1064, "事务内仅支持 WHERE id= / BETWEEN / IN 查询".to_string());
+            // b：非主键列谓词 → 主库候选 ∪ 同事务写集覆盖复检
+            return txn_select_by_predicate(engine, session, sql, proj.as_deref(), limit, is_sum, &upper);
         }
     };
     if is_sum {
@@ -1265,6 +1266,81 @@ fn txn_select(
         }
     }
     build_result_set(proj.as_deref(), raw, upper.contains("ORDER BY"), limit)
+}
+
+/// b：事务内**非主键列谓词** SELECT（普通 / SUM(k) 聚合）：
+/// 候选 = 主库当前视图命中（sqlish，事务持引擎写锁 → 视图稳定）∪ 同事务写集；
+/// 逐候选 `txn_get` 覆盖取值 + `sqlish::doc_matches_where` 谓词复检 → 结果与
+/// 快照+同事务写一致（自增后自见、删除即不可见、新增被收录）。
+fn txn_select_by_predicate(
+    engine: &Engine,
+    session: &mut Session,
+    sql: &str,
+    proj: Option<&[ProjCol]>,
+    limit: Option<usize>,
+    is_sum: bool,
+    upper: &str,
+) -> QueryResponse {
+    // 取 WHERE 谓词原文（ASCII 偏移与 lower 一致；按 rest 原样切片保字符串大小写语义）
+    let lower = sql.to_lowercase();
+    let pos = match lower.find("where") {
+        Some(p) => p,
+        None => return QueryResponse::Err(1064, "事务内无 WHERE 全表查询暂不支持".to_string()),
+    };
+    let rest = &sql[pos + 5..];
+    let ol = rest.to_lowercase();
+    let end = [
+        ol.find("order by"),
+        ol.find(" limit "),
+        ol.find(" limit)"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(rest.len());
+    let tail = rest[..end].trim();
+    if tail.is_empty() {
+        return QueryResponse::Err(1064, "事务内无 WHERE 全表查询暂不支持".to_string());
+    }
+    let cond_sql = format!("SELECT docid FROM t WHERE {tail}");
+    let txn = session.txn.as_mut().unwrap();
+    const CAP: u64 = 200_000;
+    let base = match crate::sqlish::execute(engine, &cond_sql, CAP) {
+        Ok(r) => r,
+        Err(e) => return QueryResponse::Err(3500, format!("事务谓词读失败: {e}")),
+    };
+    let mut set: std::collections::HashSet<u64> = base.into_iter().map(|r| r.0).collect();
+    set.extend(txn.write_set().iter().copied());
+    let mut ids: Vec<u64> = set.into_iter().collect();
+    ids.sort_unstable();
+    let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        match engine.txn_get(txn, id) {
+            Ok(Some(v)) => {
+                if crate::sqlish::doc_matches_where(&cond_sql, &v) {
+                    rows.push((id, v));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return QueryResponse::Err(3500, format!("事务读失败: {e}")),
+        }
+    }
+    if is_sum {
+        let mut sum: i64 = 0;
+        for (_, doc) in &rows {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
+                if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
+                    sum += k;
+                }
+            }
+        }
+        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
+        return QueryResponse::Set {
+            columns: vec![sum_col],
+            rows: vec![vec![sum.to_string().into_bytes()]],
+        };
+    }
+    build_result_set(proj, rows, upper.contains("ORDER BY"), limit)
 }
 
 /// 提取 `WHERE id BETWEEN A AND B` 闭区间 → (A, B)；非 id BETWEEN → None。
@@ -3962,6 +4038,47 @@ mod tests {
         let mut p3 = 0usize;
         let _ = read_lenenc(&row3, &mut p3).unwrap();
         assert_eq!(&row3[p3..p3 + 1], b"6");
+    }
+
+    #[test]
+    fn txn_select_non_pk_predicate_overlay() {
+        // b：事务内非主键列谓词 SELECT——同事务 UPDATE/INSERT 覆盖可见、被改行正确排除
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let addr = server.serve_once("127.0.0.1:0").unwrap();
+        let mut c = TestClient::connect(addr);
+        let (scramble, _) = c.handshake();
+        c.authenticate("root", "secret", &scramble);
+        let mut base = |id: u64, k: i64, s: &str| {
+            let doc = format!("{{\"k\":{k},\"s\":\"{s}\"}}");
+            let sql = format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')");
+            assert_eq!(c.query(&sql)[0][0], OK_PACKET);
+        };
+        base(1, 1, "a");
+        base(2, 2, "b");
+        base(3, 3, "a");
+        base(4, 4, "b");
+        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
+        // 同事务 UPDATE k=k+1（doc2: 2→3）
+        assert_eq!(c.query("UPDATE documents SET k=k+1 WHERE id=2")[0][0], OK_PACKET);
+        // 同事务 INSERT doc5 (k=5, s='b')
+        assert_eq!(
+            c.query("INSERT INTO documents (id, doc) VALUES (5, '{\"k\":5,\"s\":\"b\"}')")[0][0],
+            OK_PACKET
+        );
+        let sum_col = |r: &Vec<Vec<u8>>| -> String {
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        // s='a'：doc1(1)+doc3(3)=4（doc2 已改 s=b 不变、doc2 k=3 计入 b 组）
+        let ra = c.query("SELECT SUM(k) FROM documents WHERE s='a'");
+        assert_eq!(sum_col(&ra), "4");
+        // s='b'：doc2(3,自增后)+doc4(4)+doc5(5,同事务插入)=12
+        let rb = c.query("SELECT SUM(k) FROM documents WHERE s='b'");
+        assert_eq!(sum_col(&rb), "12");
+        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
     }
 
     #[test]
