@@ -34,6 +34,10 @@ const CLIENT_PROTOCOL_41: u32 = 1 << 9;
 const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
 const CLIENT_CONNECT_WITH_DB: u32 = 1 << 3;
+/// 客户端连接属性（RustMySQL v26 等客户端**无条件**随握手响应发送该能力位与键值对载荷：
+/// OS/客户端名等；若不消费 attrs 字节，认证后首条命令会被读错 → 连接建立失败
+/// CouldNotSetupConnection，即 mysql crate ↔ SCC 握手不兼容根因）。
+const CLIENT_CONNECT_ATTRS: u32 = 1 << 20;
 const CLIENT_TRANSACTIONS: u32 = 1 << 13;
 const CLIENT_MULTI_STATEMENTS: u32 = 1 << 16;
 const CAPABILITIES: u32 = CLIENT_PROTOCOL_41
@@ -717,6 +721,16 @@ fn parse_handshake_response(
     }
     if cap & CLIENT_PLUGIN_AUTH != 0 {
         let _plugin = read_nul_string(resp, &mut pos)?;
+    }
+    // 协议 41 握手响应最后字段：CLIENT_CONNECT_ATTRS = lenenc 总长 + 键值对字节。
+    // 实测 RustMySQL v26 无视服务器未声明而发送 attrs（client_cap 含 bit20）——必须消费，
+    // 否则残留字节被误读为认证后首条命令 → CouldNotSetupConnection。
+    if cap & CLIENT_CONNECT_ATTRS != 0 {
+        let attr_len = read_lenenc_raw(resp, &mut pos)? as usize;
+        if pos + attr_len > resp.len() {
+            return Err(Error::Cluster("connect attrs 越界".into()));
+        }
+        pos += attr_len;
     }
     Ok(session.user == user && check_native_password(&auth_response, scramble, password))
 }
