@@ -751,6 +751,18 @@
   边界；4000 行 33% 删除收敛后 GC 排空（总丢弃=删除数、空间回收、语义、重启不重复触发）；
   demo：删除密集(-50%) vs 均匀(-2%) 空间回收对照；565 全绿（development_remain §11 Ex-8.7）。
 
+### P78. ORDER BY 排序键恒 Null：`sort_key` 未按字段取值（整文档当值）
+- **问题**：sqlish ORDER BY 新功能三执行测试全挂（`amount DESC` 返回 `[0,1,2]` 而非
+  `[99,98,97]`），排序退化为稳定序；parse 测试却通过 → 一度怀疑 execute 拿到的
+  `order_by` 为空（顶层 `parse_select` 与 Parser 双入口疑云），实际二者直接串联无丢失。
+- **根因**：`sort_key(doc, field)` 反序列化后直接 `match v`（v = **整篇文档对象**），
+  从未 `v.get(field)`——顶层是 Object，落到 `_ => Null`，排序键恒 Null，所有行相等。
+- **修复**：`match v.get(field)`（缺省/JSON null/嵌套 → Null；Number → f64；String → 字节序）。
+- **回归**：+4 测试（parse 多字段/大小写、数值 DESC、数值 ASC+WHERE+OFFSET、字符串
+  ASC/DESC + 缺省 NULL 稳定序）；同时修正两处测试期望错误（LIMIT 3 OFFSET 1 断言
+  2 行 → 改 LIMIT 2；`city DESC` 等值组稳定序无法断言倒序 → 改 `note DESC` 断言
+  `[99,98]`）；574 全绿（development.md 7.101）。
+
 ---
 
 ## 环境备忘（不入库）

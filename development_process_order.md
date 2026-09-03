@@ -47,6 +47,7 @@
 | AC | 导出增强：与 Compaction 共享后台 IO 优先级（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 收尾（40e8abb）：CF scan_limiter Token Bucket（扫描路径专用，前台点查不受影响）+ export --io-rate-limit-mb（默认 storage.io_rate_limit_mb 同 Compaction 后台预算语义）；+1 测试 477 全绿；**导出功能全部完成**；详见 development.md 7.68 |
 | AD | 10 亿库扩展阶段 A~D：全局 docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片级可观测 | P0 | ✅ 完成 | `src/docid_alloc.rs`（AtomicU64 无锁分配 + 水位续跑 + 扩容归属不变 + 溢出保护）；`src/shard_build.rs` + shanshui-cunji-shard-build（行号取模/前缀路由/--shard-id 并行/BOM 修复）；`src/shard_inverted.rs`（分片内 local 位图 + 前缀组合 + 跨分片分页窗口 + 真实 Engine 集成）；`src/raft_rpc.rs`（RaftMsg serde + RaftTransport + RaftNodeRuntime 选举/复制/failover/多数派）；`src/shard_metrics.rs`（分片水位 gauge + 读写计数 + 80%/90% 预警 + /metrics 集成）；demo 24 测试 + kernel 30 单测，530 全绿；详见 development.md 7.81~7.86（10b 设计已并入 design_remain §19 归档） |
 | AE | LSM 读路径范围查询优化（Ex-8 系列） | P0 | ✅ 完成 2026-09-03 | Ex-8.1~8.3（e63603a/49469f6/0d8fdcf+bbb1c7a）+ 50m release 复测：非事务 id BETWEEN p50 86ms→**2.48ms**、vs MySQL 差距 **~102×→3.6×**（窗口位置无关）；Ex-8.4~8.14 后续项（8.5/8.9/8.11 A/B/8.12/8.13）与 Ex-9 系列见 development_remain §11/§12/§14~§16/§18/§19 |
+| AF | SQL 能力补全：ORDER BY / GROUP BY 系列 | P0 | 🚧 #1 完成（2026-09-03） | 用户给定开发顺序（按价值/成本）：① ORDER BY 单字段+LIMIT（✅ 已完成）→ ② GROUP BY 单字段+COUNT/SUM → ③ ORDER BY 多字段 → ④ GROUP BY 多字段+常用聚合 → ⑤ GROUP BY+HAVING → ⑥ 倒排索引加速 GROUP BY（Ex-9.3）；每项配套 demo/单测/文档后推进下一项 |
 
 ## 3. 大项详情
 
@@ -218,6 +219,19 @@
 
 > 依赖链：O 项第①步（读 API &self 化）是 O 第②③步与 R 项共同前置；S 项已独立完成（✅ e7a413a，
 > 不依赖并发改造）；建议顺序 O → R → T/W/X → V → U。
+
+### AF. SQL 能力补全：ORDER BY / GROUP BY 系列（P0，🚧 #1 已完成 2026-09-03）
+- **背景**：sqlish 类 SQL 子集缺 ORDER BY / GROUP BY / JOIN / 子查询（宽表真机对比中作为能力差距
+  记录）；用户给定 6 项开发顺序（按价值/成本，见队列 AF 行）。
+- **#1 ORDER BY 单字段 + LIMIT（✅ 已完成）**：`Select.order_by: Vec<(String,bool)>` + Parser 分支
+  （`ORDER BY f [ASC|DESC](, …)`，大小写兼容）+ execute 排序路径（候选集上限 SORT_MAX_ROWS=20 万，
+  超限报 QueryTooExpensive 提示 WHERE/LIMIT 收敛；等值回退/谓词下推与排序互斥；排序键
+  Null<Num<Str，数值/字符串混排对齐 MySQL）+ OFFSET/LIMIT 切片；
+  - **根因修复（P76）**：`sort_key` 未取 `v.get(field)`，整文档当值 → 全键恒 Null → 排序退化为稳定序；
+  - 测试 +4（parse 多字段/大小写、数值降序、数值升序+OFFSET、字符串升序/降序/缺省 NULL 稳定），
+    574 全绿无回归；
+- **待推进 #2~#6**：GROUP BY 单字段+COUNT/SUM → ORDER BY 多字段 → GROUP BY 多字段 → HAVING →
+  倒排加速 GROUP BY（Ex-9.3）。
 
 ## 4. 已完成大项（最近）
 

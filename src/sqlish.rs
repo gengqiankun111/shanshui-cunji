@@ -68,6 +68,8 @@ pub struct Select {
     /// 聚合（7.95）：`(函数名小写, 参数字段)`——`COUNT(*)` 字段为 None；
     /// `COUNT(f)/SUM(f)/AVG(f)/MIN(f)/MAX(f)` 字段 Some。普通 SELECT 为 None。
     pub agg: Option<(String, Option<String>)>,
+    /// ORDER BY 排序项（开发顺序 #1/#3）：`(字段, 是否 DESC)`。
+    pub order_by: Vec<(String, bool)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,11 +297,40 @@ impl Parser {
         let mut where_expr = None;
         let mut limit = None;
         let mut offset = 0;
+        let mut order_by = Vec::new();
         loop {
             match self.peek()? {
                 Tok::Kw(k) if k == "WHERE" => {
                     self.next()?;
                     where_expr = Some(self.parse_expr()?);
+                }
+                Tok::Ident(k) if k.eq_ignore_ascii_case("order") => {
+                    // ORDER BY f1 [ASC|DESC], f2 [ASC|DESC], ...
+                    self.next()?; // 消费 order
+                    match self.next()? {
+                        Tok::Ident(k) if k.eq_ignore_ascii_case("by") => {}
+                        t => return Err(format!("ORDER 后期望 BY，实际 {t:?}")),
+                    }
+                    loop {
+                        let f = self.ident()?;
+                        let mut desc = false;
+                        if let Tok::Ident(d) = self.peek()? {
+                            if d.eq_ignore_ascii_case("desc") {
+                                desc = true;
+                                self.next()?;
+                            } else if d.eq_ignore_ascii_case("asc") {
+                                self.next()?;
+                            }
+                        }
+                        order_by.push((f, desc));
+                        match self.next()? {
+                            Tok::Comma => continue,
+                            t => {
+                                self.push_back(t);
+                                break;
+                            }
+                        }
+                    }
                 }
                 Tok::Kw(k) if k == "LIMIT" => {
                     self.next()?;
@@ -319,7 +350,7 @@ impl Parser {
                 t => return Err(format!("意外 token {t:?}")),
             }
         }
-        Ok(Select { columns, table, where_expr, limit, offset, agg })
+        Ok(Select { columns, table, where_expr, limit, offset, agg, order_by })
     }
     fn parse_expr(&mut self) -> PRes<WhereExpr> {
         self.parse_or()
@@ -1109,31 +1140,127 @@ fn eval(
     }
 }
 
+/// ORDER BY 候选集上限（防全库排序撑爆内存；超限报错提示 WHERE 收敛）。
+const SORT_MAX_ROWS: usize = 200_000;
+
+/// 排序键：Null(缺省/非数值非字符串) < Num < Str。
+#[derive(Debug, Clone)]
+enum SortKey {
+    Null,
+    Num(f64),
+    Str(String),
+}
+
+/// 从文档 JSON 顶层字段取排序键（数值→Num，字符串→Str，其余/缺省→Null）。
+fn sort_key(doc: &[u8], field: &str) -> SortKey {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) else {
+        return SortKey::Null;
+    };
+    match v.get(field) {
+        // 缺省 / JSON null / 非标量 → Null（排最后，MySQL 语义）。
+        None | Some(serde_json::Value::Null) => SortKey::Null,
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(SortKey::Num).unwrap_or(SortKey::Null),
+        Some(serde_json::Value::String(s)) => SortKey::Str(s.clone()),
+        Some(_) => SortKey::Null,
+    }
+}
+
+fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SortKey::Null, SortKey::Null) => Ordering::Equal,
+        (SortKey::Null, _) => Ordering::Less,
+        (_, SortKey::Null) => Ordering::Greater,
+        (SortKey::Num(x), SortKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (SortKey::Str(x), SortKey::Str(y)) => x.cmp(y),
+        // 数值与字符串混合：数值视为更小（MySQL 同语义）。
+        (SortKey::Num(_), SortKey::Str(_)) => Ordering::Less,
+        (SortKey::Str(_), SortKey::Num(_)) => Ordering::Greater,
+    }
+}
+
+struct SortRow {
+    docid: u64,
+    doc: Vec<u8>,
+    keys: Vec<SortKey>,
+}
+
 /// 执行类 SQL：解析 + 求值 + 回表 + LIMIT/OFFSET（`cap` 为无 LIMIT 时的上限保护）。
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
+    let sort = !sel.order_by.is_empty();
     // 7.94 等值回退：裸 `field=value` 倒排 term 未命中（数字等值/未索引字段）→
     // 单遍流式扫描 + LIMIT/OFFSET 早停（组合 AND/OR/NOT 内回退走 eval_cond 全量集）。
-    if let Some(WhereExpr::Cond(c)) = sel.where_expr.as_ref() {
-        if matches!(c.op, CmpOp::Eq) && c.field != "docid" {
-            let hit = engine.inverted_posting(&format!("{}={}", c.field, c.value))?;
-            if hit.is_empty() {
-                return scan_pushdown(engine, &Leaf::Cmp(c), limit, sel.offset, &guard);
+    // 含 ORDER BY 时不走早停快速路径（需完整候选集排序）。
+    if !sort {
+        if let Some(WhereExpr::Cond(c)) = sel.where_expr.as_ref() {
+            if matches!(c.op, CmpOp::Eq) && c.field != "docid" {
+                let hit = engine.inverted_posting(&format!("{}={}", c.field, c.value))?;
+                if hit.is_empty() {
+                    return scan_pushdown(engine, &Leaf::Cmp(c), limit, sel.offset, &guard);
+                }
             }
         }
-    }
-    // 谓词下推（7.93）：WHERE 为裸比较/BETWEEN（无倒排等值可收敛）→ 单遍流式扫描 +
-    // LIMIT/OFFSET 早停直接产出命中行（不再全量收集 docid 再逐行回表 get）。
-    if let Some(leaf) = sel.where_expr.as_ref().and_then(scan_leaf) {
-        return scan_pushdown(engine, &leaf, limit, sel.offset, &guard);
+        // 谓词下推（7.93）：WHERE 为裸比较/BETWEEN（无倒排等值可收敛）→ 单遍流式扫描 +
+        // LIMIT/OFFSET 早停直接产出命中行（不再全量收集 docid 再逐行回表 get）。
+        if let Some(leaf) = sel.where_expr.as_ref().and_then(scan_leaf) {
+            return scan_pushdown(engine, &leaf, limit, sel.offset, &guard);
+        }
     }
     let bitmap = match &sel.where_expr {
-        Some(e) => eval(engine, e, limit, &guard)?,
+        Some(e) => {
+            let cap_bits = if sort {
+                SORT_MAX_ROWS as u64 + sel.offset + limit
+            } else {
+                limit
+            };
+            eval(engine, e, cap_bits, &guard)?
+        }
         None => full_docids(engine, &guard)?,
     };
+    if sort {
+        if bitmap.len() as usize > SORT_MAX_ROWS {
+            return Err(Error::QueryTooExpensive(format!(
+                "ORDER BY 候选集过大（{} 行，上限 {}），请加 WHERE 收敛或用 LIMIT",
+                bitmap.len(),
+                SORT_MAX_ROWS
+            )));
+        }
+        let mut srows: Vec<SortRow> = Vec::with_capacity(bitmap.len() as usize);
+        for docid in bitmap {
+            if let Some(v) = engine.get(docid as u64)? {
+                let keys = sel
+                    .order_by
+                    .iter()
+                    .map(|(f, _)| sort_key(&v, f))
+                    .collect();
+                srows.push(SortRow { docid: docid as u64, doc: v, keys });
+            }
+        }
+        srows.sort_by(|a, b| {
+            for (((f, desc), k1), k2) in sel.order_by.iter().zip(&a.keys).zip(&b.keys) {
+                let mut ord = cmp_sort_key(k1, k2);
+                if *desc {
+                    ord = ord.reverse();
+                }
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let mut out = Vec::new();
+        for r in srows.into_iter().skip(sel.offset as usize) {
+            if out.len() as u64 >= limit {
+                break;
+            }
+            out.push((r.docid, r.doc));
+        }
+        return Ok(out);
+    }
     let mut rows = Vec::new();
     let mut skipped = 0u64;
     for docid in bitmap {
@@ -1499,6 +1626,56 @@ mod tests {
         assert_ne!(p1[0].0, p2[0].0, "分页不重叠");
         assert!(parse_select("SELECT * FROM t JOIN x").is_err(), "JOIN 拒绝");
         assert!(parse_select("SELECT * FROM t GROUP BY city").is_err(), "GROUP BY 拒绝");
+    }
+
+    // ---------- ORDER BY（开发顺序 #1：单字段 + LIMIT） ----------
+
+    #[test]
+    fn order_by_amount_desc_limit() {
+        let mut e = engine_with_docs();
+        let rows = execute(&mut e, "SELECT * FROM t ORDER BY amount DESC LIMIT 3", 1000).unwrap();
+        assert_eq!(rows.len(), 3);
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![99, 98, 97], "amount 降序取前 3（最大 990/980/970）");
+    }
+
+    #[test]
+    fn order_by_numeric_asc_with_where_and_offset() {
+        let mut e = engine_with_docs();
+        // WHERE 收敛后排序 + OFFSET/LIMIT 切片
+        let rows = execute(
+            &mut e,
+            "SELECT * FROM t WHERE amount>=500 AND amount<600 ORDER BY amount ASC LIMIT 2 OFFSET 1",
+            1000,
+        )
+        .unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![51, 52], "amount 500..590 升序，跳过最小 50，取 51/52");
+    }
+
+    #[test]
+    fn order_by_string_field_asc() {
+        let mut e = engine_with_docs();
+        let rows = execute(&mut e, "SELECT * FROM t ORDER BY note ASC LIMIT 3", 1000).unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![0, 1, 10], "note 字典序（note-0 < note-1 < note-10 < note-2，同 MySQL）");
+        // DESC：note-99/98 最大，倒序前 2
+        let rows2 = execute(&mut e, "SELECT * FROM t ORDER BY note DESC LIMIT 2", 1000).unwrap();
+        let ids2: Vec<u64> = rows2.iter().map(|r| r.0).collect();
+        assert_eq!(ids2, vec![99, 98], "note 降序取前 2");
+        // 缺省字段全 NULL（ASC 均排最前且彼此相等）→ 稳定序返回
+        let rows3 = execute(&mut e, "SELECT * FROM t ORDER BY nokey ASC LIMIT 2", 1000).unwrap();
+        let ids3: Vec<u64> = rows3.iter().map(|r| r.0).collect();
+        assert_eq!(ids3, vec![0, 1], "缺省字段全 NULL，稳定序返回");
+    }
+
+    #[test]
+    fn order_by_parse_multi_field_and_case() {
+        let s = parse_select("SELECT * FROM t WHERE amount>1 ORDER BY amount DESC, note ASC LIMIT 5").unwrap();
+        assert_eq!(s.order_by, vec![("amount".into(), true), ("note".into(), false)]);
+        assert_eq!(s.limit, Some(5));
+        let s2 = parse_select("SELECT * FROM t order by note LIMIT 1").unwrap();
+        assert_eq!(s2.order_by, vec![("note".into(), false)], "小写 order by 亦可");
     }
 }
 

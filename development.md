@@ -2832,6 +2832,28 @@ impl RuntimePools {
    key-only 无法跳过）；文档库结构使 COUNT 仍慢于 MySQL 主键索引计数（~11×），已记录
    为结构限制，后续若要亚秒需引擎级 docid 可见计数维护（跨模块联动大工程，另行立项）。
 
+### 7.101 sqlish ORDER BY 支持（开发顺序 AF #1：单字段/多字段 + ASC/DESC + LIMIT）— ✅ 已完成
+
+> 2026-09-03。用户给定 SQL 能力开发顺序（AF 项 #1 最前：最简单、解决列表页刚需）。
+> sqlish 子集此前对 ORDER BY 直接报解析错误（能力差距，宽表对比中记录为 ERR）。
+
+1. **语法（src/sqlish.rs）**：`Select.order_by: Vec<(String,bool)>` + Parser 新分支
+   `ORDER BY f [ASC|DESC](, f [ASC|DESC]…)`（大小写混用兼容；ORDER/BY/ASC/DESC 为
+   Ident 词类——不在关键字白名单，按字面匹配）。
+2. **执行（execute）**：`sort` 时禁用等值回退/谓词下推（排序需完整候选集）；
+   `eval` 候选上限 `SORT_MAX_ROWS+offset+limit`，bitmap 超 20 万报 QueryTooExpensive
+   （提示 WHERE 收敛/LIMIT）；逐行 `engine.get` 提取排序键 → `sort_by` 多字段
+   comparator（DESC 逐键 reverse）→ OFFSET/LIMIT 切片。
+3. **排序键语义（对齐 MySQL）**：Null < Num < Str（缺省字段/JSON null 为 Null——
+   ASC 排最前、DESC 排最后）；数值按 f64、字符串按字节字典序（`note-10 < note-2`
+   与 MySQL 排序规则一致）；数值/字符串混排时数值更小。
+4. **根因修复（P78）**：`sort_key` 初版未取 `v.get(field)`，整文档当值 → 排序键恒
+   Null → 排序退化为稳定序（三执行测试全挂，parse 测试通过误导排查方向）。
+5. **回归**：+4 测试（parse 多字段/大小写、数值 DESC、数值 ASC+WHERE+OFFSET、
+   字符串 ASC/DESC + 缺省 NULL 稳定序），全量 **574 全绿**。
+6. **后续**：GROUP BY 单字段+COUNT/SUM（AF #2）→ ORDER BY 多字段终验（AF #3）→ …
+   排期见 development_process_order.md AF 行。
+
 ## Ex 系列扩展（归档自 development_extension.md，2026-09-03 合并）
 
 > 2026-09-03 归档合并：development_extension.md（v0.1 分布式事务落地计划 L1~L3 + Ex-4~7
