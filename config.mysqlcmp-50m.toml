@@ -1,0 +1,15 @@
+# 5000 万量级对比专用（3308，orders 50m 灌入）
+# 默认配置会把 title 等高基数唯一字段也建倒排 → 词条爆炸 → 倒排段 GC(>1024MB) 持续重写
+# 饿死写入（~16m 行处从 6.5万 rows/s 崩到 ~0.9k）。Ex-4 准则：只对枚举/低基数建倒排。
+# 查询语义不变：status/city 快速路径保留；amount/ts/title 本就全扫回退。
+[inverted]
+engine = "fst"
+inverted_fields = ["status", "city"]
+fulltext_fields = []
+exclude_fields = []
+max_term_len = 96
+# Ex-9.1b：倒排段 GC 阈值 = open_with_gc 的 segment_max_size_mb。2026-09-03 已用
+# segment_max_size_mb=64 触发一次全量 GC（1038 段 → 单 v4 段 654.8MB），5 亿 COUNT
+# status p50 0.25ms（doc_count_fast 载荷求和）。恢复 2048MB 防后续写入触发频繁全量 GC
+# （新写段为 v4 有载荷 → 混合多段仍走求和，无需频繁合并）。
+segment_max_size_mb = 2048
