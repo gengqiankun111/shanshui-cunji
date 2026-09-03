@@ -420,30 +420,33 @@
 | C5 COMMIT 持久 | PASS | —（时序伪差，非引擎问题） |
 | C6 ROLLBACK 丢弃 | PASS | — |
 
-### 缺陷 A：事务内 SELECT … FOR UPDATE 不是当前读（C1、C3 失败）——P0 先修
+### 缺陷 A：事务内 SELECT … FOR UPDATE 不是当前读（C1、C3 失败）——✅ 已修复（4818ecb）
 
-- 代码定位：`src/mysql.rs txn_select()`（~L1197-1269）——拿到 ids 后一律 `engine.txn_get(txn, id)`
+- 代码定位：`src/mysql.rs txn_select()`——拿到 ids 后一律 `engine.txn_get(txn, id)`
   （快照），BETWEEN 分支一律 `engine.scan_range_txn(txn, …)`（快照）；**FOR UPDATE 关键字被完全忽略**。
-- 修法提示：开头判 FOR UPDATE → 点/IN 走 `txn.read_own(id)` 优先（自写可见）否则 `engine.get(id)`
-  （最新已提交，引擎已有）；范围走最新 `engine.scan_range(start, end)` + 同事务写覆盖
-  （仿 `scan_range_txn` 尾部 read_own/新 docid 并入逻辑，基表换最新扫描）。**引擎侧不需要动**。
+- 修法（已落地）：解析前剥离尾部 FOR UPDATE → 点/IN 走 `txn_read_current`（`read_own` 优先，
+  否则 `engine.get` 最新已提交；**不写 snap 快照缓存**——当前读不污染 RR 一致读）；范围走
+  `txn_scan_current`（`engine.scan_range` 最新基表 + read_own 覆盖/删除排除/新 docid 并入）；
+  非主键谓词分支同步支持。**引擎侧未动**。快照一致读路径保持原样。
+- 验证：`txn_for_update_current_read_c1/c3` 两连接端到端（快照稳定 0/5、FOR UPDATE 见 1 /
+  隐藏已删行、随后一致读不被污染）；lib 602 全绿。
 - 复现（C1）：pre 插 id=900100 → BEGIN → 点读见 0 → aux 提交 UPDATE val+1 → 再点读仍 0（快照对）→
   `SELECT … FOR UPDATE`：mysql=[900100|1]（当前读）vs mydb=[900100|0] ✗。C3 同根：他事务已 DELETE
   提交后 FOR UPDATE，mysql=∅、mydb 仍返回旧行 900300。
 
-### 缺陷 B：BETWEEN 范围一致读出现幻读（C4 失败）——P0 与 A 并行排期
+### 缺陷 B：BETWEEN 范围一致读出现幻读（C4 失败）——P0 待修（缺陷 A 已闭环，本项为下一下）
 
 - 代码定位：mysql.rs BETWEEN 分支 → `engine.scan_range_txn` → `self.primary.scan_range_at(snapshot,…)`。
   对照点读 `get_bytes_at`（过滤正常），**疑 `column_family.rs::scan_range_at` 的 memtable 层未按
   seq ≤ snapshot 选版本/裁剪**（或只对 SST 生效）。修复从 scan_range_at 与 get_bytes_at 差异入手。
 - 复现（C4）：pre 插 id=900401 → BEGIN → BETWEEN 900400-900402 一致读仅见 900401（两库一致）→
   aux 提交插 900400 → 再一致读：mysql 快照不见幻影 vs mydb=[900400|1; 900401|0] 幻影可见 ✗；
-  同一 SQL 加 FOR UPDATE 两库一致（当前读见幻影，正确）。
+  同一 SQL 加 FOR UPDATE 两库一致（当前读见幻影，正确——缺陷 A 修复后经 `txn_scan_current` 保持）。
 - 要点：点读快照（C1/C3）过滤是对的；只有 BETWEEN 范围快照扫不按快照过滤——幻影行 seq 在快照后仍被返回。
 
 ### 排期与验证
 
-- 实现顺序：缺陷 A → 缺陷 B（可并行，均为 txn 读路径；A 修后 C1/C3 过，B 修后 C4 过）。
+- 实现顺序：缺陷 A ✅（4818ecb，C1/C3 转绿）→ 缺陷 B（下一下，C4 转绿后 C1~C6 全绿收敛）。
 - 验证：环境 MySQL 3306（db rr）、SCC 3309（db-s3-3a）；命令
   `rr-conformance --rr-cases --out <dir> --mysql-url … --my-url …`；用例源码
   `rr-conformance/src/rr_cases.rs`（+main.rs 入口，尚未提交）。目标 C1~C6 全绿。
