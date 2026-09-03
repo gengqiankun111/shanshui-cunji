@@ -1565,9 +1565,18 @@ fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
                 }
             }
             let mut last_id = 0u64;
+            // §27 P1：事务内语句级 auto 段预分配（多行一次性申请，逐行零原子）
+            let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count() as u64;
+            let mut auto_cur = if auto_rows > 0 {
+                Some(auto_alloc_block(engine, &session.auto_id, auto_rows))
+            } else {
+                None
+            };
             for (id, doc) in &rows {
                 let real_id = if *id == 0 {
-                    alloc_auto_id(engine, &session.auto_id) // §27 P0：水位续接（≥ max docid + 1）
+                    let cur = auto_cur.take().unwrap();
+                    auto_cur = Some(cur + 1);
+                    cur
                 } else {
                     *id
                 };
@@ -2560,10 +2569,19 @@ fn insert_response(
                 }
             }
             // H-6 扩展：多行 VALUES 批量入库（逐行 put，事务外；行数作为 affected）
+            // §27 P1：语句级 auto 段预分配（多行一次性申请，逐行零原子）
+            let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count() as u64;
+            let mut auto_cur = if auto_rows > 0 {
+                Some(auto_alloc_block(engine, auto_id, auto_rows))
+            } else {
+                None
+            };
             let mut last_id = 0u64;
             for (id, doc) in &rows {
                 let real_id = if *id == 0 {
-                    alloc_auto_id(engine, auto_id) // §27 P0：水位续接（≥ max docid + 1）
+                    let cur = auto_cur.take().unwrap();
+                    auto_cur = Some(cur + 1);
+                    cur
                 } else {
                     *id
                 };
@@ -2580,13 +2598,14 @@ fn insert_response(
     }
 }
 
-/// §27 P0：docid 水位续接的自动 id 分配——起点 ≥ 引擎已写入最大 docid + 1（重启续接不撞
-/// 已提交行；显式大 id 后自动 id 抬位）。并发安全：先 `fetch_max(水位)` 把计数器抬到水位
-/// 再 `fetch_add`，多连接并发分配返回值仍连续唯一（首个 = 水位，此后 +1）。
-fn alloc_auto_id(engine: &Engine, auto_id: &AtomicU64) -> u64 {
+/// §27 P0/P1：auto docid 段预分配——一次申请 `n` 个连续 id 的块（返回块起点，
+/// 使用 [start, start+n)），把逐行 2×原子降为语句级 1 次（大 INSERT/批量导入受益）。
+/// 起点 ≥ 引擎已写入最大 docid + 1（`Engine::auto_watermark`，重启续接不撞已提交行）；
+/// 并发安全：`fetch_max(水位)` 抬底后 `fetch_add(n)` 原子取段，多连接窗口不重叠。
+fn auto_alloc_block(engine: &Engine, auto_id: &AtomicU64, n: u64) -> u64 {
     let wm = engine.auto_watermark(); // 已写入最大 docid + 1（空库 = 1）
     auto_id.fetch_max(wm, Ordering::Relaxed);
-    auto_id.fetch_add(1, Ordering::Relaxed)
+    auto_id.fetch_add(n, Ordering::Relaxed)
 }
 
 /// UPDATE documents SET field=expr WHERE id=1（非事务：字段级 / 整体替换）。
@@ -3862,6 +3881,44 @@ mod tests {
         match ins(&mut e, "INSERT INTO documents VALUES (0,'{\"auto\":1}')") {
             super::QueryResponse::Ok(1, last) => assert_eq!(last, 100),
             _ => panic!("auto 插入失败"),
+        }
+    }
+
+    #[test]
+    fn auto_multirow_block_allocation() {
+        // §27 P1：多行 INSERT 中 auto 行一次性申请连续块（语句级一次 fetch_add），
+        // 与显式 id 混合按行序分配、块内唯一递增；下一条语句按引擎水位续接
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = std::sync::atomic::AtomicU64::new(1);
+        let ins = |e: &mut crate::engine::Engine, sql: &str| {
+            super::insert_response(e, sql, &auto)
+        };
+        // 显式基准 100
+        match ins(&mut e, "INSERT INTO documents VALUES (100,'{\"x\":1}')") {
+            super::QueryResponse::Ok(1, _) => {}
+            _ => panic!("显式插入失败"),
+        }
+        // 混合多行：auto×3 与显式 200/300 交错 → auto 块起点 101（> max 100），
+        // 按行序取 101,102,103；last_id = 最后一行（显式 300）
+        match ins(
+            &mut e,
+            "INSERT INTO documents VALUES (0,'{\"a\":1}'),(200,'{\"b\":1}'),(0,'{\"a\":2}'),(0,'{\"a\":3}'),(300,'{\"c\":1}')",
+        ) {
+            super::QueryResponse::Ok(5, last) => assert_eq!(last, 300),
+            _ => panic!("多行混合插入失败"),
+        }
+        for id in [101u64, 102, 103] {
+            assert!(e.get(id).unwrap().is_some(), "auto 块内 {id} 应存在");
+        }
+        assert!(e.get(200).unwrap().is_some());
+        assert!(e.get(300).unwrap().is_some());
+        // 下一条单行 auto：按引擎水位（max=300）续接 → 301，不撞不重复
+        match ins(&mut e, "INSERT INTO documents VALUES (0,'{\"a\":4}')") {
+            super::QueryResponse::Ok(1, last) => assert_eq!(last, 301, "新语句按水位续接"),
+            super::QueryResponse::Err(1062, m) => panic!("续接撞库 1062: {m}"),
+            _ => panic!("单行 auto 失败"),
         }
     }
 

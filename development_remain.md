@@ -565,8 +565,8 @@
 
 | 项 | 内容 | 状态/优先级 |
 |---|---|---|
-| docid 水位续接 | auto_id 分配器起点 = max_docid+1（首次分配经 `Engine::auto_watermark` 惰性全库 keys-only 恢复，重启续接不撞库）；显式 id 经 put fetch_max 同步抬水位 | ✅ 已完成（本提交：`Engine::auto_watermark` + `alloc_auto_id`（fetch_max(水位)+fetch_add 并发安全）；测试 `auto_watermark_resumes_after_reopen` / `auto_insert_resumes_above_explicit_ids`，lib 611 全绿） |
-| 段预分配 | 批量导入/大 INSERT 用段分配（alloc(start,len)），降低 fetch_add 竞争 | 待排 P1 |
+| docid 水位续接 | auto_id 分配器起点 = max_docid+1（首次分配经 `Engine::auto_watermark` 惰性全库 keys-only 恢复，重启续接不撞库）；显式 id 经 put fetch_max 同步抬水位 | ✅ 已完成（623726e：`Engine::auto_watermark` + `auto_alloc_block`；测试 `auto_watermark_resumes_after_reopen` / `auto_insert_resumes_above_explicit_ids`） |
+| 段预分配 | 多行 INSERT 语句级**块分配**：`auto_alloc_block`（fetch_max(水位)+fetch_add(行数)）一次取段、逐行零原子，与显式 id 混插按行序分配 | ✅ 已完成（本提交：insert_response/txn_insert 多行 auto 块预分配；测试 `auto_multirow_block_allocation`（混合行序 + 下语句水位续接 301），lib 612 全绿） |
 | 表内 row_id 分配器 | §26 多表落地时：每表 `(table_id, row_id 水位)` 分配器（持久化水位存哪：系统键/列族）；与显式 id 冲突 1062 保持 | 随 §26 立项 |
 | AUTO_INCREMENT 列属性 | CREATE TABLE `id INT AUTO_INCREMENT` 解析（属性忽略→接受）→ 该表插入无 id 走自动 docid | 随 mysql 兼容增强（可与水位续接并行） |
 | Snowflake（远期备选） | 仅当真分布式多写者无协调分配出现时复评（现有 docid_alloc 已覆盖分片场景） | 远期，不主动排期 |
