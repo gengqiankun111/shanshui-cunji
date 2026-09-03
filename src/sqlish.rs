@@ -70,6 +70,11 @@ pub struct Select {
     pub agg: Option<(String, Option<String>)>,
     /// ORDER BY 排序项（开发顺序 #1/#3）：`(字段, 是否 DESC)`。
     pub order_by: Vec<(String, bool)>,
+    /// GROUP BY 分组字段（AF#2 单字段；None = 无分组）。聚合列见 `group_aggs`。
+    pub group_by: Option<String>,
+    /// GROUP BY 聚合列（AF#2：#2 起支持多个；每个 `(函数名小写, 参数字段)`，
+    /// `COUNT(*)` 字段为 None）。无 GROUP BY 时为空，标量聚合走 `agg`。
+    pub group_aggs: Vec<(String, Option<String>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,11 +253,16 @@ impl Parser {
     fn parse_select(&mut self) -> PRes<Select> {
         self.expect_kw("SELECT")?;
         let mut columns = Vec::new();
-        let mut agg = None;
+        let mut plain: Vec<String> = Vec::new();
+        let mut aggs: Vec<(String, Option<String>)> = Vec::new();
+        let mut star_seen = false;
         loop {
             let item = self.next()?;
             match item {
-                Tok::Star => columns.push("*".into()),
+                Tok::Star => {
+                    columns.push("*".into());
+                    star_seen = true;
+                }
                 Tok::Ident(i) => {
                     // 7.95 聚合函数列：COUNT(*) / COUNT(f) / SUM(f) / AVG(f) / MIN(f) / MAX(f)
                     if matches!(self.peek()?, Tok::LParen) {
@@ -270,15 +280,13 @@ impl Parser {
                                 Tok::RParen => {}
                                 t => return Err(format!("聚合期望右括号，实际 {t:?}")),
                             }
-                            if agg.is_some() {
-                                return Err("暂不支持多列/多聚合（无 GROUP BY）".into());
-                            }
-                            agg = Some((upper.to_lowercase(), arg));
+                            aggs.push((upper.to_lowercase(), arg));
                             columns.push(upper);
                         } else {
                             return Err(format!("不支持的函数列: {i}"));
                         }
                     } else {
+                        plain.push(i.clone());
                         columns.push(i);
                     }
                 }
@@ -298,11 +306,28 @@ impl Parser {
         let mut limit = None;
         let mut offset = 0;
         let mut order_by = Vec::new();
+        let mut group_by = None;
         loop {
             match self.peek()? {
                 Tok::Kw(k) if k == "WHERE" => {
                     self.next()?;
                     where_expr = Some(self.parse_expr()?);
+                }
+                Tok::Ident(k) if k.eq_ignore_ascii_case("group") => {
+                    // AF#2：GROUP BY 单字段（多字段排期 AF#4）
+                    self.next()?; // 消费 group
+                    match self.next()? {
+                        Tok::Ident(k) if k.eq_ignore_ascii_case("by") => {}
+                        t => return Err(format!("GROUP 后期望 BY，实际 {t:?}")),
+                    }
+                    if group_by.is_some() {
+                        return Err("重复 GROUP BY".into());
+                    }
+                    let f = self.ident()?;
+                    if matches!(self.peek()?, Tok::Comma) {
+                        return Err("暂只支持单字段 GROUP BY（多字段排期 AF#4）".into());
+                    }
+                    group_by = Some(f);
                 }
                 Tok::Ident(k) if k.eq_ignore_ascii_case("order") => {
                     // ORDER BY f1 [ASC|DESC], f2 [ASC|DESC], ...
@@ -350,7 +375,45 @@ impl Parser {
                 t => return Err(format!("意外 token {t:?}")),
             }
         }
-        Ok(Select { columns, table, where_expr, limit, offset, agg, order_by })
+        // 组装：无 GROUP BY → 单标量聚合（7.95 兼容）；有 GROUP BY → 组聚合列清单。
+        let mut agg = None;
+        let group_aggs = aggs.clone();
+        if let Some(g) = &group_by {
+            if star_seen {
+                return Err("SELECT * 与 GROUP BY 混用不支持（须显式分组字段）".into());
+            }
+            for p in &plain {
+                if p != g {
+                    return Err(format!(
+                        "非分组列 {p} 须等于 GROUP BY 字段 {g}（或只选聚合列）"
+                    ));
+                }
+            }
+            for (n, f) in &aggs {
+                let up = n.to_uppercase();
+                if !matches!(up.as_str(), "COUNT" | "SUM") {
+                    return Err(format!("GROUP BY 聚合暂只支持 COUNT/SUM（{n} 排期 AF#4）"));
+                }
+                if f.is_none() && up != "COUNT" {
+                    return Err(format!("{n}(*) 不支持（仅 COUNT(*)）"));
+                }
+            }
+        } else if aggs.len() > 1 {
+            return Err("暂不支持多列/多聚合（无 GROUP BY）".into());
+        } else {
+            agg = aggs.into_iter().next();
+        }
+        Ok(Select {
+            columns,
+            table,
+            where_expr,
+            limit,
+            offset,
+            agg,
+            order_by,
+            group_by,
+            group_aggs,
+        })
     }
     fn parse_expr(&mut self) -> PRes<WhereExpr> {
         self.parse_or()
@@ -1189,6 +1252,13 @@ struct SortRow {
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
+    if sel.group_by.is_some() {
+        // GROUP BY 结果非 (docid, doc) 行模型 → 显式拒绝（走 mysql 协议分组接口），
+        // 防普通执行入口静默返回未分组文档。
+        return Err(Error::Config(
+            "GROUP BY 查询须经分组执行入口 execute_group_by".into(),
+        ));
+    }
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
     let sort = !sel.order_by.is_empty();
@@ -1297,6 +1367,12 @@ pub struct AggScalar {
 /// （非数值行跳过；数值按 f64 累加——大整数超 2^53 精度受限，标注限制）。
 pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>> {
     let sel = parse_select(sql)?;
+    if sel.group_by.is_some() {
+        // GROUP BY 走 execute_group_by（多行分组），非本标量入口。
+        return Err(Error::Config(
+            "GROUP BY 查询须经分组执行入口 execute_group_by".into(),
+        ));
+    }
     let Some((name, field)) = sel.agg.clone() else {
         return Ok(None);
     };
@@ -1418,6 +1494,301 @@ fn fmt_num(x: f64) -> String {
     } else {
         x.to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// GROUP BY（开发顺序 AF#2：单字段 + COUNT/SUM）
+// ---------------------------------------------------------------------------
+
+/// GROUP BY 结果集：组字段列 + 每聚合列一列（headers 与 rows[].cells 对齐）。
+#[derive(Debug, Clone)]
+pub struct GroupResult {
+    /// GROUP BY 字段名（结果集首列列头）。
+    pub group_field: String,
+    /// 聚合列头（如 `COUNT(*)` / `SUM(amount)`）。
+    pub headers: Vec<String>,
+    /// 分组行（按组键升序：Null < Num < Str，对齐 MySQL ASC）。
+    pub rows: Vec<GroupRow>,
+}
+
+/// 单个分组结果行。
+#[derive(Debug, Clone)]
+pub struct GroupRow {
+    /// 组键显示文本（None = NULL 组：字段缺省 / JSON null / 嵌套结构）。
+    pub key_text: Option<String>,
+    /// 组键是否为数值（决定结果集首列类型 LONGLONG/DOUBLE vs VAR_STRING）。
+    pub key_is_num: bool,
+    /// 各聚合值（None = SQL NULL，如空数值集 SUM）；与 `GroupResult::headers` 对齐。
+    pub cells: Vec<Option<String>>,
+}
+
+/// 组键（自定义 Eq/Hash：`-0.0` 与 `0.0` 归并为同组，数值按位等价）。
+#[derive(Debug, Clone)]
+enum GroupKey {
+    Null,
+    Num(f64),
+    Str(String),
+}
+
+impl GroupKey {
+    fn norm(x: f64) -> f64 {
+        if x == 0.0 {
+            0.0
+        } else {
+            x
+        }
+    }
+    fn text(&self) -> Option<String> {
+        match self {
+            GroupKey::Null => None,
+            GroupKey::Num(x) => Some(fmt_num(*x)),
+            GroupKey::Str(s) => Some(s.clone()),
+        }
+    }
+    fn is_num(&self) -> bool {
+        matches!(self, GroupKey::Num(_))
+    }
+}
+
+impl PartialEq for GroupKey {
+    fn eq(&self, o: &Self) -> bool {
+        use GroupKey::*;
+        match (self, o) {
+            (Null, Null) => true,
+            (Num(a), Num(b)) => GroupKey::norm(*a).to_bits() == GroupKey::norm(*b).to_bits(),
+            (Str(a), Str(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for GroupKey {}
+impl std::hash::Hash for GroupKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use GroupKey::*;
+        match self {
+            Null => 0u8.hash(state),
+            Num(x) => {
+                1u8.hash(state);
+                GroupKey::norm(*x).to_bits().hash(state);
+            }
+            Str(s) => {
+                2u8.hash(state);
+                s.hash(state);
+            }
+        }
+    }
+}
+
+fn cmp_group_key(a: &GroupKey, b: &GroupKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (GroupKey::Null, GroupKey::Null) => Ordering::Equal,
+        (GroupKey::Null, _) => Ordering::Less,
+        (_, GroupKey::Null) => Ordering::Greater,
+        (GroupKey::Num(x), GroupKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (GroupKey::Str(x), GroupKey::Str(y)) => x.cmp(y),
+        (GroupKey::Num(_), GroupKey::Str(_)) => Ordering::Less,
+        (GroupKey::Str(_), GroupKey::Num(_)) => Ordering::Greater,
+    }
+}
+
+/// 组内聚合累积器（每组一份；name/field 由 specs 顺序对应，见调用处 zip）。
+#[derive(Debug, Clone)]
+struct AggAcc {
+    /// COUNT(*) / COUNT(f) 计入行数。
+    count: u64,
+    /// SUM 累加与数值行数（n_num==0 → 组 SUM 为 NULL）。
+    sum: f64,
+    n_num: u64,
+}
+
+/// 从文档取组键：顶层字段优先字节级取值（免整文档反序列化）；点路径/其余值
+/// serde 回退——Number → Num、String → Str，其余（缺省/null/布尔/嵌套）→ NULL 组
+/// （与 SQL「NULL 分一组」语义一致）。
+fn group_key_of(doc: &[u8], field: &str) -> GroupKey {
+    if !field.contains('.') {
+        match light_top_field(doc, field) {
+            Some(LightVal::Num(b)) => {
+                if let Some(x) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<f64>().ok()) {
+                    return GroupKey::Num(GroupKey::norm(x));
+                }
+            }
+            Some(LightVal::Str(b)) => {
+                if let Ok(s) = std::str::from_utf8(b) {
+                    return GroupKey::Str(s.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(doc) else {
+        return GroupKey::Null;
+    };
+    match field_of(&v, field) {
+        Some(Value::Number(n)) => n.as_f64().map(GroupKey::Num).unwrap_or(GroupKey::Null),
+        Some(Value::String(s)) => GroupKey::Str(s.clone()),
+        _ => GroupKey::Null,
+    }
+}
+
+/// 字段是否「存在且非 JSON null」（COUNT(f) 语义，任意类型非 null 计入）。
+fn field_non_null(doc: &[u8], f: &str) -> bool {
+    if !f.contains('.') {
+        if let Some(r) = light_top_field(doc, f) {
+            return !matches!(r, LightVal::Absent | LightVal::Null);
+        }
+    }
+    serde_json::from_slice::<Value>(doc)
+        .ok()
+        .map(|v| {
+            field_of(&v, f)
+                .map(|fv| !matches!(fv, Value::Null))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 取数值字段（SUM(f) 只统计 JSON number；非数值/缺省 → None）。
+fn numeric_field(doc: &[u8], f: &str) -> Option<f64> {
+    if !f.contains('.') {
+        if let Some(LightVal::Num(b)) = light_top_field(doc, f) {
+            if let Some(x) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<f64>().ok()) {
+                return Some(x);
+            }
+        }
+    }
+    serde_json::from_slice::<Value>(doc)
+        .ok()
+        .and_then(|v| field_of(&v, f).and_then(|fv| fv.as_f64()))
+}
+
+/// GROUP BY 执行（AF#2）：`SELECT <g>, COUNT(*)/COUNT(f)/SUM(f) ... GROUP BY <g>` →
+/// 全量单遍扫描分组（与无索引聚合同语义，不依赖倒排完整性；WHERE 行级过滤），
+/// 组键升序输出（Null < Num < Str），LIMIT/OFFSET 对**组行**切片；`cap` = 分组数
+/// 上限（超限 QueryTooExpensive）兼 LIMIT 缺省值。
+///
+/// 非 GROUP BY SQL 返回 `Ok(None)`（调用方继续走标量聚合/普通查询）。
+pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<GroupResult>> {
+    let sel = parse_select(sql)?;
+    let Some(g) = sel.group_by.clone() else {
+        return Ok(None);
+    };
+    let specs = sel.group_aggs.clone();
+    if specs.is_empty() {
+        return Err(Error::Config("GROUP BY 需至少一个聚合列（COUNT/SUM）".into()));
+    }
+    let guard = engine.query_guard();
+    let mut groups: std::collections::HashMap<GroupKey, AggAcc> = std::collections::HashMap::new();
+    let mut scanned = 0u64;
+    engine.scan_stream(None, None, |_docid, doc| {
+        scanned += 1;
+        if scanned % 4096 == 0 && guard.is_expired() {
+            return Err(Error::QueryTooExpensive(
+                "GROUP BY 全量扫描超时（熔断中止）".into(),
+            ));
+        }
+        if let Some(wh) = &sel.where_expr {
+            let hit = match light_where_matches(doc, wh) {
+                Some(r) => r,
+                None => serde_json::from_slice::<Value>(doc)
+                    .map(|v| wh.matches_doc(&v))
+                    .unwrap_or(false),
+            };
+            if !hit {
+                return Ok(true);
+            }
+        }
+        let key = group_key_of(doc, &g);
+        let acc = groups
+            .entry(key)
+            .or_insert_with(|| AggAcc { count: 0, sum: 0.0, n_num: 0 });
+        for (name, fld) in &specs {
+            match name.as_str() {
+                "count" => {
+                    if fld.is_none() || field_non_null(doc, fld.as_ref().unwrap()) {
+                        acc.count += 1;
+                    }
+                }
+                "sum" => {
+                    if let Some(x) = numeric_field(doc, fld.as_ref().unwrap()) {
+                        acc.sum += x;
+                        acc.n_num += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if groups.len() as u64 > cap {
+            return Err(Error::QueryTooExpensive(format!(
+                "GROUP BY 分组数超过上限（{} 组，上限 {cap}），请加 WHERE 收敛",
+                groups.len()
+            )));
+        }
+        Ok(true)
+    })?;
+    let mut list: Vec<(GroupKey, AggAcc)> = groups.into_iter().collect();
+    // 组行排序：无 ORDER BY → 组键升序（Null 最前，对齐 MySQL ASC）；
+    // 有 ORDER BY → 仅支持按**分组字段**排序（本期），DESC 时键序反转
+    //（Null 随之排到组末，对齐 MySQL DESC）。
+    for (f, _) in &sel.order_by {
+        if f != &g {
+            return Err(Error::Config(format!(
+                "GROUP BY 结果排序仅支持分组字段 {g}（暂不支持 {f}；排期 AF#5）"
+            )));
+        }
+    }
+    list.sort_by(|a, b| {
+        let mut ord = cmp_group_key(&a.0, &b.0);
+        for (_, desc) in &sel.order_by {
+            if *desc {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        ord
+    });
+    let offset = sel.offset as usize;
+    let limit = sel.limit.unwrap_or(cap).min(cap) as usize;
+    let rows: Vec<GroupRow> = list
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(k, a)| {
+            let cells = specs
+                .iter()
+                .map(|(name, _)| match name.as_str() {
+                    "count" => Some(a.count.to_string()),
+                    "sum" => {
+                        if a.n_num > 0 {
+                            Some(fmt_num(a.sum))
+                        } else {
+                            None // 空数值集 SUM → SQL NULL
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            GroupRow {
+                key_text: k.text(),
+                key_is_num: k.is_num(),
+                cells,
+            }
+        })
+        .collect();
+    let headers: Vec<String> = specs
+        .iter()
+        .map(|(n, f)| {
+            let arg = f.as_deref().unwrap_or("*");
+            format!("{}({arg})", n.to_uppercase())
+        })
+        .collect();
+    Ok(Some(GroupResult {
+        group_field: g,
+        headers,
+        rows,
+    }))
 }
 
 #[cfg(test)]
@@ -1676,6 +2047,144 @@ mod tests {
         assert_eq!(s.limit, Some(5));
         let s2 = parse_select("SELECT * FROM t order by note LIMIT 1").unwrap();
         assert_eq!(s2.order_by, vec![("note".into(), false)], "小写 order by 亦可");
+    }
+
+    // ---------- GROUP BY（开发顺序 AF#2：单字段 + COUNT/SUM） ----------
+    // fixture：docid 0..99；city 循环 beijing/shanghai/shenzhen；status active 当 i%3==0；
+    // amount = i*10（全表 0..990，总和 49500）；note = note-{i}。
+
+    #[test]
+    fn group_by_count_single_field() {
+        let mut e = engine_with_docs();
+        let gr = execute_group_by(&mut e, "SELECT city, COUNT(*) FROM t GROUP BY city", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gr.group_field, "city");
+        assert_eq!(gr.headers, vec!["COUNT(*)"]);
+        let keys: Vec<Option<String>> = gr.rows.iter().map(|r| r.key_text.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![Some("beijing".into()), Some("shanghai".into()), Some("shenzhen".into())],
+            "组键升序（字典序）"
+        );
+        let counts: Vec<u64> = gr
+            .rows
+            .iter()
+            .map(|r| r.cells[0].as_ref().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(counts, vec![34, 33, 33], "i%3==0/1/2 各 34/33/33");
+    }
+
+    #[test]
+    fn group_by_status_multi_agg_sum() {
+        let mut e = engine_with_docs();
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gr.headers, vec!["COUNT(*)", "SUM(amount)"]);
+        let keys: Vec<&str> = gr.rows.iter().map(|r| r.key_text.as_deref().unwrap()).collect();
+        assert_eq!(keys, vec!["active", "inactive"]);
+        // active：i%3==0 共 34 行，amount 和 = 30×(0+1+…+33) = 16830
+        let a = &gr.rows[0];
+        assert_eq!(a.cells[0].as_deref(), Some("34"));
+        assert_eq!(a.cells[1].as_deref(), Some("16830"));
+        // inactive：66 行，总和 = 49500 - 16830 = 32670
+        let b = &gr.rows[1];
+        assert_eq!(b.cells[0].as_deref(), Some("66"));
+        assert_eq!(b.cells[1].as_deref(), Some("32670"));
+    }
+
+    #[test]
+    fn group_by_sum_with_where() {
+        let mut e = engine_with_docs();
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT city, SUM(amount) FROM t WHERE amount>=500 AND amount<600 GROUP BY city",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        // 命中 docid 50..59（i%3: 0→beijing、1→shanghai、2→shenzhen）：
+        // beijing(51/54/57)=1620、shanghai(52/55/58)=1650、shenzhen(50/53/56/59)=2180
+        let sums: Vec<&str> = gr
+            .rows
+            .iter()
+            .map(|r| r.cells[0].as_deref().unwrap())
+            .collect();
+        assert_eq!(sums, vec!["1620", "1650", "2180"]);
+        // 行级过滤后无 shanghai 组缺席（各组均含匹配行）
+        assert_eq!(gr.rows.len(), 3);
+    }
+
+    #[test]
+    fn group_by_missing_field_null_group_and_empty_sum() {
+        let mut e = engine_with_docs();
+        // 缺省字段 → 全部并入 NULL 组；SUM(缺省数值字段) → 无数值行 → NULL
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT nokey, COUNT(*), SUM(amount2) FROM t GROUP BY nokey",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gr.rows.len(), 1, "全 NULL 键并为一组");
+        assert!(gr.rows[0].key_text.is_none(), "NULL 组键文本为 None");
+        assert_eq!(gr.rows[0].cells[0].as_deref(), Some("100"), "COUNT(*) 计 100 行");
+        assert!(gr.rows[0].cells[1].is_none(), "空数值集 SUM → SQL NULL");
+    }
+
+    #[test]
+    fn group_by_limit_slices_groups() {
+        let mut e = engine_with_docs();
+        let gr = execute_group_by(&mut e, "SELECT city, COUNT(*) FROM t GROUP BY city LIMIT 2", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(gr.rows.len(), 2, "LIMIT 对组行切片");
+        assert_eq!(gr.rows[0].key_text.as_deref(), Some("beijing"));
+        assert_eq!(gr.rows[1].key_text.as_deref(), Some("shanghai"));
+    }
+
+    #[test]
+    fn group_by_order_by_group_field_desc() {
+        let mut e = engine_with_docs();
+        let gr = execute_group_by(
+            &mut e,
+            "SELECT city, COUNT(*) FROM t GROUP BY city ORDER BY city DESC",
+            1000,
+        )
+        .unwrap()
+        .unwrap();
+        let keys: Vec<&str> = gr.rows.iter().map(|r| r.key_text.as_deref().unwrap()).collect();
+        assert_eq!(keys, vec!["shenzhen", "shanghai", "beijing"], "组键 DESC");
+        // 排序字段 ≠ 分组字段 → 拒绝（组结果仅支持按分组字段排序，AF#5 扩展）
+        let mut e2 = engine_with_docs();
+        assert!(execute_group_by(
+            &mut e2,
+            "SELECT city, COUNT(*) FROM t GROUP BY city ORDER BY amount",
+            1000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn group_by_parse_rejections() {
+        // 无 GROUP BY 多聚合仍拒绝（标量路径旧语义）
+        assert!(parse_select("SELECT COUNT(*), SUM(amount) FROM t").is_err());
+        // 非分组列 ≠ GROUP BY 字段 → 拒绝
+        assert!(parse_select("SELECT status, COUNT(*) FROM t GROUP BY city").is_err());
+        // 多字段 GROUP BY 排期 AF#4 → 拒绝
+        assert!(parse_select("SELECT COUNT(*) FROM t GROUP BY city, status").is_err());
+        // SELECT * 与 GROUP BY 混用 → 拒绝
+        assert!(parse_select("SELECT * FROM t GROUP BY city").is_err());
+        // GROUP BY 聚合暂限 COUNT/SUM（AVG/MIN/MAX 属 AF#4）→ 拒绝
+        assert!(parse_select("SELECT city, AVG(amount) FROM t GROUP BY city").is_err());
+        // 无聚合列的 GROUP BY → 拒绝
+        let mut e = engine_with_docs();
+        assert!(execute_group_by(&mut e, "SELECT city FROM t GROUP BY city", 1000).is_err());
     }
 }
 

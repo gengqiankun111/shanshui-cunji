@@ -2854,6 +2854,33 @@ impl RuntimePools {
 6. **后续**：GROUP BY 单字段+COUNT/SUM（AF #2）→ ORDER BY 多字段终验（AF #3）→ …
    排期见 development_process_order.md AF 行。
 
+### 7.102 sqlish GROUP BY 单字段 + COUNT/SUM（开发顺序 AF #2）— ✅ 已完成
+
+> 2026-09-03。用户开发顺序 #2（核心聚合，业务价值最高）。此前 sqlish 对 GROUP BY
+> 直接报解析错误（能力差距，宽表对比记录为 ERR）。
+
+1. **解析（src/sqlish.rs）**：`Select.group_by`（单字段）+ `group_aggs`（聚合列清单，
+   允许多个 COUNT/SUM）。列清单解析改造为多槽位收集，尾部循环新增 GROUP BY 分支；
+   **组装期校验**：无 GROUP BY 的多聚合仍拒绝（标量路径旧语义不回退）、普通列须等于
+   分组字段（或只选聚合列）、`SELECT *` 与 GROUP BY 混用拒绝、多字段 GROUP BY 与
+   AVG/MIN/MAX 聚合显式拒绝（AF#4 排期）。
+2. **执行（execute_group_by）**：全量单遍扫描（`scan_stream` + WHERE 字节级 light 过滤 +
+   看门狗逐批熔断），每组 HashMap 累积（内存 O(组数)，组数超 cap 报 QueryTooExpensive）；
+   组键 Null<Num<Str（自定义 Eq/Hash，`-0.0` 归并 0.0），升序输出对齐 MySQL ASC；
+   LIMIT/OFFSET 对**组行**切片。聚合语义：COUNT(*) 计行 / COUNT(f) 字段存在且非 null /
+   SUM(f) 数值累加（空数值集 → SQL NULL）。字段取值顶层走字节级 light、点路径 serde 回退。
+3. **协议接入（src/mysql.rs select_response）**：分组查询先于标量聚合路由（分组 SQL 含
+   聚合列须走多行执行器）；结果集首列=组字段（类型按实际值推断 LONGLONG/DOUBLE/
+   VAR_STRING），聚合列头 COUNT(*)/SUM(f)，SUM 值含小数 → DOUBLE 列型；NULL 组键/
+   空 SUM → 0xfb NULL 单元格。
+4. **防呆**：`execute`/`execute_aggregate` 对 GROUP BY SQL 显式拒绝（防普通入口静默
+   返回未分组文档/单行标量误配）。
+5. **回归**：+7 测试（count 分组、status 多聚合 SUM 对照手算、WHERE 过滤分组、缺省字段
+   NULL 组 + 空数值 SUM、LIMIT 组切片、parse 拒绝矩阵、协议层多行结果集），全量
+   **581 全绿**。
+6. **后续**：ORDER BY 多字段终验（AF #3，多键 comparator 已就绪）→ GROUP BY 多字段
+   （AF #4）→ HAVING（AF #5）→ 倒排加速 GROUP BY（AF #6 / Ex-9.3）。
+
 ## Ex 系列扩展（归档自 development_extension.md，2026-09-03 合并）
 
 > 2026-09-03 归档合并：development_extension.md（v0.1 分布式事务落地计划 L1~L3 + Ex-4~7

@@ -2087,6 +2087,65 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             rows: Vec::new(),
         };
     }
+    // AF#2：GROUP BY 单字段 + COUNT/SUM → 多行分组结果集（组字段列 + 每聚合一列）。
+    // 置于标量聚合前（分组 SQL 含聚合列，须先路由到多行分组执行器）。
+    match crate::sqlish::execute_group_by(engine, sql, 10_000) {
+        Ok(Some(gr)) => {
+            // 首列（组字段）类型按实际值：整型 LONGLONG / 浮点 DOUBLE / 字符串 VAR_STRING。
+            let mut key_type = MYSQL_TYPE_VAR_STRING;
+            for r in &gr.rows {
+                if let Some(t) = &r.key_text {
+                    key_type = if !r.key_is_num {
+                        MYSQL_TYPE_VAR_STRING
+                    } else if t.contains('.') || t.contains('e') || t.contains('E') {
+                        MYSQL_TYPE_DOUBLE
+                    } else {
+                        MYSQL_TYPE_LONGLONG
+                    };
+                    break;
+                }
+            }
+            let key_charset = if key_type == MYSQL_TYPE_VAR_STRING { 45 } else { 63 };
+            let mut columns =
+                vec![column_payload(&gr.group_field, key_type, key_charset)];
+            // 聚合列：COUNT(*) 整型；SUM 有小数（. / e）→ DOUBLE，否则整型。
+            for (i, h) in gr.headers.iter().enumerate() {
+                let frac = gr.rows.iter().any(|r| {
+                    r.cells
+                        .get(i)
+                        .map(|c| {
+                            c.as_deref()
+                                .map(|t| t.contains('.') || t.contains('e') || t.contains('E'))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                });
+                columns.push(column_payload(
+                    h,
+                    if frac { MYSQL_TYPE_DOUBLE } else { MYSQL_TYPE_LONGLONG },
+                    63,
+                ));
+            }
+            let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(gr.rows.len());
+            for r in &gr.rows {
+                let mut row = Vec::with_capacity(columns.len());
+                match &r.key_text {
+                    Some(t) => row.push(t.clone().into_bytes()),
+                    None => row.push(vec![MYSQL_NULL_CELL]),
+                }
+                for c in &r.cells {
+                    match c {
+                        Some(t) => row.push(t.clone().into_bytes()),
+                        None => row.push(vec![MYSQL_NULL_CELL]),
+                    }
+                }
+                rows.push(row);
+            }
+            return QueryResponse::Set { columns, rows };
+        }
+        Ok(None) => {}
+        Err(e) => return QueryResponse::Err(1064, format!("query error: {e}")),
+    }
     // 7.95 聚合（字段条件 / 无 WHERE）：COUNT/SUM/AVG/MIN/MAX → 单行单列。
     // 放在 sqlish 兜底前——id 主键窗口聚合（BETWEEN/IN 分支）已先行返回，不受影响；
     // 聚合走全量单遍扫描 matches_doc（不依赖倒排完整性，与 MySQL 无索引聚合同语义）。
@@ -3100,6 +3159,48 @@ mod tests {
             .unwrap()
             .expect("全扫聚合");
         assert_eq!(agg.text, "3", "快路径与全扫数值一致");
+    }
+
+    #[test]
+    fn group_by_select_response_multi_row_result_set() {
+        // AF#2 协议层：GROUP BY 走 select_response → 多行分组结果集
+        //（首列组字段 + COUNT/SUM 聚合列；NULL 组键 → 0xfb 标记单元格）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.sstable.compression = "none".into();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let rows_in = [("bj", 10), ("bj", 20), ("sh", 5), ("sh", 15), ("gz", 99)];
+        for (i, (city, amount)) in rows_in.iter().enumerate() {
+            let doc = format!(r#"{{"city":"{city}","amount":{amount}}}"#);
+            let refs: Vec<&str> = Vec::new();
+            e.put(i as u64 + 1, doc.into_bytes(), &refs).unwrap();
+        }
+        match select_response(&e, "SELECT city, COUNT(*), SUM(amount) FROM t GROUP BY city") {
+            QueryResponse::Set { columns, rows } => {
+                assert_eq!(columns.len(), 3, "组字段列 + 2 聚合列");
+                assert_eq!(rows.len(), 3, "bj/sh/gz 三组");
+                let keys: Vec<String> =
+                    rows.iter().map(|r| String::from_utf8(r[0].clone()).unwrap()).collect();
+                assert_eq!(keys, vec!["bj", "gz", "sh"], "组键字符串升序");
+                assert_eq!(String::from_utf8(rows[0][1].clone()).unwrap(), "2");
+                assert_eq!(String::from_utf8(rows[0][2].clone()).unwrap(), "30");
+                assert_eq!(String::from_utf8(rows[1][1].clone()).unwrap(), "1");
+                assert_eq!(String::from_utf8(rows[1][2].clone()).unwrap(), "99");
+                assert_eq!(String::from_utf8(rows[2][1].clone()).unwrap(), "2");
+                assert_eq!(String::from_utf8(rows[2][2].clone()).unwrap(), "20");
+            }
+            _ => panic!("GROUP BY 应返回多行结果集"),
+        }
+        // 缺省字段 → 单 NULL 组；组键单元格 = NULL 标记
+        match select_response(&e, "SELECT missing, COUNT(*) FROM t GROUP BY missing") {
+            QueryResponse::Set { columns, rows } => {
+                assert_eq!(columns.len(), 2);
+                assert_eq!(rows.len(), 1, "全缺省并为一组");
+                assert_eq!(rows[0][0], vec![MYSQL_NULL_CELL]);
+                assert_eq!(String::from_utf8(rows[0][1].clone()).unwrap(), "5");
+            }
+            _ => panic!("GROUP BY 缺省字段应返回结果集"),
+        }
     }
 
     #[test]

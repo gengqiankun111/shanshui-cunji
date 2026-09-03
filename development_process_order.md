@@ -47,7 +47,7 @@
 | AC | 导出增强：与 Compaction 共享后台 IO 优先级（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 收尾（40e8abb）：CF scan_limiter Token Bucket（扫描路径专用，前台点查不受影响）+ export --io-rate-limit-mb（默认 storage.io_rate_limit_mb 同 Compaction 后台预算语义）；+1 测试 477 全绿；**导出功能全部完成**；详见 development.md 7.68 |
 | AD | 10 亿库扩展阶段 A~D：全局 docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片级可观测 | P0 | ✅ 完成 | `src/docid_alloc.rs`（AtomicU64 无锁分配 + 水位续跑 + 扩容归属不变 + 溢出保护）；`src/shard_build.rs` + shanshui-cunji-shard-build（行号取模/前缀路由/--shard-id 并行/BOM 修复）；`src/shard_inverted.rs`（分片内 local 位图 + 前缀组合 + 跨分片分页窗口 + 真实 Engine 集成）；`src/raft_rpc.rs`（RaftMsg serde + RaftTransport + RaftNodeRuntime 选举/复制/failover/多数派）；`src/shard_metrics.rs`（分片水位 gauge + 读写计数 + 80%/90% 预警 + /metrics 集成）；demo 24 测试 + kernel 30 单测，530 全绿；详见 development.md 7.81~7.86（10b 设计已并入 design_remain §19 归档） |
 | AE | LSM 读路径范围查询优化（Ex-8 系列） | P0 | ✅ 完成 2026-09-03 | Ex-8.1~8.3（e63603a/49469f6/0d8fdcf+bbb1c7a）+ 50m release 复测：非事务 id BETWEEN p50 86ms→**2.48ms**、vs MySQL 差距 **~102×→3.6×**（窗口位置无关）；Ex-8.4~8.14 后续项（8.5/8.9/8.11 A/B/8.12/8.13）与 Ex-9 系列见 development_remain §11/§12/§14~§16/§18/§19 |
-| AF | SQL 能力补全：ORDER BY / GROUP BY 系列 | P0 | 🚧 #1 完成（2026-09-03） | 用户给定开发顺序（按价值/成本）：① ORDER BY 单字段+LIMIT（✅ 已完成）→ ② GROUP BY 单字段+COUNT/SUM → ③ ORDER BY 多字段 → ④ GROUP BY 多字段+常用聚合 → ⑤ GROUP BY+HAVING → ⑥ 倒排索引加速 GROUP BY（Ex-9.3）；每项配套 demo/单测/文档后推进下一项 |
+| AF | SQL 能力补全：ORDER BY / GROUP BY 系列 | P0 | 🚧 #1~#2 完成（2026-09-03） | 用户给定开发顺序（按价值/成本）：① ORDER BY 单字段+LIMIT（✅ da4c08a）→ ② GROUP BY 单字段+COUNT/SUM（✅ 本期）→ ③ ORDER BY 多字段 → ④ GROUP BY 多字段+常用聚合 → ⑤ GROUP BY+HAVING → ⑥ 倒排索引加速 GROUP BY（Ex-9.3）；每项配套 demo/单测/文档后推进下一项 |
 
 ## 3. 大项详情
 
@@ -230,8 +230,18 @@
   - **根因修复（P76）**：`sort_key` 未取 `v.get(field)`，整文档当值 → 全键恒 Null → 排序退化为稳定序；
   - 测试 +4（parse 多字段/大小写、数值降序、数值升序+OFFSET、字符串升序/降序/缺省 NULL 稳定），
     574 全绿无回归；
-- **待推进 #2~#6**：GROUP BY 单字段+COUNT/SUM → ORDER BY 多字段 → GROUP BY 多字段 → HAVING →
-  倒排加速 GROUP BY（Ex-9.3）。
+- **#2 GROUP BY 单字段 + COUNT/SUM（✅ 已完成 2026-09-03）**：`Select.group_by` +
+  `group_aggs`（列清单多聚合槽位改造，组装期校验：无 GROUP BY 多聚合仍拒绝、非分组列须
+  等于分组字段、SELECT * 混用拒绝、AVG/MIN/MAX 拒绝留 AF#4）；`execute_group_by` 全量单遍
+  扫描分组（WHERE light 行级过滤，看门狗熔断；分组数超 `cap` 报 QueryTooExpensive；
+  HashMap 组聚合 O(组数) 内存）；组键 Null<Num<Str 自定义 Eq/Hash（-0.0 归一）升序输出，
+  LIMIT/OFFSET 对组行切片；COUNT(*) 计行 / COUNT(f) 非 null 计数 / SUM(f) 数值累加
+  （空数值集 → SQL NULL）；mysql.rs `select_response` 分组路由（组字段列类型按值推断
+  LONGLONG/DOUBLE/VAR_STRING，聚合列 SUM 有小数 → DOUBLE；NULL 组键 0xfb 单元格）；
+  - 测试 +7（count 分组/多聚合 SUM 对照手算值/WHERE 过滤分组/缺省字段 NULL 组+空 SUM/
+    LIMIT 组切片/parse 拒绝矩阵/协议层多行结果集），581 全绿；
+- **待推进 #3~#6**：ORDER BY 多字段终验 → GROUP BY 多字段 → HAVING → 倒排加速
+  GROUP BY（Ex-9.3）。
 
 ## 4. 已完成大项（最近）
 
