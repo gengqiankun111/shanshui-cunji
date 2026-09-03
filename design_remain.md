@@ -270,6 +270,21 @@ Ex-8.9 空闲感知维护（P3）/ Ex-8.10 txn 扫描位图过滤（P1 正确性
 
 **可选留存（不建议立项，记录备选）**：行式块内无重启点，块内 scan 为顺序扫至命中（~130 doc/块）；若未来块内查找成为实测瓶颈，可加块内稀疏重启点/二分（纯内存/格式微调），P3 微项。现阶段点查路径（Zone Map→L2 二分→分区布隆→块缓存）已覆盖。
 
+## 15. 写路径/锁优化提案审计（2026-09-03）
+
+> **来源**：外部建议——①写路径阶段化提交（持锁只做内存、释放后再 fsync + 后台 ack，宣称 50k→500k TPS）；
+> ②MemTable 切换原子指针化；③deletion_bitmap RwLock → ArcSwap 无锁快照。逐项对照代码：
+
+| 项 | 判定 | 依据 |
+|---|---|---|
+| ①写路径阶段化提交（fsync 移锁外 + 后台 ack） | ❌ 不采纳（前提部分过时） | **fsync 早已不在写锁内**：put_nosync 锁内只做 WAL 内存 append + memtable put + 倒排内存攒批；落盘由组提交窗口统一 fsync（M8-P0，2ms 批次，实测 68~91k ops/s）。50k-65k（协议接入）瓶颈 = 单写者串行 + 倒排/合并背压，非锁内 fsync。改"后台 ack"破坏现同步耐久语义（put 返回 = 已入组提交窗口），需新确认协议，与组提交重叠收益有限——**多写者 + 引擎写锁拆分才是真上限**（已列为远期 Ex-13 触发项） |
+| ②MemTable 切换原子指针化 | ✅ 已具备（双缓冲 + P72/Z 无锁合并） | MemTableBuffer 已 RwLock &self 化 + immutable 冻结 + 写路径在引擎写锁内切换（不并发于写）；memtable 插入为 crossbeam 无锁。无需改动 |
+| ③deletion_bitmap 读路径无锁化 | 🔶 **采纳小优化候选（Ex-8.14，P2）** | 现状 bits: RwLock<Vec<u64>>，`is_deleted` 每调用取读锁——**scan/count 逐行判定**（50m 行级）读锁竞争真实存在。方向：位图读无锁化（读侧原子 u64 位组直接读 + 写侧按"扩容才需锁"设计，或 seqlock/ArcSwap 只读快照），保留 4KB 脏页 fsync 持久语义 |
+| 锁护城河复核（读读并行/ArcSwap/倒排分段） | ✅ 属实 | O 项 RwLock 读读并行（1 亿 read_only +13.3×）、ssts ArcSwap 无锁快照、倒排 256 分区锁——外部评估与本实现一致 |
+
+### 采纳汇总（→ development_remain §18）
+Ex-8.14 deletion bitmap 读无锁化（P2）；写路径多写者维持远期（Ex-13/§9 触发链）。
+
 ## 设计决策边界（已定，不重复评估）
 
 - 2PC / TCC / Seata 本体：不做（L1 outbox + L2 SAGA 已覆盖）
