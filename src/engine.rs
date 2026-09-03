@@ -1373,6 +1373,12 @@ impl Engine {
             u64::MAX
         };
         let mut out: Vec<QueryRow> = self.primary.scan_range_at(snapshot, start, end)?;
+        // Ex-8.10：删除位图语义对齐（与 txn_get/get_at 一致）——快照视图先排除位图已删 docid。
+        // 置于 read_own 覆盖**之前**：事务内对已删 docid 的未提交写（自写复活）仍可覆盖显现。
+        // 注：位图删除为非版本化全局语义（get_at 同近似），快照不晚于删除时点亦隐藏（既有取舍）。
+        if let Some(bm) = &self.deletion_bitmap {
+            out.retain(|(d, _)| !bm.is_deleted(*d));
+        }
         // 同事务写覆盖：write_set 中的 docid 用 read_own 值替换/排除
         for row in out.iter_mut() {
             if let Some(own) = txn.read_own(row.0) {
@@ -1383,6 +1389,37 @@ impl Engine {
             }
         }
         out.retain(|(_, v)| !v.is_empty());
+        // Ex-8.10：事务内未提交 Put 的**新 docid / 已删复活**（基表扫描不含该行）并入窗口——
+        // read_own 仅覆盖"已出现"的行（上循环）；此处对 write_set 中未见 docid 补入最新自写值。
+        if !txn.ops().is_empty() {
+            let mut own_ids: Vec<u64> = txn
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    crate::txn::Op::Put { docid, .. } => Some(*docid),
+                    crate::txn::Op::Delete { .. } => None,
+                })
+                .collect();
+            own_ids.sort_unstable();
+            own_ids.dedup();
+            let present: std::collections::HashSet<u64> = out.iter().map(|(d, _)| *d).collect();
+            let mut added = false;
+            for d in own_ids {
+                if present.contains(&d) {
+                    continue;
+                }
+                let in_win = start.map_or(true, |s| d >= s) && end.map_or(true, |e| d <= e);
+                if in_win {
+                    if let Some(Some(v)) = txn.read_own(d) {
+                        out.push((d, v.to_vec()));
+                        added = true;
+                    }
+                }
+            }
+            if added {
+                out.sort_by_key(|r| r.0); // 保持升序（自写并入后重排；事务窗口通常小）
+            }
+        }
         Ok(out)
     }
 
@@ -2204,6 +2241,47 @@ mod tests {
         assert_eq!(map.len(), 4, "事务内删除 docid 4 应从扫描排除");
         assert!(!map.contains_key(&4));
         e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_scan_respects_deletion_bitmap_revival_and_insert() {
+        // Ex-8.10：事务扫描删除位图过滤（与 txn_get/get_at 对齐）+ 事务内自写复活已删 docid / 新插入
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=10u64 {
+            e.put(i, format!("v-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        e.delete(5).unwrap(); // 位图删除
+        // (1) 快照扫描排除位图已删（与 txn_get 一致）
+        {
+            let mut t = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+            let rows = e.scan_range_txn(&mut t, None, None).unwrap();
+            assert_eq!(rows.len(), 9, "位图已删 docid 5 应从扫描排除");
+            assert!(!rows.iter().any(|r| r.0 == 5));
+            assert!(e.txn_get(&mut t, 5).unwrap().is_none(), "与 txn_get 语义一致");
+            e.txn_rollback(t);
+        }
+        // (2) 事务内复活已删 docid 5（未提交）→ 扫描应含自写值（位图过滤后 read_own 复活）
+        {
+            let mut t = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+            t.put(5, b"revived".to_vec(), vec!["t".into()]);
+            let rows = e.scan_range_txn(&mut t, None, None).unwrap();
+            let map: std::collections::HashMap<u64, Vec<u8>> = rows.into_iter().collect();
+            assert_eq!(map.len(), 10);
+            assert_eq!(map.get(&5).unwrap(), b"revived", "自写复活已删 docid 应可见");
+            e.txn_rollback(t);
+        }
+        // (3) 事务内新插入 docid 11 → 窗口含自写
+        {
+            let mut t = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+            t.put(11, b"new".to_vec(), vec!["t".into()]);
+            let rows = e.scan_range_txn(&mut t, Some(9), Some(11)).unwrap();
+            let map: std::collections::HashMap<u64, Vec<u8>> = rows.into_iter().collect();
+            assert_eq!(map.len(), 3, "docid 9,10 已有 + 11 自写");
+            assert_eq!(map.get(&11).unwrap(), b"new");
+            e.txn_rollback(t);
+        }
     }
 
     #[test]
