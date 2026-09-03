@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod migrate;
 pub mod mv;
 pub mod mysql;
+pub mod multitable;
 pub mod optimizer;
 pub mod outbox;
 pub mod per_cpu;
