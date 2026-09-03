@@ -391,3 +391,15 @@
 > | batch_delete | 同上删除批量（`DELETE WHERE id IN (…)` / `f IN (…)`，返回受影响行数） | 新执行入口 |
 >
 > 优先级：P1（MySQL 生态常见 DML 形态）。实现顺序：UPDATE/DELETE … IN → batch 语法与语义确认 → batch_update/delete 执行器 + 单测 + wire 冒烟。
+
+## 24. MySQL 收敛缺口清单（用户 2026-09-03，RR 对照 Stage3 后按序解决）
+
+| # | 缺口 | 表现 | 状态/计划 |
+|---|---|---|---|
+| a | INSERT 不校验主键重复 | MySQL 1062 vs SCC 成功（DUP 取消 ~40%、覆盖=潜在覆盖语义） | 待排：insert_response 先 get 判存在 → 1062（含 txn 路径） |
+| b | 事务内 SELECT 仅 WHERE id=/BETWEEN/IN | 非主键列谓词直接 1064 | 待排：txn SELECT 复用 sqlish 条件（只读快照语义） |
+| c | DROP TABLE 不 purge 数据 | --init 后残留上轮行 | 待排：DROP 清库数据目录/段（对齐 MySQL 语义） |
+| d | UPDATE/DELETE WHERE id IN(…) 不支持 | 仅支持 id=（批量写通道废） | ✅ 已实现（3d4ac30，非 txn 路径） |
+| e | DIFF=21 / DEADLOCK=2 语义分歧 | RR Stage3 核心产出被 a/c 污染 | 待 a~c 修复后重跑核对 |
+
+> 注：d 的 txn 路径（事务内 UPDATE/DELETE … IN）需同步扩展；e 依赖 a/c 先修再重测。
