@@ -1939,6 +1939,137 @@ fn having_matches(
     }
 }
 
+/// Ex-9.3 ④b：无 WHERE 单字段 `GROUP BY` 的倒排词典枚举快路径（免逐行扫描）。
+/// 路由条件：聚合列 ⊆ {`COUNT(*)`, `SUM/AVG/MIN/MAX(stats_field)`（后者须 ∈ stats_fields）}。
+/// NULL 组语义精确：总行数 = `engine.count_all_docs`（key-only）；缺字段行 = N − Σ组行数。
+/// 若存在缺字段行且含数值聚合 → 缺字段行的数值贡献无法经倒排获得 → 放弃快路径回退全扫
+/// （宁慢勿错）。gs 为空（数值字段无倒排 term / 字段全缺）→ 回退全扫保证与扫描路径一致。
+fn group_by_fast_inverted(
+    engine: &Engine,
+    sel: &Select,
+    g: &str,
+    specs: &[(String, Option<String>)],
+    cap: u64,
+) -> Result<Option<GroupResult>> {
+    for (n, f) in specs {
+        let ok = match n.as_str() {
+            "count" => f.is_none(),
+            "sum" | "avg" | "min" | "max" => f
+                .as_deref()
+                .is_some_and(|ff| engine.stats_field_pos(ff).is_some()),
+            _ => false,
+        };
+        if !ok {
+            return Ok(None);
+        }
+    }
+    let gs = engine.inverted_group_stats(g)?;
+    if gs.is_empty() {
+        return Ok(None); // 数值字段（无 term）/ 无该字段文档 → 回退扫描路径
+    }
+    let has_numeric = specs
+        .iter()
+        .any(|(n, _)| matches!(n.as_str(), "sum" | "avg" | "min" | "max"));
+    let sum_rows: u64 = gs.iter().map(|x| x.1).sum();
+    let total = engine.count_all_docs()?;
+    let null_rows = total.saturating_sub(sum_rows);
+    if has_numeric && null_rows > 0 {
+        return Ok(None);
+    }
+    let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = Vec::with_capacity(gs.len() + 1);
+    for (value, count, stats) in gs {
+        let states = specs
+            .iter()
+            .map(|(n, f)| {
+                let mut st = AggState::new();
+                match n.as_str() {
+                    "count" => st.count = count,
+                    _ => {
+                        let pos = engine.stats_field_pos(f.as_deref().unwrap()).unwrap();
+                        if let Some(a) = stats.get(pos) {
+                            st.n_num = a.n;
+                            st.sum = a.sum;
+                            st.min = a.min;
+                            st.max = a.max;
+                        }
+                    }
+                }
+                st
+            })
+            .collect();
+        list.push((vec![GroupKey::Str(value)], states));
+    }
+    if null_rows > 0 {
+        // 缺该字段文档并入 NULL 组（仅 COUNT(*) 场景可达此处）
+        let states = specs
+            .iter()
+            .map(|(n, f)| {
+                let mut st = AggState::new();
+                if n == "count" && f.is_none() {
+                    st.count = null_rows;
+                }
+                st
+            })
+            .collect();
+        list.push((vec![GroupKey::Null], states));
+    }
+    // HAVING 过滤（对齐主路径语义）
+    if let Some(h) = &sel.having {
+        let fields = [g.to_string()];
+        list.retain(|(k, sts)| having_matches(h, &fields, k, specs, sts));
+    }
+    // 排序：ORDER BY 仅限分组字段（= g）；DESC 反转（NULL 组随之移末）
+    for (f, _) in &sel.order_by {
+        if f != g {
+            return Err(Error::Config(format!(
+                "GROUP BY 结果排序字段 {f} 须属于分组字段（{g}）"
+            )));
+        }
+    }
+    let desc = sel.order_by.iter().any(|(_, d)| *d);
+    list.sort_by(|a, b| {
+        let mut o = cmp_group_key(&a.0[0], &b.0[0]);
+        if desc {
+            o = o.reverse();
+        }
+        o
+    });
+    let offset = sel.offset as usize;
+    let limit = sel.limit.unwrap_or(cap).min(cap) as usize;
+    let rows: Vec<GroupRow> = list
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(k, sts)| {
+            let keys = k.iter().map(|gk| gk.text()).collect();
+            let key_is_num = k.iter().map(|gk| gk.is_num()).collect();
+            let cells = specs
+                .iter()
+                .zip(sts.iter())
+                .map(|((name, _), st)| agg_cell(name, st))
+                .collect();
+            GroupRow { keys, key_is_num, cells }
+        })
+        .collect();
+    let funcs: Vec<&str> = specs.iter().map(|(n, _)| n.as_str()).collect();
+    let group_cols: Vec<String> = sel
+        .columns
+        .iter()
+        .filter(|c| !funcs.contains(&c.to_lowercase().as_str()))
+        .cloned()
+        .collect();
+    let headers: Vec<String> = specs
+        .iter()
+        .map(|(n, f)| spec_header(n, f))
+        .collect();
+    Ok(Some(GroupResult {
+        group_fields: vec![g.to_string()],
+        group_cols,
+        headers,
+        rows,
+    }))
+}
+
 /// GROUP BY 执行（AF#2~#4）：`SELECT <cols>, COUNT/SUM/AVG/MIN/MAX ... GROUP BY f1, f2...` →
 /// 全量单遍扫描分组（与无索引聚合同语义，不依赖倒排完整性；WHERE 行级过滤），组键升序
 /// 输出（Null < Num < Str；`ORDER BY` 决定键序——仅限分组字段），LIMIT/OFFSET 对**组行**
@@ -1954,6 +2085,12 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
     let specs = sel.group_aggs.clone();
     if specs.is_empty() {
         return Err(Error::Config("GROUP BY 需至少一个聚合列".into()));
+    }
+    // Ex-9.3 ④b：无 WHERE 单字段 GROUP BY → 倒排词典枚举快路径（不可路由自动回退扫描）。
+    if sel.where_expr.is_none() && fields.len() == 1 {
+        if let Some(res) = group_by_fast_inverted(engine, &sel, &fields[0], &specs, cap)? {
+            return Ok(Some(res));
+        }
     }
     let guard = engine.query_guard();
     // 复合组键 = 各分组 level 键向量；每组持每聚合列一个累积器（与 specs 对齐）。
@@ -2257,6 +2394,65 @@ mod tests {
         // 语法错误：空列表 / 缺右括号
         assert!(parse_select("SELECT * FROM t WHERE city IN ()").is_err());
         assert!(parse_select("SELECT * FROM t WHERE city IN ('a'").is_err());
+    }
+
+    #[test]
+    fn group_by_fast_inverted_matches_scan() {
+        // Ex-9.3 ④b：无 WHERE 单字段 GROUP BY 倒排快路径结果与全扫一致（含 NULL 组；
+        // 数值聚合遇缺字段行自动回退全扫）。
+        let mk = |stats: bool| -> (crate::engine::Engine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = crate::config::Config::default();
+            if stats {
+                cfg.inverted.stats_fields = vec!["amount".to_string()];
+            }
+            let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+            let put = |e: &mut crate::engine::Engine, id: u64, st: Option<&str>, amt: Option<f64>| {
+                let mut d = serde_json::json!({});
+                if let Some(s) = st {
+                    d["status"] = serde_json::json!(s);
+                }
+                if let Some(a) = amt {
+                    d["amount"] = serde_json::json!(a);
+                }
+                let b = serde_json::to_vec(&d).unwrap();
+                let t: Vec<&str> = match st {
+                    Some("active") => vec!["status=active"],
+                    Some("inactive") => vec!["status=inactive"],
+                    _ => Vec::new(),
+                };
+                e.put_nosync(id, b, &t).unwrap();
+            };
+            put(&mut e, 1, Some("active"), Some(10.0));
+            put(&mut e, 2, Some("active"), Some(20.0));
+            put(&mut e, 3, Some("active"), None);
+            put(&mut e, 4, Some("inactive"), Some(5.0));
+            put(&mut e, 5, None, Some(7.0)); // 缺 status → NULL 组（含数值贡献）
+            (e, dir)
+        };
+        let enc = |r: &GroupRow| -> (Vec<Option<String>>, Vec<Option<String>>) {
+            (r.keys.clone(), r.cells.clone())
+        };
+        let (mut es, _d1) = mk(true);
+        let (mut en, _d2) = mk(false);
+        for sql in [
+            "SELECT status, COUNT(*) FROM t GROUP BY status",
+            "SELECT status, SUM(amount) FROM t GROUP BY status",
+            "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status",
+            "SELECT status, COUNT(*) FROM t GROUP BY status HAVING COUNT(*) > 1",
+        ] {
+            let a = execute_group_by(&mut es, sql, 1000).unwrap().unwrap();
+            let b = execute_group_by(&mut en, sql, 1000).unwrap().unwrap();
+            let ra: Vec<_> = a.rows.iter().map(enc).collect();
+            let rb: Vec<_> = b.rows.iter().map(enc).collect();
+            assert_eq!(ra, rb, "{sql} 快路径应与全扫一致");
+        }
+        // NULL 组精确：COUNT(*) 无 WHERE 下缺 status 的 doc5 → NULL 组 count=1
+        let gr = execute_group_by(&mut es, "SELECT status, COUNT(*) FROM t GROUP BY status", 1000)
+            .unwrap()
+            .unwrap();
+        let null_row = gr.rows.iter().find(|r| r.keys[0].is_none()).expect("应有 NULL 组");
+        assert_eq!(null_row.cells[0].as_deref(), Some("1"), "NULL 组计 1 行（doc5）");
     }
 
     #[test]
