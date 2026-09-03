@@ -42,6 +42,7 @@ struct Cfg {
     out: String,
     ext_every: u64,
     lite: bool,
+    single: bool,
     init: bool,
 }
 
@@ -81,6 +82,8 @@ fn main() {
         // --lite-writes：SCC SQL 层仅支持 `UPDATE/DELETE WHERE id=N`（不支持 IN 列表）
         // 时使用——把批量写（BatchUpd/BatchDel）替换为同构批量读，两侧执行同一 SQL。
         lite: has(&args, "--lite-writes"),
+        // --single：单表模式（仅 t_test）——SCC 单 docid 集合双表同 id 种子互撞的绕开方式。
+        single: has(&args, "--single"),
         init: has(&args, "--init"),
     };
 
@@ -175,7 +178,7 @@ fn init_dbs(cfg: &Cfg) -> anyhow::Result<()> {
     let mut d = conn(&cfg.my_url)?;
     ensure_db(&mut m, &cfg.mysql_db);
     ensure_db(&mut d, &cfg.my_db);
-    init::init(&mut m, &mut d, cfg.rows)
+    init::init(&mut m, &mut d, cfg.rows, cfg.single)
 }
 
 fn setup_rr(c: &mut Conn) {
@@ -229,7 +232,7 @@ fn worker(
         if id >= cfg.txns {
             break;
         }
-        let ops = ops::gen_txn(&mut rng, seg, cfg.lite);
+        let ops = ops::gen_txn(&mut rng, seg, cfg.lite, cfg.single);
         let out = run_txn(&mut wc, &ops, id, cfg.ext_every);
         let mut cnt = counts.lock().unwrap();
         cnt.txn += 1;
@@ -298,10 +301,15 @@ fn dump_compare(cfg: &Cfg) -> bool {
     };
     ensure_db(&mut d, &cfg.my_db);
     let mut all_ok = true;
-    for (tbl, sql) in [
-        ("t_test", "SELECT id,val FROM t_test ORDER BY id"),
-        ("t_combo", "SELECT id,a,b,val FROM t_combo ORDER BY id"),
-    ] {
+    let tables: Vec<(&str, &str)> = if cfg.single {
+        vec![("t_test", "SELECT id,val FROM t_test ORDER BY id")]
+    } else {
+        vec![
+            ("t_test", "SELECT id,val FROM t_test ORDER BY id"),
+            ("t_combo", "SELECT id,a,b,val FROM t_combo ORDER BY id"),
+        ]
+    };
+    for (tbl, sql) in tables {
         let rm = exec_stmt(&mut m, sql);
         let rd = exec_stmt(&mut d, sql);
         if rm.err.is_some() || rd.err.is_some() {

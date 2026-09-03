@@ -15,8 +15,9 @@ pub const DDL_DROP_T_TEST: &str = "DROP TABLE IF EXISTS t_test";
 pub const DDL_DROP_T_COMBO: &str = "DROP TABLE IF EXISTS t_combo";
 
 /// 清空 + 建表 + 种子 rows 行（val=0；t_combo a=i、b=i%50 → (a,b) 全唯一）。
-/// 种子保证两边逐行同构（终态 dump 基准一致）。
-pub fn init(m: &mut Conn, d: &mut Conn, rows: u32) -> anyhow::Result<()> {
+/// `single`（--single）：仅 t_test——SCC 单 docid 集合下双表同 id 种子会互相撞
+/// （缺口：表级 docid 前缀未实现），单表模式绕开用于 RR 随机对拍。
+pub fn init(m: &mut Conn, d: &mut Conn, rows: u32, single: bool) -> anyhow::Result<()> {
     for sql in [
         DDL_DROP_T_TEST,
         DDL_DROP_T_COMBO,
@@ -26,15 +27,17 @@ pub fn init(m: &mut Conn, d: &mut Conn, rows: u32) -> anyhow::Result<()> {
         m.query_drop(sql)?;
         d.query_drop(sql)?;
     }
-    seed(m, Table::TTest, rows, rows)?;
-    seed(d, Table::TTest, rows, rows)?;
-    seed(m, Table::TCombo, rows, rows)?;
-    seed(d, Table::TCombo, rows, rows)?;
+    seed(m, Table::TTest, rows)?;
+    seed(d, Table::TTest, rows)?;
+    if !single {
+        seed(m, Table::TCombo, rows)?;
+        seed(d, Table::TCombo, rows)?;
+    }
     Ok(())
 }
 
 /// 批量多行 VALUES 分块灌种子（块 500 行），两库逐块一致。
-fn seed(c: &mut Conn, t: Table, rows: u32, _cap: u32) -> anyhow::Result<()> {
+fn seed(c: &mut Conn, t: Table, rows: u32) -> anyhow::Result<()> {
     let mut id = 1u32;
     while id <= rows {
         let end = (id + 499).min(rows);

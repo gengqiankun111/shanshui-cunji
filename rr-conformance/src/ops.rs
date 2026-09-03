@@ -349,11 +349,12 @@ impl Seg {
 /// 生成一个事务的操作序列（键全部分配在本 worker 的 Seg 内 → 跨 worker 零冲突）。
 /// `lite`（--lite-writes）：SCC 不支持 `UPDATE/DELETE WHERE id IN (...)` → 批量写替换为
 /// 同构批量读（两侧 SQL 仍一致，保证 MySQL 端也不会把本可执行的写吃掉）。
-pub fn gen_txn(rng: &mut StdRng, seg: Seg, lite: bool) -> Vec<Op> {
+/// `single`（--single）：仅生成 t_test 操作（绕开双表同 docid 种子互撞的架构缺口）。
+pub fn gen_txn(rng: &mut StdRng, seg: Seg, lite: bool, single: bool) -> Vec<Op> {
     let mut ops: Vec<Op> = Vec::new();
     let n = rng.gen_range(2..=6);
     for _ in 0..n {
-        let t = if rng.gen_bool(0.5) { Table::TTest } else { Table::TCombo };
+        let t = if single || rng.gen_bool(0.5) { Table::TTest } else { Table::TCombo };
         // 70% 单点 / 30% 范围·批量
         if rng.gen_bool(0.7) {
             let pick: u32 = rng.gen_range(0..5);
@@ -390,7 +391,9 @@ pub fn gen_txn(rng: &mut StdRng, seg: Seg, lite: bool) -> Vec<Op> {
                 // RangeFu 只走主键（a 无索引：FOR UPDATE 全表 next-key 锁 → 跨 worker 死锁）
                 1 => ops.push(Op::RangeFu { t, on: Col::Pk, lo, hi }),
                 2 => {
-                    let ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
+                    let mut ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
+                    ids.sort_unstable();
+                    ids.dedup(); // 批量 IN 列表去重：MySQL 行集去重，避免逐项返回重复行
                     if lite {
                         // SCC 不支持批量 UPDATE → 同构批量读（覆盖批量读通道）
                         ops.push(Op::BatchSel { t, ids });
@@ -399,13 +402,18 @@ pub fn gen_txn(rng: &mut StdRng, seg: Seg, lite: bool) -> Vec<Op> {
                     }
                 }
                 3 => {
-                    let items: Vec<(u32, u32, u32)> = (0..rng.gen_range(2..=5))
+                    let mut items: Vec<(u32, u32, u32)> = (0..rng.gen_range(2..=5))
                         .map(|_| (seg.pick_new(rng), seg.pick_a(rng), rng.gen_range(0..50)))
                         .collect();
+                    // 批量插 id 去重：MySQL 行集去重 vs SCC 逐项 → 行数/TRY 差
+                    items.sort_by_key(|x| x.0);
+                    items.dedup_by_key(|x| x.0);
                     ops.push(Op::BatchIns { t, items });
                 }
                 4 => {
-                    let ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
+                    let mut ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
+                    ids.sort_unstable();
+                    ids.dedup(); // 批量 IN 列表去重：MySQL 行集去重，避免逐项返回重复行
                     if lite {
                         // SCC 不支持批量 DELETE → 同构批量读
                         ops.push(Op::BatchSel { t, ids });
@@ -414,7 +422,9 @@ pub fn gen_txn(rng: &mut StdRng, seg: Seg, lite: bool) -> Vec<Op> {
                     }
                 }
                 _ => {
-                    let ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
+                    let mut ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
+                    ids.sort_unstable();
+                    ids.dedup(); // 批量 IN 列表去重：MySQL 行集去重，避免逐项返回重复行
                     ops.push(Op::BatchSel { t, ids });
                 }
             }
