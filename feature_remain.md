@@ -13,6 +13,7 @@
 
 | 功能 | 模块 | 说明 |
 |---|---|---|
+| 事务扫描位图过滤（Ex-8.10，✅ e1ae41b） | 事务/删除 | scan_range_txn 排除位图已删 + 自写新插入/复活并入（558 全绿） |
 | 删除位图读无锁化（Ex-8.14，已排期 P2） | 读路径/删除 | is_deleted 每行取 RwLock 读锁（scan/count 50m 行级开销真实）→ 读侧原子位组直读/ArcSwap 快照；保留 4KB 脏页 fsync 语义。写路径阶段化提交/MemTable 切换已复核不需改（design_remain §15 / development_remain §18） |
 | 自适应多级 Block 索引（已评估，2026-09-03） | 存储/读路径 | ❌ 不采纳：块级 zstd 下"行级细索引跳块解压直读 200B"不可达（关键前提错误）；热路径已被 BlockCache/HotCache/Ex-8.3 覆盖；mmap 数据面不适用。备选记录 = 块内稀疏重启点 P3 微项（design_remain §14 / development_remain §17） |
 | 分层压缩（Ex-8.12，已排期 P2） | 存储/压缩 | 值得做：L2+ zstd 高等级（6~15）——zstd 解压近等级无关 → 近免费空间/IO 收益，代价仅后台压缩 CPU；落地点 = compaction out_level 选档（现有 compression_level 单配置）。风险核查：Ex-5.8 块级复用在跨层等级变化失效 + L0/L1 轻量档中间层放大；50m 库 A/B 量化后定默认。共享字典压缩 = 远期触发（design_remain §12 / development_remain §16） |

@@ -186,9 +186,11 @@
 
 ## 14. "量变优化"采纳候选（design_remain §10，2026-09-03 排期）
 
-- **Ex-8.10（P1，正确性收尾）事务扫描删除位图过滤**：
-  - [ ] `scan_range_txn` / `scan_range_at` 快照视图排除位图已删 docid（与 get_at/scan_stream 对齐；
-    delete 位图语义跨全部读路径一致）；demo + 单测（txn 扫描删除段 + put 复活 + flush/compact 后）
+- **Ex-8.10（P1，正确性收尾）事务扫描删除位图过滤** — ✅ 完成（e1ae41b，558 全绿）
+  - [x] `scan_range_txn` 快照视图先排除位图已删 docid（与 txn_get/get_at 对齐，置于 read_own 覆盖前）；
+    补 write_set 中未出现的自写 Put（新 docid / 已删复活）按窗口并入 + 保持升序
+  - [x] 单测 txn_scan_respects_deletion_bitmap_revival_and_insert（位图排除 / 复活 / 新插入 / 与 txn_get 一致）
+  - [x] 注：位图删除为非版本化全局语义（get_at 同近似）——快照不晚于删除时点亦隐藏，属既有取舍（已注释）
 - **Ex-8.9（P3）空闲感知维护调度**：
   - [ ] 负载信号：读/写计数（metrics）、CPU/IO 等待、L0 段数；低负载窗口（QPS<峰 20% 且 CPU<40%）：
     收紧合并阈值（urgency 权重提高）、触发倒排 GC、深度合并 L0→1、执行删除位图脏页回收；
