@@ -1532,7 +1532,16 @@ pub struct AggScalar {
 /// （等值 posting 可能只覆盖增量写入）；与 MySQL 无索引聚合同语义，看门狗预算保护。
 /// COUNT(f) = 字段存在且非 JSON null（任意类型）；SUM/AVG/MIN/MAX 只统计数值字段行
 /// （非数值行跳过；数值按 f64 累加——大整数超 2^53 精度受限，标注限制）。
-pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>> {
+/// P1-3：带 docid 区间窗口的标量聚合（非默认表按表区间执行；`start/end` 均为 None = 全库）。
+/// 窗口非空时禁用倒排统计快路径与 `count_all_docs` 快路径（两者为引擎全库口径，跨表会
+/// 串表）——强制窗口内全扫，语义与按表区间聚合一致。
+pub fn execute_aggregate_window(
+    engine: &Engine,
+    sql: &str,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> Result<Option<AggScalar>> {
+    let scoped = start.is_some() || end.is_some();
     let sel = parse_select(sql)?;
     if !sel.group_by.is_empty() {
         // GROUP BY 走 execute_group_by（多行分组），非本标量入口。
@@ -1547,6 +1556,19 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
         return Err(Error::Config(format!("{name}(*) 不支持（仅 COUNT(*)）")));
     }
     if field.is_none() && sel.where_expr.is_none() {
+        if scoped {
+            // COUNT(*) 无 WHERE（表区间版）：docid 窗口 keys-only 计数（免文档值反序列化）
+            let mut n = 0u64;
+            engine.scan_stream_ids(start, end, |_| {
+                n += 1;
+                Ok(true)
+            })?;
+            return Ok(Some(AggScalar {
+                header: "COUNT(*)".into(),
+                is_null: false,
+                text: n.to_string(),
+            }));
+        }
         // 7.100：COUNT(*) 无 WHERE → 引擎 key-only 流式计数（免文档值反序列化）。
         // 语义与全表扫描 COUNT 一致（同 key 最新版本、Tombstone 跳过）。
         let n = engine.count_all_docs()?;
@@ -1559,7 +1581,8 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
     // Ex-9.3 第③步：`SUM/AVG/MIN/MAX(stats_field) ... WHERE f='v'`（裸等值、无排序/分组）
     // → 倒排 term 统计载荷免全扫（内存累积 + v5 段载荷；仅 stats_fields 声明字段可路由；
     // 未命中（未声明/term 无统计/多条件）→ 回落既有全量扫描，结果语义不变）。
-    if matches!(name.as_str(), "sum" | "avg" | "min" | "max") {
+    // P1-3：表区间窗口禁用（倒排为引擎全库口径，跨表会串表）。
+    if !scoped && matches!(name.as_str(), "sum" | "avg" | "min" | "max") {
         if let (Some(f), Some(WhereExpr::Cond(c))) = (field.as_ref(), sel.where_expr.as_ref()) {
             if c.op == CmpOp::Eq
                 && c.field != "docid"
@@ -1600,7 +1623,7 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     let mut scanned = 0u64;
-    engine.scan_stream(None, None, |_docid, doc| {
+    engine.scan_stream(start, end, |_docid, doc| {
         scanned += 1;
         if scanned % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(
@@ -1689,6 +1712,11 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
         _ => (true, String::new()), // 空集 SUM/AVG/MIN/MAX → NULL
     };
     Ok(Some(AggScalar { header, is_null, text }))
+}
+
+/// 全库标量聚合（兼容入口 = 无窗口）。
+pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>> {
+    execute_aggregate_window(engine, sql, None, None)
 }
 
 /// 数字文本化：整值（Rust f64 to_string）无小数点。
@@ -2094,7 +2122,16 @@ fn group_by_fast_inverted(
 /// 切片；`cap` = 分组数上限（超限 QueryTooExpensive）兼 LIMIT 缺省值。
 ///
 /// 非 GROUP BY SQL 返回 `Ok(None)`（调用方继续走标量聚合/普通查询）。
-pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<GroupResult>> {
+/// P1-3：带 docid 区间窗口的 GROUP BY 执行（非默认表按表区间分组；None/None = 全库）。
+/// 窗口非空禁用倒排词典枚举快路径（引擎全库口径，跨表会串表）→ 强制窗口扫描。
+pub fn execute_group_by_window(
+    engine: &Engine,
+    sql: &str,
+    cap: u64,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> Result<Option<GroupResult>> {
+    let scoped = start.is_some() || end.is_some();
     let sel = parse_select(sql)?;
     let fields = sel.group_by.clone();
     if fields.is_empty() {
@@ -2105,7 +2142,8 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         return Err(Error::Config("GROUP BY 需至少一个聚合列".into()));
     }
     // Ex-9.3 ④b：无 WHERE 单字段 GROUP BY → 倒排词典枚举快路径（不可路由自动回退扫描）。
-    if sel.where_expr.is_none() && fields.len() == 1 {
+    // P1-3：表区间窗口禁用（倒排为引擎全库口径，跨表会串表）。
+    if !scoped && sel.where_expr.is_none() && fields.len() == 1 {
         if let Some(res) = group_by_fast_inverted(engine, &sel, &fields[0], &specs, cap)? {
             return Ok(Some(res));
         }
@@ -2115,7 +2153,7 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
     let mut groups: std::collections::HashMap<Vec<GroupKey>, Vec<AggState>> =
         std::collections::HashMap::new();
     let mut scanned = 0u64;
-    engine.scan_stream(None, None, |_docid, doc| {
+    engine.scan_stream(start, end, |_docid, doc| {
         scanned += 1;
         if scanned % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(
@@ -2242,6 +2280,11 @@ pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<G
         headers,
         rows,
     }))
+}
+
+/// 全库 GROUP BY（兼容入口 = 无窗口）。
+pub fn execute_group_by(engine: &Engine, sql: &str, cap: u64) -> Result<Option<GroupResult>> {
+    execute_group_by_window(engine, sql, cap, None, None)
 }
 
 #[cfg(test)]

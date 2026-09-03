@@ -1031,7 +1031,6 @@ impl ColumnFamily {
         end: Option<&[u8]>,
         skip: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<u64> {
-        let snapshot_seq = u64::MAX; // 最新视图（同 scan_stream）
         self.memtable.with_iter_range(start, end, |mut mem_iters| {
             let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
             let snap = self.ssts.load();
@@ -1090,9 +1089,13 @@ impl ColumnFamily {
                     for i in frontier {
                         let (k, v, seq) = cur[i].take().unwrap();
                         debug_assert!(k == min_key, "同 key 归并");
-                        if v.is_some() && seq <= snapshot_seq && seq >= best_seq {
+                        // P1-2（Tombstone 折叠修复）：取**最大 seq 版本**判定可见性——
+                        // 旧实现"遇到任一 Some 即 best_put"，高 seq 的 None（删除墓碑）
+                        // 被忽略 → 已删 key 仍被 keys-only 输出/计数（DELETE 后纯 id
+                        // 窗口 / COUNT 可见性错误，非事务 Tombstone 路径实测暴露）。
+                        if seq > best_seq {
                             best_seq = seq;
-                            best_put = true;
+                            best_put = v.is_some();
                         }
                         cur[i] = if i < mem_count {
                             mem_iters[i].next().transpose()?
@@ -1126,7 +1129,6 @@ impl ColumnFamily {
         end: Option<&[u8]>,
         mut f: F,
     ) -> Result<()> {
-        let snapshot_seq = u64::MAX; // 最新视图
         self.memtable.with_iter_range(start, end, |mut mem_iters| {
             let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
             let snap = self.ssts.load();
@@ -1180,9 +1182,10 @@ impl ColumnFamily {
                     for i in frontier {
                         let (k, v, seq) = cur[i].take().unwrap();
                         debug_assert!(k == min_key, "同 key 归并");
-                        if v.is_some() && seq <= snapshot_seq && seq >= best_seq {
+                        // P1-2：同 count_keys_range——最大 seq 版本为 Tombstone 则跳过
+                        if seq > best_seq {
                             best_seq = seq;
-                            best_put = true;
+                            best_put = v.is_some();
                         }
                         cur[i] = if i < mem_count {
                             mem_iters[i].next().transpose()?

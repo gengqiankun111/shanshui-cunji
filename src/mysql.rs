@@ -1,4 +1,4 @@
-//! MySQL wire protocol 适配（development_process_order H 项）：让 MySQL 客户端 / 生态工具
+﻿//! MySQL wire protocol 适配（development_process_order H 项）：让 MySQL 客户端 / 生态工具
 //! （mysql cli、JDBC、Navicat、sysbench）直接接入本数据库。
 //!
 //! 实现范围（H-1~H-3）：
@@ -1571,27 +1571,102 @@ fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
     match parse_insert_multi(sql) {
         Ok(Some(rows)) => {
             let txn = session.txn.as_mut().unwrap();
+            // P1-1：事务内 IGNORE / ODKU（IGNORE 优先）——逐行冲突处理（忽略 / 转 UPDATE）
+            let ignore = is_insert_ignore(sql);
+            let odku = if ignore {
+                None
+            } else {
+                parse_insert_odku(sql)
+            };
             let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
-            // a：事务内主键重复校验（1062）——同语句重复 + 快照/同事务可见均拒绝（预校验不落批）
-            let mut seen = std::collections::HashSet::new();
-            for (id, _) in &rows {
-                if *id == 0 {
-                    continue;
-                }
-                if !seen.insert(*id) {
-                    return QueryResponse::Err(
-                        1062,
-                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
-                    );
-                }
-                if let Ok(Some(_)) = engine.txn_get(txn, docid_for(tid, *id)) {
-                    return QueryResponse::Err(
-                        1062,
-                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
-                    );
+            // a：事务内主键重复校验（1062）——同语句重复 + 快照/同事务可见均拒绝（预校验不落批）。
+            // Plain 模式专属；IGNORE/ODKU 按行实时冲突处理。
+            if !ignore && odku.is_none() {
+                let mut seen = std::collections::HashSet::new();
+                for (id, _) in &rows {
+                    if *id == 0 {
+                        continue;
+                    }
+                    if !seen.insert(*id) {
+                        return QueryResponse::Err(
+                            1062,
+                            format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                        );
+                    }
+                    if let Ok(Some(_)) = engine.txn_get(txn, docid_for(tid, *id)) {
+                        return QueryResponse::Err(
+                            1062,
+                            format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                        );
+                    }
                 }
             }
             let mut last_row = 0u64;
+            // P1-1：事务内 IGNORE / ODKU 逐行冲突处理（affected：插入 1、ODKU 更新 2、IGNORE 跳过不计）
+            if ignore || odku.is_some() {
+                let mut affected = 0u64;
+                for (id, doc) in &rows {
+                    let docid = if *id == 0 {
+                        match next_auto_docid_txn(engine, txn, tid, &session.auto_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                if ignore {
+                                    continue;
+                                }
+                                return QueryResponse::Err(1064, format!("auto 分配失败: {e}"));
+                            }
+                        }
+                    } else if *id > ROW_ID_MASK {
+                        if ignore {
+                            continue;
+                        }
+                        return QueryResponse::Err(1064, format!("id {id} 超出 48bit row_id 上限"));
+                    } else {
+                        docid_for(tid, *id)
+                    };
+                    last_row = row_id_of(docid);
+                    let exists = engine.txn_get(txn, docid).ok().flatten();
+                    if ignore {
+                        if exists.is_some() {
+                            continue;
+                        }
+                        match put_doc_txn(txn, docid, doc) {
+                            Ok(()) => affected += 1,
+                            Err(_) => {} // 行级错误忽略跳过
+                        }
+                        continue;
+                    }
+                    match exists {
+                        Some(oldv) => {
+                            let mut cur = String::from_utf8_lossy(&oldv).into_owned();
+                            let mut err = None;
+                            for (col, ex) in odku.as_deref().unwrap_or(&[]) {
+                                match odku_apply_set(Some(cur.as_bytes()), doc, col, ex) {
+                                    Ok(s) => cur = s,
+                                    Err(e) => {
+                                        err = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(e) = err {
+                                return QueryResponse::Err(1064, format!("odku error: {e}"));
+                            }
+                            match put_doc_txn(txn, docid, &cur) {
+                                Ok(()) => affected += 2,
+                                Err(e) => {
+                                    return QueryResponse::Err(1064, format!("odku error: {e}"))
+                                }
+                            }
+                        }
+                        None => match put_doc_txn(txn, docid, doc) {
+                            Ok(()) => affected += 1,
+                            Err(e) => return QueryResponse::Err(1064, format!("insert error: {e}")),
+                        },
+                    }
+                }
+                return QueryResponse::Ok(affected, last_row);
+            }
             // §27 P1：默认表事务内段预分配；§26 M2：非默认表 auto 逐行探测（事务视图）
             let mut auto_cur = if auto_rows > 0 && tid == 0 {
                 Some(auto_alloc_block(engine, &session.auto_id, auto_rows as u64))
@@ -1754,6 +1829,22 @@ fn txn_update(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
 /// 事务内 DELETE：攒批删除（d txn 路径扩展：WHERE id IN / 字段条件；单 id= 语义不变）。
 fn txn_delete(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryResponse {
     let tid = table_id_for(&table_name_of(sql));
+    // P1-2：事务内无 WHERE 的 `DELETE FROM <表>` → 整表删除（快照视图枚举本表可见 docid →
+    // 逐条写删，commit 原子；其它表不受影响）
+    if !sql.to_lowercase().contains("where") {
+        let txn = session.txn.as_mut().unwrap();
+        let base = table_base(tid);
+        let top = base + ROW_ID_MASK;
+        let mut n = 0u64;
+        match engine.scan_stream_ids(Some(base), Some(top), |d| {
+            txn.delete(d);
+            n += 1;
+            Ok(true)
+        }) {
+            Ok(()) => return QueryResponse::Ok(n, 0),
+            Err(e) => return QueryResponse::Err(1064, format!("delete all error: {e}")),
+        }
+    }
     let ids: Vec<u64> = match parse_delete(sql) {
         Ok(id) => vec![id],
         Err(_) => {
@@ -2363,6 +2454,10 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     // MySQL 客户端以 `id` 为主键列 → 主键点查（sqlish 侧为 docid 特例）
     // §26 M1：SQL row_id → 引擎 docid（docid = table_id<<48 | row）
     let tid = table_id_for(&table_name_of(sql));
+    // P1-3：聚合/分组按**本表 docid 区间**执行（sqlish 窗口入口）——默认表 = [0, 2^48) 与
+    // 单表库全库等价、多表库正确隔离（documents 不混入其它表）；倒排统计快路径保留于直接
+    // sqlish API（bench/demo），本 server 路径一律窗口（禁用跨表倒排串表）。
+    let (agg_start, agg_end) = (Some(table_base(tid)), Some(table_base(tid) + ROW_ID_MASK));
     if let Some(id) = extract_point_id(sql) {
         // 标量聚合点查：`SELECT SUM(k)/count(k) … WHERE id=N` → 单行单列（与 BETWEEN/IN
         // 分支同语义；须先于普通点查短路——否则被当行集返回（返回 id 列而非字段和）
@@ -2501,23 +2596,13 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             rows: Vec::new(),
         };
     }
-    // §26 M1b：非默认表字段聚合/分组（sqlish 全库无区间参数）→ 明确 1064；
-    // 纯字段谓词 SELECT 放行（兜底行按本表区间过滤，不跨表）
-    if tid != 0 {
-        let u4 = sql.to_uppercase();
-        let agg_form =
-            u4.contains("SUM(") || u4.contains("COUNT(") || u4.contains("AVG(")
-                || u4.contains("MIN(") || u4.contains("MAX(");
-        if agg_form || u4.contains("GROUP BY") {
-            return QueryResponse::Err(
-                1064,
-                "非默认表字段聚合/分组查询暂不支持（§26 M1b，纯字段谓词可用）".to_string(),
-            );
-        }
-    }
+    // §26 M1b + P1-3：非默认表聚合/分组**按本表 docid 区间执行**（sqlish 增加窗口入口
+    // execute_aggregate_window / execute_group_by_window；窗口内过滤防跨表串表，不再 1064）。
+    // 注：非默认表窗口聚合禁用倒排统计快路径（引擎全库口径），语义=表区间全扫。
     // AF#2~#4：GROUP BY（单/多字段 + COUNT/SUM/AVG/MIN/MAX）→ 多行分组结果集
     //（选中分组列 + 每聚合一列）。置于标量聚合前（分组 SQL 含聚合列，须先路由到多行分组执行器）。
-    match crate::sqlish::execute_group_by(engine, sql, 10_000) {
+    // P1-3：非默认表走 docid 窗口（按表区间分组，防倒排词典/全库跨表串表）。
+    match crate::sqlish::execute_group_by_window(engine, sql, 10_000, agg_start, agg_end) {
         Ok(Some(gr)) => {
             // 分组列：列为选中的分组字段（select 顺序）；level = 该字段在全部组字段中的位序。
             let mut columns: Vec<Vec<u8>> = Vec::new();
@@ -2586,7 +2671,8 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     // 7.95 聚合（字段条件 / 无 WHERE）：COUNT/SUM/AVG/MIN/MAX → 单行单列。
     // 放在 sqlish 兜底前——id 主键窗口聚合（BETWEEN/IN 分支）已先行返回，不受影响；
     // 聚合走全量单遍扫描 matches_doc（不依赖倒排完整性，与 MySQL 无索引聚合同语义）。
-    match crate::sqlish::execute_aggregate(engine, sql) {
+    // P1-3：非默认表按表 docid 区间聚合（窗口内全扫，禁用跨表倒排统计快路径）
+    match crate::sqlish::execute_aggregate_window(engine, sql, agg_start, agg_end) {
         Ok(Some(agg)) => {
             let (col_type, charset) = if agg.header.starts_with("AVG(")
                 || agg.header.starts_with("MIN(")
@@ -2648,41 +2734,120 @@ fn insert_response(
     let tid = table_id_for(&table_name_of(sql));
     match parse_insert_multi(sql) {
         Ok(Some(rows)) => {
+            // P1-1：INSERT IGNORE / ON DUPLICATE KEY UPDATE（IGNORE 优先——冲突行跳过）
+            let ignore = is_insert_ignore(sql);
+            let odku = if ignore {
+                None
+            } else {
+                parse_insert_odku(sql)
+            };
             let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
             // a：主键重复校验（MySQL 1062）——同语句重复 + 库中已存在均拒绝（按表 docid），
-            // 预校验保证多行 VALUES 语句级失败不产生部分写入。
-            let mut seen = std::collections::HashSet::new();
-            for (id, _) in &rows {
-                if *id == 0 {
-                    continue; // auto 分配不会重复
-                }
-                if *id > ROW_ID_MASK {
-                    return QueryResponse::Err(
-                        1064,
-                        format!("id {id} 超出 48bit row_id 上限"),
-                    );
-                }
-                if !seen.insert(*id) {
-                    return QueryResponse::Err(
-                        1062,
-                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
-                    );
-                }
-                if let Ok(Some(_)) = engine.get(docid_for(tid, *id)) {
-                    return QueryResponse::Err(
-                        1062,
-                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
-                    );
+            // 预校验保证多行 VALUES 语句级失败不产生部分写入。Plain 模式专属：
+            // IGNORE/ODKU 按行实时冲突处理（忽略 / 转 UPDATE）。
+            if !ignore && odku.is_none() {
+                let mut seen = std::collections::HashSet::new();
+                for (id, _) in &rows {
+                    if *id == 0 {
+                        continue; // auto 分配不会重复
+                    }
+                    if *id > ROW_ID_MASK {
+                        return QueryResponse::Err(
+                            1064,
+                            format!("id {id} 超出 48bit row_id 上限"),
+                        );
+                    }
+                    if !seen.insert(*id) {
+                        return QueryResponse::Err(
+                            1062,
+                            format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                        );
+                    }
+                    if let Ok(Some(_)) = engine.get(docid_for(tid, *id)) {
+                        return QueryResponse::Err(
+                            1062,
+                            format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                        );
+                    }
                 }
             }
             // H-6 扩展：多行 VALUES 批量入库（逐行 put，事务外；行数作为 affected）
             // §27 P1：默认表语句级 auto 段预分配；§26 M2：非默认表 auto 逐行探测
-            let mut auto_cur = if auto_rows > 0 && tid == 0 {
+            // IGNORE/ODKU 模式逐行探测（冲突跳行/更新，段预取会浪费被跳过行的 id）
+            let mut auto_cur = if auto_rows > 0 && tid == 0 && !ignore && odku.is_none() {
                 Some(auto_alloc_block(engine, auto_id, auto_rows as u64))
             } else {
                 None
             };
             let mut last_row = 0u64;
+            // P1-1：IGNORE / ODKU 逐行冲突处理（affected：插入 1、ODKU 更新 2、IGNORE 跳过不计）
+            if ignore || odku.is_some() {
+                let mut affected = 0u64;
+                for (id, doc) in &rows {
+                    let docid = if *id == 0 {
+                        match next_auto_docid(engine, tid, auto_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                if ignore {
+                                    continue;
+                                }
+                                return QueryResponse::Err(1064, format!("auto 分配失败: {e}"));
+                            }
+                        }
+                    } else if *id > ROW_ID_MASK {
+                        if ignore {
+                            continue;
+                        }
+                        return QueryResponse::Err(1064, format!("id {id} 超出 48bit row_id 上限"));
+                    } else {
+                        docid_for(tid, *id)
+                    };
+                    last_row = row_id_of(docid);
+                    let exists = engine.get(docid).ok().flatten();
+                    if ignore {
+                        // 冲突 / 写入错误均降级跳过（MySQL IGNORE 语义）
+                        if exists.is_some() {
+                            continue;
+                        }
+                        match put_doc(engine, docid, doc) {
+                            Ok(()) => affected += 1,
+                            Err(_) => {} // 行级错误（如坏 JSON）忽略跳过
+                        }
+                        continue;
+                    }
+                    // ODKU
+                    match exists {
+                        Some(oldv) => {
+                            // 冲突行：按赋值列表逐项更新（多赋值顺序应用）
+                            let mut cur = String::from_utf8_lossy(&oldv).into_owned();
+                            let mut err = None;
+                            for (col, ex) in odku.as_deref().unwrap_or(&[]) {
+                                match odku_apply_set(Some(cur.as_bytes()), doc, col, ex) {
+                                    Ok(s) => cur = s,
+                                    Err(e) => {
+                                        err = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(e) = err {
+                                return QueryResponse::Err(1064, format!("odku error: {e}"));
+                            }
+                            match put_doc(engine, docid, &cur) {
+                                Ok(()) => affected += 2,
+                                Err(e) => {
+                                    return QueryResponse::Err(1064, format!("odku error: {e}"))
+                                }
+                            }
+                        }
+                        None => match put_doc(engine, docid, doc) {
+                            Ok(()) => affected += 1,
+                            Err(e) => return QueryResponse::Err(1064, format!("insert error: {e}")),
+                        },
+                    }
+                }
+                return QueryResponse::Ok(affected, last_row);
+            }
             for (id, doc) in &rows {
                 // 引擎 docid = 表区间 + SQL row_id（auto：默认表段取 / 非默认表探测）
                 let docid = if *id == 0 {
@@ -2907,8 +3072,17 @@ fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
     }
 }
 
-/// DELETE FROM documents WHERE id=1 / id IN (...) / <字段条件>。
+/// DELETE FROM documents WHERE id=1 / id IN (...) / <字段条件> / （P1-2）无 WHERE = 整表删除。
 fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
+    // P1-2：无 WHERE 的 `DELETE FROM <表>` → 整表删除（本表 docid 区间逐行删 + 表文件回收，
+    // 默认表 documents 同区间语义——不动其它表；对齐 MySQL DELETE 全表 = 逐行删除）
+    if !sql.to_lowercase().contains("where") {
+        let tid = table_id_for(&table_name_of(sql));
+        return match drop_table_range(engine, tid) {
+            Ok(n) => QueryResponse::Ok(n as u64, 0),
+            Err(e) => QueryResponse::Err(1064, format!("delete all error: {e}")),
+        };
+    }
     match parse_delete_where(sql) {
         Ok(where_part) => {
             // §26 M1：SQL row_id / 字段候选 → 本表 docid
@@ -3022,9 +3196,13 @@ fn route_where_ids(tid: u16, where_part: &str, ids: Vec<u64>) -> Vec<u64> {
 fn table_name_of(sql: &str) -> String {
     let lower = sql.trim().to_lowercase();
     let rest = if lower.starts_with("insert") {
-        lower
-            .find("insert into")
-            .map(|p| &lower[p + "insert into".len()..])
+        // 兼容 `INSERT [IGNORE] INTO …`（P1-1：IGNORE 关键字在 INTO 前）
+        let mut body = &lower["insert".len()..];
+        body = body.trim_start();
+        if let Some(b) = body.strip_prefix("ignore") {
+            body = b.trim_start();
+        }
+        body.strip_prefix("into")
     } else if lower.starts_with("update") {
         lower
             .find("update")
@@ -3172,6 +3350,100 @@ fn parse_insert_multi(sql: &str) -> Result<Option<Vec<(u64, String)>>> {
         return Ok(None);
     }
     Ok(Some(rows))
+}
+
+// ---------- P1-1：INSERT IGNORE / INSERT … ON DUPLICATE KEY UPDATE ----------
+
+/// `INSERT [IGNORE]` 判定（MySQL：IGNORE = 重复/错误行降级跳过，不报 1062）。
+fn is_insert_ignore(sql: &str) -> bool {
+    let s = sql.trim();
+    let after = s.get("insert".len()..).unwrap_or("");
+    after.trim_start()
+        .get(.."ignore".len())
+        .map(|t| t.eq_ignore_ascii_case("ignore"))
+        .unwrap_or(false)
+}
+
+/// 解析 `ON DUPLICATE KEY UPDATE col=expr[, col=expr…]` → 赋值列表；无该子句 → None。
+/// 赋值项顶层逗号切分（引号感知，复用 split_values）。
+fn parse_insert_odku(sql: &str) -> Option<Vec<(String, String)>> {
+    let lower = sql.trim().to_lowercase();
+    let kw = "on duplicate key update";
+    let p = lower.find(kw)?;
+    let tail = sql[p + kw.len()..].trim().trim_end_matches(';').trim();
+    let mut out = Vec::new();
+    for item in split_values(tail) {
+        let eq = item.find('=')?;
+        let col = item[..eq].trim().to_string();
+        let expr = item[eq + 1..].trim().to_string();
+        if !col.is_empty() && !expr.is_empty() {
+            out.push((col, expr));
+        }
+    }
+    Some(out)
+}
+
+/// ODKU 单赋值应用：作用于当前文档 `prev`（None = 空对象；文档本体即整 JSON，业务列即 JSON 字段）。
+/// 支持子集（对齐本引擎 UPDATE 能力）：
+/// - `doc=<整 doc>|VALUES(doc)` → **整文档覆盖**（文档列 doc/value 直指文档本体）；
+/// - `id/docid=…` → 主键不可更新，忽略（MySQL：冲突即主键重复，不改主键）；
+/// - `col=VALUES(col)` → 从插入 doc 取同名字段值覆盖旧 doc 该字段；
+/// - `col=col+N` → 数值自增；
+/// - 其余 `col=<字面量>` → JSON 类型化赋值（数字/布尔/对象按 JSON，字符串去引号）。
+/// 返回应用后的整文档字符串。
+fn odku_apply_set(
+    prev: Option<&[u8]>,
+    insert_doc: &str,
+    col: &str,
+    expr: &str,
+) -> Result<String> {
+    let col = col.trim();
+    // 文档本体整体覆盖
+    if col.eq_ignore_ascii_case("doc") || col.eq_ignore_ascii_case("value") {
+        let e = expr.trim();
+        let eu = e.to_uppercase();
+        let whole = if eu.starts_with("VALUES(") {
+            insert_doc.to_string()
+        } else {
+            unquote(e)
+        };
+        return Ok(whole);
+    }
+    // 主键列不可更新
+    if col.eq_ignore_ascii_case("id") || col.eq_ignore_ascii_case("docid") {
+        return Ok(String::from_utf8_lossy(prev.unwrap_or(b"{}")).into_owned());
+    }
+    let mut doc: serde_json::Value = prev
+        .and_then(|v| serde_json::from_slice(v).ok())
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !doc.is_object() {
+        doc = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = doc.as_object_mut().unwrap();
+    let e = expr.trim();
+    let eu = e.to_uppercase();
+    if eu.starts_with("VALUES(") {
+        // 从插入 doc 同名取值（无列名插入 doc = 整 JSON，字段取 key 需先解析）
+        let open = e.find('(').unwrap_or(0);
+        let inner_col = e[open + 1..]
+            .trim_end_matches(')')
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+        let ins: serde_json::Value = serde_json::from_str(insert_doc)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+        let v = ins.get(&inner_col).cloned().unwrap_or(serde_json::Value::Null);
+        obj.insert(col.to_string(), v);
+    } else if let Some(n) = parse_increment_expr(col, e) {
+        let cur = obj.get(col).and_then(|x| x.as_i64()).unwrap_or(0);
+        obj.insert(col.to_string(), serde_json::Value::from(cur + n));
+    } else {
+        let raw = unquote(e);
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw));
+        obj.insert(col.to_string(), v);
+    }
+    serde_json::to_string(&doc).map_err(|e| crate::error::Error::Serialize(e.to_string()))
 }
 
 /// 解析 `UPDATE documents SET field=expr WHERE id=1` → (id, field, expr)。
@@ -5517,6 +5789,325 @@ mod tests {
             400
         );
         assert!(rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 400").is_empty());
+    }
+    #[test]
+    fn p1_insert_ignore_and_on_duplicate_key() {
+        // P1-1：INSERT IGNORE（冲突跳过不报 1062）/ ON DUPLICATE KEY UPDATE（冲突改更新）
+        // —— 非事务 + 事务内一致；Plain 重复仍 1062（回归）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut engine = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = AtomicU64::new(1);
+        let rows_of = |e: &Engine, sql: &str| -> Vec<Vec<Vec<u8>>> {
+            match select_response(e, sql) {
+                QueryResponse::Set { rows, .. } => rows,
+                _ => panic!("应为 ResultSet: {sql}"),
+            }
+        };
+        // 种子
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT INTO t_a(id, doc) VALUES(7, '{\"v\":\"a7\"}')", &auto),
+            QueryResponse::Ok(1, 7)
+        ));
+        // Plain 重复仍 1062（回归）
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT INTO t_a(id, doc) VALUES(7, '{}')", &auto),
+            QueryResponse::Err(1062, _)
+        ));
+        // INSERT IGNORE 重复 → 成功跳过（affected 0），行不变
+        match insert_response(
+            &mut engine,
+            "INSERT IGNORE INTO t_a(id, doc) VALUES(7, '{\"v\":\"ignored\"}')",
+            &auto,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 0, "重复行应被忽略（不计 affected）"),
+            _ => panic!("INSERT IGNORE 重复应 Ok"),
+        }
+        assert_eq!(rows_of(&engine, "SELECT v FROM t_a WHERE id=7")[0][0], b"a7");
+        // INSERT IGNORE 新行 → 正常插入
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT IGNORE INTO t_a(id, doc) VALUES(8, '{\"v\":\"a8\"}')", &auto),
+            QueryResponse::Ok(1, 8)
+        ));
+        // 多行 IGNORE：重复(7)跳过、新(9)插入 → affected=1
+        match insert_response(
+            &mut engine,
+            "INSERT IGNORE INTO t_a(id, doc) VALUES(7, '{}'), (9, '{\"v\":\"a9\"}')",
+            &auto,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 1, "多行 IGNORE 仅新行计 affected"),
+            _ => panic!("多行 INSERT IGNORE 应 Ok"),
+        }
+        assert_eq!(rows_of(&engine, "SELECT v FROM t_a WHERE id=9")[0][0], b"a9");
+        // ODKU 冲突整 doc 覆盖（doc=VALUES(doc)）→ affected 2、行更新
+        match insert_response(
+            &mut engine,
+            "INSERT INTO t_a(id, doc) VALUES(7, '{\"v\":\"a7b\"}') ON DUPLICATE KEY UPDATE doc=VALUES(doc)",
+            &auto,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 2, "ODKU 更新 affected=2"),
+            _ => panic!("ODKU 冲突应 Ok"),
+        }
+        assert_eq!(rows_of(&engine, "SELECT v FROM t_a WHERE id=7")[0][0], b"a7b");
+        // ODKU 无冲突 → 普通插入 affected=1
+        match insert_response(
+            &mut engine,
+            "INSERT INTO t_a(id, doc) VALUES(10, '{\"v\":\"a10\"}') ON DUPLICATE KEY UPDATE doc=VALUES(doc)",
+            &auto,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 1, "ODKU 无冲突 = 插入"),
+            _ => panic!("ODKU 无冲突应 Ok"),
+        }
+        // ODKU 字段级：k=k+5 自增 + v='changed' 字面量（列名形态组装 doc：业务列=JSON 字段）
+        match insert_response(
+            &mut engine,
+            "INSERT INTO t_a(id, doc) VALUES(7, '{\"v\":\"seed\",\"k\":1}') ON DUPLICATE KEY UPDATE k=k+5, v='changed'",
+            &auto,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 2),
+            _ => panic!("ODKU 字段级应 Ok"),
+        }
+        {
+            let v = rows_of(&engine, "SELECT v, k FROM t_a WHERE id=7");
+            assert_eq!(v[0][0], b"changed", "ODKU 字面量赋值生效");
+            assert_eq!(v[0][1], b"5", "ODKU 自增 k=k+5（旧无 k → 0+5）");
+        }
+        // VALUES(col) 引用插入 doc 字段（无 doc 列形态：业务列组装 JSON）
+        match insert_response(
+            &mut engine,
+            "INSERT INTO t_a(id, k, v) VALUES(8, 99, 'x') ON DUPLICATE KEY UPDATE k=VALUES(k)",
+            &auto,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 2, "id=8 已存在（IGNORE 段插入）"),
+            _ => panic!("ODKU VALUES(col) 应 Ok"),
+        }
+        {
+            let v = rows_of(&engine, "SELECT k FROM t_a WHERE id=8");
+            assert_eq!(v[0][0], b"99", "VALUES(k) 从插入 doc 取值生效");
+        }
+        // 事务内：IGNORE 跳过 + ODKU 更新（BEGIN/COMMIT）
+        let s_auto = Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(Arc::clone(&s_auto));
+        assert!(matches!(
+            super::dispatch_query(&mut engine, "BEGIN", &mut s),
+            QueryResponse::Ok(0, 0)
+        ));
+        match super::dispatch_query(
+            &mut engine,
+            "INSERT IGNORE INTO t_a(id, doc) VALUES(7, '{\"v\":\"txn-ignored\"}')",
+            &mut s,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 0, "事务内 IGNORE 重复跳过"),
+            _ => panic!("事务内 IGNORE 应 Ok"),
+        }
+        match super::dispatch_query(
+            &mut engine,
+            "INSERT INTO t_a(id, doc) VALUES(7, '{\"v\":\"txn-odku\"}') ON DUPLICATE KEY UPDATE doc=VALUES(doc)",
+            &mut s,
+        ) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 2, "事务内 ODKU 更新"),
+            _ => panic!("事务内 ODKU 应 Ok"),
+        }
+        assert!(matches!(
+            super::dispatch_query(&mut engine, "COMMIT", &mut s),
+            QueryResponse::Ok(0, 0)
+        ));
+        assert_eq!(rows_of(&engine, "SELECT v FROM t_a WHERE id=7")[0][0], b"txn-odku");
+    }
+    #[test]
+    fn p1_delete_from_table_without_where() {
+        // P1-2：`DELETE FROM <表>`（无 WHERE）= 整表删除（仅本表区间，其它表/默认表不受影响）
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.storage.deletion_bitmap_enabled = false; // 多表高位 docid 删除需关位图（§26 约束）
+        let mut engine = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = AtomicU64::new(1);
+        let rows_of = |e: &Engine, sql: &str| -> Vec<Vec<Vec<u8>>> {
+            match select_response(e, sql) {
+                QueryResponse::Set { rows, .. } => rows,
+                _ => panic!("应为 ResultSet: {sql}"),
+            }
+        };
+        // 三表同 id 共存
+        for i in 1..=5u64 {
+            insert_response(&mut engine, &format!("INSERT INTO t_a(id, doc) VALUES({i}, '{{\"v\":\"a{i}\"}}')"), &auto);
+            insert_response(&mut engine, &format!("INSERT INTO t_b(id, doc) VALUES({i}, '{{\"v\":\"b{i}\"}}')"), &auto);
+        }
+        for i in 1..=3u64 {
+            insert_response(&mut engine, &format!("INSERT INTO documents(id, doc) VALUES({i}, '{{\"v\":\"d{i}\"}}')"), &auto);
+        }
+        // DELETE FROM t_a（无 WHERE）→ 仅清 t_a，t_b / documents 保留
+        match delete_response(&mut engine, "DELETE FROM t_a") {
+            QueryResponse::Ok(n, 0) => assert_eq!(n, 5, "t_a 全表删除 affected=5"),
+            r => panic!("DELETE 全表应 Ok"),
+        }
+        assert!(rows_of(&engine, "SELECT id FROM t_a WHERE id BETWEEN 1 AND 10").is_empty());
+        assert_eq!(rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10").len(), 5, "t_b 不受影响");
+        assert_eq!(rows_of(&engine, "SELECT id FROM documents WHERE id BETWEEN 1 AND 10").len(), 3, "documents 不受影响");
+        // 再插同 id 不 1062（表已清）
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT INTO t_a(id, doc) VALUES(1, '{\"v\":\"a1b\"}')", &auto),
+            QueryResponse::Ok(1, 1)
+        ));
+        // DELETE FROM documents（默认表，无 WHERE）→ 只清默认表
+        match delete_response(&mut engine, "DELETE FROM documents") {
+            QueryResponse::Ok(n, 0) => assert_eq!(n, 3),
+            r => panic!("DELETE documents 全表应 Ok"),
+        }
+        assert!(rows_of(&engine, "SELECT id FROM documents WHERE id BETWEEN 1 AND 10").is_empty());
+        assert_eq!(rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10").len(), 5);
+        // 事务内 DELETE FROM t_b（无 WHERE）：快照删除，commit 原子
+        let s_auto = Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(Arc::clone(&s_auto));
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s), QueryResponse::Ok(0, 0)));
+        match super::dispatch_query(&mut engine, "DELETE FROM t_b", &mut s) {
+            QueryResponse::Ok(n, _) => assert_eq!(n, 5, "事务内全表删除 affected=5"),
+            r => panic!("事务内 DELETE 全表应 Ok"),
+        }
+        // 事务内 DELETE（未提交）同事务 SELECT：本事务视图已删除 → 空
+        match super::dispatch_query(&mut engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10", &mut s) {
+            QueryResponse::Set { rows, .. } => assert!(rows.is_empty(), "事务内 DELETE 后同事务读不可见"),
+            r => panic!("事务内 SELECT 应 Set"),
+        }
+        // 外部引擎读（未提交）→ 仍可见（原子性）
+        assert_eq!(rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10").len(), 5);
+        assert!(matches!(super::dispatch_query(&mut engine, "COMMIT", &mut s), QueryResponse::Ok(0, 0)));
+        assert!(rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10").is_empty(), "commit 后 t_b 清空");
+        // 事务内回滚恢复
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s), QueryResponse::Ok(0, 0)));
+        assert!(matches!(super::dispatch_query(&mut engine, "DELETE FROM t_a", &mut s), QueryResponse::Ok(n, _) if n == 1));
+        assert!(matches!(super::dispatch_query(&mut engine, "ROLLBACK", &mut s), QueryResponse::Ok(0, 0)));
+        assert_eq!(rows_of(&engine, "SELECT id FROM t_a WHERE id BETWEEN 1 AND 10").len(), 1, "回滚后恢复");
+    }
+    #[test]
+    fn p1_nondefault_aggregates_scoped_to_table() {
+        // P1-3：非默认表 COUNT/SUM/GROUP BY 按**本表 docid 区间**执行（窗口聚合，不跨表串表）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut engine = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = AtomicU64::new(1);
+        let rows_of = |e: &Engine, sql: &str| -> Vec<Vec<Vec<u8>>> {
+            match select_response(e, sql) {
+                QueryResponse::Set { rows, .. } => rows,
+                r => panic!("应为 ResultSet: {sql}"),
+            }
+        };
+        // t_a：k=10*i（4 行，v='a'）；t_b：k=1000+i（同 id 不同值）；documents：k=7
+        for i in 1..=4u64 {
+            insert_response(
+                &mut engine,
+                &format!("INSERT INTO t_a(id, doc) VALUES({i}, '{{\"v\":\"a\",\"k\":{}}}')", i * 10),
+                &auto,
+            );
+            insert_response(
+                &mut engine,
+                &format!("INSERT INTO t_b(id, doc) VALUES({i}, '{{\"v\":\"b\",\"k\":{}}}')", 1000 + i),
+                &auto,
+            );
+        }
+        insert_response(&mut engine, "INSERT INTO documents(id, doc) VALUES(1, '{\"v\":\"d\",\"k\":7}')", &auto);
+        // COUNT(*) 无 WHERE：仅本表 4 行（不含 t_b / documents）
+        assert_eq!(rows_of(&engine, "SELECT COUNT(*) FROM t_a")[0][0], b"4");
+        assert_eq!(rows_of(&engine, "SELECT COUNT(*) FROM t_b")[0][0], b"4");
+        assert_eq!(rows_of(&engine, "SELECT COUNT(*) FROM documents")[0][0], b"1", "默认表不受影响");
+        // SUM(k) 按表区间（t_a=10+20+30+40=100；t_b 的 1001.. 不得混入）
+        assert_eq!(rows_of(&engine, "SELECT SUM(k) FROM t_a")[0][0], b"100");
+        assert_eq!(rows_of(&engine, "SELECT SUM(k) FROM t_b")[0][0], b"4010");
+        // 字段谓词聚合（窗口内过滤）
+        assert_eq!(rows_of(&engine, "SELECT COUNT(*) FROM t_a WHERE v='a'")[0][0], b"4");
+        assert_eq!(rows_of(&engine, "SELECT COUNT(*) FROM t_b WHERE v='a'")[0][0], b"0", "t_b 无 v=a 行");
+        assert_eq!(rows_of(&engine, "SELECT SUM(k) FROM t_a WHERE v='a'")[0][0], b"100");
+        // GROUP BY 字符串字段 + COUNT（非默认表分组）
+        let g = rows_of(&engine, "SELECT v, COUNT(*) FROM t_a GROUP BY v");
+        assert_eq!(g.len(), 1, "t_a 仅一组");
+        assert_eq!(g[0], vec![b"a".to_vec(), b"4".to_vec()]);
+        let gb = rows_of(&engine, "SELECT v, COUNT(*) FROM t_b GROUP BY v");
+        assert_eq!(gb.len(), 1);
+        assert_eq!(gb[0], vec![b"b".to_vec(), b"4".to_vec()]);
+        // GROUP BY 数值字段 + SUM（窗口内按表）
+        let gk = rows_of(&engine, "SELECT k, COUNT(*) FROM t_a GROUP BY k ORDER BY k");
+        assert_eq!(gk.len(), 4, "t_a 每组 k 各 1 行（4 组）");
+        // MIN/MAX/AVG 同口径
+        assert_eq!(rows_of(&engine, "SELECT MAX(k) FROM t_a")[0][0], b"40");
+        assert_eq!(rows_of(&engine, "SELECT MIN(k) FROM t_b")[0][0], b"1001");
+    }
+    #[test]
+    fn p1_for_update_current_read_semantics() {
+        // P1-4 验证：SELECT … FOR UPDATE = 事务内**当前读**（最新已提交 + 自写），
+        // 快照读不受影响（RR 幻影/不可重复读由当前读排除）；放行形态核对
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut engine = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let a1 = Arc::new(AtomicU64::new(1));
+        let a2 = Arc::new(AtomicU64::new(1));
+        let mut s1 = super::new_session(Arc::clone(&a1));
+        let mut s2 = super::new_session(Arc::clone(&a2));
+        let rows_of = |e: &Engine, sql: &str| -> Vec<Vec<Vec<u8>>> {
+            match select_response(e, sql) {
+                QueryResponse::Set { rows, .. } => rows,
+                _ => panic!("应为 ResultSet: {sql}"),
+            }
+        };
+        // 基表：documents id=1..3；t_x id=1..2
+        for i in 1..=3u64 {
+            insert_response(&mut engine, &format!("INSERT INTO documents(id, doc) VALUES({i}, '{{\"k\":{i}}}')"), &a1);
+        }
+        for i in 1..=2u64 {
+            insert_response(&mut engine, &format!("INSERT INTO t_x(id, doc) VALUES({i}, '{{\"k\":{}}}')", i * 100), &a1);
+        }
+        // s1 事务建立快照（RR）
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s1), QueryResponse::Ok(0, 0)));
+        // s2 并发事务插入 documents id=4 并提交（seq 高于 s1 快照）
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s2), QueryResponse::Ok(0, 0)));
+        match super::dispatch_query(&mut engine, "INSERT INTO documents(id, doc) VALUES(4, '{\"k\":4}')", &mut s2) {
+            QueryResponse::Ok(1, _) => {}
+            r => panic!("s2 插入失败"),
+        }
+        assert!(matches!(super::dispatch_query(&mut engine, "COMMIT", &mut s2), QueryResponse::Ok(0, 0)));
+        // s1 普通快照读：BETWEEN 窗口仍 3 行（新行对快照不可见）
+        match super::dispatch_query(&mut engine, "SELECT id FROM documents WHERE id BETWEEN 1 AND 10", &mut s1) {
+            QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 3, "快照读不含 s2 已提交新行"),
+            r => panic!("快照读失败"),
+        }
+        // s1 FOR UPDATE（当前读）：可见最新已提交（含 id=4）——RR 下由当前读排除幻影
+        match super::dispatch_query(
+            &mut engine,
+            "SELECT id FROM documents WHERE id BETWEEN 1 AND 10 FOR UPDATE",
+            &mut s1,
+        ) {
+            QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 4, "FOR UPDATE 当前读应含 s2 已提交新行"),
+            r => panic!("FOR UPDATE 范围读失败"),
+        }
+        // 点查 FOR UPDATE 同语义 + 自写覆盖可见
+        match super::dispatch_query(&mut engine, "SELECT id FROM documents WHERE id=4 FOR UPDATE", &mut s1) {
+            QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 1),
+            r => panic!("FOR UPDATE 点查失败"),
+        }
+        // FOR UPDATE 后同事务 UPDATE（快照内行）并 commit（锁/写路径闭合）。
+        // 注：RR 保守策略下对"快照外新提交行"（如 s2 刚插的 id=4）当前读后可读，
+        // 但随后写该行 commit 会被并发冲突判定拒绝（保守近似，见 development_remain 注记）。
+        match super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":11}' WHERE id=1", &mut s1) {
+            QueryResponse::Ok(1, _) => {}
+            r => panic!("FOR UPDATE 后同事务 UPDATE 失败"),
+        }
+        assert!(matches!(super::dispatch_query(&mut engine, "COMMIT", &mut s1), QueryResponse::Ok(0, 0)));
+        // 非默认表 FOR UPDATE：主键窗口放行
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s1), QueryResponse::Ok(0, 0)));
+        match super::dispatch_query(&mut engine, "SELECT id FROM t_x WHERE id BETWEEN 1 AND 10 FOR UPDATE", &mut s1) {
+            QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 2, "非默认表窗口 FOR UPDATE 放行"),
+            r => panic!("非默认表 FOR UPDATE 窗口失败"),
+        }
+        assert!(matches!(super::dispatch_query(&mut engine, "ROLLBACK", &mut s1), QueryResponse::Ok(0, 0)));
+        // 边界核对：非默认表**字段谓词**事务查询仍 1064（§26 边界，主键/窗口可用）
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s1), QueryResponse::Ok(0, 0)));
+        assert!(matches!(
+            super::dispatch_query(&mut engine, "SELECT id FROM t_x WHERE k=100", &mut s1),
+            QueryResponse::Err(1064, _)
+        ));
+        assert!(matches!(super::dispatch_query(&mut engine, "ROLLBACK", &mut s1), QueryResponse::Ok(0, 0)));
+        // 已提交数据核对：FOR UPDATE 读到的 id=4（s2 插入，k=4）未被改动；同事务改的 id=1 生效
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=4")[0][0], b"4");
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=1")[0][0], b"11");
     }
     #[test]
     fn m1_p0_replace_and_null_auto() {
