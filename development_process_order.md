@@ -45,8 +45,8 @@
 | AA | 导出增强：流式管道 + JDBC 直连（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 阶段 3（c6b5417）：流式管道（--filter/--project/--mask Filter+Projection+Sink 分叉，内存 O(批)）+ JDBC 直连（MysqlWireClient MySQL wire 客户端建表+批量 INSERT 无文件落盘）+ --rate-limit；端到端验证 CSV/Parquet/JDBC；476 全绿；详见 development.md 7.66 |
 | AB | 导出增强：MySQL 兼容 CSV 配套 + 建表 DDL（2026-09-01） | 延伸 | ✅ 完成 | design 20.5（313bd81）：--mysql-compatible 自动生成 CREATE TABLE + LOAD DATA INFILE 配套 SQL（比逐条 INSERT 快 ~20 倍）+ --mysql-max-varchar 控制 VARCHAR/TEXT + --dry-run-schema --target clickhouse\|mysql 建表 DDL（MergeTree / InnoDB）；+4 测试 476 全绿；详见 development.md 7.67 |
 | AC | 导出增强：与 Compaction 共享后台 IO 优先级（2026-09-01） | 延伸 | ✅ 完成 | design 20.5 收尾（40e8abb）：CF scan_limiter Token Bucket（扫描路径专用，前台点查不受影响）+ export --io-rate-limit-mb（默认 storage.io_rate_limit_mb 同 Compaction 后台预算语义）；+1 测试 477 全绿；**导出功能全部完成**；详见 development.md 7.68 |
-| AD | 10 亿库扩展阶段 A~D：全局 docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片级可观测 | P0 | ✅ 完成 | `src/docid_alloc.rs`（AtomicU64 无锁分配 + 水位续跑 + 扩容归属不变 + 溢出保护）；`src/shard_build.rs` + shanshui-cunji-shard-build（行号取模/前缀路由/--shard-id 并行/BOM 修复）；`src/shard_inverted.rs`（分片内 local 位图 + 前缀组合 + 跨分片分页窗口 + 真实 Engine 集成）；`src/raft_rpc.rs`（RaftMsg serde + RaftTransport + RaftNodeRuntime 选举/复制/failover/多数派）；`src/shard_metrics.rs`（分片水位 gauge + 读写计数 + 80%/90% 预警 + /metrics 集成）；demo 24 测试 + kernel 30 单测，530 全绿；详见 development.md 7.81~7.86 / design-10b-extension.md §5.1/§5.3/§6 |
-| AE | LSM 读路径范围查询优化（Ex-8.1~8.3：非事务 id BETWEEN 流式化 + scan 层/文件剪枝 + 块缓存/keys-only） | P0 | ⏳ 排期 2026-09-03 | 5000 万对照范围 100× → 个位数×：审计+3308 实验证伪「缺 B+Tree」前提，真实根因=收集路径线性索引税（非事务 67~101ms 位置依赖 vs 事务流式 ~5ms）；拆点/验收见 design_remain §7 / development_remain §11 / feature_remain |
+| AD | 10 亿库扩展阶段 A~D：全局 docid 分配器 + 分片构建工具 + 分片化倒排 + raft RPC + 分片级可观测 | P0 | ✅ 完成 | `src/docid_alloc.rs`（AtomicU64 无锁分配 + 水位续跑 + 扩容归属不变 + 溢出保护）；`src/shard_build.rs` + shanshui-cunji-shard-build（行号取模/前缀路由/--shard-id 并行/BOM 修复）；`src/shard_inverted.rs`（分片内 local 位图 + 前缀组合 + 跨分片分页窗口 + 真实 Engine 集成）；`src/raft_rpc.rs`（RaftMsg serde + RaftTransport + RaftNodeRuntime 选举/复制/failover/多数派）；`src/shard_metrics.rs`（分片水位 gauge + 读写计数 + 80%/90% 预警 + /metrics 集成）；demo 24 测试 + kernel 30 单测，530 全绿；详见 development.md 7.81~7.86（10b 设计已并入 design_remain §19 归档） |
+| AE | LSM 读路径范围查询优化（Ex-8 系列） | P0 | ✅ 完成 2026-09-03 | Ex-8.1~8.3（e63603a/49469f6/0d8fdcf+bbb1c7a）+ 50m release 复测：非事务 id BETWEEN p50 86ms→**2.48ms**、vs MySQL 差距 **~102×→3.6×**（窗口位置无关）；Ex-8.4~8.14 后续项（8.5/8.9/8.11 A/B/8.12/8.13）与 Ex-9 系列见 development_remain §11/§12/§14~§16/§18/§19 |
 
 ## 3. 大项详情
 
@@ -86,7 +86,7 @@
   （广播精确命中 + 逐条可见）——对照基线 1074s 提升 ~2100×，目标 <60s 达标；写路径 RTT 分摊到批 + 组提交
   消除逐条 fsync；剩余耗时在逐条点查读路径（跨地域 RTT ~52ms/次，非 C 项范围）。
 
-### H. MySQL 协议适配（MySQL 生态接入，P1）🔄 进行中
+### H. MySQL 协议适配（MySQL 生态接入，P1）✅ 已完成（H-1~H-6，mysql cli + pymysql + sysbench 风格全通过）
 - **背景**：sqlish 为类 SQL 子集（仅 SELECT 点查/范围 + LIMIT），MySQL 客户端/生态工具
   （mysql cli、JDBC/MyBatis、Navicat、sysbench）无法接入；网关层实现 MySQL wire protocol →
   生态工具直接可用（协议兼容场景的 sysbench 压测前提，见上一轮压测选型分析）；

@@ -93,7 +93,7 @@
   与紧凑持平（x1.0）、数据仅 +0.1%
 - **回归**：488 全绿（+3：分页与全量一致、跨段去重、v3 往返）
 
-## 10. 10 亿库扩展（设计 `design-10b-extension.md`，阶段 A P0）
+## 10. 10 亿库扩展（阶段 A~D 已完成，见 process_order AD；设计并入 design_remain §19 归档）
 
 - **来源**：2026-09-02 规划（10 亿库分片扩展方案）
 - **阶段 A（P0）— ✅ 已完成**：全局 docid 分配器 `src/docid_alloc.rs`（分片前缀
@@ -316,6 +316,16 @@
 - **远期不排期**：组合索引范围聚合（依赖 B+Tree 化，Ex-8.4 触发链）、物化视图 / 聚合缓存（TTL/失效语义待产品化）
 - **验收口径（3 亿库）**：无条件 COUNT(*) ≤1ms；条件 COUNT ≤1ms（Ex-9.1）；`SUM WHERE status` ≤100ms（Ex-9.3）；
   数值与全扫一致（抽样断言）
+
+## 20. Ex-3 Calvin 确定性事务评估归档（归档自 development_extension.md，2026-09-03 合并）
+
+- **判定**：✅ 评估完成——**不进入 kernel（远期方向保留）**（development_extension.md Ex-3.3 /
+  development.md 7.45 记录一致）
+- **理由摘要**：写路径 docid 一致性哈希 → 单 docid 事务天然不分片；L1 outbox + L2 SAGA 已覆盖
+  跨节点/异步最终一致；Calvin 需全局事务序协调器（单点）+ 读写集预声明（倒排词表难静态声明），
+  投入产出不匹配
+- **远期触发**：出现强一致多 docid 跨分区事务需求时，按"全局事务序 + 状态机衔接 ReplicationLog"
+  落地——阶段一/二/三排期见本文件 **§7**，完整蓝图见 design_remain.md §1（design_extension 13.3/14.8/14.9）
 
 ## 已完成基线（勿重复）
 

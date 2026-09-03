@@ -68,7 +68,7 @@
 | 两级索引（Level 1 内存常驻摘要 + Level 2 精确） | design 4.4.2（阶段 2） | ✅ 评估完成（7.80 `demo two-level-index`：全局摘要内存为 Zone Map 7812×、过滤收益为 0、点查已 sub-ms）→ **不引入**（现有 Block Index+布隆+Zone Map 已覆盖） | — |
 | Tiered 分层合并（每次只合最小 2 段） | development 7.3 | ✅ 评估完成（7.78 `demo tiered-compaction`：模拟验证写放大不优于 Leveled，当前分批+无锁合并已解决阻塞痛点）→ **暂不引入**（读放大回归风险） | 写放大再优化需求（key 级更新密集场景复评） |
 | io_uring 热路径实测收益 | development 7.71 | ✅ 已实测 | 阿里云 Debian 12 / 内核 6.1：池初始化成功、核隔离生效；2 核小机器写 -13%（SQPOLL 占核）、读持平（块缓存主导）→ 默认关；收益在多核/高 IOPS 场景（7.63 指引） |
-| **10 亿库扩展（分片横向扩展）** | `design-10b-extension.md`（2026-09-02） | ✅ 阶段 A~D 机制全部落地（7.81~7.98，550 全绿）：A docid 分配器+分片构建工具、B 分片化倒排（local 位图+前缀组合+跨分片分页）、C raft RPC 接线（RaftTransport + TcpRaftTransport 真实 TCP `1adc5ec` + scale_out RouteChannel 联动 `9821dc0`）、D 分片可观测（水位预警）；⏳ 剩余 = 硬件验收（10 分片 10 亿构建 `tmp_10b_acceptance.py` 就绪、亿级 posting 规模）+ raft TCP 多进程编排联调；**已实现/未实现总表见 design-10b-extension.md §10** | 10 亿规模需求（当前 1 亿库 10×；分片基建 + 扩容编排已就绪） |
+| **10 亿库扩展（分片横向扩展）** | 设计已并入 §19 归档（design-10b-extension.md 已合并删除） | ✅ 阶段 A~D 机制全部落地（7.81~7.98，550 全绿）：A docid 分配器+分片构建工具、B 分片化倒排（local 位图+前缀组合+跨分片分页）、C raft RPC 接线（RaftTransport + TcpRaftTransport 真实 TCP `1adc5ec` + scale_out RouteChannel 联动 `9821dc0`）、D 分片可观测（水位预警）；⏳ 剩余 = 硬件验收（10 分片 10 亿构建 `tmp_10b_acceptance.py` 就绪、亿级 posting 规模）+ raft TCP 多进程编排联调 | 10 亿规模需求（当前 1 亿库 10×；分片基建 + 扩容编排已就绪） |
 
 ## 7. LSM 读路径范围查询优化（Ex-8 系列，✅ 已排期 2026-09-03）
 
@@ -348,6 +348,55 @@ Ex-8.14 deletion bitmap 读无锁化（P2）；写路径多写者维持远期（
 - 不立项"桶/分区 LSM 重构"；四阶段与现状重叠/已落地部分不重复排期。
 - 唯一留存触发项 = **宽 L0 文件 range 局部合并（sub-compaction）**，P3、需随机主键/更新密集负载实测触发。
 - 复评触发条件（若出现任一）：随机主键（UUID/业务键）+ 删除密集 + 多写者并发数据模型。
+
+## 18. design_extension.md 归档汇总（归档自 design_extension.md，2026-09-03 合并）
+
+> 2026-09-03 归档：design_extension.md 多主题内容（v0.1 分布式事务第 1~8 章 / v0.2 倒排字段
+> 策略第 9 章 / v0.3 SSD 原生第 10 章 / v0.4 并发读第 11 章 / v0.5 多核第 12 章 / v0.6~v0.8
+> SAGA 网关与 Calvin 深化第 13/14 章）已全部"决策执行完毕或评估定档"。下表为每章去向
+> （源章 → Ex → commit/落地处），**不复制正文**；design.md 已有对应章节处（如 4.8 SSD、
+> 5.x 倒排）一律不动。
+>
+> **结论摘要（第 1~8 章）**：采用 **L1 本地消息表（outbox）+ L2 SAGA**；**不做 2PC/XA/3PC/
+> TCC/Seata 本体**；**L3 Calvin 评估完成不立项**——远期触发条件见本文件 §1（Calvin 远期蓝图）
+> 与 development_remain.md §20。
+
+| 源章 | 主题 | 状态 | 去向（commit / 落地处） |
+|---|---|---|---|
+| 1~8 | 分布式事务技术全景 / 开源调研 / 借鉴点 / 分层决策 L0~L3 / 架构衔接 / 风险红线 | ✅ L1/L2 已实现，L3 评估不立项 | Ex-1 `7348acd`（development 7.43）/ Ex-2 `990bf6b`+`781199e`（7.44/7.57）/ Ex-3 demo（7.45）；决策摘要 = 本文件 §1 与文末"设计决策边界" |
+| 9.1~9.4 | 倒排索引字段策略（三准则 + ≤20 字段 + 配置模板） | ✅ 已实现（Ex-4） | development 7.46（`db-50m-opt`：inverted 2231.8→144.3MB）；模板固化 `config.import-example.toml`；design.md 5.x 倒排章节已有对应，不动 |
+| 9.5 | db-50m 量化收益（✅ 实测回填） | ✅ | → 同 Ex-4（7.46 / development_extension Ex-4 验证节） |
+| 10 | SSD 原生优化（HDD→SSD 转变 + P0/P1/P2 优先级） | ✅ 已实现（Ex-5.1~5.10） | `056b21d`…`e6a5610`（development 7.24~7.26/7.31~7.37）；设计主体 design.md 4.8 已有，不动 |
+| 11 | 并发读优化（五方案取舍 + Seqlock 倒排设计） | ✅ 已落地 | Ex-6.1 seqlock 原语 `1946161`（7.28）独立先行；Ex-6.2/6.3 段清单/FST 字典 ArcSwap `c8183cf`（7.42 / P50）；前置"解除 Engine 全局锁"由大项 O（`df16058`/`4585bb9`/`e9f7d39`）满足；SSD 读写并发基线实测留目标硬件 |
+| 12 | 多核优化（Shard Everything 五处理点 + 伪共享设计） | ✅ 已实现（Ex-7.1~7.4） | `c5fa66c`/`b294532`/`fd0b519`/`ddbc20e`（development 7.38~7.41） |
+| 13.1/13.2 | SAGA 网关 HTTP API + 跨分片端到端架构 | ✅ 已实现（Ex-2.5） | `781199e`（development 7.57：三端点 + HttpStep + 3 网关 e2e）；2 节点真实联调留分布式构建阶段 |
+| 13.3 | Calvin 全局事务序落地蓝图（远期方向） | 🔍 已评估：不立项 | 触发条件 13.3.1 → design_remain §1（远期蓝图）+ development_remain.md §20（Ex-3 评估归档） |
+| 13.4 | Ex-2.5 扩展落地任务（✅ 已完成） | ✅ | `781199e`（四子任务：HttpStep/http_post、三端点路由、e2e、文档回填，7.57） |
+| 13.5 | SAGA 补偿协议形式化（不变量 I1~I4 + 恢复时序 + 双幂等） | ✅ 已实现 | `170bf21`+`136882f`（development 7.57，+10 测试：13.5.3 恢复时序/屏障空转） |
+| 13.6/13.7 | 步骤依赖 DAG 并行执行 + 后台对账自动重试 | ✅ 已实现 | `71aa712`（development 7.58，459 全绿） |
+| 14 | Calvin 全局事务序深化设计（远期蓝图 v0.7/v0.8） | 🔍 远期/不立项（13.3.1 触发才落地） | → design_remain §1（14.8 阶段一/二/三）+ §6（raft 14.x 已评估/落地、Calvin 硬件卸载已评估）；其中元数据 raft 阶段一先行落地（7.77 `e2a76a0`）+ 阶段二 RPC 机制（7.85 `eab9a38` / 7.88 `1adc5ec`） |
+| 附录 | 与各文档关系 | 不再需要 | 各落地章节已内嵌引用（development_extension / development.md 7.x / problem_solving P#） |
+
+## 19. design-10b-extension.md 归档汇总（归档自 design-10b-extension.md，2026-09-03 合并）
+
+> 2026-09-03 归档：10 亿库扩展方案（2026-09-02 规划）为**纯设计蓝图且已实现**——阶段 A~D
+> 机制全部落地（development.md 7.81~7.98 / development_process_order.md 大项 AD ✅），本表
+> 记录每阶段去向（阶段 → 模块 → 状态/commit），**不复制整章正文**；剩余 ⏳ 均为硬件/部署级
+> 验收（详见源文档 §9 验收标准与 §10"未实现"表）。
+
+| 阶段/模块 | 内容 | 状态 | commit / 落地处 |
+|---|---|---|---|
+| A docid 分配器 | 全局 docid 分配器（分片前缀 `shard<<40\|local` + 分片内 AtomicU64 自增 + 扩容归属不变 + 溢出保护） | ✅ | `src/docid_alloc.rs` `a8c4e17`（development 7.81，源 §5.1） |
+| A 分片构建工具 | `shard-build --shard-id` 多进程并行导入（CSV/JSONL，行号取模/前缀路由/BOM 修复） | ✅ | `src/shard_build.rs` `ff4f1d7`（development 7.82） |
+| B 分片化倒排 | 分片内 local 位图 + 前缀组合全局 docid + 跨分片分页窗口 + 真实 Engine 集成 | ✅ | `src/shard_inverted.rs` `f42bfea`（development 7.83） |
+| C raft RPC 接线 | RaftTransport trait + LocalRaftTransport 进程内 + TcpRaftTransport 真实 TCP + scale_out RouteChannel raft 联动 | ✅ 机制完成 | `src/raft_rpc.rs` `eab9a38`（7.85）/`1adc5ec`（7.88）/`9821dc0`（7.98）；⏳ 真实 TCP 多进程/多节点编排联调随部署 |
+| D 分片级可观测 | docid 水位 gauge + 读写计数 + 80%/90% 上限预警 + /metrics 告警 | ✅ | `src/shard_metrics.rs` `3f2d69a`（development 7.86） |
+| 稳定性 / 工具 | 180s 高并发 CRUD（13.8 万 ops 零错误）+ P74/P75/P76 闭环 + 10 亿验收脚本 | ✅ | development 7.84/7.87/7.88；`tmp_10b_acceptance.py`（4×1000 冒烟通过） |
+| ⏳ 验收-1~4 | 10 分片×1 亿构建 / 亿级 posting 规模回归 / 点查≥10 万 QPS·写入≥20 万 rows/s 真机 / 真实 TCP 扩容·故障切换联调 | ⏳ 硬件/部署 | 源 §9 + §10"未实现"表；development_remain.md §10 同步跟踪 |
+| 远期 | Roaring64（docid 20 亿+）/ 存算分离彻底化 / Calvin gseq raft 联动 | 🔍 远期 | 触发条件见源 §10 与 design_remain §6 |
+
+> 关联：development_process_order.md 大项 AD（530 全绿）；development_remain.md §10
+> （10 亿库扩展 A~D 完成明细）；development.md 7.81~7.98（逐阶段落地记录）。
 
 ## 设计决策边界（已定，不重复评估）
 

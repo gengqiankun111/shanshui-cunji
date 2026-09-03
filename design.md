@@ -431,7 +431,7 @@ inverted.shard_locks = 256    # 倒排分片锁分区数（P0）
 - **阶段一（P0，低风险快速收益）**：SST 4KB 块 + 倒排分片锁 + 倒排更新批处理 + Compaction 参数调优（20×/并行）；
 - **阶段二（P1 核心改造）**：环形大文件 WAL 规模化 + 删除位图 + 倒排 FST/mmap 字典 + 元数据-数据解耦；
 - **阶段三（P2 进阶优化）**：热/冷列物理分离 + 增量 Checkpoint + 冷热感知 Compaction + 多 SSD 条带化。
-- 落地任务跟踪见 development_extension.md Ex-5（SSD 原生迁移计划）。
+- 落地任务跟踪见 development.md「Ex 系列扩展」归档节 Ex-5（SSD 原生迁移计划；development_extension.md 已并入归档）。
 
 ---
 
