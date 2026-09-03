@@ -14,7 +14,7 @@
 | 功能 | 模块 | 说明 |
 |---|---|---|
 | 事务扫描位图过滤（Ex-8.10，✅ e1ae41b） | 事务/删除 | scan_range_txn 排除位图已删 + 自写新插入/复活并入（558 全绿） |
-| 删除位图读无锁化（Ex-8.14，已排期 P2） | 读路径/删除 | is_deleted 每行取 RwLock 读锁（scan/count 50m 行级开销真实）→ 读侧原子位组直读/ArcSwap 快照；保留 4KB 脏页 fsync 语义。写路径阶段化提交/MemTable 切换已复核不需改（design_remain §15 / development_remain §18） |
+| 删除位图读无锁化（Ex-8.14，✅ 2c623d9） | 读路径/删除 | is_deleted 改 ArcSwap 快照 + 原子字节读（无 RwLock/无互斥）；写路径短 Mutex + 倍增扩容；格式/持久语义不变（559 全绿） |
 | 自适应多级 Block 索引（已评估，2026-09-03） | 存储/读路径 | ❌ 不采纳：块级 zstd 下"行级细索引跳块解压直读 200B"不可达（关键前提错误）；热路径已被 BlockCache/HotCache/Ex-8.3 覆盖；mmap 数据面不适用。备选记录 = 块内稀疏重启点 P3 微项（design_remain §14 / development_remain §17） |
 | 分层压缩（Ex-8.12，已排期 P2） | 存储/压缩 | 值得做：L2+ zstd 高等级（6~15）——zstd 解压近等级无关 → 近免费空间/IO 收益，代价仅后台压缩 CPU；落地点 = compaction out_level 选档（现有 compression_level 单配置）。风险核查：Ex-5.8 块级复用在跨层等级变化失效 + L0/L1 轻量档中间层放大；50m 库 A/B 量化后定默认。共享字典压缩 = 远期触发（design_remain §12 / development_remain §16） |
 | L1/L2 延迟大合并（Ex-8.11，已排期 P2） | Compaction/写放大 | 值得做：`l0==0 && (l1>1||l2>1)` 即全收敛 → 级联写放大属实（column_family.rs:1573-1583）。新增 L1/L2 独立段数/大小阈值受控实验（A/B 在 50m 库测写放大/点查/范围）；前置 Ex-8.2 剪枝防范围读放大回退；L0 全局键索引与主动异步压 L0 已落地不重复（design_remain §11 / development_remain §15） |

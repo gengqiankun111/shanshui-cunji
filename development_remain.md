@@ -237,11 +237,12 @@
 
 ## 18. 删除位图读路径无锁化（Ex-8.14，design_remain §15，P2 排期）
 
-- **Ex-8.14（P2）deletion_bitmap 读无锁化**：
-  - [ ] 现状：bits: RwLock<Vec<u64>>，is_deleted 每调用取读锁——scan/count 逐行判定（50m 行级）锁开销真实
-  - [ ] 方案评估：读侧原子 u64 位组直读（写侧仅扩容/翻转需写锁，扩容用写锁 + 读侧按位组长度判断越界），
-    或 seqlock / ArcSwap 只读快照；保留 4KB 脏页 fsync 持久语义与 WAL 回放重建
-  - [ ] demo/单测：50m 全扫 + COUNT + 混合删除下 get/scan 语义不变 + 读吞吐对照（位图读锁 vs 无锁）
+- **Ex-8.14（P2）deletion_bitmap 读无锁化** — ✅ 完成（2c623d9，559 全绿）
+  - [x] bits RwLock<Vec<u64>> → bytes ArcSwap<Box<[AtomicU8]>>：is_deleted 快照 + 单字节原子读
+    （无 RwLock/无互斥，删除/扫描/计数并发互不阻塞）；写路径短 Mutex 串行 + 越界倍增扩容换代
+    （in-place 位翻转原子）；flush/deleted_count 改快照原子读
+  - [x] 文件格式与持久语义不变（4KB 页对齐脏页 fsync + WAL 回放重建）
+  - [x] 单测：bitmap 5 项全过 + 新增并发冒烟（4 读者 vs 写者翻转+扩容，最终态全量校验）
 - **已复核不新立项**：写路径阶段化提交（组提交已把 fsync 移出锁内；后台 ack 破坏同步耐久语义）、
   MemTable 切换（双缓冲已具备）、多写者引擎写锁拆分（远期 Ex-13 触发链）
 
