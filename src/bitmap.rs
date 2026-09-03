@@ -72,16 +72,24 @@ impl DeletionBitmap {
     }
 
     /// 删除：置位（O(1) 内存）+ 标记脏页；仅当位确实翻转才写页（重复删除零 IO）。
-    pub fn mark_deleted(&self, docid: u64) {
+    /// Ex-8.7：返回是否**新置位**（此前未删）——调用方据此维护删除密度计数器（幂等重删不重计）。
+    pub fn mark_deleted(&self, docid: u64) -> bool {
         if !self.is_deleted(docid) {
             self.mutate(docid, true);
+            true
+        } else {
+            false
         }
     }
 
     /// 复活（put 重新写入）：清位（O(1)）+ 标记脏页；位本就未置时零 IO。
-    pub fn clear(&self, docid: u64) {
+    /// Ex-8.7：返回是否**实际清位**（此前已删）——调用方据此减除删除密度计数（复活才减）。
+    pub fn clear(&self, docid: u64) -> bool {
         if self.is_deleted(docid) {
             self.mutate(docid, false);
+            true
+        } else {
+            false
         }
     }
 

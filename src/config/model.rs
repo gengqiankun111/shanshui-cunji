@@ -640,6 +640,14 @@ pub struct StorageConfig {
     pub l1_trigger_files: usize,
     /// Ex-8.11：L2 段数触发阈值（L1 下沉后 L2 收敛为单段的触发数）。0 = 现行为（L2>1 即收敛）。
     pub l2_trigger_files: usize,
+    /// Ex-8.7：删除密度 Compaction（删除位图置位率驱动的 GC 合并）——置位率 ≥
+    /// `delete_density_min_ratio` 且自上次 GC 以来新增置位 ≥ `delete_density_min_docs` 时，
+    /// compaction 紧迫度增加删除密度维度并把删除密集段（含收敛后单底层段）重写回收空间。
+    /// 0.0 = 关闭（仅当 `deletion_bitmap_enabled` 且 >0 时生效）。
+    pub delete_density_min_ratio: f32,
+    /// Ex-8.7：单次 GC 触发的最小**新增**置位 docid 数（防小批量删除触发整段重写；
+    /// 重启后初始基准 = 打开时位图置位数，历史置位不重复触发）。
+    pub delete_density_min_docs: u64,
 }
 
 impl Default for StorageConfig {
@@ -682,6 +690,10 @@ impl Default for StorageConfig {
             // Ex-8.11：L1/L2 段数触发阈值默认 0 = 现行为（L0 空时 L1>1 下沉 / L2>1 收敛）。
             l1_trigger_files: 0,
             l2_trigger_files: 0,
+            // Ex-8.7：删除密度 GC 默认开启——置位率 ≥10% 且自上次 GC 新增置位 ≥1000 时触发
+            // （防小批量删除/历史置位误触发整段重写；删除密集负载空间回收依赖此路径）。
+            delete_density_min_ratio: 0.10,
+            delete_density_min_docs: 1000,
         }
     }
 }

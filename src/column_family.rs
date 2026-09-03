@@ -164,7 +164,15 @@ pub struct CompactReport {
     pub freed_bytes: u64,
     /// 压实输出所在层（0 = 未压实；1 / 2 = L1 / L2）。
     pub out_level: u32,
+    /// Ex-8.7：压实中按删除位图**物理丢弃**的键数（Ex-5.6 位图删除数据回收量；
+    /// 引擎据此决定删除密度 GC 是否继续排空 / 收敛）。
+    pub dropped_keys: usize,
 }
+
+/// Ex-8.7 删除密度跨列族紧迫度权重（外挂项，见 `Engine::delete_garbage_urgency`）：
+/// 取值介于 L0 大小软阈值超限（+8）与 L0 段数主因子（×10/段）之间——收敛后（L0=0）的
+/// 删除密集主列族能压过空闲 delta/cidx 率先被合并回收空间，又不抢占真正 L0 段数压力档。
+pub const DD_URGENCY: u32 = 6;
 
 impl ColumnFamily {
     /// 打开（或创建）一个列族：加载 Manifest/SST、回放 WAL。WAL 与数据同目录（旧布局）。
@@ -1463,6 +1471,7 @@ impl ColumnFamily {
                 kept_keys: 0,
                 freed_bytes: 0,
                 out_level: 0,
+                dropped_keys: 0,
             });
         }
         if let Some(rep) = self.try_meta_only_compact(&sel, out_level)? {
@@ -1509,9 +1518,89 @@ impl ColumnFamily {
                 kept_keys: 0,
                 freed_bytes: 0,
                 out_level: 0,
+                dropped_keys: 0,
             });
         }
         self.compact_merge(&sel, out_level, drop_key)
+    }
+
+    /// Ex-8.7：删除密度 GC 压实——先走常规 Leveled 选段（多段候选时等价 `compact_filtered`，
+    /// 合并中按位图物理丢弃已删键）；**无多段候选**（如已收敛为单底层段）且 `allow_single=true`
+    /// 时重写单个最底层段回收删除空间（删除位图语义下 delete 不写 Tombstone，已删旧数据
+    /// 只能靠压实物理丢弃；收敛后单段不再参与常规合并，故需显式 GC 重写）。
+    /// 单段重写绕开 Ex-5.8 块级复用（元数据拼接无法丢键），走全量合并保证 `drop_key` 生效；
+    /// `allow_single=false` = 传统 `compact_filtered`（单段不重写，兼容既有调用）。
+    pub fn compact_gc(
+        &self,
+        drop_key: &dyn Fn(&[u8]) -> bool,
+        allow_single: bool,
+    ) -> Result<CompactReport> {
+        let empty = CompactReport {
+            merged_ssts: 0,
+            kept_keys: 0,
+            freed_bytes: 0,
+            out_level: 0,
+            dropped_keys: 0,
+        };
+        let snap = self.ssts.load();
+        let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
+        let cap = if self.l1_trigger_files > 0 {
+            self.l1_trigger_files
+        } else {
+            self.effective_l0_threshold()
+        };
+        let (sel, out_level) = select_compaction_inputs_ex(
+            &snap.levels,
+            cap,
+            self.l1_trigger_files,
+            self.l2_trigger_files,
+            &heat,
+            &self.cooling_indices(),
+            &snap.sizes,
+            self.compact_input_max_bytes,
+        );
+        if sel.len() >= 2 {
+            return self.compact_merge(&sel, out_level, drop_key);
+        }
+        if !allow_single {
+            return Ok(empty);
+        }
+        let Some((idx, lvl)) = self.pick_gc_single(&snap) else {
+            return Ok(empty);
+        };
+        self.compact_merge(&[idx], lvl, drop_key)
+    }
+
+    /// Ex-8.7：删除密度单段 GC 候选——最深层（max level）非冷却最大段优先（删除空间回收
+    /// 潜力大）；该层全冷却时忽略冷却回退选择（保证排空最终收敛，宁可多读一次不漏回收）。
+    fn pick_gc_single(&self, snap: &SstSnapshot) -> Option<(usize, u32)> {
+        let cooling = self.cooling_indices();
+        let best = |cooling: &std::collections::HashSet<usize>| -> Option<(usize, u32)> {
+            let mut best: Option<(usize, u32, u64)> = None;
+            for (i, lvl) in snap.levels.iter().enumerate() {
+                if cooling.contains(&i) {
+                    continue;
+                }
+                let sz = snap.sizes.get(i).copied().unwrap_or_else(|| snap.ssts[i].file_len());
+                let cand = (i, *lvl, sz);
+                best = Some(match best {
+                    None => cand,
+                    Some(b) => {
+                        if cand.1 > b.1 || (cand.1 == b.1 && cand.2 > b.2) {
+                            cand
+                        } else {
+                            b
+                        }
+                    }
+                });
+            }
+            best.map(|(i, lvl, _)| (i, lvl))
+        };
+        match best(&cooling) {
+            Some(pick) => Some(pick),
+            None if !cooling.is_empty() => best(&std::collections::HashSet::new()),
+            None => None,
+        }
     }
 
     /// 全量合并压实主体（sel 已由调用方选出）：读全部输入行 → 排序去重 → 位图过滤 → 重写。
@@ -1742,6 +1831,7 @@ impl ColumnFamily {
             kept_keys: eliminated,
             freed_bytes,
             out_level,
+            dropped_keys: dropped,
         })
     }
 
@@ -2733,6 +2823,50 @@ mod tests {
         assert_eq!(cf.get(1).unwrap().unwrap().0, b"v1");
         assert!(cf.get(2).unwrap().is_none(), "Tombstone 语义保留");
         assert_eq!(cf.get(3).unwrap().unwrap().0, b"v3");
+    }
+
+    #[test]
+    fn compact_gc_rewrites_single_segment_dropping_deleted_keys() {
+        // Ex-8.7：收敛为单段（常规 select 无多段候选）——`compact_gc(allow_single=true)`
+        // 单段重写按位图已删键物理丢弃回收空间；`allow_single=false`（传统路径）不重写。
+        let dir = tmp();
+        let cfg = small_cfg(256);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        for d in 1..=40u64 {
+            cf.put(d, format!("v{d}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        for d in 41..=80u64 {
+            cf.put(d, format!("v{d}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.merged_ssts, 2, "常规合并收敛");
+        assert_eq!(cf.sst_count(), 1, "已收敛为单段");
+
+        let deleted = |k: &[u8]| {
+            k.len() == 8 && {
+                let id = u64::from_be_bytes(k.try_into().unwrap());
+                id % 3 == 0
+            }
+        };
+        // 传统路径（allow_single=false）：单段不重写（空转）
+        let rep0 = cf.compact_gc(&deleted, false).unwrap();
+        assert_eq!(rep0.merged_ssts, 0, "allow_single=false 不重写单段");
+        // 删除密度 GC：单段重写 → 1/3 键物理丢弃
+        let rep = cf.compact_gc(&deleted, true).unwrap();
+        assert_eq!(rep.merged_ssts, 1, "单段重写 1 段");
+        assert!(rep.dropped_keys > 0, "应物理丢弃已删键: {}", rep.dropped_keys);
+        assert!(rep.freed_bytes > 0, "重写应释放空间");
+        let rows = cf.scan_range(None, None).unwrap();
+        assert!(rows.iter().all(|(d, _)| d % 3 != 0), "已删键全部消失");
+        assert_eq!(rows.len(), 54, "80 - ⌊80/3⌋ = 54 存活");
+        // 二次 GC：无垃圾可丢 → 0 丢弃（引擎排空收敛判定依据）
+        let rep2 = cf.compact_gc(&deleted, true).unwrap();
+        assert_eq!(rep2.dropped_keys, 0, "无已删键 → 0 丢弃收敛");
+        // 重启后物理态一致
+        let mut cf2 = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert_eq!(cf2.scan_range(None, None).unwrap().len(), 54);
     }
 
     #[test]

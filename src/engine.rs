@@ -98,6 +98,22 @@ pub struct Engine {
     /// compaction 物理删除）；None = 关闭（传统 Tombstone 路径）。
     /// P72：`Arc`——worker 无锁合并 clone 后并发读位图过滤（写路径在 Engine 写锁内）。
     deletion_bitmap: Option<Arc<DeletionBitmap>>,
+    /// Ex-8.7 删除密度（删除位图置位率驱动 Compaction）调度状态——`Arc` 供无锁合并
+    /// （`CompactTargets::run`）在 Engine 读锁外按压实结果回写（drop>0 继续排空 / 0 收敛）。
+    /// - `garbage_marked`：位图当前置位 docid **净数**（幂等重删不重计、复活即减，精确）；
+    ///   打开时 = 位图既有置位数（历史置位）。
+    /// - `garbage_done`：最近一次"排空收敛"时的 `garbage_marked` 快照——此后需新增置位
+    ///   ≥ `delete_density_min_docs` 才再次进入删除密度触发（历史置位不重复触发重写）。
+    /// - `garbage_draining`：排空进行中（最近一轮主列族压实实际物理丢弃 >0 → 继续 GC，
+    ///   直至某轮 0 丢弃 → 收敛并刷新 `garbage_done`）。
+    garbage_marked: Arc<AtomicU64>,
+    garbage_done: Arc<AtomicU64>,
+    garbage_draining: Arc<AtomicBool>,
+    /// 曾写入的最大 docid（≈ 曾插入文档数，删除置位率分母；put 时 fetch_max）。
+    max_docid: AtomicU64,
+    /// 删除密度触发阈值（`storage.delete_density_min_ratio` / `_min_docs`）。
+    dd_min_ratio: f32,
+    dd_min_docs: u64,
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     affinity: crate::affinity::CpuPartition,
@@ -137,6 +153,7 @@ fn merge_report(base: &mut crate::column_family::CompactReport, other: &crate::c
     base.merged_ssts += other.merged_ssts;
     base.kept_keys += other.kept_keys;
     base.freed_bytes += other.freed_bytes;
+    base.dropped_keys += other.dropped_keys;
 }
 
 /// P72（无锁合并）：`Engine::compaction_targets` 的产物——已 clone 的三 CF Arc + 删除位图 Arc
@@ -154,6 +171,29 @@ pub struct CompactTargets {
     pub do_primary: bool,
     pub do_cidx: bool,
     pub do_delta: bool,
+    /// Ex-8.7：删除密度状态（Engine 字段的 Arc clone，`run()` 锁外按压实结果回写）。
+    pub garbage_marked: Arc<AtomicU64>,
+    pub garbage_done: Arc<AtomicU64>,
+    pub garbage_draining: Arc<AtomicBool>,
+    /// Ex-8.7：本轮到 `gc_single` 是否允许**单段重写**（删除密度触发时 true——
+    /// 收敛后单底层段无常规合并候选，需重写才能物理回收已删数据）。
+    pub gc_single: bool,
+}
+
+/// Ex-8.7：主列族压实反馈——按删除位图实际**物理丢弃 >0** → 继续删除密度排空；
+/// 0 丢弃 → 排空收敛（快照 `garbage_marked`，此后需新增置位 ≥ min_docs 才再触发）。
+fn apply_gc_feedback(
+    draining: &AtomicBool,
+    done: &AtomicU64,
+    marked: &AtomicU64,
+    r: &crate::column_family::CompactReport,
+) {
+    if r.dropped_keys > 0 {
+        draining.store(true, Ordering::Relaxed);
+    } else {
+        draining.store(false, Ordering::Relaxed);
+        done.store(marked.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
 }
 
 impl CompactTargets {
@@ -165,18 +205,22 @@ impl CompactTargets {
             kept_keys: 0,
             freed_bytes: 0,
             out_level: 0,
+            dropped_keys: 0,
         };
         let mut rep = empty;
         let bm = self.deletion_bitmap.as_ref();
         let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
         if self.do_primary {
+            // Ex-8.7：过滤压实（多段常规合并等价 compact_filtered；删除密度触发时
+            // `gc_single=true` 允许收敛后单底层段重写回收）→ 按 dropped 回写排空状态
             let r = if needs_filter {
                 let f = |k: &[u8]| bm.is_some_and(|b| b.is_deleted_key(k));
-                self.primary.compact_filtered(&f)?
+                self.primary.compact_gc(&f, self.gc_single)?
             } else {
                 self.primary.compact()?
             };
             merge_report(&mut rep, &r);
+            apply_gc_feedback(&self.garbage_draining, &self.garbage_done, &self.garbage_marked, &r);
         }
         if self.do_cidx {
             if let Some(c) = &self.cidx {
@@ -405,6 +449,12 @@ impl Engine {
         } else {
             None
         };
+        // Ex-8.7：打开时既有置位数 = 删除密度基准（`garbage_done` 同值）——
+        // 重启后历史置位不重复触发 GC 重写；需**本会话新增置位** ≥ min_docs 才触发。
+        let bm_deleted = deletion_bitmap
+            .as_ref()
+            .map(|b| b.deleted_count())
+            .unwrap_or(0);
         // 本地消息表（Ex-1）：开启时打开 outbox 列族（数据盘，与 primary 同崩溃安全模型）
         let outbox = if cfg.outbox.enabled {
             Some(Outbox::open(&sst_root.join("outbox"), cfg)?)
@@ -470,6 +520,12 @@ impl Engine {
             compact_worker: Arc::new(AtomicBool::new(false)),
             inverted_gc_pending: Arc::new(AtomicBool::new(false)),
             deletion_bitmap,
+            garbage_marked: Arc::new(AtomicU64::new(bm_deleted)),
+            garbage_done: Arc::new(AtomicU64::new(bm_deleted)),
+            garbage_draining: Arc::new(AtomicBool::new(false)),
+            max_docid: AtomicU64::new(0),
+            dd_min_ratio: cfg.storage.delete_density_min_ratio,
+            dd_min_docs: cfg.storage.delete_density_min_docs,
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
@@ -609,8 +665,12 @@ impl Engine {
         self.delta.delete_prefix(&encode_docid(docid))?;
         // ②.5 删除位图复活（Ex-5.6）：put 覆盖 delete → 清位（O(1) 内存，位未置时零 IO）；
         //     持久性与 WAL 同步（flush_wal 先刷位图后刷 WAL）
+        //     Ex-8.7：实际清位（此前已删）→ 减除删除密度净置位数；fetch_max 维护密度分母。
+        self.max_docid.fetch_max(docid, Ordering::Relaxed);
         if let Some(bm) = &self.deletion_bitmap {
-            bm.clear(docid);
+            if bm.clear(docid) {
+                self.garbage_marked.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
         //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
@@ -920,7 +980,11 @@ impl Engine {
         self.hotcache.invalidate(docid);
         match &self.deletion_bitmap {
             Some(bm) => {
-                bm.mark_deleted(docid);
+                // Ex-8.7：**新置位**（此前未删）才计入删除密度净置位数——
+                // WAL 回放/重复删除幂等（位已置 → 不计，与 bm_deleted 初始化口径一致）。
+                if bm.mark_deleted(docid) {
+                    self.garbage_marked.fetch_add(1, Ordering::Relaxed);
+                }
                 self.primary
                     .delete_record_wal(encode_docid(docid).to_vec())?;
                 self.delta.delete_prefix(&encode_docid(docid))?;
@@ -1627,17 +1691,55 @@ impl Engine {
         self.inverted.bitmap_and(terms).map(|b| b.len())
     }
 
+    /// Ex-8.7：删除置位率 = 净置位数 / max(置位数, 曾写入最大 docid)——"位图置位率"密度。
+    fn delete_gc_density(&self) -> f32 {
+        let marked = self.garbage_marked.load(Ordering::Relaxed);
+        let denom = marked.max(self.max_docid.load(Ordering::Relaxed)).max(1);
+        marked as f32 / denom as f32
+    }
+
+    /// Ex-8.7：删除密度 Compaction 是否就绪（needs_compact / 紧迫度 / GC 单段重写门槛）：
+    /// 位图开启 + `delete_density_min_ratio` > 0 + 置位率 ≥ 阈值 + 无积压……
+    /// （`garbage_draining` 排空中无视"新增置位"门槛——直到某轮 0 丢弃收敛）。
+    pub fn delete_garbage_pending(&self) -> bool {
+        if self.deletion_bitmap.is_none() || self.dd_min_ratio <= 0.0 {
+            return false;
+        }
+        let marked = self.garbage_marked.load(Ordering::Relaxed);
+        if marked == 0 {
+            return false;
+        }
+        let draining = self.garbage_draining.load(Ordering::Relaxed);
+        if !draining && marked.saturating_sub(self.garbage_done.load(Ordering::Relaxed)) < self.dd_min_docs {
+            return false;
+        }
+        self.delete_gc_density() >= self.dd_min_ratio
+    }
+
+    /// Ex-8.7：删除密度维度的跨列族紧迫度权重（W 项公式外挂项）——就绪时 +`DD_URGENCY`：
+    /// 低于 L0 段数主因子（×10/段），高于纯 L0 大小软阈值 +8 之下的次级——
+    /// 收敛后（L0=0）删除密集主列族仍能压过空闲 delta/cidx 率先被合并回收空间。
+    fn delete_garbage_urgency(&self) -> u32 {
+        if self.delete_garbage_pending() {
+            crate::column_family::DD_URGENCY
+        } else {
+            0
+        }
+    }
+
     /// 基础 Compaction（design 4.5，阶段 3；Ex-5.4 并行化）：primary/cidx/delta 列族压实。
     /// 并行度 `compaction_parallel`：0 = 自动（min(4, 核数/2)）；1 = 串行；>1 = 指定。
     /// W 项：跨列族**紧迫度调度**——每轮仅压实紧迫度最高档（L0 压力/大小超限最大）的列族，
     /// 并列档并行（保留 SSD 并发收益）；其余列族由后台 worker 后续轮次（`while needs_compact`）
     /// 压实——压力最大的列族（通常 primary 主数据）优先收敛，读路径最快受益。
     /// Ex-5.6：删除位图开启时 primary 压实按位图**物理丢弃**已删 docid 的旧数据（墓碑不污染层级）。
+    /// Ex-8.7：删除密集时紧迫度叠加删除密度权重；触发后允许收敛单段重写（`compact_gc`），
+    /// 并按压实**实际丢弃数**回写排空状态（drop>0 继续 / 0 收敛，见 `apply_gc_feedback`）。
     /// O 项第③步：`&self`——后台合并 worker 在引擎**读锁**下执行（合并不阻塞读；
     /// 与写互斥由 Engine RwLock 保证，快照 store 无并发丢失）。
     pub fn compact(&self) -> Result<crate::column_family::CompactReport> {
-        // W 项：紧迫度 = 列族 compaction_urgency（L0 段数×10 + 大小超限 +8）
-        let pu = self.primary.compaction_urgency();
+        // W 项：紧迫度 = 列族 compaction_urgency（L0 段数×10 + 大小超限 +8）+ 删除密度权重
+        let pu = self.primary.compaction_urgency() + self.delete_garbage_urgency();
         let du = self.delta.compaction_urgency();
         let cu = self.cidx.as_ref().map_or(0, |c| c.compaction_urgency());
         let max = pu.max(du).max(cu);
@@ -1646,6 +1748,7 @@ impl Engine {
             kept_keys: 0,
             freed_bytes: 0,
             out_level: 0,
+            dropped_keys: 0,
         };
         if max == 0 {
             return Ok(empty); // 无压力（调用方应在 needs_compact 下进入）
@@ -1653,6 +1756,8 @@ impl Engine {
         let do_p = pu == max;
         let do_c = self.cidx.is_some() && cu == max;
         let do_d = du == max;
+        // Ex-8.7：删除密度触发时允许主列族"单底层段重写"（GC 回收已删数据）
+        let gc_single = self.delete_garbage_pending();
 
         let parallel = if self.compaction_parallel == 0 {
             std::thread::available_parallelism()
@@ -1672,11 +1777,12 @@ impl Engine {
             let mut rep = empty;
             if do_p {
                 let r = if needs_filter {
-                    self.primary.compact_filtered(&filter)?
+                    self.primary.compact_gc(&filter, gc_single)?
                 } else {
                     self.primary.compact()?
                 };
                 merge_report(&mut rep, &r);
+                apply_gc_feedback(&self.garbage_draining, &self.garbage_done, &self.garbage_marked, &r);
             }
             if do_c {
                 let r = self.cidx.as_ref().unwrap().compact()?;
@@ -1699,7 +1805,7 @@ impl Engine {
                 Some(s.spawn(move || {
                     crate::affinity::bind_current(&cc);
                     if needs_filter {
-                        p.compact_filtered(&f)
+                        p.compact_gc(&f, gc_single)
                     } else {
                         p.compact()
                     }
@@ -1727,9 +1833,20 @@ impl Engine {
                 None
             };
             let mut merged = empty;
-            for h in [h1, h2, h3].into_iter().flatten() {
-                let r = h.join().unwrap()?;
-                merge_report(&mut merged, &r);
+            // h1（下标 0）= primary：join 后按实际丢弃回写删除密度排空状态
+            for (k, h) in [h1, h2, h3].into_iter().enumerate() {
+                if let Some(handle) = h {
+                    let r = handle.join().unwrap()?;
+                    if k == 0 && do_p {
+                        apply_gc_feedback(
+                            &self.garbage_draining,
+                            &self.garbage_done,
+                            &self.garbage_marked,
+                            &r,
+                        );
+                    }
+                    merge_report(&mut merged, &r);
+                }
             }
             self.metrics.compact_count.fetch_add(1, Ordering::Relaxed);
             Ok(merged)
@@ -1737,11 +1854,13 @@ impl Engine {
         Ok(merged)
     }
 
-    /// 是否需要 Compaction（主数据 / delta / cidx 任一列族 L0 超阈值或 L1/L2 需收敛）。
+    /// 是否需要 Compaction（主数据 / delta / cidx 任一列族 L0 超阈值或 L1/L2 需收敛，
+    /// 或 Ex-8.7 删除密度就绪——位图删除数据待回收）。
     pub fn needs_compact(&self) -> bool {
         self.primary.needs_compact()
             || self.delta.needs_compact()
             || self.cidx.as_ref().map_or(false, |c| c.needs_compact())
+            || self.delete_garbage_pending()
     }
 
     /// P72（无锁合并）：读取三 CF Arc + 删除位图 Arc + 紧迫度判定（紧凑调度复刻 `compact`）——
@@ -1749,7 +1868,7 @@ impl Engine {
     /// `CompactTargets::run()` 执行**无锁合并**（与写并发；ssts 变更经 CF `sst_mutate` 互斥，
     /// flush 同锁 → 无丢失更新）。返回 None = 无紧迫度（不需要合并）。
     pub fn compaction_targets(&self) -> Option<CompactTargets> {
-        let pu = self.primary.compaction_urgency();
+        let pu = self.primary.compaction_urgency() + self.delete_garbage_urgency();
         let du = self.delta.compaction_urgency();
         let cu = self.cidx.as_ref().map_or(0, |c| c.compaction_urgency());
         let max = pu.max(du).max(cu);
@@ -1764,6 +1883,10 @@ impl Engine {
             do_primary: pu == max,
             do_cidx: self.cidx.is_some() && cu == max,
             do_delta: du == max,
+            garbage_marked: Arc::clone(&self.garbage_marked),
+            garbage_done: Arc::clone(&self.garbage_done),
+            garbage_draining: Arc::clone(&self.garbage_draining),
+            gc_single: self.delete_garbage_pending(),
         })
     }
 
@@ -3970,6 +4093,182 @@ mod tests {
                 "docid {i} 追平一致"
             );
         }
+    }
+
+    // ============ Ex-8.7 删除密度 Compaction ============
+
+    #[test]
+    fn delete_gc_pending_gates_on_ratio_and_min_docs() {
+        // 边界：min_docs（新增置位门槛）与 min_ratio（置位率门槛）独立生效——
+        // 小批量删除不触发；达到 min_docs 但密度不足不触发；两者满足才就绪。
+        let dir = tmp();
+        let mut cfg = cfg();
+        cfg.storage.auto_compact = false;
+        cfg.storage.delete_density_min_docs = 10;
+        cfg.storage.delete_density_min_ratio = 0.10;
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        for d in 1..=100u64 {
+            e.put(d, format!("v{d}").into_bytes(), &[]).unwrap();
+        }
+        assert!(!e.delete_garbage_pending(), "无删除不就绪");
+        for d in 1..=9u64 {
+            e.delete(d).unwrap();
+        }
+        assert!(
+            !e.delete_garbage_pending(),
+            "密度 9%<10% 不就绪（虽已满足 min_docs 阈值语义由另一例覆盖）"
+        );
+        e.delete(10).unwrap(); // 置位率 10%
+        assert!(
+            e.delete_garbage_pending(),
+            "置位率 10% ≥ 阈值 + 新增 ≥ min_docs → 就绪"
+        );
+        assert!(e.needs_compact(), "就绪 → needs_compact 置位");
+        // min_docs 门槛独立验证：置位率足够但新增不足 → 不就绪
+        cfg.storage.delete_density_min_docs = 50;
+        let mut e2 = Engine::open(&tmp(), &cfg).unwrap();
+        for d in 1..=100u64 {
+            e2.put(d, format!("v{d}").into_bytes(), &[]).unwrap();
+        }
+        for d in 1..=20u64 {
+            e2.delete(d).unwrap(); // 密度 20% ≥10%，但新增 20 < min_docs 50
+        }
+        assert!(!e2.delete_garbage_pending(), "新增置位不足 min_docs 不就绪");
+    }
+
+    #[test]
+    fn delete_density_gc_drains_converged_primary_and_reclaims_space() {
+        // Ex-8.7 核心：删除密集负载（位图开启）收敛为单底层段后——常规 select 无多段候选，
+        // 删除密度 urgency 触发 GC **单段重写**物理回收已删数据；排空（0 丢弃轮）后收敛。
+        let dir = tmp();
+        let mut cfg = cfg();
+        cfg.storage.auto_compact = false;
+        let n = 4_000u64;
+        let delete_every = 3u64; // 33% 删除密集
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        // 批量灌入（put_nosync 免逐条 fsync）+ 分批 flush → 多 L0
+        let chunk = 1_000u64;
+        for (c, d) in (1..=n).enumerate() {
+            e.put_nosync(d, format!("v{d}").into_bytes(), &[]).unwrap();
+            if (c as u64 + 1) % chunk == 0 {
+                e.flush_primary().unwrap();
+            }
+        }
+        e.flush_wal().unwrap();
+        // 常规压实收敛（无删除 → 位图无关路径）：L0 多段 → 底层单段
+        let mut guard = 0;
+        while e.primary.sst_count() > 1 && guard < 20 {
+            let _ = e.compact().unwrap();
+            guard += 1;
+        }
+        assert_eq!(e.primary.sst_count(), 1, "已收敛为单段");
+        let bytes_before = e.primary.sst_bytes();
+        assert!(bytes_before > 0);
+        // 删除密集（均匀 1/3：3,6,9,…）
+        let mut deleted = 0u64;
+        for d in (delete_every..=n).step_by(delete_every as usize) {
+            e.delete(d).unwrap();
+            deleted += 1;
+        }
+        e.flush_wal().unwrap();
+        assert!(
+            e.delete_garbage_pending(),
+            "置位率≈1/3 ≥ 阈值、新增≥min_docs → 删除密度就绪"
+        );
+        // GC 排空：逐轮压实直至某轮 0 丢弃收敛
+        let mut total_dropped = 0u64;
+        let mut rounds = 0;
+        while e.delete_garbage_pending() && rounds < 20 {
+            let rep = e.compact().unwrap();
+            total_dropped += rep.dropped_keys as u64;
+            rounds += 1;
+        }
+        assert!(!e.needs_compact(), "排空收敛后不再需要合并");
+        assert_eq!(total_dropped, deleted, "全部已删数据物理丢弃");
+        let bytes_after = e.primary.sst_bytes();
+        assert!(
+            bytes_after < bytes_before,
+            "删除密集段重写应回收空间: {} → {}",
+            bytes_before,
+            bytes_after
+        );
+        // 语义：存活可见、已删不可见、全表计数一致
+        for d in 1..=n {
+            let expect = d % delete_every != 0;
+            assert_eq!(e.get(d).unwrap().is_none(), !expect, "docid {d}");
+        }
+        let live = e.count_all_docs().unwrap();
+        assert_eq!(live, n - deleted, "可见行数 = 总行 - 已删");
+        // 重启：done 基准 = 打开时置位数 → 历史置位不重复触发 GC 重写
+        drop(e);
+        let mut e2 = Engine::open(&dir, &cfg).unwrap();
+        assert!(!e2.delete_garbage_pending(), "历史置位不重复触发");
+        assert!(e2.get(3).unwrap().is_none(), "已删 docid3 重启后仍不可见");
+        assert_eq!(e2.get(2).unwrap().unwrap(), b"v2");
+    }
+
+    #[test]
+    fn delete_density_demo_dense_vs_uniform_reclaim_contrast() {
+        // Ex-8.7 demo：删除密集 vs 均匀（少量删除）负载——同样载入量下，删除密集
+        // 经删除密度 GC 回收 ≈删除比例的空间；均匀负载不触发（置位率/新增均低于门槛），
+        // 段不重写、空间保持（对照"删除密集段优先被合并以释放空间"的收益）。
+        let dense_dir = tmp();
+        let uniform_dir = tmp();
+        let mut cfg = cfg();
+        cfg.storage.auto_compact = false;
+        cfg.storage.delete_density_min_docs = 100; // 演示用小阈值
+        cfg.storage.delete_density_min_ratio = 0.05;
+        let n = 2_000u64;
+        let load = |dir: &std::path::Path, e: &mut Engine| {
+            for (c, d) in (1..=n).enumerate() {
+                e.put_nosync(d, format!("doc-{d:05}").into_bytes(), &[]).unwrap();
+                if (c as u64 + 1) % 500 == 0 {
+                    e.flush_primary().unwrap();
+                }
+            }
+            e.flush_wal().unwrap();
+            let mut g = 0;
+            while e.primary.sst_count() > 1 && g < 20 {
+                let _ = e.compact().unwrap();
+                g += 1;
+            }
+        };
+        let mut dense = Engine::open(&dense_dir, &cfg).unwrap();
+        load(&dense_dir, &mut dense);
+        let mut uniform = Engine::open(&uniform_dir, &cfg).unwrap();
+        load(&uniform_dir, &mut uniform);
+        // 删除密集：删除 50%（step 2）→ GC 回收；均匀：仅删 2% 且低于增量门槛 → 不触发
+        let mut del = 0u64;
+        for d in (1..=n).step_by(2) {
+            dense.delete(d).unwrap();
+            del += 1;
+        }
+        for d in (1..=n).step_by(50) {
+            uniform.delete(d).unwrap();
+        }
+        dense.flush_wal().unwrap();
+        uniform.flush_wal().unwrap();
+        let mut rounds = 0;
+        while dense.delete_garbage_pending() && rounds < 20 {
+            let _ = dense.compact().unwrap();
+            rounds += 1;
+        }
+        assert!(!uniform.delete_garbage_pending(), "均匀少量删除不触发 GC");
+        let dense_bytes = dense.primary.sst_bytes();
+        let uniform_bytes = uniform.primary.sst_bytes();
+        println!(
+            "[Ex-8.7 demo] 载入 {n} 行：删除密集(-50%) GC 后 {} bytes vs 均匀(-2%) {} bytes；排空 {} 轮",
+            dense_bytes, uniform_bytes, rounds
+        );
+        assert_eq!(dense.primary.sst_count(), 1, "删除密集收敛单段");
+        assert_eq!(uniform.primary.sst_count(), 1, "均匀收敛单段");
+        assert!(
+            dense_bytes < uniform_bytes,
+            "删除密集应显著回收空间: dense={} uniform={}",
+            dense_bytes,
+            uniform_bytes
+        );
+        assert_eq!(dense.count_all_docs().unwrap(), n - del, "可见行一致");
     }
 
     #[test]
