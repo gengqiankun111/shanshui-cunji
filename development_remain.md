@@ -398,8 +398,53 @@
 |---|---|---|---|
 | a | INSERT 不校验主键重复 | MySQL 1062 vs SCC 成功（DUP 取消 ~40%、覆盖=潜在覆盖语义） | ✅ 已实现（a5b4171，非事务+事务路径预校验 1062、无部分写入） |
 | b | 事务内 SELECT 仅 WHERE id=/BETWEEN/IN | 非主键列谓词直接 1064 | ✅ 已实现（f78290b，主库候选 ∪ 同事务写集 txn_get 覆盖 + 谓词复检） |
-| c | DROP TABLE 不 purge 数据 | --init 后残留上轮行 | 待排：DROP 清库数据目录/段（对齐 MySQL 语义） |
+| c | DROP TABLE 不 purge 数据 | --init 后残留上轮行 | ✅ 已实现（10c946c，DROP/TRUNCATE 走 Engine::purge_all 清内存+磁盘段+倒排+位图；重启空库；600 lib 全绿） |
 | d | UPDATE/DELETE WHERE id IN(…) 不支持 | 仅支持 id=（批量写通道废） | ✅ 已实现（3d4ac30，非 txn 路径） |
-| e | DIFF=21 / DEADLOCK=2 语义分歧 | RR Stage3 核心产出被 a/c 污染 | 待 a~c 修复后重跑核对 |
+| e | DIFF=21 / DEADLOCK=2 语义分歧 | RR Stage3 核心产出被 a/c 污染 | 已由权威 rr-cases C1~C6 收敛为缺陷 A/B（FOR UPDATE 当前读、BETWEEN 幻读）→ 见 §25 排期 |
 
-> 注：d 的 txn 路径（事务内 UPDATE/DELETE … IN）需同步扩展；e 依赖 a/c 先修再重测。
+> 注：d 的 txn 路径（事务内 UPDATE/DELETE … IN）需同步扩展；e 已细化入 §25（缺陷 A/B），修后按 §25 环境复验 C1~C6 全绿即收敛。
+
+## 25. RR 一致性权威结果与缺陷排期（rr-cases C1~C6，用户 2026-09-03）
+
+> 权威结果（results-rrcases3 / rr-cases.log）。修正此前误报：**C5 "COMMIT 不持久化"不成立**——
+> 上轮失败因用例把 BEGIN 发在准备行插入之前、SCC 快照建得过早（MySQL 快照在首次一致读才建）；
+> 准备行移到 BEGIN 前之后 C5 通过（final 两库均为 1）。C1/C3 的"点读快照稳定/已删行仍见"
+> 两步本身 PASS——点读快照是对的，仅 FOR UPDATE 当前读语义缺失。
+
+| 用例 | 结论 | 失败步骤 |
+|---|---|---|
+| C1 快照稳定 | FAIL | 仅最后一步：FOR UPDATE 当前读 |
+| C2 自写可见 | PASS | — |
+| C3 已删行在快照 | FAIL | 仅最后一步：FOR UPDATE 当前读 |
+| C4 防幻读 | FAIL | 步骤3：范围一致读出现幻影 |
+| C5 COMMIT 持久 | PASS | —（时序伪差，非引擎问题） |
+| C6 ROLLBACK 丢弃 | PASS | — |
+
+### 缺陷 A：事务内 SELECT … FOR UPDATE 不是当前读（C1、C3 失败）——P0 先修
+
+- 代码定位：`src/mysql.rs txn_select()`（~L1197-1269）——拿到 ids 后一律 `engine.txn_get(txn, id)`
+  （快照），BETWEEN 分支一律 `engine.scan_range_txn(txn, …)`（快照）；**FOR UPDATE 关键字被完全忽略**。
+- 修法提示：开头判 FOR UPDATE → 点/IN 走 `txn.read_own(id)` 优先（自写可见）否则 `engine.get(id)`
+  （最新已提交，引擎已有）；范围走最新 `engine.scan_range(start, end)` + 同事务写覆盖
+  （仿 `scan_range_txn` 尾部 read_own/新 docid 并入逻辑，基表换最新扫描）。**引擎侧不需要动**。
+- 复现（C1）：pre 插 id=900100 → BEGIN → 点读见 0 → aux 提交 UPDATE val+1 → 再点读仍 0（快照对）→
+  `SELECT … FOR UPDATE`：mysql=[900100|1]（当前读）vs mydb=[900100|0] ✗。C3 同根：他事务已 DELETE
+  提交后 FOR UPDATE，mysql=∅、mydb 仍返回旧行 900300。
+
+### 缺陷 B：BETWEEN 范围一致读出现幻读（C4 失败）——P0 与 A 并行排期
+
+- 代码定位：mysql.rs BETWEEN 分支 → `engine.scan_range_txn` → `self.primary.scan_range_at(snapshot,…)`。
+  对照点读 `get_bytes_at`（过滤正常），**疑 `column_family.rs::scan_range_at` 的 memtable 层未按
+  seq ≤ snapshot 选版本/裁剪**（或只对 SST 生效）。修复从 scan_range_at 与 get_bytes_at 差异入手。
+- 复现（C4）：pre 插 id=900401 → BEGIN → BETWEEN 900400-900402 一致读仅见 900401（两库一致）→
+  aux 提交插 900400 → 再一致读：mysql 快照不见幻影 vs mydb=[900400|1; 900401|0] 幻影可见 ✗；
+  同一 SQL 加 FOR UPDATE 两库一致（当前读见幻影，正确）。
+- 要点：点读快照（C1/C3）过滤是对的；只有 BETWEEN 范围快照扫不按快照过滤——幻影行 seq 在快照后仍被返回。
+
+### 排期与验证
+
+- 实现顺序：缺陷 A → 缺陷 B（可并行，均为 txn 读路径；A 修后 C1/C3 过，B 修后 C4 过）。
+- 验证：环境 MySQL 3306（db rr）、SCC 3309（db-s3-3a）；命令
+  `rr-conformance --rr-cases --out <dir> --mysql-url … --my-url …`；用例源码
+  `rr-conformance/src/rr_cases.rs`（+main.rs 入口，尚未提交）。目标 C1~C6 全绿。
+- 遗留对照口径：rr_cases 模块提交与否按用户节奏；SCC 端口/库名以实测为准。
