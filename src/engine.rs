@@ -122,6 +122,9 @@ pub struct Engine {
     garbage_draining: Arc<AtomicBool>,
     /// 曾写入的最大 docid（≈ 曾插入文档数，删除置位率分母；put 时 fetch_max）。
     max_docid: AtomicU64,
+    /// §27 P0：重启后 max_docid 归零 → `auto_watermark` 首次调用做一次全库 keys-only
+    /// 恢复（AtomicBool swap 保证只扫一次；运行期 put 的 fetch_max 持续维护）。
+    max_docid_loaded: AtomicBool,
     /// 删除密度触发阈值（`storage.delete_density_min_ratio` / `_min_docs`）。
     dd_min_ratio: f32,
     dd_min_docs: u64,
@@ -536,6 +539,7 @@ impl Engine {
             garbage_done: Arc::new(AtomicU64::new(bm_deleted)),
             garbage_draining: Arc::new(AtomicBool::new(false)),
             max_docid: AtomicU64::new(0),
+            max_docid_loaded: AtomicBool::new(false),
             dd_min_ratio: cfg.storage.delete_density_min_ratio,
             dd_min_docs: cfg.storage.delete_density_min_docs,
             affinity: crate::affinity::plan_partition(&cfg.affinity),
@@ -954,6 +958,7 @@ impl Engine {
         self.pending_inverted.lock().unwrap().clear();
         self.global_seq.store(0, Ordering::Relaxed);
         self.max_docid.store(0, Ordering::Relaxed);
+        self.max_docid_loaded.store(false, Ordering::Relaxed);
         self.garbage_marked.store(0, Ordering::Relaxed);
         self.garbage_done.store(0, Ordering::Relaxed);
         self.garbage_draining.store(false, Ordering::Relaxed);
@@ -1467,6 +1472,25 @@ impl Engine {
                 }
                 f(docid)
             })
+    }
+
+    /// §27 P0：auto_increment / 自动 docid **水位** = 已写入最大 docid + 1（自动分配起点，
+    /// 重启续接不撞已提交行、显式大 id 后自动 id 抬位）。运行期由 put 的 fetch_max 维护；
+    /// 重启后（max_docid 归零）首次调用做一次全库 keys-only 扫描恢复现存最大 docid
+    /// （AtomicBool swap 只扫一次；顺带修复删除密度分母 Ex-8.7 的重启失真）。
+    pub fn auto_watermark(&self) -> u64 {
+        if !self.max_docid_loaded.swap(true, Ordering::AcqRel) {
+            let mut mx = 0u64;
+            // 扫描失败（读损坏等）保守保持 0 → 水位 1；loaded 已置位避免每次重扫
+            let _ = self.scan_stream_ids(None, None, |d| {
+                if d > mx {
+                    mx = d;
+                }
+                Ok(true)
+            });
+            self.max_docid.store(mx, Ordering::Relaxed);
+        }
+        self.max_docid.load(Ordering::Relaxed) + 1
     }
 
     /// 7.100 全库可见行计数（COUNT(*) 无 WHERE 快路径）：主数据 key-only 流式计数——
@@ -2745,6 +2769,28 @@ mod tests {
         let c2 = e.count_all_docs().unwrap();
         assert_eq!(c1, c2);
         assert_eq!(c1, 20_000);
+    }
+
+    #[test]
+    fn auto_watermark_resumes_after_reopen() {
+        // §27 P0：auto docid 水位 = 已写入最大 docid + 1；重启后惰性全库扫描恢复
+        // （auto 分配续接不撞已提交行）；loaded 后幂等不重扫
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 运行期：put 的 fetch_max 维护 → 水位 = 曾写最大 + 1
+        e.put(5, b"v5".to_vec(), &[]).unwrap();
+        e.put(2, b"v2".to_vec(), &[]).unwrap();
+        assert_eq!(e.auto_watermark(), 6, "运行期水位 = max+1");
+        assert_eq!(e.auto_watermark(), 6, "重复调用幂等");
+        e.put(100, b"v100".to_vec(), &[]).unwrap();
+        assert_eq!(e.auto_watermark(), 101, "显式大 id 抬水位");
+        // 重启：max_docid 归零 → 首次 auto_watermark 扫现存最大恢复（不含新引擎的 put 前）
+        drop(e);
+        let e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        assert_eq!(e2.auto_watermark(), 101, "重启后惰性恢复现存最大+1");
+        assert_eq!(e2.auto_watermark(), 101);
+        // 恢复后的水位保证 auto 分配不撞已提交行（分配 ≥ 101）
+        assert!(e2.auto_watermark() > 100);
     }
 
     #[test]

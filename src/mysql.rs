@@ -1567,7 +1567,7 @@ fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
             let mut last_id = 0u64;
             for (id, doc) in &rows {
                 let real_id = if *id == 0 {
-                    session.auto_id.fetch_add(1, Ordering::Relaxed)
+                    alloc_auto_id(engine, &session.auto_id) // §27 P0：水位续接（≥ max docid + 1）
                 } else {
                     *id
                 };
@@ -2563,7 +2563,7 @@ fn insert_response(
             let mut last_id = 0u64;
             for (id, doc) in &rows {
                 let real_id = if *id == 0 {
-                    auto_id.fetch_add(1, Ordering::Relaxed)
+                    alloc_auto_id(engine, auto_id) // §27 P0：水位续接（≥ max docid + 1）
                 } else {
                     *id
                 };
@@ -2578,6 +2578,15 @@ fn insert_response(
         Ok(None) => QueryResponse::Ok(0, 0),
         Err(e) => QueryResponse::Err(1064, format!("insert syntax: {e}")),
     }
+}
+
+/// §27 P0：docid 水位续接的自动 id 分配——起点 ≥ 引擎已写入最大 docid + 1（重启续接不撞
+/// 已提交行；显式大 id 后自动 id 抬位）。并发安全：先 `fetch_max(水位)` 把计数器抬到水位
+/// 再 `fetch_add`，多连接并发分配返回值仍连续唯一（首个 = 水位，此后 +1）。
+fn alloc_auto_id(engine: &Engine, auto_id: &AtomicU64) -> u64 {
+    let wm = engine.auto_watermark(); // 已写入最大 docid + 1（空库 = 1）
+    auto_id.fetch_max(wm, Ordering::Relaxed);
+    auto_id.fetch_add(1, Ordering::Relaxed)
 }
 
 /// UPDATE documents SET field=expr WHERE id=1（非事务：字段级 / 整体替换）。
@@ -3853,6 +3862,42 @@ mod tests {
         match ins(&mut e, "INSERT INTO documents VALUES (0,'{\"auto\":1}')") {
             super::QueryResponse::Ok(1, last) => assert_eq!(last, 100),
             _ => panic!("auto 插入失败"),
+        }
+    }
+
+    #[test]
+    fn auto_insert_resumes_above_explicit_ids() {
+        // §27 P0：auto(id=0) 分配从引擎 max docid+1 起——显式大 id 后自动 id 抬位不撞；
+        // 重启续接（惰性水位恢复）不撞已提交行（不再从 1 起 1062）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let auto = std::sync::atomic::AtomicU64::new(1);
+        // 显式大 id
+        match super::insert_response(&mut e, "INSERT INTO documents VALUES (900100,'{\"k\":0}')", &auto) {
+            super::QueryResponse::Ok(1, _) => {}
+            _ => panic!("显式插入失败"),
+        }
+        // auto：从 max+1 = 900101 分配
+        match super::insert_response(&mut e, "INSERT INTO documents VALUES (0,'{\"auto\":1}')", &auto) {
+            super::QueryResponse::Ok(1, last) => assert_eq!(last, 900101, "显式 900100 后 auto 应抬位"),
+            super::QueryResponse::Err(1062, m) => panic!("auto 撞已存在行 1062: {m}"),
+            _ => panic!("auto 插入失败"),
+        }
+        assert!(e.get(900101).unwrap().is_some());
+        // 连续 auto → 900102（唯一递增）
+        match super::insert_response(&mut e, "INSERT INTO documents VALUES (0,'{\"auto\":2}')", &auto) {
+            super::QueryResponse::Ok(1, last) => assert_eq!(last, 900102),
+            _ => panic!("auto#2 失败"),
+        }
+        assert!(e.get(900102).unwrap().is_some());
+        // 重启续接：auto_id 计数仍 < 水位 → 抬到现存最大+1（900103），不撞已提交行
+        drop(e);
+        let mut e2 = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        match super::insert_response(&mut e2, "INSERT INTO documents VALUES (0,'{\"auto\":3}')", &auto) {
+            super::QueryResponse::Ok(1, last) => assert_eq!(last, 900103, "重启后 auto 续接不撞库"),
+            super::QueryResponse::Err(1062, m) => panic!("重启后 auto 撞已提交行 1062: {m}"),
+            _ => panic!("重启 auto 插入失败"),
         }
     }
 

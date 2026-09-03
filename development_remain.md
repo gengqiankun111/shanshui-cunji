@@ -545,7 +545,7 @@
 
 | 项 | 内容 | 状态/优先级 |
 |---|---|---|
-| docid 水位续接 | auto_id 分配器起点 = max_docid+1（首插/启动推进；重启续接不撞库）；显式 id 分配时同步抬水位（防碰撞提前） | 待排 P0（小改，mysql.rs auto_id → 引擎水位感知） |
+| docid 水位续接 | auto_id 分配器起点 = max_docid+1（首次分配经 `Engine::auto_watermark` 惰性全库 keys-only 恢复，重启续接不撞库）；显式 id 经 put fetch_max 同步抬水位 | ✅ 已完成（本提交：`Engine::auto_watermark` + `alloc_auto_id`（fetch_max(水位)+fetch_add 并发安全）；测试 `auto_watermark_resumes_after_reopen` / `auto_insert_resumes_above_explicit_ids`，lib 611 全绿） |
 | 段预分配 | 批量导入/大 INSERT 用段分配（alloc(start,len)），降低 fetch_add 竞争 | 待排 P1 |
 | 表内 row_id 分配器 | §26 多表落地时：每表 `(table_id, row_id 水位)` 分配器（持久化水位存哪：系统键/列族）；与显式 id 冲突 1062 保持 | 随 §26 立项 |
 | AUTO_INCREMENT 列属性 | CREATE TABLE `id INT AUTO_INCREMENT` 解析（属性忽略→接受）→ 该表插入无 id 走自动 docid | 随 mysql 兼容增强（可与水位续接并行） |
