@@ -2568,6 +2568,48 @@ mod tests {
     }
 
     #[test]
+    fn seq_prune_snapshot_reads_stable_across_reopen() {
+        // Ex-8.6：段级 min seq 快照剪枝——旧快照读对新文件整段跳过；语义与版本过滤一致；
+        // 重开后惰性推导重建（无 manifest 扩展）结果不变。
+        let dir = tempfile::tempdir().unwrap();
+        let run = |e: &Engine, old_snap: u64| {
+            // 旧快照：只应见文件1（1..=50），文件2（101..=150）整段 seq > 快照 → 剪枝
+            assert!(e.get_at(5, old_snap).unwrap().is_some(), "文件1 行在快照内");
+            assert!(e.get_at(101, old_snap).unwrap().is_none(), "文件2 行在快照后应不可见");
+            assert!(e.get_at(1, old_snap).unwrap().is_some());
+            // 最新视图（MAX）：全部可见
+            assert!(e.get_at(150, u64::MAX).unwrap().is_some());
+            assert_eq!(e.count_all_docs().unwrap(), 100);
+            // 最新流式全扫：文件2 贡献（MAX 不剪枝）
+            let mut n = 0u64;
+            e.scan_stream(None, None, |_d, _v| {
+                n += 1;
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(n, 100);
+        };
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=50u64 {
+            e.put(i, format!("v-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap(); // 文件1
+        // 旧快照（在文件2 写入前）：
+        let mut t = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        let old_snap = t.snapshot();
+        e.txn_rollback(t);
+        for i in 101..=150u64 {
+            e.put(i, format!("v-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap(); // 文件2（全部行 seq > old_snap）
+        run(&e, old_snap);
+        drop(e);
+        // 重开：seq_min 记忆清空 → 首次快照读惰性 keys-only 推导重建
+        let e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        run(&e2, old_snap);
+    }
+
+    #[test]
     fn batch_get_matches_get_with_delta_and_deletion_bitmap() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = Engine::open(dir.path(), &cfg()).unwrap();

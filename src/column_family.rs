@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,12 @@ pub struct ColumnFamily {
     l1_trigger_files: usize,
     /// Ex-8.11：L2 段数触发阈值（0 = 现行为：L2>1 即收敛为单段）。
     l2_trigger_files: usize,
+    /// Ex-8.6：文件级**最小 put seq** 惰性记忆（path → min seq of put rows）。
+    /// 快照读（get_bytes_at / scan_stream_at，snapshot<MAX）整段剪枝用：文件所有 put
+    /// 行的 seq 均 > 快照点 → 该段对快照贡献为空，O(1) 跳过（免建迭代器/免读块）。
+    /// 未知（首见/重启后）→ 对该文件做一次 keys-only 扫描推导（一次性，按需缓存）；
+    /// 重启安全：无需 manifest 扩展，首次快照读自动重建。
+    seq_min: RwLock<std::collections::HashMap<PathBuf, u64>>,
     /// 单次合并输入大小上限（字节；`storage.compact_input_max_mb`；0 = 不限）——
     /// L0 分批合并防大输入一次合并长时间阻塞写。
     compact_input_max_bytes: u64,
@@ -345,6 +351,7 @@ impl ColumnFamily {
             // Ex-8.11：L1/L2 段数触发阈值（0 = 现行为）
             l1_trigger_files: cfg.storage.l1_trigger_files,
             l2_trigger_files: cfg.storage.l2_trigger_files,
+            seq_min: RwLock::new(std::collections::HashMap::new()),
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
@@ -655,6 +662,10 @@ impl ColumnFamily {
                 }
             }
             for &i in idxs {
+                // Ex-8.6：文件最小行 seq > 快照 → 整段剪枝（段内无 ≤ 快照的 put/Tombstone）
+                if snapshot_seq != u64::MAX && self.sst_min_seq(&snap.ssts[i])? > snapshot_seq {
+                    continue;
+                }
                 if let Some((value, seq)) = get_from_sst_at(&snap.ssts[i], &cache, key, snapshot_seq)?
                 {
                     if best.as_ref().map_or(true, |(s, _)| seq > *s) {
@@ -668,6 +679,30 @@ impl ColumnFamily {
             Some((_, None)) => Ok(None), // 快照点已删除
             None => Ok(None),
         }
+    }
+
+    /// Ex-8.6：该文件**所有行**（put + Tombstone）的最小 seq——惰性 keys-only 推导 + 记忆。
+    /// 快照读剪枝：`快照 < 文件最小行 seq` → 文件内既无 ≤ 快照的 put 也无 ≤ 快照的 Tombstone，
+    /// 对快照视图贡献为空（含墓碑掩蔽），可整段跳过。未知文件首次调用做一次全文件 keys-only
+    /// 扫描（一次性成本 ≈ COUNT 免值计数；重启后首次快照读自动重建，无需 manifest 扩展）。
+    fn sst_min_seq(&self, sst: &SstReader) -> Result<u64> {
+        let p = sst.path();
+        {
+            let m = self.seq_min.read().unwrap();
+            if let Some(v) = m.get(p) {
+                return Ok(*v);
+            }
+        }
+        let mut mn = u64::MAX;
+        let mut it = crate::sstable::SstRangeIter::new_keys(sst, None, None)?;
+        while let Some((_k, _v, seq)) = it.next().transpose()? {
+            if seq < mn {
+                mn = seq;
+            }
+        }
+        let v = if mn == u64::MAX { u64::MAX } else { mn };
+        self.seq_min.write().unwrap().insert(p.to_path_buf(), v);
+        Ok(v)
     }
 
     /// 范围扫描 [start, end]（闭区间，None 端无边界）：先收集 MemTable 与各 SST 候选，
@@ -779,6 +814,10 @@ impl ColumnFamily {
                 // Ex-8.2：scan 路径段级 key 范围剪枝——窗口不相交的段免建迭代器
                 // （此前无条件对快照全部 SST 建迭代器，无层/文件粗筛）
                 if !sst_intersects_window(sst, start, end) {
+                    continue;
+                }
+                // Ex-8.6：文件最小行 seq > 快照 → 整段剪枝（段内无 ≤ 快照的行，快照贡献为空）
+                if snapshot_seq != u64::MAX && self.sst_min_seq(sst)? > snapshot_seq {
                     continue;
                 }
                 sst_iters.push(crate::sstable::SstRangeIter::new_cached(
