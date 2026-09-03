@@ -1042,6 +1042,9 @@ fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> Quer
         if upper.starts_with("INSERT") {
             return txn_insert(engine, session, sql);
         }
+        if upper.starts_with("REPLACE") {
+            return txn_replace(engine, session, sql);
+        }
         if upper.starts_with("UPDATE") {
             return txn_update(engine, session, sql);
         }
@@ -1070,6 +1073,9 @@ fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> Quer
     }
     if upper.starts_with("INSERT") {
         return insert_response(engine, sql, &session.auto_id);
+    }
+    if upper.starts_with("REPLACE") {
+        return replace_response(engine, sql, &session.auto_id);
     }
     if upper.starts_with("UPDATE") {
         return update_response(engine, sql);
@@ -1714,18 +1720,15 @@ fn txn_update(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
                 Ok(v) => v,
                 Err(err) => return QueryResponse::Err(1064, format!("update syntax: {err}")),
             };
-            // §26 M1：非默认表事务字段条件 UPDATE 暂不支持（防跨表写）
-            if tid != 0 && !wp.trim().to_lowercase().starts_with("id in") {
-                return QueryResponse::Err(
-                    1064,
-                    "事务内字段条件 UPDATE 暂仅支持默认表（§26 M1 边界）".to_string(),
-                );
-            }
+            // §26 M1b：非默认表字段条件 UPDATE 放开——候选限定本表区间（防跨表写）
             let txn = session.txn.as_mut().unwrap();
-            let ids = match txn_resolve_where_ids(engine, txn, &wp) {
+            let mut ids = match txn_resolve_where_ids(engine, txn, &wp) {
                 Ok(v) => v,
                 Err(err) => return QueryResponse::Err(1064, format!("update where: {err}")),
             };
+            if !wp.trim().to_lowercase().starts_with("id in") {
+                ids.retain(|d| ((*d >> 48) as u16) == tid);
+            }
             (ids, f, e)
         }
     };
@@ -1755,18 +1758,16 @@ fn txn_delete(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
                 Ok(v) => v,
                 Err(e) => return QueryResponse::Err(1064, format!("delete syntax: {e}")),
             };
-            // §26 M1：非默认表事务字段条件 DELETE 暂不支持（防跨表删）
-            if tid != 0 && !wp.trim().to_lowercase().starts_with("id in") {
-                return QueryResponse::Err(
-                    1064,
-                    "事务内字段条件 DELETE 暂仅支持默认表（§26 M1 边界）".to_string(),
-                );
-            }
+            // §26 M1b：非默认表字段条件 DELETE 放开——候选限定本表区间（防跨表删）
             let txn = session.txn.as_mut().unwrap();
-            match txn_resolve_where_ids(engine, txn, &wp) {
+            let mut ids = match txn_resolve_where_ids(engine, txn, &wp) {
                 Ok(v) => v,
                 Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+            };
+            if !wp.trim().to_lowercase().starts_with("id in") {
+                ids.retain(|d| ((*d >> 48) as u16) == tid);
             }
+            ids
         }
     };
     // §26 M1：汇合点统一幂等译码（单 id / id in → docid）
@@ -2497,12 +2498,19 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
             rows: Vec::new(),
         };
     }
-    // §26 M1：非主键形态（字段谓词/分组/字段聚合）非默认表 → 明确边界（宁错勿跨表，M1b 放开）
+    // §26 M1b：非默认表字段聚合/分组（sqlish 全库无区间参数）→ 明确 1064；
+    // 纯字段谓词 SELECT 放行（兜底行按本表区间过滤，不跨表）
     if tid != 0 {
-        return QueryResponse::Err(
-            1064,
-            "非默认表字段谓词/分组/字段聚合查询暂不支持（§26 M1 边界，主键访问可用）".to_string(),
-        );
+        let u4 = sql.to_uppercase();
+        let agg_form =
+            u4.contains("SUM(") || u4.contains("COUNT(") || u4.contains("AVG(")
+                || u4.contains("MIN(") || u4.contains("MAX(");
+        if agg_form || u4.contains("GROUP BY") {
+            return QueryResponse::Err(
+                1064,
+                "非默认表字段聚合/分组查询暂不支持（§26 M1b，纯字段谓词可用）".to_string(),
+            );
+        }
     }
     // AF#2~#4：GROUP BY（单/多字段 + COUNT/SUM/AVG/MIN/MAX）→ 多行分组结果集
     //（选中分组列 + 每聚合一列）。置于标量聚合前（分组 SQL 含聚合列，须先路由到多行分组执行器）。
@@ -2598,7 +2606,13 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     }
     // 一般 SELECT → sqlish 引擎（结果按投影列裁剪；limit/排序 sqlish 内部处理）
     match crate::sqlish::execute(engine, sql, 10_000) {
-        Ok(rows) => build_result_set(proj.as_deref(), rows, false, None),
+        Ok(mut rows) => {
+            // §26 M1b：非默认表纯字段谓词 → 兜底行限定本表区间（防跨表泄漏）
+            if tid != 0 {
+                rows.retain(|(d, _)| ((*d >> 48) as u16) == tid);
+            }
+            build_result_set(proj.as_deref(), rows, false, None)
+        }
         Err(e) => QueryResponse::Err(1064, format!("query error: {e}")),
     }
 }
@@ -2691,6 +2705,96 @@ fn insert_response(
         }
         Ok(None) => QueryResponse::Ok(0, 0),
         Err(e) => QueryResponse::Err(1064, format!("insert syntax: {e}")),
+    }
+}
+
+/// REPLACE INTO <t> → INSERT INTO 前缀（parse_insert_multi 只认 INSERT 关键字）。
+fn replace_as_insert(sql: &str) -> String {
+    let s = sql.trim();
+    let sp = s.find(' ').unwrap_or(s.len());
+    format!("INSERT{}", &s[sp..])
+}
+
+/// P0-2：REPLACE INTO = 覆盖写（显式 id 已存在 → 先删后插；不存在 → 直接插），
+/// 对齐 MySQL REPLACE 语义；非事务（写锁内逐行 delete+put 近似原子）。
+fn replace_response(engine: &mut Engine, sql: &str, auto_id: &AtomicU64) -> QueryResponse {
+    let tid = table_id_for(&table_name_of(sql));
+    let isql = replace_as_insert(sql);
+    match parse_insert_multi(&isql) {
+        Ok(Some(rows)) => {
+            let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
+            if auto_rows > 0 && tid != 0 {
+                return QueryResponse::Err(
+                    1064,
+                    "非默认表 AUTO_INCREMENT 分配暂不支持（§26 M2）".to_string(),
+                );
+            }
+            let mut auto_cur = if auto_rows > 0 {
+                Some(auto_alloc_block(engine, auto_id, auto_rows as u64))
+            } else {
+                None
+            };
+            let mut last_row = 0u64;
+            for (id, doc) in &rows {
+                let docid = if *id == 0 {
+                    let c = auto_cur.take().unwrap();
+                    auto_cur = Some(c + 1);
+                    c
+                } else {
+                    docid_for(tid, *id)
+                };
+                last_row = row_id_of(docid);
+                // REPLACE：覆盖 put 已等效"删旧插新"（同 docid 覆盖整 doc，倒排由 put 重建；
+                // 历史版本保留于版本链，读路径取最新——缺陷 B 语义自洽）
+                if let Err(e) = put_doc(engine, docid, doc) {
+                    return QueryResponse::Err(1064, format!("replace error: {e}"));
+                }
+            }
+            QueryResponse::Ok(rows.len() as u64, last_row)
+        }
+        Ok(None) => QueryResponse::Ok(0, 0),
+        Err(e) => QueryResponse::Err(1064, format!("replace syntax: {e}")),
+    }
+}
+
+/// P0-2：事务内 REPLACE（写集 delete+put 覆盖，commit 原子）。
+fn txn_replace(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryResponse {
+    let tid = table_id_for(&table_name_of(sql));
+    let isql = replace_as_insert(sql);
+    match parse_insert_multi(&isql) {
+        Ok(Some(rows)) => {
+            let txn = session.txn.as_mut().unwrap();
+            let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
+            if auto_rows > 0 && tid != 0 {
+                return QueryResponse::Err(
+                    1064,
+                    "非默认表 AUTO_INCREMENT 分配暂不支持（§26 M2）".to_string(),
+                );
+            }
+            let mut auto_cur = if auto_rows > 0 {
+                Some(auto_alloc_block(engine, &session.auto_id, auto_rows as u64))
+            } else {
+                None
+            };
+            let mut last_row = 0u64;
+            for (id, doc) in &rows {
+                let docid = if *id == 0 {
+                    let c = auto_cur.take().unwrap();
+                    auto_cur = Some(c + 1);
+                    c
+                } else {
+                    docid_for(tid, *id)
+                };
+                last_row = row_id_of(docid);
+                // REPLACE：覆盖 put 等效删旧插新（写集覆盖，commit 原子）
+                if let Err(e) = put_doc_txn(txn, docid, doc) {
+                    return QueryResponse::Err(1064, format!("replace error: {e}"));
+                }
+            }
+            QueryResponse::Ok(rows.len() as u64, last_row)
+        }
+        Ok(None) => QueryResponse::Ok(0, 0),
+        Err(e) => QueryResponse::Err(1064, format!("replace syntax: {e}")),
     }
 }
 
@@ -2958,12 +3062,19 @@ fn parse_insert_multi(sql: &str) -> Result<Option<Vec<(u64, String)>>> {
                     }
                 }
             }
-            // sysbench 兼容：无 id 列（auto_increment 语义）→ id=0 由调用方自动分配
+            // sysbench 兼容：无 id 列（auto_increment 语义）→ id=0 由调用方自动分配；
+            // 显式 NULL（`INSERT INTO t VALUES (NULL, ...)`）= auto 同义（P0-1）
             let id = match idv {
-                Some(v) => v
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| Error::Cluster("id 非法".into()))?,
+                Some(v) => {
+                    let t = v.trim();
+                    let low = t.to_lowercase();
+                    if low == "null" || t.is_empty() {
+                        0u64
+                    } else {
+                        t.parse::<u64>()
+                            .map_err(|_| Error::Cluster("id 非法".into()))?
+                    }
+                }
                 None => 0u64,
             };
             let doc = match docv {
@@ -2981,10 +3092,17 @@ fn parse_insert_multi(sql: &str) -> Result<Option<Vec<(u64, String)>>> {
             };
             rows.push((id, doc));
         } else {
-            let id = parts[0]
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| Error::Cluster("id 非法".into()))?;
+            // 无列名形态：仅 (id, doc) 双值（多业务列须显式列名，文档库无列 schema）
+            let id = {
+                let t = parts[0].trim();
+                let low = t.to_lowercase();
+                if low == "null" || t.is_empty() {
+                    0u64 // `VALUES (NULL, '...')` → auto（P0-1）
+                } else {
+                    t.parse::<u64>()
+                        .map_err(|_| Error::Cluster("id 非法".into()))?
+                }
+            };
             let doc = unquote(parts.get(1).cloned().unwrap_or_default().as_str());
             rows.push((id, doc));
         }
@@ -5266,5 +5384,45 @@ mod tests {
         // 表级范围窗口不跨表：t_a BETWEEN 不含 t_b 行
         let win = rows_of(&engine, "SELECT id FROM t_b WHERE id BETWEEN 1 AND 10");
         assert_eq!(win.len(), 2, "t_b 区间窗口仅本表 2 行（7、8）");
+    }
+    #[test]
+    fn m1_p0_replace_and_null_auto() {
+        // P0-2：REPLACE 覆盖写（存在删后插，不再 1062）；P0-1：VALUES(NULL, ...) → auto
+        let mut engine = test_engine();
+        let auto = AtomicU64::new(1);
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT INTO documents VALUES (5, '{\"v\":\"old\"}')", &auto),
+            QueryResponse::Ok(1, 5)
+        ));
+        let r5 = replace_response(&mut engine, "REPLACE INTO documents VALUES (5, '{\"v\":\"new\"}')", &auto);
+        match r5 {
+            QueryResponse::Ok(1, 5) => {}
+            QueryResponse::Err(c, m) => panic!("replace err {c}: {m}"),
+            _ => panic!("replace 返回异常"),
+        }
+        assert!(matches!(
+            replace_response(&mut engine, "REPLACE INTO documents VALUES (6, '{\"v\":\"six\"}')", &auto),
+            QueryResponse::Ok(1, 6)
+        ));
+        let rows = match select_response(&engine, "SELECT id, v FROM documents WHERE id BETWEEN 5 AND 6") {
+            QueryResponse::Set { rows, .. } => rows,
+            _ => panic!("应为 ResultSet"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], b"new", "REPLACE 覆盖生效");
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT INTO documents VALUES (6, '{}')", &auto),
+            QueryResponse::Err(1062, _)
+        ));
+        assert!(matches!(
+            insert_response(&mut engine, "INSERT INTO documents VALUES (NULL, '{\"auto\":1}')", &auto),
+            QueryResponse::Ok(1, _)
+        ));
+        let row = match select_response(&engine, "SELECT id FROM documents WHERE id=7") {
+            QueryResponse::Set { rows, .. } => rows,
+            _ => panic!("应为 ResultSet"),
+        };
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0][0], b"7", "NULL → auto 落 7");
     }
 }
