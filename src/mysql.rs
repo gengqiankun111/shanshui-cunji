@@ -1195,28 +1195,126 @@ fn parse_isolation_level(upper: &str) -> Option<crate::txn::Isolation> {
     }
 }
 
+/// 缺陷 A：事务内**单行当前读**取值（SELECT … FOR UPDATE）——同事务未提交写优先
+/// （read_own：`Some(Some(v))`=put 最新、`Some(None)`=本事务删除→行隐藏），否则读引擎
+/// **最新已提交**（`Engine::get`：含删除位图过滤 + Delta 覆盖 + HotCache）。
+/// 不写事务 snap 快照缓存（当前读结果不得污染 RR 一致读——C1 断言快照仍见旧值）。
+fn txn_read_current(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    docid: u64,
+) -> crate::error::Result<Option<Vec<u8>>> {
+    if txn.is_finished() {
+        return Err(crate::error::Error::TxnAborted(format!(
+            "txn#{} 已结束",
+            txn.id
+        )));
+    }
+    if let Some(own) = txn.read_own(docid) {
+        return Ok(own.map(|v| v.to_vec()));
+    }
+    engine.get(docid)
+}
+
+/// 缺陷 A：事务内**范围当前读**（SELECT … FOR UPDATE + id BETWEEN/范围）——基表 = 引擎
+/// **最新已提交**扫描（`Engine::scan_range`，含删除位图过滤），再叠加同事务写覆盖
+/// （read_own 值替换 / 本事务删除排除、write_set Put 新 docid 窗口并入）——语义与
+/// `Engine::scan_range_txn` 尾部一致，仅基表由快照视图换当前视图（引擎侧不动）。
+fn txn_scan_current(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> crate::error::Result<Vec<crate::engine::QueryRow>> {
+    if txn.is_finished() {
+        return Err(crate::error::Error::TxnAborted(format!(
+            "txn#{} 已结束",
+            txn.id
+        )));
+    }
+    let mut out: Vec<crate::engine::QueryRow> = engine.scan_range(start, end)?;
+    // 同事务写覆盖：已出现的行用 read_own 最新值替换 / 本事务删除（None）置空 → 下方过滤
+    for row in out.iter_mut() {
+        if let Some(own) = txn.read_own(row.0) {
+            match own {
+                Some(v) => row.1 = v.to_vec(),
+                None => row.1.clear(),
+            }
+        }
+    }
+    out.retain(|(_, v)| !v.is_empty());
+    // 同事务未提交 Put 的新 docid（窗口内且基表未见——本事务写未落引擎）并入
+    let own_ids: Vec<u64> = txn
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            crate::txn::Op::Put { docid, .. } => Some(*docid),
+            crate::txn::Op::Delete { .. } => None,
+        })
+        .collect();
+    let present: std::collections::HashSet<u64> = out.iter().map(|(d, _)| *d).collect();
+    let mut added = false;
+    for d in own_ids {
+        if present.contains(&d) {
+            continue;
+        }
+        let in_win = start.map_or(true, |s| d >= s) && end.map_or(true, |e| d <= e);
+        if in_win {
+            if let Some(Some(v)) = txn.read_own(d) {
+                out.push((d, v.to_vec()));
+                added = true;
+            }
+        }
+    }
+    if added {
+        out.sort_by_key(|r| r.0); // 保持升序（自写并入后重排；事务窗口通常小）
+    }
+    Ok(out)
+}
+
 /// 事务内 SELECT：快照查询（含同事务未提交写可见）。
 /// sysbench 兼容（H-6 扩展）：`WHERE id=N` 点查 / `id BETWEEN A AND B` 范围 /
 /// `id IN (...)` 多点 / `SUM(k)` 聚合 / `ORDER BY ... LIMIT N`（简化为排序截断）。
 /// M 项优化（P0）：BETWEEN 范围走一次快照扫描（`scan_range_txn`），替代逐 id `txn_get`；
 /// 点查 / IN 保持逐 id（目标少，逐 id 更快）。
+/// 缺陷 A：`FOR UPDATE` 尾部修饰 → **当前读**（`txn_read_current` / `txn_scan_current`，
+/// 最新已提交 + 自写覆盖；不污染快照缓存）——RR 对照 C1/C3 修复。
 /// O 项第②步：`&Engine`（事务读在 RwLock 读锁下执行）。
 fn txn_select(
     engine: &Engine,
     session: &mut Session,
     sql: &str,
 ) -> QueryResponse {
-    let proj = parse_projection(sql);
-    let limit = extract_limit(sql);
-    let upper = sql.to_uppercase();
+    // FOR UPDATE = 当前读标记：解析前剥离该尾部修饰（parser 只认查询核心；FOR UPDATE 语法
+    // 恒在 ORDER BY / LIMIT 之后）；读路径按标记分流。
+    let for_update = sql.to_uppercase().contains("FOR UPDATE");
+    let core: &str = if for_update {
+        match sql.to_lowercase().find("for update") {
+            Some(p) => &sql[..p],
+            None => sql, // 防御：出现在非尾部（字符串字面量误匹配）→ 保持原样
+        }
+    } else {
+        sql
+    };
+    let proj = parse_projection(core);
+    let limit = extract_limit(core);
+    let upper = core.to_uppercase();
     // 聚合：`SELECT SUM(k) FROM ... WHERE id BETWEEN A AND B` → 单行单列数值
     let is_sum = upper.contains("SUM(");
     let txn = session.txn.as_mut().unwrap();
-    // 范围查询（BETWEEN）：一次快照扫描（M 项 P0，逐 id txn_get → scan_range_txn）
-    if let Some((a, b)) = extract_between_range(sql) {
-        let rows = match engine.scan_range_txn(txn, Some(a), Some(b)) {
-            Ok(r) => r,
-            Err(e) => return QueryResponse::Err(3500, format!("事务范围读失败: {e}")),
+    // 范围查询（BETWEEN）：快照扫描（M 项 P0，逐 id txn_get → scan_range_txn）；
+    // FOR UPDATE → 当前读（最新已提交扫描 + 同事务写覆盖）
+    if let Some((a, b)) = extract_between_range(core) {
+        let rows = if for_update {
+            match txn_scan_current(engine, txn, Some(a), Some(b)) {
+                Ok(r) => r,
+                Err(e) => return QueryResponse::Err(3500, format!("事务范围当前读失败: {e}")),
+            }
+        } else {
+            match engine.scan_range_txn(txn, Some(a), Some(b)) {
+                Ok(r) => r,
+                Err(e) => return QueryResponse::Err(3500, format!("事务范围读失败: {e}")),
+            }
         };
         if is_sum {
             // 聚合：扫描结果逐行解析 JSON 累加 k 字段（缺失视为 0）；返回单行单列
@@ -1237,19 +1335,26 @@ fn txn_select(
         // 普通范围查询：按投影裁剪（字段列类型推断）+ ORDER BY / LIMIT
         return build_result_set(proj.as_deref(), rows, upper.contains("ORDER BY"), limit);
     }
-    // 点查 / IN：逐 id 快照 get（同事务写可见）
-    let ids: Vec<u64> = match extract_target_ids(sql) {
+    // 点查 / IN：逐 id 快照 get（同事务写可见）/ FOR UPDATE 当前读
+    let ids: Vec<u64> = match extract_target_ids(core) {
         Some(v) => v,
         None => {
-            // b：非主键列谓词 → 主库候选 ∪ 同事务写集覆盖复检
-            return txn_select_by_predicate(engine, session, sql, proj.as_deref(), limit, is_sum, &upper);
+            // b：非主键列谓词 → 主库候选 ∪ 同事务写集覆盖复检（缺陷 A：支持 FOR UPDATE 当前读）
+            return txn_select_by_predicate(
+                engine, session, core, proj.as_deref(), limit, is_sum, &upper, for_update,
+            );
         }
     };
     if is_sum {
         // 聚合：逐 id 取 doc，解析 JSON 累加 k 字段（缺失视为 0）；返回单行单列
         let mut sum: i64 = 0;
         for id in &ids {
-            if let Ok(Some(v)) = engine.txn_get(txn, *id) {
+            let r = if for_update {
+                txn_read_current(engine, txn, *id)
+            } else {
+                engine.txn_get(txn, *id)
+            };
+            if let Ok(Some(v)) = r {
                 if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&v) {
                     if let Some(k) = doc.get("k").and_then(|x| x.as_i64()) {
                         sum += k;
@@ -1263,10 +1368,15 @@ fn txn_select(
             rows: vec![vec![sum.to_string().into_bytes()]],
         };
     }
-    // 普通点查 / IN：逐 id 快照 get（同事务写可见），按投影裁剪
+    // 普通点查 / IN：逐 id 快照 get（同事务写可见）/ 当前读，按投影裁剪
     let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
     for id in &ids {
-        match engine.txn_get(txn, *id) {
+        let r = if for_update {
+            txn_read_current(engine, txn, *id)
+        } else {
+            engine.txn_get(txn, *id)
+        };
+        match r {
             Ok(Some(v)) => raw.push((*id, v)),
             Ok(None) => {}
             Err(e) => return QueryResponse::Err(3500, format!("事务读失败: {e}")),
@@ -1287,6 +1397,7 @@ fn txn_select_by_predicate(
     limit: Option<usize>,
     is_sum: bool,
     upper: &str,
+    for_update: bool,
 ) -> QueryResponse {
     // 取 WHERE 谓词原文（ASCII 偏移与 lower 一致；按 rest 原样切片保字符串大小写语义）
     let lower = sql.to_lowercase();
@@ -1322,7 +1433,13 @@ fn txn_select_by_predicate(
     ids.sort_unstable();
     let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
     for id in ids {
-        match engine.txn_get(txn, id) {
+        // 缺陷 A：FOR UPDATE → 当前读取值（最新已提交 + 自写覆盖），其余走快照 txn_get
+        let r = if for_update {
+            txn_read_current(engine, txn, id)
+        } else {
+            engine.txn_get(txn, id)
+        };
+        match r {
             Ok(Some(v)) => {
                 if crate::sqlish::doc_matches_where(&cond_sql, &v) {
                     rows.push((id, v));
@@ -2573,12 +2690,8 @@ fn parse_insert_multi(sql: &str) -> Result<Option<Vec<(u64, String)>>> {
     Ok(Some(rows))
 }
 
-/// 解析 `UPDATE documents SET doc='...' WHERE id=1` → (id, doc)。
-/// 解析 `UPDATE tbl SET field=expr WHERE id=N` → (id, field, expr)。
-/// field 可为任意列；expr 支持 `field+N`（字段自增）、`'string'`（字符串赋值）、
-/// `doc='{json}'`（整体替换，兼容旧语义）。
 /// 解析 `UPDATE documents SET field=expr WHERE id=1` → (id, field, expr)。
-#[cfg(test)]
+/// 注：事务内 UPDATE 仍为单点语义（txn_update 调用）；非事务路径用 parse_update_where。
 fn parse_update(sql: &str) -> Result<(u64, String, String)> {
     let lower = sql.to_lowercase();
     let set_pos = lower.find("set").ok_or_else(|| Error::Cluster("UPDATE 缺 SET".into()))?;
@@ -2608,8 +2721,8 @@ fn parse_increment_expr(field: &str, expr: &str) -> Option<i64> {
     num.trim().parse::<i64>().ok()
 }
 
-/// 解析 `DELETE FROM documents WHERE id=1` → id。
-#[cfg(test)]
+/// 解析 `DELETE FROM documents WHERE id=1` → id（事务内 DELETE 单点路径调用；
+/// 非事务路径用 parse_delete_where）。
 fn parse_delete(sql: &str) -> Result<u64> {
     let lower = sql.to_lowercase();
     let where_pos = lower.find("where").ok_or_else(|| {
@@ -2679,8 +2792,7 @@ fn resolve_where_ids(engine: &mut Engine, where_part: &str) -> Result<Vec<u64>> 
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
-/// 解析 `id = 123`（WHERE 子句内）。
-#[cfg(test)]
+/// 解析 `id = 123`（WHERE 子句内；事务内单点路径 parse_update/parse_delete 调用）。
 fn parse_where_id(where_part: &str) -> Result<u64> {
     let eq = where_part
         .find('=')
@@ -4143,6 +4255,116 @@ mod tests {
         let rb = c.query("SELECT SUM(k) FROM documents WHERE s='b'");
         assert_eq!(sum_col(&rb), "12");
         assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
+    fn txn_for_update_current_read_c1() {
+        // 缺陷 A（C1）：FOR UPDATE = 当前读，见最新已提交；一致读仍快照
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        let sum = |c: &mut TestClient, sql: &str| -> String {
+            let r = c.query(sql);
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            main.query("INSERT INTO documents (id, doc) VALUES (900100, '{\"k\":0}')")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900100"), "0");
+        assert_eq!(
+            aux.query("UPDATE documents SET k=k+1 WHERE id=900100")[0][0],
+            OK_PACKET
+        );
+        // RR 一致读仍见快照旧值 0；FOR UPDATE 见最新已提交 1；当前读不污染快照
+        assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900100"), "0");
+        assert_eq!(
+            sum(
+                &mut main,
+                "SELECT SUM(k) FROM documents WHERE id=900100 FOR UPDATE"
+            ),
+            "1"
+        );
+        assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900100"), "0");
+        assert_eq!(main.query("COMMIT")[0][0], OK_PACKET);
+    }
+
+    #[test]
+    fn txn_for_update_current_read_c3() {
+        // 缺陷 A（C3）：他事务 DELETE 已提交后 FOR UPDATE 当前读不可见；快照仍见已删行
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        let sum = |c: &mut TestClient, sql: &str| -> String {
+            let r = c.query(sql);
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            main.query("INSERT INTO documents (id, doc) VALUES (900300, '{\"k\":5}')")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900300"), "5");
+        assert_eq!(aux.query("DELETE FROM documents WHERE id=900300")[0][0], OK_PACKET);
+        // 快照仍见已删行；FOR UPDATE 当前读行已删 → 聚合为 0
+        assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900300"), "5");
+        assert_eq!(
+            sum(
+                &mut main,
+                "SELECT SUM(k) FROM documents WHERE id=900300 FOR UPDATE"
+            ),
+            "0"
+        );
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
     }
 
     #[test]
