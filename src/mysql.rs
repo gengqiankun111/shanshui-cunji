@@ -1039,7 +1039,7 @@ fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Session) -> Quer
             return txn_select(engine, session, sql);
         }
         if upper.starts_with("INSERT") {
-            return txn_insert(session, sql);
+            return txn_insert(engine, session, sql);
         }
         if upper.starts_with("UPDATE") {
             return txn_update(engine, session, sql);
@@ -1341,10 +1341,29 @@ fn extract_limit(sql: &str) -> Option<usize> {
 
 /// 事务内 INSERT：攒批到事务（commit 时原子应用）。支持多行 VALUES。
 /// sysbench 兼容：无 id 列（id=0）→ auto_increment 自动分配。
-fn txn_insert(session: &mut Session, sql: &str) -> QueryResponse {
+fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryResponse {
     match parse_insert_multi(sql) {
         Ok(Some(rows)) => {
             let txn = session.txn.as_mut().unwrap();
+            // a：事务内主键重复校验（1062）——同语句重复 + 快照/同事务可见均拒绝（预校验不落批）
+            let mut seen = std::collections::HashSet::new();
+            for (id, _) in &rows {
+                if *id == 0 {
+                    continue;
+                }
+                if !seen.insert(*id) {
+                    return QueryResponse::Err(
+                        1062,
+                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                    );
+                }
+                if let Ok(Some(_)) = engine.txn_get(txn, *id) {
+                    return QueryResponse::Err(
+                        1062,
+                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                    );
+                }
+            }
             let mut last_id = 0u64;
             for (id, doc) in &rows {
                 let real_id = if *id == 0 {
@@ -2235,6 +2254,26 @@ fn insert_response(
 ) -> QueryResponse {
     match parse_insert_multi(sql) {
         Ok(Some(rows)) => {
+            // a：主键重复校验（MySQL 1062）——同语句重复 + 库中已存在均拒绝，
+            // 预校验保证多行 VALUES 语句级失败不产生部分写入。
+            let mut seen = std::collections::HashSet::new();
+            for (id, _) in &rows {
+                if *id == 0 {
+                    continue; // auto 分配不会重复
+                }
+                if !seen.insert(*id) {
+                    return QueryResponse::Err(
+                        1062,
+                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                    );
+                }
+                if let Ok(Some(_)) = engine.get(*id) {
+                    return QueryResponse::Err(
+                        1062,
+                        format!("Duplicate entry '{id}' for key 'PRIMARY'"),
+                    );
+                }
+            }
             // H-6 扩展：多行 VALUES 批量入库（逐行 put，事务外；行数作为 affected）
             let mut last_id = 0u64;
             for (id, doc) in &rows {
@@ -3491,6 +3530,50 @@ mod tests {
             super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
         }
         assert!(e.get(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_dup_pk_1062() {
+        // a：INSERT 主键重复 → MySQL 1062（同语句重复 / 库中已存在；预校验 → 无部分写入）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let put = |e: &mut crate::engine::Engine, id: u64| {
+            let doc = format!("{{\"a\":1}}");
+            e.put(id, doc.as_bytes().to_vec(), &[]).unwrap();
+        };
+        put(&mut e, 2);
+        let auto = std::sync::atomic::AtomicU64::new(100);
+        let ins = |e: &mut crate::engine::Engine, sql: &str| super::insert_response(e, sql, &auto);
+        // 库中已存在 → 1062
+        match ins(&mut e, "INSERT INTO documents VALUES (2,'x')") {
+            super::QueryResponse::Err(1062, m) => assert!(m.contains("Duplicate entry '2'")),
+            _ => panic!("应报 1062"),
+        }
+        // 同语句内重复 → 1062 且前序行不落（预校验，无部分写入）
+        match ins(&mut e, "INSERT INTO documents VALUES (3,'x'),(3,'y')") {
+            super::QueryResponse::Err(1062, _) => {}
+            _ => panic!("应报 1062"),
+        }
+        assert!(e.get(3).unwrap().is_none(), "语句失败不得部分写入");
+        // 多行含已存在键 → 1062 且新键不落
+        match ins(&mut e, "INSERT INTO documents VALUES (4,'w'),(2,'z')") {
+            super::QueryResponse::Err(1062, _) => {}
+            _ => panic!("应报 1062"),
+        }
+        assert!(e.get(4).unwrap().is_none(), "含重复的语句失败不得部分写入");
+        // 正常显式 id 与 auto(id=0) 不受影响
+        match ins(&mut e, "INSERT INTO documents VALUES (5,'{\"a\":1}')") {
+            super::QueryResponse::Ok(n, last) => {
+                assert_eq!(n, 1);
+                assert_eq!(last, 5);
+            }
+            _ => panic!("正常插入失败"),
+        }
+        match ins(&mut e, "INSERT INTO documents VALUES (0,'{\"auto\":1}')") {
+            super::QueryResponse::Ok(1, last) => assert_eq!(last, 100),
+            _ => panic!("auto 插入失败"),
+        }
     }
 
     #[test]
