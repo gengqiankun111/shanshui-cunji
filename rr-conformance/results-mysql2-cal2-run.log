@@ -1,0 +1,13 @@
+﻿[init] 双库建表+种子完成 rows=2000
+dump t_test: 一致 rows=1793
+dump t_combo: 不一致 -> results-mysql2-cal2/dump.diff
+== rr-conformance summary ==
+txns=2000 threads=8 elapsed=8.3s
+committed=1191 outer_diff=0
+rollback[DUP]=800
+rollback[DIFF]=7
+rollback[DEADLOCK]=2
+conn_err=0
+final_dump_equal=false
+
+[FAIL] 终态不一致，详见 results-mysql2-cal2/dump.diff

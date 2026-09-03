@@ -39,7 +39,14 @@ rr-conformance --init --txns 200 --threads 4 \
 
 - `t_test`（主键 id）单点行锁；`t_combo`（主键 id + 二级 a,b）等值/范围/批量；
 - 70% 单点 / 30% 范围·批量；单点写类按锁 key 升序重排（降随机死锁），range/batch 原样下发；
-- `--p-dup` 控制撞既有键概率（采集 DUPLICATE 行为）。
+- **worker 按键分区**：种子行 `[1,rows]` 均分给 `--threads` 个 worker，新行池在 rows 后按
+  worker 步进预留——跨 worker 键零重叠。否则两个同引擎库各自多 worker 独立调度也会因
+  提交顺序不同产生合法分歧（逐 op 行集 DIFF + 终态分叉，见 2000 事务标定）；
+  分区后每个 worker 内事务串行 → 双端历史等价。需 `--rows ≥ 8×threads`。
+- **FOR UPDATE 仅主键（id）作用域**：t_combo 的 a/(a,b) 无索引，MySQL 在其上 FOR UPDATE 走
+  全表 next-key 锁 → 锁扩散到其它 worker 键区造成跨 worker 死锁（一侧回滚一侧未回滚 =
+  终态分叉）。故非主键谓词只做纯快照读（行集自限本 worker 键区，两侧仍一致）；
+  二级列加锁/间隙行为差异记入已知边界。
 
 ## 已知边界（方案约定）
 

@@ -40,7 +40,6 @@ struct Cfg {
     seed: u64,
     out: String,
     ext_every: u64,
-    p_dup: f64,
     init: bool,
 }
 
@@ -77,9 +76,13 @@ fn main() {
         seed: arg(&args, "--seed", "1").parse().unwrap_or(1),
         out: arg(&args, "--out", "results"),
         ext_every: arg(&args, "--ext-every", "64").parse().unwrap_or(64),
-        p_dup: arg(&args, "--p-dup", "0.1").parse().unwrap_or(0.1),
         init: has(&args, "--init"),
     };
+
+    if (cfg.rows as usize) < cfg.threads * 8 {
+        eprintln!("--rows {} 太小：按 worker 键分区需 --rows ≥ 8×threads={}", cfg.rows, cfg.threads * 8);
+        std::process::exit(2);
+    }
 
     std::fs::create_dir_all(&cfg.out).expect("创建输出目录");
     if cfg.init {
@@ -193,12 +196,13 @@ fn worker(
         setup_rr(c);
     }
     let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(w as u64));
+    let seg = worker_seg(w, cfg.threads, cfg.rows);
     loop {
         let id = gtrx.fetch_add(1, Ordering::Relaxed);
         if id >= cfg.txns {
             break;
         }
-        let ops = ops::gen_txn(&mut rng, cfg.rows, cfg.p_dup);
+        let ops = ops::gen_txn(&mut rng, seg);
         let out = run_txn(&mut wc, &ops, id, cfg.ext_every);
         let mut cnt = counts.lock().unwrap();
         cnt.txn += 1;
@@ -229,6 +233,23 @@ fn worker(
         }
         drop(cnt);
     }
+}
+
+/// 每个 worker 独享的新行插入池宽度（种子行 rows 之后按 worker 步进预留；需足够宽，
+/// 避免同一 worker 撞自插行过于频繁——撞上也两边一致取消，不影响对照）。
+const NEW_STRIDE: u32 = 1024;
+
+/// worker w 的专属键区：种子行 [1, rows] 均分给 threads 个 worker（余数前 rem 个多 1），
+/// 新行池在 rows 之后按 worker 步进 NEW_STRIDE——跨 worker 完全不重叠。
+fn worker_seg(w: usize, threads: usize, rows: u32) -> ops::Seg {
+    let tw = w as u32;
+    let q = rows / threads as u32;
+    let rem = rows % threads as u32;
+    let lo = 1 + tw * q + tw.min(rem);
+    let len = q + if tw < rem { 1 } else { 0 };
+    let hi = lo + len - 1;
+    let new_lo = rows + 1 + tw * NEW_STRIDE;
+    ops::Seg { lo, hi, new_lo, new_hi: new_lo + NEW_STRIDE - 1 }
 }
 
 /// 终态：新开连接全表 dump，逐行比对两库（MySQL 顺序与自研库一致则全等）。
