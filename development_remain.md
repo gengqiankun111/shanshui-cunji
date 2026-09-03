@@ -168,9 +168,22 @@
     `快照 < 文件最小行 seq` 整段跳过（含 put/Tombstone 掩蔽语义，无假阴性；仅历史快照读生效）
   - [x] 与 Ex-8.2 文件范围剪枝互补（key 范围 + seq 范围双维剪枝）
   - [x] 单测 seq_prune_snapshot_reads_stable_across_reopen（旧快照对新文件不可见 + 重开惰性重建一致）
-- **Ex-8.7（P3）删除密度 urgency**：
-  - [ ] compaction_urgency 增加删除密度维度（位图置位率/段内删除比例加权），删除密集段优先合并释放空间
-  - [ ] demo：删除密集 vs 均匀负载下空间回收/读路径段数收敛对照
+- **Ex-8.7（P3）删除密度 urgency** — ✅ 完成（a6d53c3，565 全绿）
+  - [x] compaction urgency 增加删除密度维度：Engine 级**净置位计数**（bitmap mark/clear 返回"是否实际翻转"，
+    幂等重删不重计 / 复活即减 / 打开基准 = 位图既有置位数）+ `max_docid` 分母 → 位图置位率；
+    就绪门槛 = 置位率 ≥ `delete_density_min_ratio`（默认 0.10）**且**自上次 GC 新增置位 ≥
+    `delete_density_min_docs`（默认 1000；重启后历史置位不重复触发整段重写）
+  - [x] 三处挂载：`Engine::needs_compact` 追加 `delete_garbage_pending`；`compact` / `compaction_targets`
+    主列族紧迫度 **+DD_URGENCY(6)**（介于 L0 大小软阈值 +8 与段数主因子 ×10 之间——收敛后 L0=0 的
+    删除密集主列族压过空闲 delta/cidx 率先被合并，又不抢占真正 L0 段数压力档）
+  - [x] 收敛单段 GC 重写：`ColumnFamily::compact_gc(drop_key, allow_single)`——常规 select 无多段候选
+    （已收敛单底层段）时全量重写物理丢弃已删键（绕开 Ex-5.8 块级复用：元数据拼接无法丢键）；
+    `CompactReport` 增 `dropped_keys` 回写排空状态（drop>0 → 继续排空；0 丢弃 → 收敛快照 done=marked）
+  - [x] 单测 ×4（含 demo 对照）：compact_gc 单段重写物理丢弃 + 二次 0 丢弃收敛 + 重启一致；
+    置位率×min_docs 双门槛边界；4000 行 33% 删除收敛后 GC 排空（总丢弃=删除数、空间回收、语义、
+    重启不重复触发）；demo：删除密集(-50%) vs 均匀(-2%) 同载入量下空间回收对照
+  - 已知取舍：GC 再触发 = 新增置位 ≥ min_docs（排空 0-丢弃轮中断）；垃圾高度集中于少数小段而大段
+    先被选中清空时可能留尾——后续写波 structural 合并仍按位图过滤回收（有兜底，见 problem_solving）
 - **Ex-8.8（P2）posting LRU 双区热点化 + 参数化** — ✅ 内核完成（8f70b3e，561 全绿）
   - [x] 单 LRU(256) → PostingLru 双区（Segmented/2Q：protected 60% + probation 40%，
     POSTING_CACHE_CAP 总量参数化）：命中提升保护区免被低频突发逐出；新 term 只入普通区（满逐冷）；

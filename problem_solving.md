@@ -730,6 +730,27 @@
 - **回归测试**：真实 TCP 3 节点选举/日志复制/failover + 纯传输往返，9 raft_rpc 测试
   0.05s 全绿；538 全绿（development 7.88）。
 
+### P77. 删除位图语义下删除数据永不复收：收敛单段无合并候选（Ex-8.7）
+- **问题**：Ex-5.6 删除位图开启后 delete 不写 LSM Tombstone，已删 docid 旧数据只能靠
+  Compaction 按位图物理丢弃。但 Leveled 收敛后主列族为**单底层段**（select 无多段候选 →
+  永不合并），删除密集负载收敛后空间永不复收；且跨列族 urgency（W 项）只含 L0 段数/大小，
+  无删除信号 → 删除密集主列族在 L0=0 时永远排不上队。
+- **修复**（compaction urgency 增删除密度维度）：
+  1. bitmap mark/clear 返回"是否实际翻转" → Engine 维护**净置位计数**（幂等重删不重计、
+     复活即减、打开基准=位图既有置位）+ max_docid 分母 = 位图置位率；
+  2. 就绪门槛 = 置位率 ≥ `delete_density_min_ratio`(0.10) 且自上次 GC 新增置位 ≥
+     `delete_density_min_docs`(1000)——重启后历史置位不重复触发整段重写；
+  3. 主列族紧迫度 **+DD_URGENCY(6)**（介于 L0 大小 +8 与段数 ×10 之间）+ `needs_compact` 追加
+     就绪项；`compact_gc(allow_single)` 无多段候选时**单底层段全量重写**回收（绕开 Ex-5.8
+     块级复用：元数据拼接无法丢键）；
+  4. CompactReport 增 `dropped_keys` 回写排空状态：drop>0 继续排空 / 0 丢弃收敛（done=marked）。
+- **已知取舍**：再触发 = 新增置位 ≥ min_docs；0-丢弃轮中断排空时若垃圾集中于少数小段而
+  大段先被选中清空可能留尾——后续写波 structural 合并仍按位图过滤（有兜底）；误删不存在
+  docid 的置位会抬高密度，代价仅一次 0-丢弃重写。
+- **回归测试**：compact_gc 单段重写物理丢弃/二次 0 丢弃收敛/重启一致；置位率×min_docs 双门槛
+  边界；4000 行 33% 删除收敛后 GC 排空（总丢弃=删除数、空间回收、语义、重启不重复触发）；
+  demo：删除密集(-50%) vs 均匀(-2%) 空间回收对照；565 全绿（development_remain §11 Ex-8.7）。
+
 ---
 
 ## 环境备忘（不入库）
