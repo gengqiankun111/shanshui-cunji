@@ -91,6 +91,24 @@ fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((seq, payload))
 }
 
+/// 读完整命令负载（COM_QUERY 等）：MySQL 协议单包载荷上限 0xFFFFFF——客户端对超大
+/// 语句自动分包（seq 递增，直到短包收尾）；此处拼接续包还原完整命令，防包序错乱。
+/// 返回 `(下一个响应 seq, 拼接后的完整负载)`——响应 seq 须接在请求最后一包之后
+/// （单包命令 seq0 → 响应从 1 起；两包命令 seq0,1 → 响应从 2 起，客户端会校验）。
+fn read_command(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut next_seq = 0u8;
+    loop {
+        let (seq, p) = read_packet(stream)?;
+        next_seq = seq.wrapping_add(1);
+        let full = p.len() == 0xFFFFFF;
+        buf.extend_from_slice(&p);
+        if !full {
+            return Ok((next_seq, buf));
+        }
+    }
+}
+
 fn write_lenenc(buf: &mut Vec<u8>, v: u64) {
     if v < 251 {
         buf.push(v as u8);
@@ -738,7 +756,7 @@ fn handle_connection(
 
     // ④ 命令循环
     loop {
-        let (_, cmd) = match read_packet(stream) {
+        let (cmd_seq, cmd) = match read_command(stream) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -748,11 +766,11 @@ fn handle_connection(
             continue;
         }
         // 命令分发（无 IO 逻辑——同步/异步连接共用，异步路径经 spawn_blocking）
-        let (seq0, packets) = handle_command(&engine, &mut session, &cmd);
+        let (_, packets) = handle_command(&engine, &mut session, &cmd);
         let Some(packets) = packets else {
             return Ok(()); // COM_QUIT / EOF
         };
-        let mut seq = seq0;
+        let mut seq = cmd_seq;
         for p in packets {
             write_packet(stream, seq, &p)?;
             seq = seq.wrapping_add(1);
@@ -847,6 +865,23 @@ async fn read_packet_async(
     Ok((seq, payload))
 }
 
+/// 异步版 [`read_command`]：拼接 >16MB 分包命令（COM_QUERY 大语句）。
+async fn read_command_async(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut next_seq = 0u8;
+    loop {
+        let (seq, p) = read_packet_async(stream).await?;
+        next_seq = seq.wrapping_add(1);
+        let full = p.len() == 0xFFFFFF;
+        buf.extend_from_slice(&p);
+        if !full {
+            return Ok((next_seq, buf));
+        }
+    }
+}
+
 /// 异步写 MySQL 包。
 async fn write_packet_async(
     stream: &mut tokio::net::TcpStream,
@@ -900,7 +935,7 @@ async fn handle_connection_async(
     write_packet_async(stream, 2, &ok_payload(0, 0)).await?;
     // ③ 命令循环：异步读包（idle 不占线程）→ spawn_blocking 执行查询 → 异步写响应
     loop {
-        let (_, cmd) = match read_packet_async(stream).await {
+        let (cmd_seq, cmd) = match read_command_async(stream).await {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(Error::Io(e)),
@@ -911,18 +946,18 @@ async fn handle_connection_async(
         let engine2 = engine.clone();
         let mut sess = session.take().expect("session 应存在");
         let r = tokio::task::spawn_blocking(move || {
-            let (seq0, pkts) = handle_command(&engine2, &mut sess, &cmd);
-            (sess, seq0, pkts)
+            let (_, pkts) = handle_command(&engine2, &mut sess, &cmd);
+            (sess, pkts)
         })
         .await
         .map_err(|e| {
             Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("blocking task: {e}")))
         })?;
         session = Some(r.0);
-        let Some(pkts) = r.2 else {
+        let Some(pkts) = r.1 else {
             return Ok(()); // COM_QUIT
         };
-        let mut seq = r.1;
+        let mut seq = cmd_seq;
         for p in pkts {
             write_packet_async(stream, seq, &p).await?;
             seq = seq.wrapping_add(1);
@@ -2536,6 +2571,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = crate::config::Config::default();
         Engine::open(dir.path(), &cfg).unwrap()
+    }
+
+    // ---------- 单元：>16MB 命令多包拼接（P 项：超大单语句 INSERT 分包） ----------
+
+    #[test]
+    fn read_command_joins_multi_packet_and_returns_next_seq() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            read_command(&mut s).unwrap()
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let big = vec![7u8; 0xFFFFFF]; // 满包（16MB-1）→ 触发续包
+        let tail = vec![9u8; 100];
+        write_packet(&mut c, 0, &big).unwrap();
+        write_packet(&mut c, 1, &tail).unwrap();
+        let (seq, payload) = h.join().unwrap();
+        assert_eq!(payload.len(), 0xFFFFFF + 100, "应拼接两包为完整命令");
+        assert_eq!(&payload[..3], &[7, 7, 7]);
+        assert_eq!(payload[0xFFFFFF], 9, "续包内容应接在第一包后");
+        assert_eq!(seq, 2, "响应 seq 应接在请求最后一包(1)之后");
+        // 单包命令（seq 0）→ 响应从 1 起（既有行为不回退）
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let h2 = std::thread::spawn(move || {
+            let (mut s, _) = l2.accept().unwrap();
+            read_command(&mut s).unwrap()
+        });
+        let mut c2 = TcpStream::connect(a2).unwrap();
+        write_packet(&mut c2, 0, &vec![1u8; 50]).unwrap();
+        let (seq2, p2) = h2.join().unwrap();
+        assert_eq!(seq2, 1);
+        assert_eq!(p2.len(), 50);
     }
 
     // ---------- 单元：认证 ----------

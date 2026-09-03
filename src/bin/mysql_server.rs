@@ -56,6 +56,11 @@ fn main() {
     let bind = opt_arg(&args, "--bind", "0.0.0.0:3307");
     let user = opt_arg(&args, "--user", "root");
     let password = opt_arg(&args, "--password", "");
+    // 全扫/聚合查询看门狗（秒，默认 30）：无索引全表类负载在大库（GB~百 GB）上单次扫描
+    // 需数分钟，默认 30s 会熔断中止；--watchdog-secs 供超大库测试/运维放行。
+    let watchdog_secs: u64 = opt_arg(&args, "--watchdog-secs", "30")
+        .parse()
+        .unwrap_or(30);
     // I 项异步协程运行时（design 9.5 10k 连接目标）：--async 切换 tokio 网络层
     let async_mode = args.iter().any(|a| a == "--async");
 
@@ -83,10 +88,10 @@ fn main() {
     let engine = Engine::open_with_timeout(
         &data_dir,
         &cfg,
-        // 7.94：字段过滤/数字等值回退/比较扫描为无索引全表类负载，默认看门狗 500ms
-        // 只够扫 ~40 万行 JSON（MySQL 无索引等值/全扫 2.5s+）；放宽到 30s 让这类查询
-        // 能完成（对齐语义），防真挂起仍有效。
-        std::time::Duration::from_secs(30),
+        // 字段过滤/数字等值回退/比较扫描为无索引全表类负载，默认看门狗 30s 只够扫 ~3GB
+        // （MySQL 无索引等值/全扫 2.5s+ 量级）；--watchdog-secs 可放行超大库全扫（对齐语义），
+        // 防真挂起仍有效。
+        std::time::Duration::from_secs(watchdog_secs),
     )
     .expect("打开引擎失败");
     println!(
