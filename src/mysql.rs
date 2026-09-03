@@ -4368,6 +4368,123 @@ mod tests {
     }
 
     #[test]
+    fn txn_between_consistent_read_no_phantom_c4() {
+        // 缺陷 B（C4 复现）：BETWEEN 一致读须快照隔离——他事务在区间内插入并提交后，
+        // 同事务重复一致读不得出现幻影行
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        // 数据行 id 提取（结果集：列数+列定义×2+EOF 后为数据行，末尾 EOF）
+        let row_ids = |r: &Vec<Vec<u8>>| -> Vec<String> {
+            let mut out = Vec::new();
+            for row in r.iter().skip(4).take(r.len().saturating_sub(5)) {
+                let mut p = 0usize;
+                let n = read_lenenc(row, &mut p).unwrap() as usize;
+                out.push(String::from_utf8(row[p..p + n].to_vec()).unwrap());
+            }
+            out
+        };
+        let sql = "SELECT * FROM documents WHERE id BETWEEN 900400 AND 900402 ORDER BY id";
+        assert_eq!(
+            main.query("INSERT INTO documents (id, doc) VALUES (900401, '{\"k\":0}')")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        // 第一次一致读：仅 900401
+        let first = main.query(sql);
+        assert_eq!(row_ids(&first), vec!["900401"], "快照仅含 900401");
+        // aux 他事务在区间内插入 900400 并提交
+        assert_eq!(
+            aux.query("INSERT INTO documents (id, doc) VALUES (900400, '{\"k\":1}')")[0][0],
+            OK_PACKET
+        );
+        // 同事务重复一致读：快照不得见幻影 900400
+        let second = main.query(sql);
+        assert_eq!(
+            row_ids(&second),
+            vec!["900401"],
+            "RR 快照隔离：区间内他事务插入不可见"
+        );
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
+    fn txn_between_no_phantom_col_insert_c4b() {
+        // 缺陷 B（权威形态复现）：列式 INSERT (id,val) + SELECT id,val BETWEEN——快照一致读须隐藏幻影
+        let engine = test_engine();
+        let server = MySqlServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        let row_ids = |r: &Vec<Vec<u8>>| -> Vec<String> {
+            let mut out = Vec::new();
+            for row in r.iter().skip(4).take(r.len().saturating_sub(5)) {
+                let mut p = 0usize;
+                let n = read_lenenc(row, &mut p).unwrap() as usize;
+                out.push(String::from_utf8(row[p..p + n].to_vec()).unwrap());
+            }
+            out
+        };
+        let sql = "SELECT id,val FROM t_test WHERE id BETWEEN 900400 AND 900402 ORDER BY id";
+        // pre（aux autocommit，BEGIN 前）：900401 val=0
+        assert_eq!(
+            aux.query("INSERT INTO t_test(id,val) VALUES(900401,0)")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        // 首读（一致读）建立快照：仅 900401
+        assert_eq!(row_ids(&main.query(sql)), vec!["900401"]);
+        // 他事务区间内插入 900400 并提交
+        assert_eq!(
+            aux.query("INSERT INTO t_test(id,val) VALUES(900400,1)")[0][0],
+            OK_PACKET
+        );
+        // 重复一致读：快照不得见幻影 900400
+        assert_eq!(row_ids(&main.query(sql)), vec!["900401"], "RR 快照隔离：列式插入幻影不可见");
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
     fn txn_nested_begin_is_error_and_idle_commit_ok() {
         let engine = test_engine();
         let server = MySqlServer::new(engine, "root", "secret");

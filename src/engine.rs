@@ -2489,6 +2489,60 @@ mod tests {
     }
 
     #[test]
+    fn txn_range_scan_hides_phantom_after_flush_c4() {
+        // 缺陷 B（C4 变体）：快照后他事务插入且已 flush 落 SST——范围快照扫仍须隐藏幻影行
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // pre：900401 已提交并落盘（快照点 0）
+        e.put(
+            900401,
+            serde_json::json!({"k": 0}).to_string().into_bytes(),
+            &[],
+        )
+        .unwrap();
+        e.flush_primary().unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 他事务在区间内插入 900400（快照后）→ flush 落 SST（幻影落盘）
+        e.put(
+            900400,
+            serde_json::json!({"k": 1}).to_string().into_bytes(),
+            &[],
+        )
+        .unwrap();
+        e.flush_primary().unwrap();
+        // 范围快照扫：仅 900401（900400 seq 在快照后，即使已落盘也不可见）
+        let rows = e.scan_range_txn(&mut txn, Some(900400), Some(900402)).unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![900401], "flush 后幻影行仍不可见");
+        assert!(e.get(900400).unwrap().is_some(), "最新视图应含他事务插入（写入在）");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
+    fn txn_scan_hides_phantom_multi_segment_heap_c4() {
+        // 缺陷 B（C4 多段变体）：>4 源走 heap 归并分支——快照后他事务插入（多段场景）仍须隐藏
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 6 段 × 100 行 pre 数据（全量窗口内 → 每段都建迭代器 → mem+6sst > 4 → heap 分支）
+        for g in 0..6u64 {
+            for i in 0..100u64 {
+                let d = g * 100 + i;
+                e.put(d, format!("v{d}").into_bytes(), &["t"]).unwrap();
+            }
+            e.flush_primary().unwrap();
+        }
+        let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 他事务在快照后插入 900400 → 最新视图可见、快照不可见
+        e.put(900400, b"phantom".to_vec(), &["t"]).unwrap();
+        let rows = e.scan_range_txn(&mut txn, None, None).unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(rows.len(), 600, "快照全量扫描应仅含 6×100 行 pre 数据");
+        assert!(!ids.contains(&900400), "heap 分支幻影行 900400 不可见");
+        assert!(e.get(900400).unwrap().is_some(), "最新视图应含幻影行（写入在）");
+        e.txn_rollback(txn);
+    }
+
+    #[test]
     fn count_all_docs_matches_scan_stream() {
         // 7.100：key-only 免值计数与 scan_stream 全表可见行一致（覆盖 + 删除 + flush 混合）
         let dir = tempfile::tempdir().unwrap();

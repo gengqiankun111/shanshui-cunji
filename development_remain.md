@@ -434,19 +434,31 @@
   `SELECT … FOR UPDATE`：mysql=[900100|1]（当前读）vs mydb=[900100|0] ✗。C3 同根：他事务已 DELETE
   提交后 FOR UPDATE，mysql=∅、mydb 仍返回旧行 900300。
 
-### 缺陷 B：BETWEEN 范围一致读出现幻读（C4 失败）——P0 待修（缺陷 A 已闭环，本项为下一下）
+### 缺陷 B：BETWEEN 范围一致读出现幻读（C4 失败）——P0 **未修**（权威复证 2026-09-03 仍 FAIL）
 
-- 代码定位：mysql.rs BETWEEN 分支 → `engine.scan_range_txn` → `self.primary.scan_range_at(snapshot,…)`。
-  对照点读 `get_bytes_at`（过滤正常），**疑 `column_family.rs::scan_range_at` 的 memtable 层未按
-  seq ≤ snapshot 选版本/裁剪**（或只对 SST 生效）。修复从 scan_range_at 与 get_bytes_at 差异入手。
+- **权威复证**：他事务在快照后插入 900400 并提交，主事务 BETWEEN 一致读 SCC 仍返回幻影
+  [900400|1; 900401|0]；同 SQL 的 FOR UPDATE 当前读**已正确**（缺陷 A 修复生效）。
+- 权威 SQL 形态：`INSERT INTO t_test(id,val) VALUES(900400,1)`（**列式**）；
+  `SELECT id,val FROM t_test WHERE id BETWEEN 900400 AND 900402 ORDER BY id`。
+- 初判代码定位：mysql.rs BETWEEN 分支 → `engine.scan_range_txn` → `self.primary.scan_range_at(snapshot,…)`。
+- **已排查（本地 4 个复现防护测试全部 PASS，干净库下无法复现）**：
+  1. `txn_between_consistent_read_no_phantom_c4`（mysql E2E，doc-JSON 形态）
+  2. `txn_between_no_phantom_col_insert_c4b`（mysql E2E，权威列式 INSERT 形态）
+  3. engine `txn_range_scan_hides_phantom_after_flush_c4`（幻影落 SST 单段）
+  4. engine `txn_scan_hides_phantom_multi_segment_heap_c4`（>4 源 heap 归并分支）
+  → `scan_range_at`/`scan_stream_at`（线性+heap）与 mysql txn BETWEEN 路由的
+  seq≤snapshot 过滤本身正确；点读 get_at（C1/C3）过滤也对。
+- **下一步排查方向（按序）**：① 权威进程**重建库后单跑 C4**（隔离累积变量）——若单跑即复现则抓
+  实际 SQL 序列/日志；② 若仅**连续多 case 同库**复现 → 怀疑库内累积残留影响窗口快照扫
+  （候选：删除位图已删 docid 使 sst_min_seq 段剪枝失效路径 / 多次 flush-compact 后段内版本 seq
+  边界 / 快照点与并发的全局 seq 分配在 flush worker 交错时取值）；③ 补列式 INSERT 是否走
+  delta/patch 而非 primary 全量（影响 `wal_next_seq`/快照点取值的核对）。
 - 复现（C4）：pre 插 id=900401 → BEGIN → BETWEEN 900400-900402 一致读仅见 900401（两库一致）→
-  aux 提交插 900400 → 再一致读：mysql 快照不见幻影 vs mydb=[900400|1; 900401|0] 幻影可见 ✗；
-  同一 SQL 加 FOR UPDATE 两库一致（当前读见幻影，正确——缺陷 A 修复后经 `txn_scan_current` 保持）。
-- 要点：点读快照（C1/C3）过滤是对的；只有 BETWEEN 范围快照扫不按快照过滤——幻影行 seq 在快照后仍被返回。
+  aux 提交插 900400 → 再一致读：mysql 快照不见幻影 vs mydb=[900400|1; 900401|0] 幻影可见 ✗。
 
 ### 排期与验证
 
-- 实现顺序：缺陷 A ✅（4818ecb，C1/C3 转绿）→ 缺陷 B（下一下，C4 转绿后 C1~C6 全绿收敛）。
+- 实现顺序：缺陷 A ✅（4818ecb，C1/C3 转绿）→ 缺陷 B（未修，C4 权威复证仍 FAIL；按"下一步排查方向"推进）。
 - 验证：环境 MySQL 3306（db rr）、SCC 3309（db-s3-3a）；命令
   `rr-conformance --rr-cases --out <dir> --mysql-url … --my-url …`；用例源码
   `rr-conformance/src/rr_cases.rs`（+main.rs 入口，尚未提交）。目标 C1~C6 全绿。
