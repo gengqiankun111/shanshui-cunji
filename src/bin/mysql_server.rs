@@ -2,7 +2,7 @@
 //! （mysql cli、JDBC、Navicat、sysbench）直接接入本数据库。
 //!
 //! 用法：
-//!   shanshui-cunji-mysql-server --data-dir <dir> [--config config.toml] [--bind 0.0.0.0:3307] [--user root] [--password 密码]
+//!   cjserver --data-dir <dir> [--config config.toml] [--bind 0.0.0.0:3307] [--user root] [--password 密码]
 //!
 //! 数据模型：库 `scc`，表 `documents`，列 `id`（BIGINT 主键）+ `doc`（JSON 文档）。
 //! 支持：握手 + mysql_native_password 认证 + SHOW DATABASES/TABLES/VARIABLES +
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use shanshui_cunji::config::Config;
 use shanshui_cunji::engine::Engine;
-use shanshui_cunji::mysql::MySqlServer;
+use shanshui_cunji::db_adapter::DbServer;
 
 fn usage() -> ! {
     eprintln!(
@@ -83,7 +83,7 @@ fn main() {
     // 用户可在 config 显式指定（0 关闭需在 config 文件显式声明）。
     if cfg.storage.group_commit_us == 0 {
         cfg.storage.group_commit_us = 2000;
-        println!("[mysql-server] 默认开启组提交（group_commit_us=2000µs，config 可覆盖）");
+        println!("[cjserver] 默认开启组提交（group_commit_us=2000µs，config 可覆盖）");
     }
     let engine = Engine::open_with_timeout(
         &data_dir,
@@ -95,11 +95,11 @@ fn main() {
     )
     .expect("打开引擎失败");
     println!(
-        "[mysql-server] 数据目录 {} 打开完成，启动 MySQL 协议服务{}: {bind}",
+        "[cjserver] 数据目录 {} 打开完成，启动 MySQL 协议服务{}: {bind}",
         data_dir.display(),
         if async_mode { "（异步协程）" } else { "" }
     );
-    let server = MySqlServer::new(engine, user, password);
+    let server = DbServer::new(engine, user, password);
     if async_mode {
         // 异步网络层：连接 idle 不占 OS 线程；查询经 spawn_blocking 复用同步引擎
         let rt = tokio::runtime::Builder::new_multi_thread()

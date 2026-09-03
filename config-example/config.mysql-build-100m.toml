@@ -1,6 +1,6 @@
 # v0.7.0 标准 MySQL 语句构建 1 亿库配置（sysbench sbtest 表：id,k,c,pad）
 # 与 5000 万库同款：k/c/pad 高基数排除倒排，点查走主键，组提交 2ms 攒批。
-# 用法：shanshui-cunji-mysql-server --data-dir D:/shanshui-data/db-100m-v070 --config config.mysql-build-100m.toml --bind 0.0.0.0:3308
+# 用法：cjserver --data-dir D:/shanshui-data/db-100m-v070 --config config.mysql-build-100m.toml --bind 0.0.0.0:3308
 
 [storage]
 data_dir = "D:/shanshui-data/db-100m-v070"

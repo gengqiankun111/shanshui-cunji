@@ -1,4 +1,4 @@
-﻿//! MySQL wire protocol 适配（development_process_order H 项）：让 MySQL 客户端 / 生态工具
+//! MySQL wire protocol 适配（development_process_order H 项）：让 MySQL 客户端 / 生态工具
 //! （mysql cli、JDBC、Navicat、sysbench）直接接入本数据库。
 //!
 //! 实现范围（H-1~H-3）：
@@ -401,7 +401,7 @@ struct Session {
 
 /// MySQL 协议服务器：持有引擎（Arc<RwLock<Engine>>，O 项第②步：读语句读锁并行、
 /// 写语句写锁互斥；每连接独立线程处理握手 → 认证 → 命令循环。
-pub struct MySqlServer {
+pub struct DbServer {
     engine: Arc<RwLock<Engine>>,
     user: String,
     password: String,
@@ -413,7 +413,7 @@ pub struct MySqlServer {
     idle_aware: bool,
 }
 
-impl MySqlServer {
+impl DbServer {
     pub fn new(engine: Engine, user: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             engine: Arc::new(RwLock::new(engine)),
@@ -586,7 +586,7 @@ impl MySqlServer {
 
     /// 7.93：倒排**落盘**后台 worker——把内存 term 落段持久化（重启后字段等值查询不丢）。
     /// 背景：引擎写路径只把 term 攒入内存（pending_inverted/mem），落段依赖显式
-    /// `flush_inverted`；mysql_server 场景无显式落盘 → 进程重启内存 term 即失，
+    /// `flush_inverted`；cjserver 服务端场景无显式落盘 → 进程重启内存 term 即失，
     /// 字段等值过滤查空（7.93 实测 `status='active'` 0 行）。本线程周期落盘：
     /// 内存 term 超阈值实时刷 + 30s 非空兜底（段文件持久，重启后经 FST 可查）。
     /// 段数增长由 GC worker（7.73 信号 + 10 分钟兜底）收敛。
@@ -4748,7 +4748,7 @@ mod tests {
         // §27：AUTO_INCREMENT 列属性接受（CREATE TABLE 空操作，属性解析容忍）+
         // 无 id 列 INSERT（id 列省略 → auto 分配连续）端到端
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -4892,7 +4892,7 @@ mod tests {
         cfg.memtable.max_size_mb = 1; // 小 MemTable → 写入过程快速 flush 多段
         cfg.storage.l0_stall_threshold = 2; // 低 L0 阈值 → 2 段 L0 即触发合并
         let engine = Engine::open(dir.path(), &cfg).unwrap();
-        let server = MySqlServer::new(engine, "root", "");
+        let server = DbServer::new(engine, "root", "");
         server.spawn_compaction_worker();
         // 写 5 段（各 ~2MB）→ L0 超阈值 → auto_compact 置信号（worker 挂载：写不阻塞）
         let val = vec![b'x'; 2048];
@@ -4930,7 +4930,7 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.inverted.segment_max_size_mb = 1; // GC 阈值 1MB（engine 打开时 ×1MB 换算）
         let engine = Engine::open(dir.path(), &cfg).unwrap();
-        let server = MySqlServer::new(engine, "root", "");
+        let server = DbServer::new(engine, "root", "");
         server.spawn_inverted_gc_worker();
         // 写 12 批（每批 1000 doc × 10 唯一 term 对）+ 刷盘 → 12 段 ≈ 1.8MB > 1MB → 置信号
         {
@@ -4982,7 +4982,7 @@ mod tests {
             cfg.inverted.segment_max_size_mb = 1;
             cfg.storage.group_commit_us = 2000; // 组提交，避免逐条 fsync 拖慢突发
             let engine = Engine::open(dir.path(), &cfg).unwrap();
-            let mut server = MySqlServer::new(engine, "root", "");
+            let mut server = DbServer::new(engine, "root", "");
             server.set_idle_aware(aware);
             // 真实集成形态：三个后台 worker 全部挂载
             server.spawn_compaction_worker();
@@ -5042,7 +5042,7 @@ mod tests {
             cfg.memtable.max_size_mb = 2;
             cfg.storage.group_commit_us = 2000;
             let engine = Engine::open(dir.path(), &cfg).unwrap();
-            let mut server = MySqlServer::new(engine, "root", "");
+            let mut server = DbServer::new(engine, "root", "");
             // 突发：8MB（8000 × 1KB 不同 docid）→ 4 次 MemTable flush → L0=4 积压
             //（auto_compact 关：写路径不置信号 → 纯 idle_run 判定）
             {
@@ -5098,7 +5098,7 @@ mod tests {
             let mut cfg = crate::config::Config::default();
             cfg.inverted.segment_max_size_mb = 1;
             let engine = Engine::open(dir.path(), &cfg).unwrap();
-            let mut server = MySqlServer::new(engine, "root", "");
+            let mut server = DbServer::new(engine, "root", "");
             // 写 12 批（1000 doc × 10 term）+ 显式刷段 → 12 段超 GC 阈值；清信号 → 纯 idle_run 判定
             {
                 let mut eng = server.engine.write().unwrap();
@@ -5322,7 +5322,7 @@ mod tests {
     #[test]
     fn handshake_auth_and_query_roundtrip() {
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
 
         let mut c = TestClient::connect(addr);
@@ -5368,7 +5368,7 @@ mod tests {
     #[test]
     fn wrong_password_rejected() {
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
         let mut c = TestClient::connect(addr);
         let (scramble, _) = c.handshake();
@@ -5381,7 +5381,7 @@ mod tests {
     #[test]
     fn txn_begin_rollback_and_commit_roundtrip() {
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
         let mut c = TestClient::connect(addr);
         let (scramble, _) = c.handshake();
@@ -5421,7 +5421,7 @@ mod tests {
     fn txn_select_non_pk_predicate_overlay() {
         // b：事务内非主键列谓词 SELECT——同事务 UPDATE/INSERT 覆盖可见、被改行正确排除
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
         let mut c = TestClient::connect(addr);
         let (scramble, _) = c.handshake();
@@ -5462,7 +5462,7 @@ mod tests {
     fn txn_for_update_current_read_c1() {
         // 缺陷 A（C1）：FOR UPDATE = 当前读，见最新已提交；一致读仍快照
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -5519,7 +5519,7 @@ mod tests {
     fn txn_for_update_current_read_c3() {
         // 缺陷 A（C3）：他事务 DELETE 已提交后 FOR UPDATE 当前读不可见；快照仍见已删行
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -5573,7 +5573,7 @@ mod tests {
         // 缺陷 B（C4 复现）：BETWEEN 一致读须快照隔离——他事务在区间内插入并提交后，
         // 同事务重复一致读不得出现幻影行
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -5634,7 +5634,7 @@ mod tests {
     fn txn_between_no_phantom_col_insert_c4b() {
         // 缺陷 B（权威形态复现）：列式 INSERT (id,val) + SELECT id,val BETWEEN——快照一致读须隐藏幻影
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -5689,7 +5689,7 @@ mod tests {
     fn txn_update_delete_where_in_and_predicate() {
         // d txn 路径：事务内 UPDATE/DELETE … WHERE id IN(...) 与字段条件——攒批可见 + 回滚原子
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -5759,7 +5759,7 @@ mod tests {
     #[test]
     fn txn_nested_begin_is_error_and_idle_commit_ok() {
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
         let mut c = TestClient::connect(addr);
         let (scramble, _) = c.handshake();
@@ -5779,7 +5779,7 @@ mod tests {
     #[test]
     fn stmt_prepare_execute_roundtrip() {
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
         let mut c = TestClient::connect(addr);
         let (scramble, _) = c.handshake();
@@ -5827,7 +5827,7 @@ mod tests {
     #[test]
     fn stmt_execute_unknown_id_is_error() {
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let addr = server.serve_once("127.0.0.1:0").unwrap();
         let mut c = TestClient::connect(addr);
         let (scramble, _) = c.handshake();
@@ -5841,7 +5841,7 @@ mod tests {
         // I 项高并发：预处理 SELECT 走 RwLock 读锁（旧实现全走写锁串行）——多连接并发
         // PREPARE/EXECUTE point_select 全部成功、无死锁（读读并行路径正确性）
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         // serve 后台阻塞 accept（I 项小栈连接线程）；预取随机端口（bind-drop 竞态概率极低）
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
@@ -5893,7 +5893,7 @@ mod tests {
     async fn async_server_protocol_roundtrip() {
         // I 项异步协程运行时：serve_async 协议往返（握手 + 认证 + SELECT + PREPARE/EXECUTE）
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -5937,7 +5937,7 @@ mod tests {
     async fn async_server_concurrent_clients_all_succeed() {
         // I 项异步协程：serve_async + 8 并发客户端查询全成功（连接 task 不占 OS 线程）
         let engine = test_engine();
-        let server = MySqlServer::new(engine, "root", "secret");
+        let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);

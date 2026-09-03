@@ -9,7 +9,7 @@
 ## 📊 与 MySQL 8.0 的同负载对照（2026-09-02，本机）
 
 > 环境：MySQL 8.0.45（InnoDB，buffer pool 8G）vs 山水存迹 **release** 经 MySQL 协议
-> （mysql-server，async，默认组提交 2ms）；同一份 SQL/驱动/负载脚本、内容一致的两张表
+> （cjserver，async，默认组提交 2ms）；同一份 SQL/驱动/负载脚本、内容一致的两张表
 > （orders 10 万行 + users 1 万行）。
 
 | 指标 | 山水存迹 | MySQL 8.0 | 差距 |
@@ -51,7 +51,7 @@
 ```bash
 cargo build --release
 shanshui-cunji server --config config.toml            # 原生 HTTP/TCP/CLI
-shanshui-cunji-mysql-server --data-dir ./data --bind 0.0.0.0:3307   # MySQL 协议（库 scc）
+cjserver --data-dir ./data --bind 0.0.0.0:3307   # MySQL 协议（库 scc）
 shanshui-cunji put --id 1 --data '{"status":"active","score":88}'
 shanshui-cunji search --filter 'status=active AND score>80'
 ```

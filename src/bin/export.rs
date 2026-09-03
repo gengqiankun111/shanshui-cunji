@@ -28,7 +28,7 @@ use shanshui_cunji::config::Config;
 use shanshui_cunji::error::Result;
 use shanshui_cunji::export_pipeline::{Filter, Projection, Sink};
 use shanshui_cunji::migrate::{load_checkpoint, save_checkpoint};
-use shanshui_cunji::mysql::MysqlWireClient;
+use shanshui_cunji::db_adapter::MysqlWireClient;
 
 /// 默认批大小（design 20.5：内存恒定 = 批 × 单行，如 10k × 1KB ≈ 10MB）。
 const DEFAULT_BATCH: usize = 10_000;

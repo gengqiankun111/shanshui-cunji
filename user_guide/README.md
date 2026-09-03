@@ -53,7 +53,9 @@
 
 ## 4. SQL / MySQL 协议能力现状（对照 MySQL 8.0，2026-09-03）
 
-### 4.1 已支持（经 mysql-server 的 MySQL wire 协议）
+> 详细三档语法清单（已支持 / 待开发 / 待决策，含事务与 RR 语义现状）见 [语法.md](./语法.md)。
+
+### 4.1 已支持（经 cjserver 的 MySQL wire 协议）
 
 - DDL 放行、INSERT/UPDATE/DELETE、事务语句 BEGIN/COMMIT/ROLLBACK、预处理语句（PREPARE/EXECUTE）；
 - SELECT：主键点查、`id BETWEEN / id IN` 范围、`WHERE f IN (…)` 值集合过滤、
@@ -84,7 +86,7 @@ cargo build --release
 shanshui-cunji server --config config.toml
 
 # MySQL 协议服务（生态工具直连：库 scc / 表 documents）
-shanshui-cunji-mysql-server --data-dir ./data --bind 0.0.0.0:3307 --user root --password 123456
+cjserver --data-dir ./data --bind 0.0.0.0:3307 --user root --password 123456
 # 例：mysql -h127.0.0.1 -P3307 -uroot -p123456 -e "INSERT INTO documents(id,doc) VALUES (1,'{\"city\":\"bj\",\"amount\":10}'); SELECT * FROM documents WHERE amount>5 ORDER BY amount DESC;"
 ```
 
@@ -125,7 +127,7 @@ curl 'http://localhost:8080/search?filter=status%3Dactive'
 
 1. **导出**：MySQL 侧 `mysqldump`（或 JDBC 拉取）；
 2. **迁移**：`shanshui-cunji-migrate` / `shanshui-cunji-import` 导入——每行 → 一个文档；
-3. **改连接**：驱动替换为 mysql-server / 原生 SDK，DAO 层改写为 Filter / 类 SQL WHERE。
+3. **改连接**：驱动替换为 cjserver / 原生 SDK，DAO 层改写为 Filter / 类 SQL WHERE。
 
 - ⚠️ 类 SQL 为子集（见 §4.2），**JOIN / 子查询不支持**；迁移与兼容策略详见
   [design.md](../design.md) 第 15 章。

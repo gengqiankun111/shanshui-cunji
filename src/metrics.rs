@@ -4,7 +4,7 @@
 //! 埋点分层（架构评审补充）：
 //! - **引擎层**（engine.rs）：读写操作计数 + 延迟直方图、Compaction/Flush 次数；
 //! - **列族层**（/metrics 时读取快照）：SST 文件数、L0 段数（`engine.stats()` 聚合）；
-//! - **网络层**（mysql.rs）：活跃/累计连接数、语句计数。
+//! - **网络层**（db_adapter.rs）：活跃/累计连接数、语句计数。
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 

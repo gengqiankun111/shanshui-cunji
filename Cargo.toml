@@ -68,7 +68,7 @@ name = "shanshui-cunji-ycsb"
 path = "src/bin/ycsb.rs"
 
 [[bin]]
-name = "shanshui-cunji-mysql-server"
+name = "cjserver"
 path = "src/bin/mysql_server.rs"
 
 [[bin]]
