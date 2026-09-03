@@ -1572,12 +1572,6 @@ fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
         Ok(Some(rows)) => {
             let txn = session.txn.as_mut().unwrap();
             let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
-            if auto_rows > 0 && tid != 0 {
-                return QueryResponse::Err(
-                    1064,
-                    "非默认表 AUTO_INCREMENT 分配暂不支持（§26 M2）".to_string(),
-                );
-            }
             // a：事务内主键重复校验（1062）——同语句重复 + 快照/同事务可见均拒绝（预校验不落批）
             let mut seen = std::collections::HashSet::new();
             for (id, _) in &rows {
@@ -1598,18 +1592,27 @@ fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRes
                 }
             }
             let mut last_row = 0u64;
-            // §27 P1：事务内语句级 auto 段预分配（多行一次性申请，逐行零原子；仅默认表）
-            let mut auto_cur = if auto_rows > 0 {
+            // §27 P1：默认表事务内段预分配；§26 M2：非默认表 auto 逐行探测（事务视图）
+            let mut auto_cur = if auto_rows > 0 && tid == 0 {
                 Some(auto_alloc_block(engine, &session.auto_id, auto_rows as u64))
             } else {
                 None
             };
             for (id, doc) in &rows {
-                // 引擎 docid = 表区间 + SQL row_id
+                // 引擎 docid = 表区间 + SQL row_id（auto：默认表段取 / 非默认表探测）
                 let docid = if *id == 0 {
-                    let cur = auto_cur.take().unwrap();
-                    auto_cur = Some(cur + 1);
-                    cur
+                    if tid == 0 {
+                        let cur = auto_cur.take().unwrap();
+                        auto_cur = Some(cur + 1);
+                        cur
+                    } else {
+                        match next_auto_docid_txn(engine, txn, tid, &session.auto_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return QueryResponse::Err(1064, format!("auto 分配失败: {e}"))
+                            }
+                        }
+                    }
                 } else {
                     docid_for(tid, *id)
                 };
@@ -2646,12 +2649,6 @@ fn insert_response(
     match parse_insert_multi(sql) {
         Ok(Some(rows)) => {
             let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
-            if auto_rows > 0 && tid != 0 {
-                return QueryResponse::Err(
-                    1064,
-                    format!("非默认表 AUTO_INCREMENT 分配暂不支持（§26 M2 表内 row_id 分配器）"),
-                );
-            }
             // a：主键重复校验（MySQL 1062）——同语句重复 + 库中已存在均拒绝（按表 docid），
             // 预校验保证多行 VALUES 语句级失败不产生部分写入。
             let mut seen = std::collections::HashSet::new();
@@ -2679,19 +2676,28 @@ fn insert_response(
                 }
             }
             // H-6 扩展：多行 VALUES 批量入库（逐行 put，事务外；行数作为 affected）
-            // §27 P1：语句级 auto 段预分配（多行一次性申请，逐行零原子；仅默认表）
-            let mut auto_cur = if auto_rows > 0 {
+            // §27 P1：默认表语句级 auto 段预分配；§26 M2：非默认表 auto 逐行探测
+            let mut auto_cur = if auto_rows > 0 && tid == 0 {
                 Some(auto_alloc_block(engine, auto_id, auto_rows as u64))
             } else {
                 None
             };
             let mut last_row = 0u64;
             for (id, doc) in &rows {
-                // 引擎 docid = 表区间 + SQL row_id（auto 行落在默认表区间）
+                // 引擎 docid = 表区间 + SQL row_id（auto：默认表段取 / 非默认表探测）
                 let docid = if *id == 0 {
-                    let cur = auto_cur.take().unwrap();
-                    auto_cur = Some(cur + 1);
-                    cur
+                    if tid == 0 {
+                        let cur = auto_cur.take().unwrap();
+                        auto_cur = Some(cur + 1);
+                        cur
+                    } else {
+                        match next_auto_docid(engine, tid, auto_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return QueryResponse::Err(1064, format!("auto 分配失败: {e}"))
+                            }
+                        }
+                    }
                 } else {
                     docid_for(tid, *id)
                 };
@@ -2723,13 +2729,8 @@ fn replace_response(engine: &mut Engine, sql: &str, auto_id: &AtomicU64) -> Quer
     match parse_insert_multi(&isql) {
         Ok(Some(rows)) => {
             let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
-            if auto_rows > 0 && tid != 0 {
-                return QueryResponse::Err(
-                    1064,
-                    "非默认表 AUTO_INCREMENT 分配暂不支持（§26 M2）".to_string(),
-                );
-            }
-            let mut auto_cur = if auto_rows > 0 {
+            // §26 M2：REPLACE auto 放开——默认表段预分配 / 非默认表逐行探测
+            let mut auto_cur = if auto_rows > 0 && tid == 0 {
                 Some(auto_alloc_block(engine, auto_id, auto_rows as u64))
             } else {
                 None
@@ -2737,9 +2738,18 @@ fn replace_response(engine: &mut Engine, sql: &str, auto_id: &AtomicU64) -> Quer
             let mut last_row = 0u64;
             for (id, doc) in &rows {
                 let docid = if *id == 0 {
-                    let c = auto_cur.take().unwrap();
-                    auto_cur = Some(c + 1);
-                    c
+                    if tid == 0 {
+                        let c = auto_cur.take().unwrap();
+                        auto_cur = Some(c + 1);
+                        c
+                    } else {
+                        match next_auto_docid(engine, tid, auto_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return QueryResponse::Err(1064, format!("auto 分配失败: {e}"))
+                            }
+                        }
+                    }
                 } else {
                     docid_for(tid, *id)
                 };
@@ -2765,13 +2775,8 @@ fn txn_replace(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRe
         Ok(Some(rows)) => {
             let txn = session.txn.as_mut().unwrap();
             let auto_rows = rows.iter().filter(|(id, _)| *id == 0).count();
-            if auto_rows > 0 && tid != 0 {
-                return QueryResponse::Err(
-                    1064,
-                    "非默认表 AUTO_INCREMENT 分配暂不支持（§26 M2）".to_string(),
-                );
-            }
-            let mut auto_cur = if auto_rows > 0 {
+            // §26 M2：REPLACE auto 放开——默认表段预分配 / 非默认表逐行探测（事务视图）
+            let mut auto_cur = if auto_rows > 0 && tid == 0 {
                 Some(auto_alloc_block(engine, &session.auto_id, auto_rows as u64))
             } else {
                 None
@@ -2779,9 +2784,18 @@ fn txn_replace(engine: &mut Engine, session: &mut Session, sql: &str) -> QueryRe
             let mut last_row = 0u64;
             for (id, doc) in &rows {
                 let docid = if *id == 0 {
-                    let c = auto_cur.take().unwrap();
-                    auto_cur = Some(c + 1);
-                    c
+                    if tid == 0 {
+                        let c = auto_cur.take().unwrap();
+                        auto_cur = Some(c + 1);
+                        c
+                    } else {
+                        match next_auto_docid_txn(engine, txn, tid, &session.auto_id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return QueryResponse::Err(1064, format!("auto 分配失败: {e}"))
+                            }
+                        }
+                    }
                 } else {
                     docid_for(tid, *id)
                 };
@@ -2806,6 +2820,36 @@ fn auto_alloc_block(engine: &Engine, auto_id: &AtomicU64, n: u64) -> u64 {
     let wm = engine.auto_watermark(); // 已写入最大 docid + 1（空库 = 1）
     auto_id.fetch_max(wm, Ordering::Relaxed);
     auto_id.fetch_add(n, Ordering::Relaxed)
+}
+
+/// §26 M2：非默认表 auto row_id 探测分配——全局自增计数低位作 row（docid = base | 低位，
+/// 该表区间唯一）；与显式 id 冲突（docid 已存在）即跳号。默认表不经过（段预分配不截断高位）。
+fn next_auto_docid(engine: &Engine, tid: u16, auto_id: &AtomicU64) -> Result<u64> {
+    for _ in 0..1_000_000 {
+        let d = auto_id.fetch_add(1, Ordering::Relaxed);
+        let docid = docid_for(tid, d);
+        if let Ok(None) = engine.get(docid) {
+            return Ok(docid);
+        }
+    }
+    Err(Error::Cluster("auto 空间耗尽（冲突过多）".into()))
+}
+
+/// 事务版：按事务视图（快照 + 写集）探测空位（落写集由调用方 put，commit 原子）。
+fn next_auto_docid_txn(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    tid: u16,
+    auto_id: &AtomicU64,
+) -> Result<u64> {
+    for _ in 0..1_000_000 {
+        let d = auto_id.fetch_add(1, Ordering::Relaxed);
+        let docid = docid_for(tid, d);
+        if let Ok(None) = engine.txn_get(txn, docid) {
+            return Ok(docid);
+        }
+    }
+    Err(Error::Cluster("auto 空间耗尽（冲突过多）".into()))
 }
 
 /// UPDATE documents SET field=expr WHERE id=1（非事务：字段级 / 整体替换）。
@@ -5424,5 +5468,41 @@ mod tests {
         };
         assert_eq!(row.len(), 1);
         assert_eq!(row[0][0], b"7", "NULL → auto 落 7");
+    }
+    #[test]
+    fn m2_per_table_auto_row_id() {
+        // §26 M2：非默认表 auto（无 id 列 / VALUES(NULL)）——表区间内唯一、显式 id 不撞
+        let mut engine = test_engine();
+        let auto = AtomicU64::new(1);
+        for i in 1..=3u64 {
+            insert_response(
+                &mut engine,
+                &format!("INSERT INTO t_x(id, doc) VALUES ({i}, '{{\"v\":\"e{i}\"}}')"),
+                &auto,
+            );
+        }
+        // 无 id 列（parse id=0 → auto 探测）：全局计数低位 1/2/3 被显式占 → 跳至 4
+        let r = insert_response(&mut engine, "INSERT INTO t_x(k, c) VALUES(1, 'a')", &auto);
+        assert!(matches!(r, QueryResponse::Ok(1, 4)), "auto 跳显式占位落 id=4");
+        let r2 = insert_response(&mut engine, "INSERT INTO t_x(k) VALUES(2)", &auto);
+        assert!(matches!(r2, QueryResponse::Ok(1, 5)), "auto 续 5");
+        let rows = match select_response(&engine, "SELECT id, k FROM t_x WHERE id BETWEEN 4 AND 5") {
+            QueryResponse::Set { rows, .. } => rows,
+            _ => panic!("应为 ResultSet"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], b"4");
+        assert_eq!(rows[1][0], b"5");
+        // 他表显式同 id=4 独立（不同表区间，不冲突）
+        insert_response(
+            &mut engine,
+            "INSERT INTO t_y(id, doc) VALUES (4, '{\"v\":\"y\"}')",
+            &auto,
+        );
+        let qy = match select_response(&engine, "SELECT id FROM t_y WHERE id=4") {
+            QueryResponse::Set { rows, .. } => rows,
+            _ => panic!("应为 ResultSet"),
+        };
+        assert_eq!(qy.len(), 1);
     }
 }
