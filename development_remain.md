@@ -313,6 +313,17 @@
 - **Ex-9.3（P3）倒排统计载荷（sum/min/max/avg）**：TermMeta/段格式扩展（写路径随 term 维护载荷 + 段格式
   版本 + GC/合并保持）→ 支撑 `SUM(amount) WHERE status='x'` 级聚合秒级；与 Ex-9.1 共用路由；
   仅对配置声明字段启用（`stats_fields`，防多数字字段全开失控——对齐 Ex-4 成本控制准则）
+  - **方案细化（2026-09-03 spike，待实现）**：代码核实确认 flush 时仅存 docid 无文档值 →
+    统计必须**写路径随 term 累积**。设计：mem 项 `term → Posting{docids, stats: Vec<f64>}`（stats 按
+    段头声明的 `stats_fields` 顺序对齐；put 时对每个 term 解析声明数字字段值累加）；段格式 v5 条目 =
+    term + varint(doc_count) + 定长 stats 数组（低基数过滤词 term 仅几十/百个/段，定长 24B×字段 × term
+    数开销可忽略）+ posting 容器；GC/合并重写保持载荷；`sum_stats(term)` 求和亚毫秒。Query 语义：
+    `SELECT status, SUM(amount) FROM t GROUP BY status` 走词典逐 term `sum_stats` + 倒排值回表组装
+    （仅需组键值，无大文档 IO）；`SUM(amount) WHERE status='x'` 单 term 直读。限制：跨段同 docid 同
+    term 覆盖（update）求和略高估（同 Ex-9.1b 注）；文档缺 stats 字段按 0 计（MySQL NULL 语义差异文档化）；
+    单值字段分区假设下 NULL 组 = 全文档数 − Σdoc_count（待做：全文档数快计或声明限制）。
+  - 后续小节：实现顺序 = ① mem 写路径累积 + Engine put 透传 stats 值 → ② 段格式 v5 写/读 → ③
+    GC/合并载荷保持 → ④ `sum_stats`/引擎 API + sqlish GROUP BY/SUM 路由 → ⑤ 50m A/B 与全量回归
 - **远期不排期**：组合索引范围聚合（依赖 B+Tree 化，Ex-8.4 触发链）、物化视图 / 聚合缓存（TTL/失效语义待产品化）
 - **验收口径（3 亿库）**：无条件 COUNT(*) ≤1ms；条件 COUNT ≤1ms（Ex-9.1）；`SUM WHERE status` ≤100ms（Ex-9.3）；
   数值与全扫一致（抽样断言）
