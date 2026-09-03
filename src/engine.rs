@@ -1296,10 +1296,10 @@ impl Engine {
         self.use_jieba
     }
 
-    /// Ex-9.3 第①步：读取某 term 内存段数值统计（与 `stats_fields` 对齐）。
-    /// 未配置 stats_fields / 无该 term → None。段部分待第②步 v5 载荷。
+    /// Ex-9.3：读取某 term 的数值统计（内存累积 + v5 段载荷；与 `stats_fields` 对齐）。
+    /// 未配置 stats_fields / 无该 term → None。
     pub fn inverted_term_stats(&self, term: &str) -> Option<Vec<crate::inverted::FieldAgg>> {
-        self.inverted.term_stats(term)
+        self.inverted.term_stats(term).ok().flatten()
     }
 
     /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
@@ -3811,6 +3811,46 @@ mod tests {
         e2.put_nosync(1, br#"{"status":"active","amount":10}"#.to_vec(), &["status=active"])
             .unwrap();
         assert!(e2.inverted_term_stats("status=active").is_none(), "未配置则无统计");
+    }
+
+    #[test]
+    fn inverted_stats_persist_across_flush_and_reopen_v5() {
+        // Ex-9.3 第②步：stats 随段 v5 载荷落盘 → flush 后 / 重开库后仍可读（不再依赖内存）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.stats_fields = vec!["amount".to_string()];
+        let put = |e: &mut Engine, docid: u64, status: &str, amount: Option<f64>| {
+            let mut doc = serde_json::json!({"status": status});
+            if let Some(a) = amount {
+                doc["amount"] = serde_json::json!(a);
+            }
+            let bytes = serde_json::to_vec(&doc).unwrap();
+            let term: &[&str] = &[if status == "active" { "status=active" } else { "status=inactive" }];
+            e.put_nosync(docid, bytes, term).unwrap();
+        };
+        let check = |e: &mut Engine, label: &str| {
+            let a = e.inverted_term_stats("status=active").expect(label);
+            assert_eq!(a[0].n, 2, "{label}: active n");
+            assert_eq!(a[0].sum, 30.0, "{label}: active sum");
+            assert_eq!(a[0].min, 10.0, "{label}: min");
+            assert_eq!(a[0].max, 20.0, "{label}: max");
+            let b = e.inverted_term_stats("status=inactive").unwrap();
+            assert_eq!(b[0].sum, 5.0, "{label}: inactive sum");
+            assert_eq!(e.inverted_doc_count("status=active").unwrap(), 3, "{label}: count");
+        };
+        {
+            let mut e = Engine::open(dir.path(), &cfg).unwrap();
+            put(&mut e, 1, "active", Some(10.0));
+            put(&mut e, 2, "active", Some(20.0));
+            put(&mut e, 3, "active", None);
+            put(&mut e, 4, "inactive", Some(5.0));
+            check(&mut e, "flush 前（mem）");
+            e.flush_inverted().unwrap(); // 段落盘 v5：含统计载荷
+            check(&mut e, "flush 后（段）");
+        }
+        // 重开（内存清空，只读段）：载荷须从 v5 段读出
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
+        check(&mut e2, "重开后（v5 段）");
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------

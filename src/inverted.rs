@@ -43,8 +43,10 @@ const SEG_MAGIC: &[u8; 8] = b"NVINV001";
 /// 段文件版本：v2 = term 带字段前缀 + Roaring 紧凑 posting；v3 = posting 分块布局
 /// （容器头索引 + 独立容器字节，K 项：分页/COUNT 按需延迟加载，全量解码与 v2 持平）；
 /// v4 = 条目插入 `varint(段内 doc_count)`（Ex-9.1b：段级 TermMeta 计数载荷 → COUNT
-/// 亚毫秒求和，免逐 docid 遍历去重；老段读取按段版本兼容回退）。
-const SEG_VERSION: u16 = 4;
+/// 亚毫秒求和，免逐 docid 遍历去重；老段读取按段版本兼容回退）；
+/// v5 = 条目在 doc_count 后追加统计载荷 `varint(fcount) + fcount × (n u64 + sum/min/max f64)`
+/// （Ex-9.3：随 term 的数值聚合，支撑 SUM/AVG/MIN/MAX 类聚合免全扫；读取按版本跳过）。
+const SEG_VERSION: u16 = 5;
 /// 段文件前缀。
 const SEG_PREFIX: &str = "inverted-";
 const MANIFEST_FILE: &str = "inverted-manifest.json";
@@ -397,10 +399,34 @@ impl InvertedIndex {
         }
     }
 
-    /// 读取某 term 内存段统计（与 `stats_fields` 对齐；段部分待第②步 v5 载荷）。
-    /// 无该 term/未配置 → None。
-    pub fn term_stats(&self, term: &str) -> Option<Vec<FieldAgg>> {
-        self.stats_mem.get(term).map(|e| e.value().clone())
+    /// 读取某 term 的数值统计（与 `stats_fields` 对齐）：内存累积 + 各 v5 段载荷合并。
+    /// 无该 term/未配置 → Ok(None)。段格式 v4 及更早无载荷（跳过）。
+    pub fn term_stats(&self, term: &str) -> Result<Option<Vec<FieldAgg>>> {
+        let mut agg: Vec<FieldAgg> = self
+            .stats_mem
+            .get(term)
+            .map(|e| e.value().clone())
+            .unwrap_or_default();
+        let segs = self.segments.load();
+        for seg in segs.iter() {
+            let Some((data, entry)) = self.segment_posting_entry(seg, term)? else {
+                continue; // gc 并发删段：跳过（与 doc_count 一致）
+            };
+            let Some(seg_stats) = parse_term_stats_at(&data, entry, Self::seg_ver(&data))? else {
+                continue; // v4 及更早 / 该 term 无载荷
+            };
+            if agg.len() < seg_stats.len() {
+                agg.resize(seg_stats.len(), FieldAgg::new());
+            }
+            for (dst, src) in agg.iter_mut().zip(seg_stats.iter()) {
+                merge_field_agg(dst, src);
+            }
+        }
+        if agg.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(agg))
+        }
     }
 
     /// 批量追加 (term, docid) 集合（Ex-5.3 倒排更新批处理）：
@@ -499,6 +525,20 @@ impl InvertedIndex {
             let bytes = encode_posting_v3(&bitmap);
             encode_varlen(&mut body, term.as_bytes());
             encode_varint(&mut body, bitmap.len() as u64);
+            // Ex-9.3（v5）：条目追加统计载荷 = varint(fcount) + fcount × (n u64 + sum/min/max f64 定长)，
+            // 取自写路径随 term 累积的 stats_mem（engine stats_fields 对齐；未配置/无贡献 → fcount 0）。
+            let stats: Vec<FieldAgg> = self
+                .stats_mem
+                .get(&term)
+                .map(|e| e.value().clone())
+                .unwrap_or_default();
+            encode_varint(&mut body, stats.len() as u64);
+            for a in &stats {
+                body.extend_from_slice(&a.n.to_le_bytes());
+                body.extend_from_slice(&a.sum.to_le_bytes());
+                body.extend_from_slice(&a.min.to_le_bytes());
+                body.extend_from_slice(&a.max.to_le_bytes());
+            }
             encode_varlen(&mut body, &bytes);
         }
 
@@ -545,6 +585,7 @@ impl InvertedIndex {
 
         // 清空内存
         self.mem.clear();
+        self.stats_mem.clear(); // 统计已随段落盘（v5 载荷），避免下次 flush 重复累积
         self.mem_docids.reset();
         info!("倒排刷盘完成: {fname}");
         Ok(())
@@ -700,6 +741,7 @@ impl InvertedIndex {
             if ver >= 4 {
                 let _c = decode_varint(&data, &mut cur)?; // 跳过 v4 doc_count 载荷
             }
+            skip_stats_v5(&data, &mut cur, ver)?; // Ex-9.3：跳过 v5 统计载荷
             let p = decode_varlen(&data, &mut cur)?.to_vec();
             if t.as_slice() == term.as_bytes() {
                 return if ver >= 3 {
@@ -754,6 +796,7 @@ impl InvertedIndex {
             if Self::seg_ver(&data) >= 4 {
                 let _c = decode_varint(&data, &mut cur)?; // Ex-9.1b：跳过 v4 doc_count 载荷
             }
+            skip_stats_v5(&data, &mut cur, Self::seg_ver(&data))?; // Ex-9.3：跳过 v5 统计载荷
             let _p = decode_varlen(&data, &mut cur)?;
             if t.as_slice() == term.as_bytes() {
                 return Ok(Some((data, entry)));
@@ -919,6 +962,7 @@ impl InvertedIndex {
             if ver >= 4 {
                 let _c = decode_varint(&data, &mut cur)?; // v4 doc_count 载荷
             }
+            skip_stats_v5(&data, &mut cur, ver)?; // Ex-9.3：跳过 v5 统计载荷
             let p = decode_varlen(&data, &mut cur)?.to_vec();
             let bitmap = if ver >= 3 {
                 decode_posting_v3(&p)?
@@ -1013,14 +1057,26 @@ impl InvertedIndex {
         }
         // G 项：段合并 → posting 缓存失效（旧段 bitmap 过期）
         self.clear_posting_cache();
-        // ① 读取全部段的所有 term 最新 posting（bitmap 合并天然去重）
-        let mut map: std::collections::BTreeMap<String, RoaringBitmap> =
+        // ① 读取全部段的所有 term 最新 posting（bitmap 合并天然去重）+ v5 统计载荷合并
+        let mut map: std::collections::BTreeMap<String, (RoaringBitmap, Vec<FieldAgg>)> =
             std::collections::BTreeMap::new();
         let segs = self.segments.load(); // Ex-6.2：快照
         for seg in segs.iter() {
             for (term, posting) in self.read_segment_terms(seg)? {
-                let e = map.entry(term).or_default();
-                *e |= posting;
+                let e = map
+                    .entry(term.clone())
+                    .or_insert_with(|| (RoaringBitmap::new(), Vec::new()));
+                e.0 |= posting;
+                if let Some((data, entry)) = self.segment_posting_entry(seg, &term)? {
+                    if let Some(ss) = parse_term_stats_at(&data, entry, Self::seg_ver(&data))? {
+                        if e.1.len() < ss.len() {
+                            e.1.resize(ss.len(), FieldAgg::new());
+                        }
+                        for (d, s) in e.1.iter_mut().zip(ss.iter()) {
+                            merge_field_agg(d, s);
+                        }
+                    }
+                }
             }
         }
 
@@ -1030,13 +1086,21 @@ impl InvertedIndex {
         let mut body = Vec::new();
         let mut term_offsets: Vec<(Vec<u8>, u64)> = Vec::new();
         encode_varint(&mut body, map.len() as u64);
-        for (term, bitmap) in &map {
+        for (term, (bitmap, stats)) in &map {
             let file_offset = (SEG_MAGIC.len() + std::mem::size_of::<u16>() + body.len()) as u64;
             term_offsets.push((term.clone().into_bytes(), file_offset));
-            // K 项（7.74）：v3 分块布局；Ex-9.1b（v4）：term + varint(段内 doc_count) + posting
+            // K 项（7.74）：v3 分块布局；Ex-9.1b（v4）：term + varint(段内 doc_count) + posting；
+            // Ex-9.3（v5）：doc_count 后写统计载荷（合并自源段；无 → fcount 0）
             let bytes = encode_posting_v3(bitmap);
             encode_varlen(&mut body, term.as_bytes());
             encode_varint(&mut body, bitmap.len() as u64);
+            encode_varint(&mut body, stats.len() as u64);
+            for a in stats {
+                body.extend_from_slice(&a.n.to_le_bytes());
+                body.extend_from_slice(&a.sum.to_le_bytes());
+                body.extend_from_slice(&a.min.to_le_bytes());
+                body.extend_from_slice(&a.max.to_le_bytes());
+            }
             encode_varlen(&mut body, &bytes);
         }
         let tmp = self.dir.join(format!("{SEG_PREFIX}{seg_id:08}.seg.tmp"));
@@ -1107,6 +1171,73 @@ pub struct GcReport {
     pub segment_count: usize,
 }
 
+/// v5：跳过 term 条目中 doc_count 之后的统计载荷（`varint(fcount)` + `fcount × 32B` 定长
+/// n u64 + sum/min/max f64）。v4 及更早无载荷（游标不动）。
+fn skip_stats_v5(data: &[u8], cur: &mut usize, ver: u16) -> Result<()> {
+    if ver >= 5 {
+        let fc = decode_varint(data, cur)? as usize;
+        let bytes = fc * (8 + 8 + 8 + 8);
+        if *cur + bytes > data.len() {
+            return Err(Error::Corrupted("倒排段统计载荷越界".into()));
+        }
+        *cur += bytes;
+    }
+    Ok(())
+}
+
+/// 解析 v5 条目统计载荷（`entry` 指向 term 起点）。v4 及更早 / fcount==0 → None。
+fn parse_term_stats_at(data: &[u8], entry: usize, ver: u16) -> Result<Option<Vec<FieldAgg>>> {
+    if ver < 5 {
+        return Ok(None);
+    }
+    let mut cur = entry;
+    let _t = decode_varlen(data, &mut cur)?;
+    let _c = decode_varint(data, &mut cur)?; // doc_count
+    let fc = decode_varint(data, &mut cur)? as usize;
+    if fc == 0 {
+        return Ok(None);
+    }
+    let bytes = fc * (8 + 8 + 8 + 8);
+    if cur + bytes > data.len() {
+        return Err(Error::Corrupted("倒排段统计载荷越界".into()));
+    }
+    let mut out = Vec::with_capacity(fc);
+    for _ in 0..fc {
+        let n = u64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
+        cur += 8;
+        let sum = f64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
+        cur += 8;
+        let min = f64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
+        cur += 8;
+        let max = f64::from_le_bytes(data[cur..cur + 8].try_into().unwrap());
+        cur += 8;
+        out.push(FieldAgg { n, sum, min, max });
+    }
+    Ok(Some(out))
+}
+
+/// 将 `src` 合并进 `dst`（n/sum 累加；min/max 取跨集极值——跨段重复 docid 的 n/sum
+/// 略高估属已文档化上界语义，见 development_remain §19）。
+fn merge_field_agg(dst: &mut FieldAgg, src: &FieldAgg) {
+    if src.n == 0 {
+        return;
+    }
+    dst.n += src.n;
+    dst.sum += src.sum;
+    if dst.n == src.n {
+        // 首次（dst 此前空）
+        dst.min = src.min;
+        dst.max = src.max;
+    } else {
+        if src.min < dst.min {
+            dst.min = src.min;
+        }
+        if src.max > dst.max {
+            dst.max = src.max;
+        }
+    }
+}
+
 /// 从段数据指定偏移解析 (term, posting) 条目（FST 字典指向的条目）。
 /// v3 = posting 分块布局（K 项）；v2 = Roaring 紧凑字节（旧段兼容）。
 fn parse_posting_at(data: &[u8], offset: usize, ver: u16) -> Result<RoaringBitmap> {
@@ -1115,6 +1246,7 @@ fn parse_posting_at(data: &[u8], offset: usize, ver: u16) -> Result<RoaringBitma
     if ver >= 4 {
         let _c = decode_varint(data, &mut cur)?; // Ex-9.1b：跳过 v4 doc_count 载荷
     }
+    skip_stats_v5(data, &mut cur, ver)?; // Ex-9.3：跳过 v5 统计载荷
     let p = decode_varlen(data, &mut cur)?.to_vec();
     if ver >= 3 {
         decode_posting_v3(&p)
@@ -1233,6 +1365,7 @@ impl PostingCursor {
         if ver >= 4 {
             let _c = decode_varint(data, &mut cur)?; // Ex-9.1b：跳过 v4 doc_count 载荷
         }
+        skip_stats_v5(data, &mut cur, ver)?; // Ex-9.3：跳过 v5 统计载荷
         let payload = decode_varlen(data, &mut cur)?; // payload 切片（pos → payload 末尾）
         let (headers, _) = v3_headers(payload)?;
         Ok(Self {
@@ -1475,6 +1608,38 @@ mod tests {
     }
 
     // ---------- 位图索引（design 5.2.4，M7-2） ----------
+
+    #[test]
+    fn gc_merges_preserve_stats_payload_v5() {
+        // Ex-9.3 第②步：GC 合并段时须保留/合并 v5 统计载荷（term_stats 前后一致）。
+        let dir = tmp();
+        let mut idx = InvertedIndex::open_with_gc(&dir, 10_000, "fst", 1).unwrap();
+        for d in 1..=5u64 {
+            idx.add("gc-a", d);
+            idx.add_stats("gc-a", &[Some(d as f64)]);
+        }
+        idx.flush_segment().unwrap();
+        for d in 6..=10u64 {
+            idx.add("gc-a", d);
+            idx.add_stats("gc-a", &[Some(d as f64)]);
+        }
+        idx.flush_segment().unwrap();
+        assert_eq!(idx.segment_count(), 2);
+        let before = idx.term_stats("gc-a").unwrap().unwrap()[0];
+        assert_eq!(before.n, 10);
+        assert_eq!(before.sum, 55.0); // 1..=10
+        assert_eq!(before.min, 1.0);
+        assert_eq!(before.max, 10.0);
+        let g = idx.gc().unwrap();
+        assert_eq!(g.merged, 2);
+        assert_eq!(idx.segment_count(), 1);
+        let after = idx.term_stats("gc-a").unwrap().unwrap()[0];
+        assert_eq!(after.n, before.n, "GC 后 n 保持");
+        assert_eq!(after.sum, before.sum, "GC 后 sum 保持");
+        assert_eq!(after.min, before.min);
+        assert_eq!(after.max, before.max);
+        assert_eq!(idx.search("gc-a").unwrap().len(), 10, "GC 后 posting 完整");
+    }
 
     // ---------- G 项：posting 检索优化（term→bitmap 缓存） ----------
 
