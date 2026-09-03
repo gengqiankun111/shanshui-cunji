@@ -1,0 +1,10 @@
+[package]
+name = "rr-conformance"
+version = "0.1.0"
+edition = "2021"
+description = "RR 隔离级别行为对照压测：MySQL ↔ 自研库（Try-Confirm-Cancel 简易两阶段 + 外部视角/终态校验）"
+
+[dependencies]
+mysql = "26"
+rand = "0.8"
+anyhow = "1"
