@@ -2311,6 +2311,24 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     let limit = extract_limit(sql);
     // MySQL 客户端以 `id` 为主键列 → 主键点查（sqlish 侧为 docid 特例）
     if let Some(id) = extract_point_id(sql) {
+        // 标量聚合点查：`SELECT SUM(k)/count(k) … WHERE id=N` → 单行单列（与 BETWEEN/IN
+        // 分支同语义；须先于普通点查短路——否则被当行集返回（返回 id 列而非字段和）
+        let upper_p = sql.to_uppercase();
+        if upper_p.contains("SUM(") || upper_p.contains("COUNT(") {
+            let mut sum: i64 = 0;
+            if let Ok(Some(v)) = engine.get(id) {
+                if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&v) {
+                    if let Some(k) = doc.get("k").and_then(|x| x.as_i64()) {
+                        sum += k;
+                    }
+                }
+            }
+            let agg_col = column_payload("agg", MYSQL_TYPE_LONGLONG, 63);
+            return QueryResponse::Set {
+                columns: vec![agg_col],
+                rows: vec![vec![sum.to_string().into_bytes()]],
+            };
+        }
         let raw = match engine.get(id) {
             Ok(Some(v)) => vec![(id, v)],
             _ => Vec::new(),
@@ -3993,27 +4011,21 @@ mod tests {
             c.query("CREATE TABLE t_test(id INT AUTO_INCREMENT PRIMARY KEY, k INT, c CHAR(50))")[0][0],
             OK_PACKET
         );
-        // 无 id 列 INSERT（id 省略 → auto 分配）；事务内一致读验证内容（txn_select 聚合路径）
+        // 无 id 列 INSERT（id 省略 → auto 分配）；非事务 SUM 验证内容（修复后正确）
         assert_eq!(c.query("INSERT INTO t_test(k, c) VALUES(7, 'x')")[0][0], OK_PACKET);
-        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
         assert_eq!(sum(&mut c, "SELECT SUM(k) FROM t_test WHERE id=1"), "7", "auto id=1 行可见");
-        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
         assert_eq!(c.query("INSERT INTO t_test(k) VALUES(8)")[0][0], OK_PACKET);
-        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
         assert_eq!(sum(&mut c, "SELECT SUM(k) FROM t_test WHERE id=2"), "8", "auto id=2 行可见");
-        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
         // 多行无 id → 语句级块分配 3,4
         assert_eq!(
             c.query("INSERT INTO t_test(k) VALUES(9),(10)")[0][0],
             OK_PACKET
         );
-        assert_eq!(c.query("BEGIN")[0][0], OK_PACKET);
         assert_eq!(
             sum(&mut c, "SELECT SUM(k) FROM t_test WHERE id BETWEEN 3 AND 4"),
             "19",
             "多行无 id 连续分配 id=3,4"
         );
-        assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
     }
 
     #[test]

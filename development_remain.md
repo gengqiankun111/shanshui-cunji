@@ -571,9 +571,10 @@
 | AUTO_INCREMENT 列属性 | CREATE TABLE `id INT AUTO_INCREMENT` 解析（属性忽略→接受）→ 该表插入无 id 走自动 docid | ✅ 已完成（功能已具备：CREATE TABLE 空操作容忍列属性 + 无 id 列 INSERT 已解析为 auto（parse_insert_multi）；补端到端验证 `auto_increment_ddl_and_idless_insert`（列属性建表 + 单/多行无 id 插入 auto 1..4 + 事务内 SUM 验证），lib 613 全绿） |
 | Snowflake（远期备选） | 仅当真分布式多写者无协调分配出现时复评（现有 docid_alloc 已覆盖分片场景） | 远期，不主动排期 |
 
-> 新发现（2026-09-03，待查）：非事务 `SELECT SUM(k) FROM t WHERE id=N` 返回异常
-> （返回 id 而非字段和；事务内 txn_select 同 SQL 正确）——疑似非事务 select_response 标量
-> 聚合 id= 快路径取值问题，与 §27 无关，另行排期定位。
+> 已修复（2026-09-03）：非事务 `SELECT SUM(k) FROM t WHERE id=N` 被 `extract_point_id`
+> 短路为普通点查（返回行集 → helper 读到 id 列）——point_id 分支补 SUM/COUNT 标量聚合
+> 前置（与 BETWEEN/IN 分支同语义）；事务路径本就正确。回归：auto_increment_ddl 测试
+> 改为非事务 SUM 断言验证修复；lib 613 全绿。
 
 ### 验收口径
 
