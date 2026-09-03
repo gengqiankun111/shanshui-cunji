@@ -378,3 +378,16 @@
   Ex-9.1b 风格（v4 doc_count 亚毫秒）扩展为 posting 统计载荷（sum/min/max/avg）以支撑
   `GROUP BY status` 与 `SUM(amount) WHERE status='x'` 聚合秒级；仅对配置声明字段启用
   （`stats_fields`，对齐 Ex-4 成本控制）。
+
+## 23. SQL DML 增强（用户 2026-09-03 排期请求）
+
+> 在已有 `WHERE f IN (…)` 过滤（sqlish `a4d37c2`）基础上，用户追加 DML 语法需求。排期项：
+>
+> | 项 | 内容 | 备注 |
+> |---|---|---|
+> | UPDATE/DELETE … WHERE f IN (…) | UPDATE/DELETE 的 WHERE 集合过滤（复用 IN 解析展开为 OR 等值；执行层按 docid 定位后逐条 put/delete，语义同现有等值 UPDATE/DELETE） | mysql.rs update_response/delete_response 扩展（现仅单条件/id 形态） |
+> | batch_insert | 多行 VALUES 批量插入语法（现 INSERT 多行已支持，等价；补统一 `batch_insert` 入口/协议？按用户上下文确认语义） | 若指多行 INSERT，已在 H-6/insert_response 支持——待用户澄清 |
+> | batch_update | 多条 `UPDATE … WHERE key=…` 或 `UPDATE … WHERE f IN (…)` 原子/高效批量（逐条语义 + 影响行数汇总；事务内可用） | 新执行入口 |
+> | batch_delete | 同上删除批量（`DELETE WHERE id IN (…)` / `f IN (…)`，返回受影响行数） | 新执行入口 |
+>
+> 优先级：P1（MySQL 生态常见 DML 形态）。实现顺序：UPDATE/DELETE … IN → batch 语法与语义确认 → batch_update/delete 执行器 + 单测 + wire 冒烟。
