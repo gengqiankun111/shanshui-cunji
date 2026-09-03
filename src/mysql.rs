@@ -408,6 +408,9 @@ pub struct MySqlServer {
     next_conn_id: AtomicU64,
     /// 无 id 列 INSERT 的 auto_increment 计数器（跨连接共享）。
     auto_id: Arc<AtomicU64>,
+    /// Ex-8.9：后台维护 worker 是否**负载感知**（Busy 退避 / Idle 密集集中）。默认开；
+    /// A/B 验收时关 = 旧固定节奏行为。
+    idle_aware: bool,
 }
 
 impl MySqlServer {
@@ -418,7 +421,13 @@ impl MySqlServer {
             password: password.into(),
             next_conn_id: AtomicU64::new(1),
             auto_id: Arc::new(AtomicU64::new(1)),
+            idle_aware: true,
         }
+    }
+
+    /// Ex-8.9：开关后台 worker 负载感知（serve/spawn 前调用）。
+    pub fn set_idle_aware(&mut self, on: bool) {
+        self.idle_aware = on;
     }
 
     /// O 项第③步：后台合并 worker。写路径（Engine::auto_compact）检测 L0 超阈值后只置
@@ -434,6 +443,7 @@ impl MySqlServer {
     ///   每轮压最高紧迫度档（同 Engine::compact 串行分支），多轮循环收敛。
     fn spawn_compaction_worker(&self) {
         let engine = self.engine.clone();
+        let aware = self.idle_aware; // Ex-8.9：负载感知开关（关 = 旧固定节奏 100ms）
         let pending = self.engine.read().unwrap().compact_pending.clone();
         let worker = self.engine.read().unwrap().compact_worker.clone();
         worker.store(true, Ordering::Release); // 写路径此后只发信号
@@ -443,27 +453,40 @@ impl MySqlServer {
             let mut last_ops = (0u64, 0u64);
             let mut idle_streak = 0u32;
             loop {
-                // Ex-8.9 空闲感知：Busy → 退避 1s；Normal → 200ms；Idle → 50ms 密集检查
-                let (busy, idle) = if let Ok(g) = engine.read() {
-                    let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let dw = w.wrapping_sub(last_ops.0);
-                    let dr = r.wrapping_sub(last_ops.1);
-                    last_ops = (w, r);
-                    (
-                        g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
-                        g.write_pressure() == 0.0 && dw == 0 && dr == 0,
-                    )
-                } else {
-                    (true, false)
-                };
-                if idle {
-                    idle_streak += 1;
-                } else {
-                    idle_streak = 0;
-                }
-                let tick_ms = if busy { 1000 } else if idle { 50 } else { 200 };
-                std::thread::sleep(std::time::Duration::from_millis(tick_ms));
+                 // Ex-8.9 空闲感知：Busy → 退避 1s；Normal → 200ms；Idle → 50ms 密集检查
+                 //（aware=false → 旧固定节奏 100ms）
+                 let (busy, idle) = if aware {
+                     if let Ok(g) = engine.read() {
+                         let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
+                         let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+                         let dw = w.wrapping_sub(last_ops.0);
+                         let dr = r.wrapping_sub(last_ops.1);
+                         last_ops = (w, r);
+                         (
+                             g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
+                             g.write_pressure() == 0.0 && dw == 0 && dr == 0,
+                         )
+                     } else {
+                         (true, false)
+                     }
+                 } else {
+                     (false, false)
+                 };
+                 if idle {
+                     idle_streak += 1;
+                 } else {
+                     idle_streak = 0;
+                 }
+                 let tick_ms = if !aware {
+                     100
+                 } else if busy {
+                     1000
+                 } else if idle {
+                     50
+                 } else {
+                     200
+                 };
+                 std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
                 // 空闲集中：连续空闲 ≥4 tick（约 ≥200ms 无读写）且距上次集中 ≥5s → 强制执行一轮
@@ -494,6 +517,7 @@ impl MySqlServer {
     /// 10 分钟兜底：覆盖刷盘未触发 / 信号丢失等异常路径（段数爆炸不再依赖显式调用）。
     fn spawn_inverted_gc_worker(&self) {
         let engine = self.engine.clone();
+        let aware = self.idle_aware; // Ex-8.9：负载感知开关（关 = 旧固定节奏 100ms）
         let pending = self.engine.read().unwrap().inverted_gc_pending.clone();
         std::thread::spawn(move || {
             let mut last_backstop = std::time::Instant::now();
@@ -501,25 +525,39 @@ impl MySqlServer {
             let mut last_ops = (0u64, 0u64);
             let mut idle_streak = 0u32;
             loop {
-                let (busy, idle) = if let Ok(g) = engine.read() {
-                    let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let dw = w.wrapping_sub(last_ops.0);
-                    let dr = r.wrapping_sub(last_ops.1);
-                    last_ops = (w, r);
-                    (
-                        g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
-                        g.write_pressure() == 0.0 && dw == 0 && dr == 0,
-                    )
+                // Ex-8.9 空闲感知：Busy → 退避 1s；Normal → 200ms；Idle → 50ms 密集检查
+                //（aware=false → 旧固定节奏 100ms）
+                let (busy, idle) = if aware {
+                    if let Ok(g) = engine.read() {
+                        let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
+                        let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+                        let dw = w.wrapping_sub(last_ops.0);
+                        let dr = r.wrapping_sub(last_ops.1);
+                        last_ops = (w, r);
+                        (
+                            g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
+                            g.write_pressure() == 0.0 && dw == 0 && dr == 0,
+                        )
+                    } else {
+                        (true, false)
+                    }
                 } else {
-                    (true, false)
+                    (false, false)
                 };
                 if idle {
                     idle_streak += 1;
                 } else {
                     idle_streak = 0;
                 }
-                let tick_ms = if busy { 1000 } else if idle { 50 } else { 200 };
+                let tick_ms = if !aware {
+                    100
+                } else if busy {
+                    1000
+                } else if idle {
+                    50
+                } else {
+                    200
+                };
                 std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                 let signaled = pending.swap(false, Ordering::AcqRel);
                 let backstop = last_backstop.elapsed() >= std::time::Duration::from_secs(600);
@@ -554,25 +592,39 @@ impl MySqlServer {
     /// 段数增长由 GC worker（7.73 信号 + 10 分钟兜底）收敛。
     fn spawn_inverted_flush_worker(&self) {
         let engine = self.engine.clone();
+        let aware = self.idle_aware; // Ex-8.9：负载感知开关（关 = 旧固定节奏 200ms 轮询）
         std::thread::spawn(move || {
             let mut last = std::time::Instant::now();
             let mut last_ops = (0u64, 0u64);
             loop {
                 // Ex-8.9：Busy → 1s（仅硬阈值落盘）；Idle → 50ms tick + 1s 密集落盘
-                let (busy, idle) = if let Ok(g) = engine.read() {
-                    let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
-                    let dw = w.wrapping_sub(last_ops.0);
-                    let dr = r.wrapping_sub(last_ops.1);
-                    last_ops = (w, r);
-                    (
-                        g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
-                        g.write_pressure() == 0.0 && dw == 0 && dr == 0,
-                    )
+                //（aware=false → 旧固定节奏 200ms 轮询 + 仅硬阈值/30s 兜底落盘）
+                let (busy, idle) = if aware {
+                    if let Ok(g) = engine.read() {
+                        let w = g.metrics.write_ops.load(std::sync::atomic::Ordering::Relaxed);
+                        let r = g.metrics.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+                        let dw = w.wrapping_sub(last_ops.0);
+                        let dr = r.wrapping_sub(last_ops.1);
+                        last_ops = (w, r);
+                        (
+                            g.write_pressure() >= 0.5 || dw >= 4 || dr >= 10,
+                            g.write_pressure() == 0.0 && dw == 0 && dr == 0,
+                        )
+                    } else {
+                        (true, false)
+                    }
                 } else {
-                    (true, false)
+                    (false, false)
                 };
-                let tick_ms = if busy { 1000 } else if idle { 50 } else { 200 };
+                let tick_ms = if !aware {
+                    200
+                } else if busy {
+                    1000
+                } else if idle {
+                    50
+                } else {
+                    200
+                };
                 std::thread::sleep(std::time::Duration::from_millis(tick_ms));
                 let mem = engine
                     .read()
@@ -4912,6 +4964,181 @@ mod tests {
         assert!(r.contains(0), "k0-0 应含 docid 0");
         let r2 = server.engine.read().unwrap().inverted_posting("k11999-9").unwrap();
         assert!(r2.contains(11999), "k11999-9 应含 docid 11999");
+    }
+
+    // ---------- Ex-8.9 切片 2A 验收：交变负载 A/B ----------
+
+    /// 交变负载 A/B（倒排落盘 worker）：写突发（倒排 mem 积压）与短空闲窗交替。
+    /// A（idle_aware）：空闲窗内 50ms tick + 1s 密集落盘 → 每轮 mem 清空，积压不跨窗累积；
+    /// B（旧固定节奏 200ms）：非硬阈值（1M）/30s 兜底不落盘 → mem 随轮次单调累积。
+    /// 验收判据：A 最终 mem=0，B 最终 mem>0（积压滞留）。
+    #[test]
+    #[ignore = "Ex-8.9 交变负载 A/B 验收（真实时钟，--ignored 手动跑）"]
+    fn ex89_ab_alternating_load_inverted_flush() {
+        for (label, aware) in [("B 旧固定节奏(aware=off)", false), ("A 空闲感知(aware=on)", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = crate::config::Config::default();
+            cfg.memtable.max_size_mb = 16; // 突发远小于 MemTable：无主数据 flush，聚焦倒排 mem
+            cfg.inverted.segment_max_size_mb = 1;
+            cfg.storage.group_commit_us = 2000; // 组提交，避免逐条 fsync 拖慢突发
+            let engine = Engine::open(dir.path(), &cfg).unwrap();
+            let mut server = MySqlServer::new(engine, "root", "");
+            server.set_idle_aware(aware);
+            // 真实集成形态：三个后台 worker 全部挂载
+            server.spawn_compaction_worker();
+            server.spawn_inverted_gc_worker();
+            server.spawn_inverted_flush_worker();
+            let mut d = 0u64;
+            for round in 0..3u64 {
+                // 突发：4 万行（每行 2 term → 倒排 mem 记 docid；主数据不触发 flush）
+                let t0 = std::time::Instant::now();
+                {
+                    let mut g = server.engine.write().unwrap();
+                    for _ in 0..40_000u64 {
+                        let v = format!("{{\"id\":{d}}}").into_bytes();
+                        let terms = ["k0", "k1"];
+                        g.put(d, v, &terms).unwrap();
+                        d += 1;
+                    }
+                    // 排空 MemTable → write_pressure=0：worker 才能判 Idle（写压力代理口径）
+                    g.flush_primary().unwrap();
+                    g.flush_wal().unwrap();
+                }
+                // 空闲窗 2.5s：A 应 ~1s 密集落盘清空 mem；B 不落盘（未到 30s/1M 阈值）
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                let mem = server.engine.read().unwrap().inverted_mem_docids();
+                eprintln!(
+                    "[{label}] round{round}: busy_ms={} mem_after_idle={mem}",
+                    t0.elapsed().as_millis()
+                );
+            }
+            let mem_final = server.engine.read().unwrap().inverted_mem_docids();
+            eprintln!("[{label}] 终态 inverted_mem_docids={mem_final}");
+            if aware {
+                assert_eq!(mem_final, 0, "A：空闲窗应把倒排 mem 落盘清空（积压不跨窗累积）");
+            } else {
+                assert!(
+                    mem_final > 50_000,
+                    "B：无空闲密集落盘 → mem 积压应滞留（实际 {mem_final}）"
+                );
+            }
+        }
+    }
+
+    /// 交变负载 A/B（compaction idle_run）：auto_compact 关闭制造无信号的 L0 积压后进入空闲。
+    /// A（idle_aware）：≥5s 连续空闲触发 idle_run → 强制 `targets.run()` 收敛 L0；
+    /// B（旧固定节奏 100ms）：无信号不动作（600s 兜底前积压滞留）。
+    /// 验收判据：A 在 idle_run 后 needs_compact=false；B 同等待时间积压原样。
+    #[test]
+    #[ignore = "Ex-8.9 交变负载 A/B 验收（真实时钟，--ignored 手动跑）"]
+    fn ex89_ab_compaction_idle_run_drains_l0_backlog() {
+        for (label, aware) in [("B 旧固定节奏(aware=off)", false), ("A 空闲感知(aware=on)", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = crate::config::Config::default();
+            cfg.storage.auto_compact = false; // 突发不收敛 → 纯 idle_run 判定（无信号路径）
+            cfg.storage.l0_stall_min = 2;
+            cfg.storage.l0_stall_max = 64;
+            cfg.storage.l0_stall_threshold = 2;
+            cfg.memtable.max_size_mb = 2;
+            cfg.storage.group_commit_us = 2000;
+            let engine = Engine::open(dir.path(), &cfg).unwrap();
+            let mut server = MySqlServer::new(engine, "root", "");
+            // 突发：8MB（8000 × 1KB 不同 docid）→ 4 次 MemTable flush → L0=4 积压
+            //（auto_compact 关：写路径不置信号 → 纯 idle_run 判定）
+            {
+                let mut g = server.engine.write().unwrap();
+                for i in 0..8_000u64 {
+                    g.put_nosync(i, vec![b'x'; 1024], &[]).unwrap();
+                }
+                g.flush_primary().unwrap(); // 排空 MemTable → pressure=0
+                g.flush_wal().unwrap();
+            }
+            let l0 = server.engine.read().unwrap().primary_l0_count();
+            assert!(l0 >= 4, "{label}: 突发应积压 L0≥4（实际 {l0}）");
+            assert!(server.engine.read().unwrap().needs_compact(), "{label}: 积压应判需要合并");
+            server.set_idle_aware(aware);
+            server.spawn_compaction_worker();
+            if aware {
+                // A：idle_run（≥5s 连续空闲）→ targets.run 收敛；12s 上限
+                let t0 = std::time::Instant::now();
+                let deadline = t0 + std::time::Duration::from_secs(12);
+                loop {
+                    if !server.engine.read().unwrap().needs_compact() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "A：idle_run 未能在时限内收敛 L0 积压"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                assert!(!server.engine.read().unwrap().needs_compact());
+                eprintln!("[{label}] L0 积压经 idle_run 收敛（{:.1}s）", t0.elapsed().as_secs_f64());
+            } else {
+                // B：无信号 → 仅 600s 兜底；等 6s 验证积压滞留
+                std::thread::sleep(std::time::Duration::from_secs(6));
+                assert!(
+                    server.engine.read().unwrap().needs_compact(),
+                    "B：旧固定节奏无信号不应收敛（600s 兜底前滞留）"
+                );
+                eprintln!("[{label}] 6s 后 L0 积压滞留（needs_compact=true）");
+            }
+        }
+    }
+
+    /// 交变负载 A/B（倒排 GC idle_run）：预建 12 段可 GC 但清空 GC 信号 → 进入空闲。
+    /// A（idle_aware）：≥5s 连续空闲 idle_run → 检查 should_gc 并执行段回收；
+    /// B（旧固定节奏 100ms）：无信号不动作。
+    /// 验收判据：A 段数收敛 ≤2；B 段数原样。
+    #[test]
+    #[ignore = "Ex-8.9 交变负载 A/B 验收（真实时钟，--ignored 手动跑）"]
+    fn ex89_ab_gc_worker_idle_run_reclaims_segments() {
+        for (label, aware) in [("B 旧固定节奏(aware=off)", false), ("A 空闲感知(aware=on)", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = crate::config::Config::default();
+            cfg.inverted.segment_max_size_mb = 1;
+            let engine = Engine::open(dir.path(), &cfg).unwrap();
+            let mut server = MySqlServer::new(engine, "root", "");
+            // 写 12 批（1000 doc × 10 term）+ 显式刷段 → 12 段超 GC 阈值；清信号 → 纯 idle_run 判定
+            {
+                let mut eng = server.engine.write().unwrap();
+                for batch in 0..12u64 {
+                    for i in batch * 1000..batch * 1000 + 1000 {
+                        let terms: Vec<String> = (0..10).map(|j| format!("k{i}-{j}")).collect();
+                        let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+                        eng.put_nosync(i, format!("{{\"id\":{i}}}").into_bytes(), &refs)
+                            .unwrap();
+                    }
+                    eng.flush_inverted().unwrap();
+                }
+                assert!(eng.inverted.should_gc(), "12 段应超 GC 阈值");
+                eng.flush_primary().unwrap(); // 排空 MemTable → pressure=0（Idle 判定前提）
+                eng.inverted_gc_pending.store(false, Ordering::Release);
+            }
+            let n_build = server.engine.read().unwrap().inverted.segment_count();
+            server.set_idle_aware(aware);
+            server.spawn_inverted_gc_worker();
+            if aware {
+                // A：idle_run（≥5s 连续空闲）→ should_gc → gc()；9s 上限
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9);
+                loop {
+                    let n = server.engine.read().unwrap().inverted.segment_count();
+                    if n <= 2 || std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let n = server.engine.read().unwrap().inverted.segment_count();
+                assert!(n <= 2, "A：idle_run 应触发 GC 收敛段（{n_build} → {n}）");
+                eprintln!("[{label}] 段数经 idle_run GC 收敛 {n_build} → {n}");
+            } else {
+                // B：无信号 → idle_run 禁用；等 6s 验证段原样
+                std::thread::sleep(std::time::Duration::from_secs(6));
+                let n = server.engine.read().unwrap().inverted.segment_count();
+                assert_eq!(n, n_build, "B：无信号 → 段不应被回收（{n_build}）");
+                eprintln!("[{label}] 6s 后段数滞留 {n_build}（无回收）");
+            }
+        }
     }
 
     // ---------- 集成：协议往返 ----------
