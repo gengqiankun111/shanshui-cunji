@@ -156,11 +156,16 @@
 > 分片跳表 / L1+B+Tree 存储 / 16KB 默认块 / TRIM / 大页 NUMA / 倒排回表 B+Tree 化等已否决或平台远期，
 > 见 design_remain §8.1。本清单 = 采纳候选（每项 demo-first 验证后实施）。
 
-- **Ex-8.5（P2）Flush 频率优化（2026-09-03 修正：档位实验优先，不做并行 flush 代码）**：
-  - [ ] **先零成本档位 A/B**：memtable.max_size_mb 256 → 512MB（config 一行），50m 库测 flush 频次/
-    停顿/L0 增长/写吞吐——双缓冲切换已不阻塞写（已有）
-  - [ ] 并行 flush（多 immutable 分片写 SST fragment）**仅当**档位实验证实 flush 为瓶颈再实施
-    （并行 flush 会推高 L0 数与 compaction 压力，非优先路径）
+- **Ex-8.5（P2）Flush 频率优化 — ✅ 档位 A/B 完成（2026-09-03，不做并行 flush）**
+  - [x] **零成本档位 A/B（memtable 256 vs 512MB，50m 库 orders 追加灌入 400 万行/档，
+    组提交 2ms，逐 2s 打点）**：256 → 61.5s / **65,019 rows/s**；512 → 60.7s / **65,916 rows/s**
+    （+1.4%，噪声级，无显著差异）
+  - [x] 停顿观察：两档均存在一次 ~5~9s 吞吐 dip（出现在相近累计写入量 ~2.87M 行处）——
+    增大 memtable 未消除停顿 → **flush 非写吞吐瓶颈**（dip 更可能来自倒排内存段刷盘/
+    其它周期性后台写，与 memtable 档位弱相关）；256 档起跑还背负 ~1GB 历史 WAL 回放滞留劣势，
+    持平结果更证 512 无增益
+  - [x] 结论：**维持默认 256MB，不做并行 flush**（Ex-8.5 修正路径确认——档位实验证实 flush 非瓶颈，
+    并行 flush 仅推高 L0/compaction 压力）；数据打点 tmp_ex85_ticks_{256,512}.txt / 脚本 tmp_ex85_load.py
 - **Ex-8.6（P2）段级 min/max seq 元数据 + 快照读整段跳过** — ✅ 完成（29be7b1，560 全绿）
   - [x] CF `seq_min` 惰性记忆（path → 文件最小行 seq；keys-only 一次性推导 + 缓存）——
     **无需 manifest/footer 扩展**：重启后首次快照读自动重建（惰性按需）
@@ -263,6 +268,50 @@
   - [x] 单测：bitmap 5 项全过 + 新增并发冒烟（4 读者 vs 写者翻转+扩容，最终态全量校验）
 - **已复核不新立项**：写路径阶段化提交（组提交已把 fsync 移出锁内；后台 ack 破坏同步耐久语义）、
   MemTable 切换（双缓冲已具备）、多写者引擎写锁拆分（远期 Ex-13 触发链）
+
+## 19. 聚合 / COUNT 加速候选（2026-09-03，`D:\traeprojs\cunji\统计.txt` 评估 → 排期）
+
+> 触发：规模测试（2026-09-03，async 3308）3 亿库 `COUNT(*)` 194s / `COUNT status='active'` 197.8s /
+> `SUM amount>90000` 214s（全扫）。外部建议"写入时维护 total_count + 倒排 TermMeta 统计载荷"。
+> 代码核实后分期如下：
+
+| 项 | 现状（代码核实） | 判定 |
+|---|---|---|
+| `COUNT(*)`（无条件） | Engine `count_all_docs` 全集合 key-only 全扫（3 亿 ~194s） | 慢，需快路径 |
+| `COUNT(*) WHERE status='x'`（单字段等值） | **引擎已具备** `inverted_doc_count("status=x")`（白名单内存位图/倒排 doc_count，demo 万次级亚毫秒）；**mysql 层未路由**——被当无索引字段整表全扫 | 协议层小改 = 最高性价比项 |
+| `SUM(amount) WHERE status='x'` | 引擎无 posting 统计载荷（仅 doc_count） | 需引擎扩展 |
+| 持久 total_count | 无跨重启精确计数 | 需设计评审（update 覆盖不重计 / delete 减 / WAL 回放幂等） |
+
+- **Ex-9.1（P1）mysql 聚合路由到倒排计数 — ✅ 完成（4 亿库实测 276.6s → 42.5s / 6.5×；亚毫秒 = Ex-9.1b）**
+  - [x] mysql.rs 单字段等值 COUNT 模板（`single_eq_count_field`：无 AND/OR/ORDER/比较/主键/非引号值）+ 读分发
+    统一入口 `dispatch_query_read_opt`（COM_QUERY / COM_STMT_EXECUTE 共用）：非事务模板命中且字段已建倒排 →
+    写锁 `Engine::inverted_doc_count`（flush pending 保证已提交写入可见）；其余维持读锁读读并行
+  - [x] `Engine::inverted_count_eligible`（白名单/bitmap 字段判定，防"未建索引误报 0"）；单测 ×3
+    （模板解析边界 / 与全扫一致 / 可路由判定），mysql 29 全绿
+  - [x] 实测（4 亿库）：`COUNT status='active'` 全扫 276.6s → 42.5s（6.5×）——精确 doc_count 回退路径；
+    **亚毫秒需段级载荷（Ex-9.1b）**
+- **Ex-9.1b（P1，2026-09-03 追加）倒排段级 doc_count 载荷 — ✅ 完成（SEG_VERSION 4，569 全绿）**
+  - [x] 段格式 v4：条目 = term + `varint(段内 doc_count)` + posting（flush_segment 与 gc 重写均写载荷，
+    段内 posting 为去重 docid 集合 → bitmap.len() 精确）；老段 v2/v3 按段版本兼容读
+    （parse_posting_at / PostingCursor / 两处 linear 回退 / read_segment_terms 全版本化）
+  - [x] `InvertedIndex::doc_count_fast`：mem 去重 + 各段载荷求和 = O(段数) 亚毫秒；**任一命中段为老格式 →
+    回退精确 `doc_count` 遍历**（正确优先）；Engine::inverted_doc_count 改 fast 优先，并移除 bitmap_count
+    短路（内存位图仅覆盖运行期写入、重启空/冷库漏存量 = 既有缺陷一并修正；位图仍服务 search/组合筛选）
+  - [x] 语义注（文档化）：同 docid 同 term 跨段覆盖（update）求和略高估；写入单调 / 后台 GC 收敛后段间
+    无重叠即精确；覆盖写入高频场景走 `doc_count`（精确去重）
+  - [x] 单测 ×2（fast==exact 跨段 + 重叠上界文档化）；存量升级路径 = 倒排 GC 把全段合并为单 v4 段后
+    COUNT 自动转亚毫秒（混合 v3 存量现回退 42.5s，见 Ex-9.1 实测）
+- **Ex-9.2（P2）持久 visible_count（无条件 COUNT(*) 快路径）**：先设计评审再定档——
+  精确档：put 覆盖判定不重计 + delete 减 + 计数随 flush/删除位图 checkpoint 持久、WAL 回放序一致幂等
+  （回放 = 原始提交一一对应，计数天然一致）→ 复杂度中高；
+  近似档：docid 由 auto 单调无洞分配且 delete 仅对已存在行（业务前提）→ visible ≈ max_docid − 位图净置位
+  （Engine 已有两原子），前提不满足（回灌/有洞/删不存在 id）即错——仅作讨论，倾向精确档
+- **Ex-9.3（P3）倒排统计载荷（sum/min/max/avg）**：TermMeta/段格式扩展（写路径随 term 维护载荷 + 段格式
+  版本 + GC/合并保持）→ 支撑 `SUM(amount) WHERE status='x'` 级聚合秒级；与 Ex-9.1 共用路由；
+  仅对配置声明字段启用（`stats_fields`，防多数字字段全开失控——对齐 Ex-4 成本控制准则）
+- **远期不排期**：组合索引范围聚合（依赖 B+Tree 化，Ex-8.4 触发链）、物化视图 / 聚合缓存（TTL/失效语义待产品化）
+- **验收口径（3 亿库）**：无条件 COUNT(*) ≤1ms；条件 COUNT ≤1ms（Ex-9.1）；`SUM WHERE status` ≤100ms（Ex-9.3）；
+  数值与全扫一致（抽样断言）
 
 ## 已完成基线（勿重复）
 
