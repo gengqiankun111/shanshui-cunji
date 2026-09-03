@@ -1981,6 +1981,14 @@ fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
         return QueryResponse::Set { columns, rows };
     }
     if upper.contains("@@") {
+        // 系统变量按名返回真值：rust mysql crate v26 在连接建立后自动执行
+        // `SELECT @@max_allowed_packet` 取非 0 数值，否则 SetupError → "Could not setup
+        // connection"。此前所有 @@ 一律回字符串版本号 → 数值解析失败 = 该错误的另一根因。
+        if upper.contains("@@MAX_ALLOWED_PACKET") {
+            let columns = vec![column_payload("@@max_allowed_packet", MYSQL_TYPE_LONGLONG, 21)];
+            let rows = vec![vec![b"67108864".to_vec()]];
+            return QueryResponse::Set { columns, rows };
+        }
         let columns = vec![column_payload("@@version", MYSQL_TYPE_VAR_STRING, 45)];
         let rows = vec![vec![SERVER_VERSION.as_bytes().to_vec()]];
         return QueryResponse::Set { columns, rows };
