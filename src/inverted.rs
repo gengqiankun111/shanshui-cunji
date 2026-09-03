@@ -117,6 +117,12 @@ pub struct InvertedIndex {
     flush_threshold: u64,
     /// 段文件 GC 阈值（字节）：磁盘段总量超此值触发 `gc()` 合并（design 5.2.2；0 = 禁用）。
     gc_threshold_bytes: u64,
+    /// Ex-8.13：后台 IO 预算（Token Bucket，与列族压缩共享同一"写压力收窄后"预算语义）。
+    /// GC/后台段写（`account_written_budgeted`）acquire 节流；前台紧急刷段
+    /// （`flush_segment`）仅记账不等待——保留写入语义（预算不足时不停前台）。
+    io_limiter: std::sync::Mutex<Option<crate::io_scheduler::IoRateLimiter>>,
+    /// Ex-8.13：倒排累计写盘字节（seg 每次新写文件累计一次；GC 与刷段均计——写放大/IO 审计数据源）。
+    inverted_written: AtomicU64,
     /// 位图索引字段白名单（design 5.2.4，M7-2）：空 = 关闭（默认零开销）。
     bitmap_fields: std::collections::HashSet<String>,
     /// 内存位图索引（Ex-5.2 分片）：field → (value → docid RoaringBitmap)，按 field hash 分
@@ -270,6 +276,8 @@ impl InvertedIndex {
             // dashmap 要求 shard 数为 2 的幂（256 = 2^8）。
             mem: DashMap::with_capacity_and_shard_amount(0, 256),
             stats_mem: DashMap::with_capacity_and_shard_amount(0, 256),
+            io_limiter: std::sync::Mutex::new(None),
+            inverted_written: AtomicU64::new(0),
             mem_docids: PerCpuCounter::new(),
             // Ex-6.2/6.3：ArcSwap 原子发布（读路径 load 拿 Arc 快照无锁）
             segments: ArcSwap::new(Arc::new(segments)),
@@ -532,6 +540,43 @@ impl InvertedIndex {
         self.mem_docids() >= self.flush_threshold
     }
 
+    /// Ex-8.13：挂载后台 IO 预算（0 = 关闭）。GC/后台段写 acquire 节流；紧急刷段仅记账。
+    pub fn attach_io_budget(&self, bytes_per_sec: u64) {
+        *self.io_limiter.lock().unwrap() = if bytes_per_sec > 0 {
+            Some(crate::io_scheduler::IoRateLimiter::new(bytes_per_sec))
+        } else {
+            None
+        };
+    }
+
+    /// Ex-7.4/Ex-8.13：动态调整倒排后台 IO 预算（前台写压力驱动收窄，与列族压缩同口径）。
+    pub fn set_io_rate_bytes(&self, bytes_per_sec: u64) {
+        if let Some(l) = self.io_limiter.lock().unwrap().as_mut() {
+            l.set_rate(bytes_per_sec);
+        }
+    }
+
+    /// Ex-8.13：倒排累计写盘字节（写放大 / IO 审计数据源）。
+    pub fn inverted_written_bytes(&self) -> u64 {
+        self.inverted_written.load(Ordering::Relaxed)
+    }
+
+    /// 新写 seg 文件记账（GC 与前台刷段均累计写盘字节）。
+    fn account_written(&self, path: &Path) {
+        let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        self.inverted_written.fetch_add(sz, Ordering::Relaxed);
+    }
+
+    /// GC/后台段写：记账 + 共享预算 acquire 节流（预算不足等待；与 CF `io_acquire` 同语义）。
+    fn account_written_budgeted(&self, path: &Path) -> Result<()> {
+        let sz = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        self.inverted_written.fetch_add(sz, Ordering::Relaxed);
+        if let Some(l) = self.io_limiter.lock().unwrap().as_mut() {
+            l.acquire(sz)?;
+        }
+        Ok(())
+    }
+
     /// 将内存字典整段刷盘为 `inverted-{id}.seg`，并原子更新 Manifest。
     /// engine=fst 时同时编译术语字典 `inverted-{id}.fst`（term → 段内条目偏移）。
     /// J 项（7.73）：改 `&self`（next_seg_id → AtomicU64 + mutate 锁；后台 GC 与写路径
@@ -593,6 +638,9 @@ impl InvertedIndex {
         std::io::Write::write_all(&mut out, &body)?;
         out.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+
+        // Ex-8.13：新段写盘记账（前台紧急刷段仅记账不等待预算）
+        self.account_written(&path);
 
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
 
@@ -1178,6 +1226,8 @@ impl InvertedIndex {
         std::io::Write::write_all(&mut out, &body)?;
         out.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        // Ex-8.13：GC 后台段写——记账 + 共享预算 acquire 节流（预算不足等待，防 GC 抢前台写带宽）
+        self.account_written_budgeted(&path)?;
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
 
         // ③ 编译新段 FST 字典（写临时文件 → rename）

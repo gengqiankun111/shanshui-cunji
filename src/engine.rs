@@ -428,6 +428,11 @@ impl Engine {
         )?;
         // 位图索引（design 5.2.4，M7-2）：白名单非空时全量重建内存位图
         inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
+        // Ex-8.13：倒排 GC/后台段写共享后台 IO 预算（与列族压缩同受 Ex-7.4 写压力收窄；
+        // 前台紧急刷段仅记账不等待）
+        if cfg.storage.io_rate_limit_mb > 0 {
+            inverted.attach_io_budget(cfg.storage.io_rate_limit_mb * 1024 * 1024);
+        }
         let cidx = {
             // V 项：Linux + 启用时注入 io_uring 池（cidx 可选 CF，失败容忍）
             #[cfg(target_os = "linux")]
@@ -677,6 +682,8 @@ impl Engine {
         if let Some(c) = &self.cidx {
             c.set_io_rate_bytes(rate);
         }
+        // Ex-8.13：倒排 GC/后台段写与列族压缩同口径收窄（共享后台 IO 预算）
+        self.inverted.set_io_rate_bytes(rate);
     }
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
@@ -2180,6 +2187,11 @@ impl Engine {
         self.primary.layer_counts()
     }
 
+    /// Ex-8.13：倒排累计写盘字节（GC/刷段 seg 新写文件字节和；IO 审计数据源）。
+    pub fn inverted_written_bytes(&self) -> u64 {
+        self.inverted.inverted_written_bytes()
+    }
+
     /// 备份前一致性准备（development 5.11 冷备份第 1-2 步）：
     /// 刷 WAL → 全部 MemTable 落盘为 SST → 倒排内存字典刷盘为 `.seg` 段，
     /// 保证数据目录磁盘态自包含（含倒排段清单 Manifest、字段注册表等随目录整体打包）。
@@ -3110,6 +3122,40 @@ mod tests {
         assert!(!eng.needs_compact(), "读锁合并后应收敛");
         assert!(eng.get(0).unwrap().is_some(), "数据应完整可读");
         assert!(eng.get(12 * 64 - 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn ex813_inverted_write_accounting_and_io_budget() {
+        // Ex-8.13 切片 1：倒排 seg 写盘统一记账（inverted_written_bytes）+ 后台 IO 预算
+        // 接线（attach/set_io_rate_bytes 不改变写入语义；默认 rate0=不启用）
+        // 1) 默认无预算：flush 后写盘字节 >0（记账累计）
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(e.inverted_written_bytes(), 0);
+        for i in 0..500u64 {
+            let d = format!("{{\"a\":{i}}}").into_bytes();
+            e.put_nosync(i, d, &["a=1"]).unwrap();
+        }
+        e.flush_inverted().unwrap();
+        let w0 = e.inverted_written_bytes();
+        assert!(w0 > 0, "倒排刷段应累计写盘字节");
+        // 2) 启用预算（rate>0）attach 不报错、写入语义不变（写盘仍累计、可读回）
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut cfg2 = crate::config::Config::default();
+        cfg2.storage.io_rate_limit_mb = 1024; // 大预算：acquire 不阻塞
+        let mut e2 = Engine::open(dir2.path(), &cfg2).unwrap();
+        for i in 0..500u64 {
+            let d = format!("{{\"a\":{i}}}").into_bytes();
+            e2.put_nosync(i, d, &["a=1"]).unwrap();
+        }
+        e2.flush_inverted().unwrap();
+        assert!(e2.inverted_written_bytes() > 0, "预算开启下刷段仍记账");
+        assert!(e2.get(100).unwrap().is_some(), "写路径不受预算影响");
+        // 3) 再次刷段 → 记账单调累计（多次 seg 写盘字节和）
+        e2.put_nosync(999, b"{}".to_vec(), &["a=1"]).unwrap();
+        e2.flush_inverted().unwrap();
+        assert!(e2.inverted_written_bytes() > w0);
     }
 
     #[test]

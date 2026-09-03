@@ -26,6 +26,10 @@
 - 双入口（写路径 auto_compact + 维护线程）同 RwLock 写锁串行即正确；维护每 tick 先读锁快检防轮询开销。
 - 先抽 io_budget 共享模块（SST 与 seg 共用），避免两套限速。
 - 默认关闭（或仅 io_rate_limit_mb>0 启动），验收达标才默认开（P3 惯例）。
+- **切片 2 前置约束（2026-09-04 实测发现）**：Engine 自身**无内部 RwLock**（锁在 gateway/server 层）；
+  后台维护线程直接调 Engine::compact/flush_inverted 与 server 写锁并发不安全 → 切片 2 需先
+  在 Engine 内建共享 RwLock（open 时初始化，写路径/查询经读锁、维护写锁），或维护线程由
+  server 调度层在无写会话窗口触发（二者择一，切片 2 设计时定）。切片 1（io_budget 记账）已落地无此依赖。
 
 ## 5. 实现顺序（demo-first）
 0. demo（src/demo/idle-maintenance）：公共 API 模拟"空闲窗口维护队列"（写突发 vs 空闲维护）验证收益 → 边界测试。
