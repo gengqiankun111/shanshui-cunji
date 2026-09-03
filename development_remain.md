@@ -138,17 +138,18 @@
   - [x] 全扫（无窗口）语义不变（全部文件照旧）
   - [x] demo/单测（scan_prunes_disjoint_ssts_windows：3 不相交文件 × 8 窗口收集==流式 +
     全扫/跨文件边界/越界空窗口）
-- **Ex-8.3（P1）扫描路径块缓存 + keys-only 投影**：
-  - [x] Part A ✅（0d8fdcf，555 全绿）：SstRangeIter 可选块缓存（new_cached/new_keys_cached，
-    与点查同 key=文件+块 offset）——读块写穿 + 全组命中免磁盘 IO/解压；scan_stream_at /
-    count_keys_range_filtered 挂 CF block_cache（此前仅点查挂载）
-  - [ ] Part B：纯 `SELECT id` 窗口扫描走 keys-only 解码（7.100 `decode_data_block_keys` 扩展到
-    有界窗口 + 行式值跳过；PAX 回退）并接线 mysql 投影判定
-  - [ ] demo/单测：scan_block_cache_warm_repeat_consistent ✅（预热后重复窗口一致）；Part B
-    keys-only 窗口 vs 全解码同结果 + 热点窗口块缓存命中
+- **Ex-8.3（P1）扫描路径块缓存 + keys-only 投影** — ✅ 完成（Part A 0d8fdcf + Part B bbb1c7a，556 全绿）
+  - [x] Part A：SstRangeIter 可选块缓存（new_cached/new_keys_cached，与点查同 key=文件+块
+    offset）——读块写穿 + 全组命中免磁盘 IO/解压；scan_stream_at / count_keys_range_filtered
+    挂 CF block_cache（此前仅点查挂载）
+  - [x] Part B：CF::scan_stream_keys（keys 流式：折叠 + Tombstone 跳过 + 早停，SST 端
+    new_keys_cached 免值解码）+ Engine::scan_stream_ids（位图过滤）；mysql 非事务 id BETWEEN
+    纯 `SELECT id`（无聚合/ORDER BY）改走 keys-only
+  - [x] 单测：scan_block_cache_warm_repeat_consistent + scan_stream_ids_matches_scan_stream
+    （覆盖折叠/删除位图/多文件/越界窗口 keys-only 与全值 docid 集一致）
 - **Ex-8.4（远期，不主动排期）**：L1/L2 B+Tree 存储替换（触发条件见 design_remain §7.2）
-- **验收**：Ex-8.1~8.3 落地后 50m 范围查询对照复测（tmp_bench_mysql_vs_scc_50m.py + probe），
-  目标 MySQL 差距 100× → 个位数×；全量回归全绿后按工作流提交 + 回填 feature_remain / development.md 7.x
+- **验收**：Ex-8.1~8.3 ✅ 全部落地（e63603a / 49469f6 / 0d8fdcf+bbb1c7a）；
+  50m release 复测（Ex-8.1 已验证 86→3.1ms；Ex-8.2/8.3 后范围 p50 与重复窗口命中待复测）
 
 ## 12. MemTable/写侧与倒排提案采纳候选（design_remain §8，2026-09-03 排期）
 
