@@ -322,6 +322,10 @@
     （仅需组键值，无大文档 IO）；`SUM(amount) WHERE status='x'` 单 term 直读。限制：跨段同 docid 同
     term 覆盖（update）求和略高估（同 Ex-9.1b 注）；文档缺 stats 字段按 0 计（MySQL NULL 语义差异文档化）；
     单值字段分区假设下 NULL 组 = 全文档数 − Σdoc_count（待做：全文档数快计或声明限制）。
+  - **落地进度（2026-09-03）**：① mem 写路径累积 + Engine put 透传 ✅（5a792cc）→ ② 段格式 v5 写/读 +
+    GC 合并保持载荷 ✅（e52941a，592 全绿）→ ③ 引擎 API + sqlish 路由：`SUM/AVG/MIN/MAX(stats_field)
+    WHERE f='v'` 裸等值走倒排载荷免全扫，未命中回落全扫数值一致 ✅（本期，593 全绿）→ ④ GROUP BY 逐
+    term 词典枚举聚合（待做：需倒排词典 term 前缀遍历）→ ⑤ 50m A/B 与全量回归（待做）。
   - 后续小节：实现顺序 = ① mem 写路径累积 + Engine put 透传 stats 值 → ② 段格式 v5 写/读 → ③
     GC/合并载荷保持 → ④ `sum_stats`/引擎 API + sqlish GROUP BY/SUM 路由 → ⑤ 50m A/B 与全量回归
 - **远期不排期**：组合索引范围聚合（依赖 B+Tree 化，Ex-8.4 触发链）、物化视图 / 聚合缓存（TTL/失效语义待产品化）

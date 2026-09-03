@@ -1302,6 +1302,12 @@ impl Engine {
         self.inverted.term_stats(term).ok().flatten()
     }
 
+    /// Ex-9.3：字段是否声明为倒排统计载荷字段（返回其在 stats_fields 中的位序，
+    /// 用于定位 term 统计的对应聚合列）。
+    pub fn stats_field_pos(&self, field: &str) -> Option<usize> {
+        self.stats_fields.iter().position(|x| x == field)
+    }
+
     /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
     /// 不随扫描总量膨胀（旧实现先全量收集 O(total) 再截断）；`total` = 范围行数
     /// （全扫计数，limit 取满页后仅计数不回表，语义与全量一致）。

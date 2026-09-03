@@ -1505,6 +1505,43 @@ pub fn execute_aggregate(engine: &Engine, sql: &str) -> Result<Option<AggScalar>
             text: n.to_string(),
         }));
     }
+    // Ex-9.3 第③步：`SUM/AVG/MIN/MAX(stats_field) ... WHERE f='v'`（裸等值、无排序/分组）
+    // → 倒排 term 统计载荷免全扫（内存累积 + v5 段载荷；仅 stats_fields 声明字段可路由；
+    // 未命中（未声明/term 无统计/多条件）→ 回落既有全量扫描，结果语义不变）。
+    if matches!(name.as_str(), "sum" | "avg" | "min" | "max") {
+        if let (Some(f), Some(WhereExpr::Cond(c))) = (field.as_ref(), sel.where_expr.as_ref()) {
+            if c.op == CmpOp::Eq
+                && c.field != "docid"
+                && sel.order_by.is_empty()
+                && sel.limit.is_none()
+                && engine.stats_field_pos(f).is_some()
+            {
+                let term = format!("{}={}", c.field, c.value);
+                if let Some(st) = engine.inverted_term_stats(&term) {
+                    if let Some(pos) = engine.stats_field_pos(f) {
+                        if let Some(a) = st.get(pos) {
+                            if a.n > 0 {
+                                let text = match name.as_str() {
+                                    "sum" => fmt_num(a.sum),
+                                    "avg" => fmt_num(a.sum / a.n as f64),
+                                    "min" => fmt_num(a.min),
+                                    "max" => fmt_num(a.max),
+                                    _ => unreachable!(),
+                                };
+                                let arg = field.as_deref().unwrap_or("*");
+                                let header = format!("{}({arg})", name.to_uppercase());
+                                return Ok(Some(AggScalar { header, is_null: false, text }));
+                            }
+                            // 子集内无数值行 → SQL NULL（与全扫一致），仍走快路径
+                            let arg = field.as_deref().unwrap_or("*");
+                            let header = format!("{}({arg})", name.to_uppercase());
+                            return Ok(Some(AggScalar { header, is_null: true, text: String::new() }));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let guard = engine.query_guard();
     let mut count = 0u64;
     let mut n_num = 0u64;
@@ -2148,6 +2185,56 @@ mod tests {
         );
         // 普通 SELECT → None（走普通查询路径）
         assert!(execute_aggregate(&e, "SELECT * FROM t WHERE amount>900").unwrap().is_none());
+    }
+
+    #[test]
+    fn stats_load_fast_path_matches_scan() {
+        // Ex-9.3 第③步：SUM/AVG/MIN/MAX ... WHERE f='v'（裸等值）走倒排统计载荷，
+        // 与无统计全扫路径数值一致（stats_fields 声明字段才路由，否则回落全扫）。
+        let put = |e: &mut crate::engine::Engine, id: u64, st: &str, amt: Option<f64>| {
+            let mut d = serde_json::json!({"status": st});
+            if let Some(a) = amt {
+                d["amount"] = serde_json::json!(a);
+            }
+            let b = serde_json::to_vec(&d).unwrap();
+            let t: &[&str] = &[if st == "active" { "status=active" } else { "status=inactive" }];
+            e.put_nosync(id, b, t).unwrap();
+        };
+        // 有统计配置
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.stats_fields = vec!["amount".to_string()];
+        let mut es = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        put(&mut es, 1, "active", Some(10.0));
+        put(&mut es, 2, "active", Some(20.0));
+        put(&mut es, 3, "active", None); // 缺 amount：不参与数值聚合（MySQL NULL 语义）
+        put(&mut es, 4, "inactive", Some(5.0));
+        let agg = |e: &mut crate::engine::Engine, sql: &str| {
+            execute_aggregate(e, sql).unwrap().unwrap()
+        };
+        assert_eq!(agg(&mut es, "SELECT SUM(amount) FROM t WHERE status='active'").text, "30");
+        assert_eq!(agg(&mut es, "SELECT AVG(amount) FROM t WHERE status='active'").text, "15");
+        assert_eq!(agg(&mut es, "SELECT MIN(amount) FROM t WHERE status='active'").text, "10");
+        assert_eq!(agg(&mut es, "SELECT MAX(amount) FROM t WHERE status='active'").text, "20");
+        assert_eq!(agg(&mut es, "SELECT SUM(amount) FROM t WHERE status='inactive'").text, "5");
+        // 无统计配置：全扫回落，数值一致
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut en = crate::engine::Engine::open(dir2.path(), &crate::config::Config::default()).unwrap();
+        put(&mut en, 1, "active", Some(10.0));
+        put(&mut en, 2, "active", Some(20.0));
+        put(&mut en, 3, "active", None);
+        put(&mut en, 4, "inactive", Some(5.0));
+        for sql in [
+            "SELECT SUM(amount) FROM t WHERE status='active'",
+            "SELECT AVG(amount) FROM t WHERE status='active'",
+            "SELECT MAX(amount) FROM t WHERE status='active'",
+            "SELECT SUM(amount) FROM t WHERE status='inactive'",
+        ] {
+            let a = agg(&mut es, sql);
+            let b = agg(&mut en, sql);
+            assert_eq!(a.text, b.text, "{sql} 快路径应等于全扫");
+            assert_eq!(a.is_null, b.is_null, "{sql} NULL 语义一致");
+        }
     }
 
     #[test]
