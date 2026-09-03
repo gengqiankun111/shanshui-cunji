@@ -3423,6 +3423,7 @@ mod tests {
         // （L1 热档段下沉 L2 必须全量重压缩）；收敛后 L2 单段 + 数据完整 + 重启可读
         let dir = tmp();
         let mut cfg = Config::default(); // compression=zstd level3
+        cfg.storage.l1_trigger_files = 0; // 本测针对 L1→L2 分层收敛语义（默认 8 延迟不影响）
         cfg.sstable.compression_level_l2 = 19;
         cfg.blockcache.block_size_kb = 1;
         cfg.memtable.max_size_mb = 256;

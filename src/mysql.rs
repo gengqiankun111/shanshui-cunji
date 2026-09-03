@@ -1229,7 +1229,14 @@ fn txn_read_current(
     if let Some(own) = txn.read_own(docid) {
         return Ok(own.map(|v| v.to_vec()));
     }
-    engine.get(docid)
+    let v = engine.get(docid)?;
+    // P1-4：FOR UPDATE 当前读命中 → 记录锁定版本（读取时引擎最新 seq）；提交时写该键
+    // 若期间无并发再改则放行（对齐 MySQL 当前读后写语义）。行不存在（None）不锁。
+    if v.is_some() {
+        let seq = engine.last_write_seq(docid)?;
+        txn.mark_current_lock(docid, seq);
+    }
+    Ok(v)
 }
 
 /// 缺陷 A：事务内**范围当前读**（SELECT … FOR UPDATE + id BETWEEN/范围）——基表 = 引擎
@@ -1249,6 +1256,13 @@ fn txn_scan_current(
         )));
     }
     let mut out: Vec<crate::engine::QueryRow> = engine.scan_range(start, end)?;
+    // P1-4：范围当前读命中行 → 记录锁定版本（引擎最新 seq；自写行 read_own 属写集，无需锁）
+    for row in &out {
+        if txn.read_own(row.0).is_none() {
+            let seq = engine.last_write_seq(row.0)?;
+            txn.mark_current_lock(row.0, seq);
+        }
+    }
     // 同事务写覆盖：已出现的行用 read_own 最新值替换 / 本事务删除（None）置空 → 下方过滤
     for row in out.iter_mut() {
         if let Some(own) = txn.read_own(row.0) {
@@ -6083,10 +6097,9 @@ mod tests {
             QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 1),
             r => panic!("FOR UPDATE 点查失败"),
         }
-        // FOR UPDATE 后同事务 UPDATE（快照内行）并 commit（锁/写路径闭合）。
-        // 注：RR 保守策略下对"快照外新提交行"（如 s2 刚插的 id=4）当前读后可读，
-        // 但随后写该行 commit 会被并发冲突判定拒绝（保守近似，见 development_remain 注记）。
-        match super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":11}' WHERE id=1", &mut s1) {
+        // P1-4 修复：FOR UPDATE 读到"快照外新提交行"后同事务 UPDATE + COMMIT 应成功
+        //（当前读锁定版本期间无并发再改 → 放行，对齐 MySQL RR 当前读后写语义）
+        match super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":44}' WHERE id=4", &mut s1) {
             QueryResponse::Ok(1, _) => {}
             r => panic!("FOR UPDATE 后同事务 UPDATE 失败"),
         }
@@ -6105,9 +6118,69 @@ mod tests {
             QueryResponse::Err(1064, _)
         ));
         assert!(matches!(super::dispatch_query(&mut engine, "ROLLBACK", &mut s1), QueryResponse::Ok(0, 0)));
-        // 已提交数据核对：FOR UPDATE 读到的 id=4（s2 插入，k=4）未被改动；同事务改的 id=1 生效
-        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=4")[0][0], b"4");
-        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=1")[0][0], b"11");
+        // 已提交数据核对：FOR UPDATE 读到并同事务 UPDATE 的 id=4 → k=44；未写的 id=1 保持原值
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=4")[0][0], b"44");
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=1")[0][0], b"1");
+    }
+    #[test]
+    fn p1_for_update_conflict_on_concurrent_modify() {
+        // P1-4：FOR UPDATE 当前读锁定集的乐观正确性——
+        // ① 正例：FOR UPDATE 读到（快照外）行后，若期间无并发再改 → 同事务写 commit 成功；
+        // ② 负例：FOR UPDATE 之后、commit 前，他事务又改了同键（seq 前进）→ 提交冲突；
+        // ③ 回归：未 FOR UPDATE 的快照写仍按旧冲突判定（锁定集不误放行）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut engine = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let a1 = Arc::new(AtomicU64::new(1));
+        let a2 = Arc::new(AtomicU64::new(1));
+        let a3 = Arc::new(AtomicU64::new(1));
+        let mut s1 = super::new_session(Arc::clone(&a1));
+        let mut s2 = super::new_session(Arc::clone(&a2));
+        let mut s3 = super::new_session(Arc::clone(&a3));
+        let rows_of = |e: &Engine, sql: &str| -> Vec<Vec<Vec<u8>>> {
+            match select_response(e, sql) {
+                QueryResponse::Set { rows, .. } => rows,
+                _ => panic!("应为 ResultSet: {sql}"),
+            }
+        };
+        for i in 1..=2u64 {
+            insert_response(&mut engine, &format!("INSERT INTO documents(id, doc) VALUES({i}, '{{\"k\":{i}}}')"), &a1);
+        }
+        // ① 正例（锁定期无并发再改 → 放行）
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s1), QueryResponse::Ok(0, 0)));
+        assert!(matches!(
+            super::dispatch_query(&mut engine, "SELECT id FROM documents WHERE id=2 FOR UPDATE", &mut s1),
+            QueryResponse::Set { rows, .. } if rows.len() == 1
+        ));
+        assert!(matches!(super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":20}' WHERE id=2", &mut s1), QueryResponse::Ok(1, _)));
+        assert!(matches!(super::dispatch_query(&mut engine, "COMMIT", &mut s1), QueryResponse::Ok(0, 0)), "无并发再改 → 当前读后写应提交成功");
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=2")[0][0], b"20");
+        // ② 负例：s1 FOR UPDATE 读锁后，s2 再改同键并提交 → s1 写同键 commit 冲突
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s1), QueryResponse::Ok(0, 0)));
+        assert!(matches!(
+            super::dispatch_query(&mut engine, "SELECT id FROM documents WHERE id=1 FOR UPDATE", &mut s1),
+            QueryResponse::Set { rows, .. } if rows.len() == 1
+        ));
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s2), QueryResponse::Ok(0, 0)));
+        assert!(matches!(super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":100}' WHERE id=1", &mut s2), QueryResponse::Ok(1, _)));
+        assert!(matches!(super::dispatch_query(&mut engine, "COMMIT", &mut s2), QueryResponse::Ok(0, 0)));
+        assert!(matches!(super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":9}' WHERE id=1", &mut s1), QueryResponse::Ok(1, _)));
+        match super::dispatch_query(&mut engine, "COMMIT", &mut s1) {
+            QueryResponse::Err(_, _) => {} // 并发再改（seq 前进）→ 乐观锁冲突
+            r => panic!("并发再改后提交应冲突"),
+        }
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=1")[0][0], b"100", "冲突回滚不得覆盖 s2 新值");
+        // ③ 回归：未 FOR UPDATE 的快照写 → 他事务先提交 → 提交冲突（锁定集不放行未锁键）
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s3), QueryResponse::Ok(0, 0)));
+        assert!(matches!(super::dispatch_query(&mut engine, "BEGIN", &mut s2), QueryResponse::Ok(0, 0)));
+        assert!(matches!(super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":200}' WHERE id=1", &mut s2), QueryResponse::Ok(1, _)));
+        assert!(matches!(super::dispatch_query(&mut engine, "COMMIT", &mut s2), QueryResponse::Ok(0, 0)));
+        assert!(matches!(super::dispatch_query(&mut engine, "UPDATE documents SET doc='{\"k\":300}' WHERE id=1", &mut s3), QueryResponse::Ok(1, _)));
+        match super::dispatch_query(&mut engine, "COMMIT", &mut s3) {
+            QueryResponse::Err(_, _) => {} // 未当前读 → 快照后并发写仍冲突（回归）
+            r => panic!("未 FOR UPDATE 的快照写应冲突"),
+        }
+        assert_eq!(rows_of(&engine, "SELECT k FROM documents WHERE id=1")[0][0], b"200");
     }
     #[test]
     fn m1_p0_replace_and_null_auto() {

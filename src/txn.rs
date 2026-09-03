@@ -330,6 +330,12 @@ pub struct Transaction {
     write_set: HashSet<u64>,
     /// 已加锁的 docid（提交/回滚时释放）。
     locks: Vec<u64>,
+    /// 缺陷 A+P1-4（FOR UPDATE 当前读锁定集）：docid → 当前读时引擎最新提交 seq。
+    /// RR 提交写写冲突检测对"快照后被并发提交"的键一律冲突——但 **FOR UPDATE 当前读
+    /// 已显式读到最新版本**（MySQL 语义：当前读加锁后写该行允许）。此集合记录当前读
+    /// 时的最新 seq：提交时若该键最新 seq **仍等于**记录值（期间无并发写）→ 放行；
+    /// 若已被并发事务再次修改（seq 前进）→ 仍按冲突处理（乐观锁正确性）。
+    locked_cur: HashMap<u64, u64>,
     /// T 项：事务内点查快照缓存（docid → 快照读结果）——RR 快照读刻意不走 HotCache
     /// （防污染全局热缓存）→ 事务内重复点查冷读放大；小容量（≤256 项）同 key 二次读直达，
     /// 提交/回滚随 Transaction drop 即弃。仅 RR/SERIALIZABLE 快照读启用（RC 读最新不缓存）。
@@ -347,6 +353,7 @@ impl Transaction {
             ops: Vec::new(),
             write_set: HashSet::new(),
             locks: Vec::new(),
+            locked_cur: HashMap::new(),
             snap_cache: std::collections::HashMap::new(),
             finished: false,
         }
@@ -362,6 +369,17 @@ impl Transaction {
 
     pub fn write_set(&self) -> &HashSet<u64> {
         &self.write_set
+    }
+
+    /// P1-4：记录 FOR UPDATE 当前读锁定（docid → 读取时引擎最新提交 seq）。
+    /// 重复当前读同键以最新一次为准（覆盖旧 seq）。
+    pub fn mark_current_lock(&mut self, docid: u64, seq: u64) {
+        self.locked_cur.insert(docid, seq);
+    }
+
+    /// P1-4：该键是否被本事务 FOR UPDATE 当前读锁定过（返回读取时的最新 seq）。
+    pub fn cur_lock_seq(&self, docid: u64) -> Option<u64> {
+        self.locked_cur.get(&docid).copied()
     }
 
     pub fn is_finished(&self) -> bool {

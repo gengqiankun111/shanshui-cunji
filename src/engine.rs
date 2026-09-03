@@ -837,10 +837,19 @@ impl Engine {
                 txn.add_lock(d);
             }
             // ② 写写冲突检测（RR/SERIALIZABLE）
+            // P1-4：FOR UPDATE **当前读**已显式读到最新版本的行允许写入（MySQL 语义）——
+            // 该键被当前读锁定且最新 seq 仍等于读取时记录值（期间无并发写）→ 放行；
+            // 被并发事务再次修改（seq 前进）→ 仍冲突（乐观锁正确性，不覆盖并发新值）。
             if txn.isolation.checks_write_conflict() {
                 for &d in txn.write_set() {
                     let cur = self.last_write_seq(d)?;
                     if cur > txn.snapshot() {
+                        let locked = txn.cur_lock_seq(d);
+                        if let Some(seen) = locked {
+                            if cur == seen {
+                                continue;
+                            }
+                        }
                         return Err(crate::error::Error::TxnConflict(format!(
                             "txn#{} 写冲突：docid={d} 在快照 {} 后被并发事务修改（当前 seq {cur}）",
                             txn.id,
@@ -882,9 +891,9 @@ impl Engine {
         self.txn_locks.lock().unwrap().release(txn.id);
     }
 
-    /// 写冲突检测辅助：docid 最后一次写入的全局 seq（主数据权威源）。
-    /// 删除位图模式下删除视为当前 seq 的写（保守：宁可多冲突不漏检）。
-    fn last_write_seq(&mut self, docid: u64) -> Result<u64> {
+    /// docid 当前最新提交版本 seq（删除位图已删 → 返回 current_seq 视为已删的"最新"）。
+    /// pub：FOR UPDATE 当前读需记录锁定版本（P1-4）。
+    pub fn last_write_seq(&self, docid: u64) -> Result<u64> {
         if let Some(bm) = &self.deletion_bitmap {
             if bm.is_deleted(docid) {
                 return Ok(self.current_seq());
