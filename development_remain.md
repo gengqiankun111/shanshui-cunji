@@ -491,20 +491,67 @@
 | B. 每表独立引擎/列族集 | 建表 = 新 Engine（子目录）或 CF 对；mysql 层按表路由 | mysql 会话层 + 多实例生命周期；引擎内改动小 | 无跨表查询则成本可控；与"单引擎多 CF"架构（primary/delta/inverted 三 CF）叠加需重设计 |
 | C. 口径单表化（已做 --single） | 测试只在单表跑 | rr-conformance 工具 | 不修引擎；产品多表仍不支持 |
 
-### 影响面清单（方案 A 前置调研要点）
+### 影响面清单（方案 A 前置调研要点，2026-09-03 修订：与 docid_alloc/自动生成统筹）
 
-- docid 语义：`encode_docid`（8B 大端 u64）贯穿 keys/CF/Engine API；表维度需入 key（长度/布局变化 →
-  段格式/键范围剪枝/seq_min 快照剪枝/删除位图页索引受影响）。
-- 倒排：posting docid → 需区分表（term 现无表维度）；位图索引 term 亦同。
-- 删除位图/删除密度/垃圾回收：按 docid 位图需表粒度或表 id 并入 docid。
-- 事务：write_set/锁表/snapshot seq 均全局 —— 多表同 seq 空间无冲突（seq 与表无关），
-  仅 docid 需带表。**若走"表 id 高位 + 全局 docid"**（表编号高位占用 docid 空间）改动最小：
-  docid = table_id << 48 | row_id —— 现有 8B 编码不动、倒排/位图/事务零改，仅 mysql 层按表
-  分配 id 段 + docid 到 SQL id 的编解码。优先评估该子方案。
+- docid 语义：`encode_docid`（8B 大端 u64）贯穿 keys/CF/Engine API；表维度需入 docid。
+  **docid 布局现状约束**：已有分片前缀方案（`docid_alloc.rs`，10 亿阶段 A）——
+  `docid = shard_id(16bit) << 40 | local_id(40bit)`，占高 16 位。多表高位必须与其统筹：
+  - 单机多表子方案：docid = `table_id << 48 | row_id(48)`（table_id 16 位、row_id 48 位，
+    8B 不变，倒排/位图/事务零改）；
+  - 与分片前缀冲突：分片（shard<<40）与表高位不能并存于同一定义 → 需统一 docid 布局决策
+    （如单机用表高位、分片构建入口复用 docid_alloc 的 shard 编码分别路由，或扩位方案留待
+    真分布式多表再评估）；**本期只做单机多表（表高位），不触碰分片路径**。
+- row_id 分配（见 §27）：显式 SQL id 直落 row_id；自动生成 = 表内自增 + 持久水位，
+  与显式 id 并存（冲突走 1062，a 已修）。**不引入 Snowflake**（单机 LSM 自增已最优；
+  分布式唯一已有 docid_alloc 分片前缀，无需时钟/worker 分配）。
+- 倒排：posting docid 无需改（docid 带表后天然隔离）；位图索引 term 亦同。
+- 删除位图/删除密度/垃圾回收：docid 位图按全局 docid，无需表粒度（docid 已编码表）。
+- 事务：write_set/锁表/snapshot seq 全局，seq 与表无关，docid 带表后无冲突。
 - 兼容：既有单表库数据（docid 0..N）视为默认表（table_id=0），零迁移。
+- mysql 层表名解析：INSERT/UPDATE/DELETE/SELECT 表名 → table_id（CREATE TABLE 分配、
+  不回收；上限 65535 表足够）；SQL id ↔ docid 编解码在会话层。
 
 ### 排期状态
 
-- **待排**（P？）：先做方案 A 的"表 id 高位 + 全局 docid"可行性细化（上条子方案），
-  产出 key/API/协议改动清单与既有数据兼容策略后再立项；rr-conformance `--init` 双表即验收场景。
-- 当前不阻塞：`--single` 已绕开对照；现有单表功能与 RR 收敛目标（C1~C6 全绿）已达成。
+- **待排**（P？）：方案 A 单机子方案（table_id 高位 + 全局 docid，row_id 分配见 §27）
+  可行性细化 → 产出 key/API/协议改动清单与兼容策略后立项；rr-conformance `--init` 双表即验收。
+- 当前不阻塞：`--single` 已绕开对照；RR 收敛目标（C1~C6 全绿）已达成。
+
+## 27. DocID 生成与自增主键增强（用户 2026-09-03 分析 + 排期）
+
+### 现状（已核实代码）
+
+- **docid 来源分两层**：引擎层 = 调用方显式传入的 u64 键（put/get/delete docid，无生成逻辑，
+  `encode_docid` 8B 大端）；mysql 兼容层 = 客户端显式 id 直用，**无 id 列 / `id=0` → 共享自增**
+  （`Session.auto_id: Arc<AtomicU64>`，跨连接从 1 起 `fetch_add`——sysbench AUTO_INCREMENT 兼容）。
+- **现有三缺陷**：① auto_id **不持久化**（重启回 1 → 续插撞已提交行 1062）；② 显式 id 与自动 id
+  混用可能碰撞（显式插到 auto_id 将分配值 → 后续自动插入 1062，a 修复后显式化）；③ 无表内
+  隔离（单表下无碍，多表后按 §26 需表内分配器）。
+- 已有分布式 docid 资产：`docid_alloc.rs`（`shard_id<<40 | local_id` 分片前缀 + `ShardLocalAllocator`
+  Atomic 分配），供 10 亿分片构建路径；单机 mysql 路径未走它。
+
+### 技术决策（2026-09-03 分析结论）
+
+- **docid 保持 u64 自增族，不引入 Snowflake**：单机 LSM 写入天然按递增 docid 顺序（友好）；
+  分布式唯一已有分片前缀（无时钟/worker 协调）；Snowflake 的"趋势递增"对 LSM 与自增等价。
+- **自增 = 服务端兜底已存在，增强方向是正确性/持久化**：
+  1. 自动分配起点续接库内水位（启动/首插取 `max_docid+1`，非恒 1）；
+  2. 批量导入用**段预分配**（每批取一段，减 fetch_add 竞争，对齐 10 亿灌数）；
+  3. 多表后分配器按表（row_id 域，见 §26）。
+- AUTO_INCREMENT 语法识别：CREATE TABLE 列属性解析为"该表主键自增"标记（当前列清单解析
+  已忽略列属性，无需新协议）；行为即现有"无 id 列/0 占位自动分配"。
+
+### 排期项
+
+| 项 | 内容 | 状态/优先级 |
+|---|---|---|
+| docid 水位续接 | auto_id 分配器起点 = max_docid+1（首插/启动推进；重启续接不撞库）；显式 id 分配时同步抬水位（防碰撞提前） | 待排 P0（小改，mysql.rs auto_id → 引擎水位感知） |
+| 段预分配 | 批量导入/大 INSERT 用段分配（alloc(start,len)），降低 fetch_add 竞争 | 待排 P1 |
+| 表内 row_id 分配器 | §26 多表落地时：每表 `(table_id, row_id 水位)` 分配器（持久化水位存哪：系统键/列族）；与显式 id 冲突 1062 保持 | 随 §26 立项 |
+| AUTO_INCREMENT 列属性 | CREATE TABLE `id INT AUTO_INCREMENT` 解析（属性忽略→接受）→ 该表插入无 id 走自动 docid | 随 mysql 兼容增强（可与水位续接并行） |
+| Snowflake（远期备选） | 仅当真分布式多写者无协调分配出现时复评（现有 docid_alloc 已覆盖分片场景） | 远期，不主动排期 |
+
+### 验收口径
+
+- 重启后无 id 续插不撞已提交行（水位续接）；显式 id 后自动 id 不撞（水位抬升）；
+  批量导入 10 亿场景分配开销可忽略（段预分配）；rr `--init`/`--single` 与既有 mysql 41、lib 测试全绿。
