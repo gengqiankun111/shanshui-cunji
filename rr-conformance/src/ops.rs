@@ -347,7 +347,9 @@ impl Seg {
 }
 
 /// 生成一个事务的操作序列（键全部分配在本 worker 的 Seg 内 → 跨 worker 零冲突）。
-pub fn gen_txn(rng: &mut StdRng, seg: Seg) -> Vec<Op> {
+/// `lite`（--lite-writes）：SCC 不支持 `UPDATE/DELETE WHERE id IN (...)` → 批量写替换为
+/// 同构批量读（两侧 SQL 仍一致，保证 MySQL 端也不会把本可执行的写吃掉）。
+pub fn gen_txn(rng: &mut StdRng, seg: Seg, lite: bool) -> Vec<Op> {
     let mut ops: Vec<Op> = Vec::new();
     let n = rng.gen_range(2..=6);
     for _ in 0..n {
@@ -362,7 +364,8 @@ pub fn gen_txn(rng: &mut StdRng, seg: Seg) -> Vec<Op> {
                 2 => {
                     // 二级等值（t_combo 才走 Ab 通道；t_test 无二级 → 转主键 sel）。
                     // 普通 SELECT：Ab 无索引，加锁=全表锁，只做纯快照读。
-                    if t == Table::TCombo {
+                    // lite：SCC 事务内仅支持 id= / BETWEEN / IN → Ab 谓词整体跳过。
+                    if t == Table::TCombo && !lite {
                         let (a, b) = (seg.pick_a(rng), rng.gen_range(0..50));
                         ops.push(Op::PointSel { t, k: Key::Ab(a, b) });
                     } else {
@@ -382,12 +385,18 @@ pub fn gen_txn(rng: &mut StdRng, seg: Seg) -> Vec<Op> {
             let lo = rng.gen_range(seg.lo..=max_lo);
             let hi = (lo + rng.gen_range(2..=30)).min(seg.hi);
             match pick {
-                0 => ops.push(Op::RangeSel { t, on: if t == Table::TCombo { Col::A } else { Col::Pk }, lo, hi }),
+                // lite：SCC 事务内不支持 a 列谓词 → 范围读只走主键 id
+                0 => ops.push(Op::RangeSel { t, on: if t == Table::TCombo && !lite { Col::A } else { Col::Pk }, lo, hi }),
                 // RangeFu 只走主键（a 无索引：FOR UPDATE 全表 next-key 锁 → 跨 worker 死锁）
                 1 => ops.push(Op::RangeFu { t, on: Col::Pk, lo, hi }),
                 2 => {
                     let ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
-                    ops.push(Op::BatchUpd { t, ids });
+                    if lite {
+                        // SCC 不支持批量 UPDATE → 同构批量读（覆盖批量读通道）
+                        ops.push(Op::BatchSel { t, ids });
+                    } else {
+                        ops.push(Op::BatchUpd { t, ids });
+                    }
                 }
                 3 => {
                     let items: Vec<(u32, u32, u32)> = (0..rng.gen_range(2..=5))
@@ -397,7 +406,12 @@ pub fn gen_txn(rng: &mut StdRng, seg: Seg) -> Vec<Op> {
                 }
                 4 => {
                     let ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();
-                    ops.push(Op::BatchDel { t, ids });
+                    if lite {
+                        // SCC 不支持批量 DELETE → 同构批量读
+                        ops.push(Op::BatchSel { t, ids });
+                    } else {
+                        ops.push(Op::BatchDel { t, ids });
+                    }
                 }
                 _ => {
                     let ids: Vec<u32> = (0..rng.gen_range(2..=5)).map(|_| seg.pick_existing(rng)).collect();

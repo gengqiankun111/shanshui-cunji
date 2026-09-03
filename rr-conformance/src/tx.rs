@@ -101,6 +101,15 @@ pub fn run_txn(
         TxnOut { committed: false, category: category.to_string(), detail: std::mem::take(log), outer_diff: None }
     };
 
+    // ---------- BEGIN：每事务显式开启（Try 预锁/事务内快照校验须在同一事务内；
+    // 无 BEGIN 时全部 op 走 autocommit，COMMIT/ROLLBACK 为空操作 → RR 语义根本没被测） ----------
+    if let Err(e) = cx.mtx.query_drop("BEGIN") {
+        return cancel(&mut log, format!("BEGIN mysql 失败: {}", compare::classify_err(&e).1), cx);
+    }
+    if let Err(e) = cx.dtx.query_drop("BEGIN") {
+        return cancel(&mut log, format!("BEGIN mydb 失败: {}", compare::classify_err(&e).1), cx);
+    }
+
     // ---------- Try 阶段：预加锁当前读（select for update，两边同时） ----------
     for op in ops {
         let sql = op.try_fu_sql();

@@ -40,6 +40,7 @@ struct Cfg {
     seed: u64,
     out: String,
     ext_every: u64,
+    lite: bool,
     init: bool,
 }
 
@@ -76,6 +77,9 @@ fn main() {
         seed: arg(&args, "--seed", "1").parse().unwrap_or(1),
         out: arg(&args, "--out", "results"),
         ext_every: arg(&args, "--ext-every", "64").parse().unwrap_or(64),
+        // --lite-writes：SCC SQL 层仅支持 `UPDATE/DELETE WHERE id=N`（不支持 IN 列表）
+        // 时使用——把批量写（BatchUpd/BatchDel）替换为同构批量读，两侧执行同一 SQL。
+        lite: has(&args, "--lite-writes"),
         init: has(&args, "--init"),
     };
 
@@ -202,7 +206,7 @@ fn worker(
         if id >= cfg.txns {
             break;
         }
-        let ops = ops::gen_txn(&mut rng, seg);
+        let ops = ops::gen_txn(&mut rng, seg, cfg.lite);
         let out = run_txn(&mut wc, &ops, id, cfg.ext_every);
         let mut cnt = counts.lock().unwrap();
         cnt.txn += 1;
