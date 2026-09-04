@@ -143,6 +143,11 @@ pub struct Engine {
     /// 注销）——compact 前取其最小值作 MVCC 保活水位（见 ColumnFamily::mvcc_keep_floor）：
     /// 最新 seq > floor 的 key 保留多版本，使删除/覆盖前旧快照在 compaction 后仍可回读。
     active_snapshots: RwLock<std::collections::BTreeSet<u64>>,
+    /// P1-C：活跃 docid 集（`COUNT(*)` O(1) 快路径基线）。None = 未初始化（首次
+    /// `count_all_docs` 全键扫一次建基线后置 Some）；写路径增量维护（新 docid put 增 /
+    /// delete 减 / 覆盖不变 / 复活增），purge 复位空集。语义 = 引擎最新视图（删除位图
+    /// 与 Tombstone 双路径一致）；跨线程由 db 层读写锁串行化，此处 Mutex 仅保护懒建/读。
+    live_docids: std::sync::Mutex<Option<RoaringTreemap>>,
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     affinity: crate::affinity::CpuPartition,
@@ -606,6 +611,7 @@ impl Engine {
             dd_min_ratio: cfg.storage.delete_density_min_ratio,
             dd_min_docs: cfg.storage.delete_density_min_docs,
             active_snapshots: RwLock::new(std::collections::BTreeSet::new()),
+            live_docids: std::sync::Mutex::new(None),
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
@@ -764,6 +770,8 @@ impl Engine {
         //     持久性与 WAL 同步（flush_wal 先刷位图后刷 WAL）
         //     Ex-8.7：实际清位（此前已删）→ 减除删除密度净置位数；fetch_max 维护密度分母。
         self.max_docid.fetch_max(docid, Ordering::Relaxed);
+        // P1-C：活跃 docid 增量记账（新 docid / 已删复活 → 插入 +1；覆盖既有不变）
+        self.live_add(docid);
         if let Some(bm) = &self.deletion_bitmap {
             if bm.clear(docid) {
                 self.garbage_marked.fetch_sub(1, Ordering::Relaxed);
@@ -1087,6 +1095,8 @@ impl Engine {
         if let Some(bm) = &self.deletion_bitmap {
             bm.purge();
         }
+        // P1-C：purge 后活跃集复位空（后续 put 从 0 增量）
+        *self.live_docids.lock().unwrap() = Some(RoaringTreemap::new());
         self.pending_inverted.lock().unwrap().clear();
         self.global_seq.store(0, Ordering::Relaxed);
         self.max_docid.store(0, Ordering::Relaxed);
@@ -1193,6 +1203,8 @@ impl Engine {
                 self.delta.delete_prefix(&encode_docid(docid))?;
             }
         }
+        // P1-C：活跃集剔除（删除位图 / Tombstone 双路径；删不存在为幂等 no-op）
+        self.live_remove(docid);
         Ok(())
     }
 
@@ -1226,6 +1238,8 @@ impl Engine {
                     self.delta.delete_prefix(&encode_docid(docid))?;
                 }
             }
+            // P1-C：活跃集剔除（幂等；delete_batch 与 delete 同语义）
+            self.live_remove(docid);
             n += 1;
             // 摊销看门狗：每 4096 行巡检（防超长批量撞硬水位/磁盘熔断）
             if n % 4096 == 0 {
@@ -1832,17 +1846,47 @@ impl Engine {
     /// 7.100 全库可见行计数（COUNT(*) 无 WHERE 快路径）：主数据 key-only 流式计数——
     /// SST keys-only 解码免文档值反序列化/clone；merge 版本语义（同 key 最新、Tombstone
     /// 跳过）与 `scan_stream` 全表扫描一致。
-    pub fn count_all_docs(&self) -> Result<u64> {
-        // Ex-8.1：删除位图启用且存在已删 docid 时，COUNT 与 scan/get 对齐（排除已删），
-        // 否则走 key-only 快速路径（零额外开销）。
-        if let Some(bm) = &self.deletion_bitmap {
-            if bm.deleted_count() > 0 {
-                return self
-                    .primary
-                    .count_keys_range_filtered(None, None, &mut |k| bm.is_deleted_key(k));
+    /// P1-C：懒建活跃 docid 基线（首次 `count_all_docs` 全键扫一次；此后写路径增量
+    /// 维护，读取 O(1)）。keys-only 扫最新视图（Tombstone / 删除位图已隐藏），口径与
+    /// 既有 count_all_docs 完全一致。
+    fn live_ensure(&self) -> Result<()> {
+        let mut g = self.live_docids.lock().unwrap();
+        if g.is_some() {
+            return Ok(());
+        }
+        let mut bm = RoaringTreemap::new();
+        self.scan_stream_ids(None, None, |d| {
+            bm.insert(d);
+            Ok(true)
+        })?;
+        *g = Some(bm);
+        Ok(())
+    }
+
+    /// P1-C：活跃集增量（put 路径）——新 docid / 已删复活 → +1；覆盖既有 docid 不变。
+    fn live_add(&mut self, docid: u64) {
+        let mut g = self.live_docids.lock().unwrap();
+        if let Some(bm) = g.as_mut() {
+            if !bm.contains(docid) {
+                bm.insert(docid);
             }
         }
-        self.primary.count_keys_range(None, None)
+    }
+
+    /// P1-C：活跃集剔除（delete 路径）——幂等（删不存在 / 重复删为 no-op）。
+    fn live_remove(&mut self, docid: u64) {
+        let mut g = self.live_docids.lock().unwrap();
+        if let Some(bm) = g.as_mut() {
+            bm.remove(docid);
+        }
+    }
+
+    /// COUNT(*) 无 WHERE 快路径（P1-C：O(1) 增量计数——首次调用全键扫建基线，
+    /// 此后 put/delete/purge 增量记账；语义与 keys-only 扫描口径一致）。
+    pub fn count_all_docs(&self) -> Result<u64> {
+        self.live_ensure()?;
+        let g = self.live_docids.lock().unwrap();
+        Ok(g.as_ref().map(|b| b.len()).unwrap_or(0))
     }
 
     /// 导出共享后台 IO 限速（design 20.5）：启用/关闭顺序扫描路径限速（MB/s；0 = 关闭）。
@@ -3086,6 +3130,58 @@ mod tests {
         .unwrap();
         assert_eq!(fast2, slow2, "count_keys_range 应与 scan_stream 一致（flush 后）");
         assert_eq!(fast, fast2, "flush 前后计数一致");
+    }
+
+    #[test]
+    fn count_all_docs_incremental_tracks_put_delete_batch_purge() {
+        // P1-C：COUNT(*) O(1) 增量记账——首查懒建基线后，put/覆盖/删除/复活/
+        // delete_batch/purge/重开全路径与 scan 口径一致
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), 0, "空库基线 0");
+        for i in 0..3000u64 {
+            let doc = serde_json::json!({"n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        assert_eq!(e.count_all_docs().unwrap(), 3000, "3000 行");
+        // 覆盖同 docid → 不增
+        e.put(5, br#"{"n":99}"#.to_vec(), &[]).unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), 3000, "覆盖不增");
+        // 单点删除 → 减；删不存在 → 幂等不减
+        e.delete(7).unwrap();
+        e.delete(8).unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), 2998);
+        e.delete(999_999).unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), 2998, "删不存在幂等");
+        // 复活（put 已删 docid）→ 增
+        e.put(7, br#"{"n":7}"#.to_vec(), &[]).unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), 2999);
+        // delete_batch（0..99 除 5/7；其中 8 已删 → 返回 98 项、live 减 97）
+        let n = e.delete_batch((0..100).filter(|d| *d != 5 && *d != 7)).unwrap();
+        assert_eq!(n, 98);
+        assert_eq!(e.count_all_docs().unwrap(), 2902, "delete_batch 增量递减");
+        // 与 scan 口径一致
+        let mut slow = 0u64;
+        e.scan_stream(None, None, |_d, _v| {
+            slow += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(e.count_all_docs().unwrap(), slow, "与 scan 可见行一致");
+        // flush + 重开（重启懒建基线恢复）
+        e.flush_wal().unwrap();
+        e.flush_primary().unwrap();
+        let before = e.count_all_docs().unwrap();
+        drop(e);
+        let e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        assert_eq!(e2.count_all_docs().unwrap(), before, "重开基线一致");
+        // purge → 0 复位，再写增量
+        let mut e3 = Engine::open(dir.path(), &cfg()).unwrap();
+        e3.purge_all().unwrap();
+        assert_eq!(e3.count_all_docs().unwrap(), 0, "purge 后复位 0");
+        e3.put(1, br#"{"a":1}"#.to_vec(), &[]).unwrap();
+        e3.put(2, br#"{"a":2}"#.to_vec(), &[]).unwrap();
+        assert_eq!(e3.count_all_docs().unwrap(), 2, "purge 后续写增量");
     }
 
     #[test]
