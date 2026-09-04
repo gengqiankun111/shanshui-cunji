@@ -2620,26 +2620,60 @@ pub fn execute_aggregate_window(
     let candidate = candidate_posting(engine, sel.where_expr.as_ref(), start, end)?;
     match candidate {
         Some(post) => {
+            // P1-D（2026-09-04 扩展）：倒排候选收敛后**按需解列**——只回表 WHERE 引用
+            // 字段 + 聚合字段（PAX 列解码 / 行式按需字段提取，P86②/P87② 基建），替代整行
+            // `engine.get` 全 25 列解码；残余范围/BETWEEN 条件在**子集文档**上判定
+            // （缺失 = 原文档缺失语义，结果与整行路径精确一致）。512/块批量回表。
+            let needed = aggregate_needed_fields(sel.where_expr.as_ref(), field.as_deref());
+            let mut chunk: Vec<u64> = Vec::with_capacity(512);
             for docid in post {
-                scanned += 1;
+                chunk.push(docid);
+                if chunk.len() < 512 {
+                    continue;
+                }
+                scanned += chunk.len() as u64;
                 if scanned % 4096 == 0 && guard.is_expired() {
                     return Err(Error::QueryTooExpensive(
                         "类 SQL 聚合候选扫描超时（熔断中止）".into(),
                     ));
                 }
-                // 窗口外候选跳过（posting 为全库口径，多表窗口交集在此过滤）
-                if let Some(s) = start {
-                    if (docid as u64) < s {
-                        continue;
+                let fv = engine.batch_get_fields(&chunk, &needed)?;
+                for (d, flds_opt) in chunk.drain(..).zip(fv.into_iter()) {
+                    // 窗口外候选跳过（posting 为全库口径，多表窗口交集在此过滤）
+                    if let Some(s) = start {
+                        if d < s {
+                            continue;
+                        }
                     }
-                }
-                if let Some(e) = end {
-                    if (docid as u64) > e {
-                        continue;
+                    if let Some(e) = end {
+                        if d > e {
+                            continue;
+                        }
                     }
+                    let Some(vals) = flds_opt else { continue };
+                    let doc = subset_doc(&needed, &vals);
+                    let bytes = serde_json::to_vec(&doc).unwrap_or_default();
+                    acc(&bytes)?;
                 }
-                if let Some(v) = engine.get(docid as u64)? {
-                    acc(&v)?;
+            }
+            if !chunk.is_empty() {
+                scanned += chunk.len() as u64;
+                let fv = engine.batch_get_fields(&chunk, &needed)?;
+                for (d, flds_opt) in chunk.drain(..).zip(fv.into_iter()) {
+                    if let Some(s) = start {
+                        if d < s {
+                            continue;
+                        }
+                    }
+                    if let Some(e) = end {
+                        if d > e {
+                            continue;
+                        }
+                    }
+                    let Some(vals) = flds_opt else { continue };
+                    let doc = subset_doc(&needed, &vals);
+                    let bytes = serde_json::to_vec(&doc).unwrap_or_default();
+                    acc(&bytes)?;
                 }
             }
         }
@@ -2704,6 +2738,58 @@ fn candidate_posting(
         }
     }
     Ok(None)
+}
+
+/// P1-D 扩展：聚合查询（WHERE + 聚合列）引用的顶层字段集——供 posting 候选收敛后的
+/// **按需解列**（只回表这些字段，免整行 25 列解码）。点路径（`a.b`）取顶层键
+/// （子树整体解出，谓词/聚合走 Value 路径时可下钻）；去重。
+fn aggregate_needed_fields(where_expr: Option<&WhereExpr>, agg: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    fn push(mut s: &str, out: &mut Vec<String>) {
+        if let Some(p) = s.find('.') {
+            s = &s[..p];
+        }
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    fn walk(e: &WhereExpr, out: &mut Vec<String>) {
+        match e {
+            WhereExpr::Cond(c) => push(&c.field, out),
+            WhereExpr::Between { field, .. } => push(field, out),
+            WhereExpr::Like { field, .. } => push(field, out),
+            WhereExpr::Not(x) => walk(x, out),
+            WhereExpr::And(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            WhereExpr::Or(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+        }
+    }
+    if let Some(we) = where_expr {
+        walk(we, &mut out);
+    }
+    if let Some(f) = agg {
+        push(f, &mut out);
+    }
+    out
+}
+
+/// P1-D 扩展：按需字段字节 → 子集 JSON 对象（缺失字段 → 键缺省 = 原文档缺省语义；
+/// `b"null"` → JSON null；非法字节忽略——与整行解析的缺省语义一致）。
+fn subset_doc(fields: &[String], vals: &[Option<Vec<u8>>]) -> Value {
+    let mut m = serde_json::Map::new();
+    for (f, v) in fields.iter().zip(vals.iter()) {
+        if let Some(bytes) = v {
+            if let Ok(vv) = serde_json::from_slice::<Value>(bytes) {
+                m.insert(f.clone(), vv);
+            }
+        }
+    }
+    Value::Object(m)
 }
 
 // ---------------------------------------------------------------------------
@@ -4708,6 +4794,76 @@ mod tests {
         assert_eq!(tz.parse::<f64>().unwrap(), 0.0, "全零行 SUM=0（行级回退不误报 NULL）");
         let (_, _, cz) = agg_scalar(&e2, "SELECT COUNT(z) FROM t");
         assert_eq!(cz, "50");
+    }
+
+    // ---------- P1-D：倒排候选收敛聚合的范围/组合条件扩展（按需解列） ----------
+
+    #[test]
+    fn p1d_candidate_projected_agg_range_and_combo() {
+        // P1-D：`SUM/COUNT(...) WHERE 倒排等值 AND 范围`——posting 候选收敛后按需解列
+        // （只回表 WHERE 引用字段 + 聚合字段），残余范围条件在子集文档判定；结果与全扫一致。
+        let e = engine_with_docs(); // docid i：status active 当 i%3==0；amount = i*10；city 循环
+        // SUM + AND(等值, 范围)：active 且 amount>=150 → i=15..99 step3（29 行）sum=10*(15+18+...+99)=16530
+        let a = execute_aggregate(
+            &e,
+            "SELECT SUM(amount) FROM t WHERE status='active' AND amount>=150",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!a.is_null);
+        assert_eq!(a.text, "16530");
+        // COUNT(*) 同条件 = 29
+        let c = execute_aggregate(
+            &e,
+            "SELECT COUNT(*) FROM t WHERE status='active' AND amount>=150",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.text, "29");
+        // AVG 组合（行级精确，聚合字段 amount 同时参与范围谓词）
+        let m = execute_aggregate(
+            &e,
+            "SELECT AVG(amount) FROM t WHERE status='active' AND amount>=150",
+        )
+        .unwrap()
+        .unwrap();
+        assert!((m.text.parse::<f64>().unwrap() - 16530.0 / 29.0).abs() < 1e-6);
+        // BETWEEN + 倒排候选：active 且 amount∈[200,500] → i=21..48 step3（10 行）sum=3450
+        let b = execute_aggregate(
+            &e,
+            "SELECT SUM(amount) FROM t WHERE status='active' AND amount BETWEEN 200 AND 500",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(b.text, "3450");
+        // 非聚合字段范围 + 分组字段组合：city='shenzhen'（i%3==2）AND amount∈[150,350]
+        // → i=17..35 step3（7 行）sum=1820
+        let d = execute_aggregate(
+            &e,
+            "SELECT SUM(amount) FROM t WHERE city='shenzhen' AND amount BETWEEN 150 AND 350",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(d.text, "1820");
+        // 无匹配组合（范围外）→ SUM NULL
+        let none = execute_aggregate(
+            &e,
+            "SELECT SUM(amount) FROM t WHERE status='active' AND amount>=100000",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(none.is_null, "无命中 SUM → SQL NULL");
+        // 候选解列字段去重（WHERE 重复引用同字段不重复回表）
+        assert_eq!(
+            aggregate_needed_fields(
+                parse_select("SELECT * FROM t WHERE status='a' AND status='b' AND amount>1")
+                    .unwrap()
+                    .where_expr
+                    .as_ref(),
+                Some("amount")
+            ),
+            vec!["status".to_string(), "amount".to_string()]
+        );
     }
 }
 
