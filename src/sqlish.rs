@@ -1655,6 +1655,93 @@ struct SortRow {
     keys: Vec<SortKey>,
 }
 
+/// P0-B：Top-K 有界堆排序——BinaryHeap 保持 top-K，内存 O(K) 替代 O(N) 全排序。
+/// 堆存储"最差的 K 个"（max-heap by reverse order），超 K 时弹最差 → 留最优 K 个。
+fn topk_sort(
+    engine: &Engine,
+    bitmap: &RoaringBitmap,
+    order_by: &[(String, bool)],
+    k: usize,
+    offset: u64,
+    limit: u64,
+    guard: &crate::watchdog::QueryGuard,
+) -> Result<Vec<QueryRow>> {
+    // 比较函数：按 order_by 排序键比较（含 DESC）
+    let cmp_rows = |a: &SortRow, b: &SortRow| -> std::cmp::Ordering {
+        for (((_, desc), k1), k2) in order_by.iter().zip(&a.keys).zip(&b.keys) {
+            let mut ord = cmp_sort_key(k1, k2);
+            if *desc {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
+    // 简化：直接用 Vec + 手动管理 top-K（避免 Ord trait 复杂性）
+    let mut heap: Vec<SortRow> = Vec::with_capacity(k + 1);
+    let mut n = 0u64;
+    for docid in bitmap {
+        n += 1;
+        if n % 4096 == 0 && guard.is_expired() {
+            return Err(Error::QueryTooExpensive(format!(
+                "Top-K 排序超时（已扫 {n} 条，熔断中止）"
+            )));
+        }
+        if let Some(v) = engine.get(docid as u64)? {
+            let keys: Vec<SortKey> = order_by.iter().map(|(f, _)| sort_key(&v, f)).collect();
+            let row = SortRow { docid: docid as u64, doc: v, keys };
+            if heap.len() < k {
+                heap.push(row);
+                // 上浮
+                let mut i = heap.len() - 1;
+                while i > 0 {
+                    let parent = (i - 1) / 2;
+                    if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
+                        heap.swap(i, parent);
+                        i = parent;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // 堆满：比堆顶（最差）更好 → 替换
+                if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
+                    heap[0] = row;
+                    // 下沉
+                    let mut i = 0;
+                    let n = heap.len();
+                    loop {
+                        let mut smallest = i;
+                        let l = 2 * i + 1;
+                        let r = 2 * i + 2;
+                        if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater {
+                            smallest = l;
+                        }
+                        if r < n && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater {
+                            smallest = r;
+                        }
+                        if smallest == i { break; }
+                        heap.swap(i, smallest);
+                        i = smallest;
+                    }
+                }
+            }
+        }
+    }
+    // 排序 top-K
+    heap.sort_by(|a, b| cmp_rows(a, b));
+    let mut out = Vec::new();
+    for r in heap.into_iter().skip(offset as usize) {
+        if out.len() as u64 >= limit {
+            break;
+        }
+        out.push((r.docid, r.doc));
+    }
+    Ok(out)
+}
+
 /// b：事务覆盖视图谓词复检——对单个文档判断其（含同事务写后的）JSON 是否命中 SQL 的
 /// WHERE 条件。sql 形如 `SELECT … FROM t WHERE <cond>`（仅使用 where_expr；无 WHERE → true）。
 /// 文档 JSON 解析失败 / 谓词解析失败 → false（对齐求值端语义：字段缺失不命中）。
@@ -1682,14 +1769,16 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
             "GROUP BY 查询须经分组执行入口 execute_group_by".into(),
         ));
     }
+    // P0-D：JOIN 路由——有 JOIN 子句时走 execute_join（参考 research/optimizer_proces.md 阶段 2）。
+    // review 修复（2026-09-04）：须在组合索引之前——若主表 WHERE 命中 composite_indexes，
+    // 组合索引会返回纯主表行并把 JOIN 静默丢弃（错结果）。
+    if sel.join.is_some() {
+        return execute_join(engine, &sel, cap);
+    }
     // P0-A：声明式组合索引路由——WHERE 等值前缀匹配 composite_indexes 时走 cidx 前缀扫描。
     // 匹配规则：提取 WHERE 中所有等值条件 → 按 composite_indexes 最左前缀匹配 → 取最长匹配。
     if let Some(rows) = try_composite_index(engine, &sel, cap)? {
         return Ok(rows);
-    }
-    // P0-D：JOIN 路由——有 JOIN 子句时走 execute_join（参考 research/optimizer_proces.md 阶段 2）
-    if sel.join.is_some() {
-        return execute_join(engine, &sel, cap);
     }
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
@@ -1724,6 +1813,13 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
         None => full_docids(engine, &guard)?,
     };
     if sort {
+        // P0-B：Top-K 有界堆——有 LIMIT 时用 BinaryHeap 保持 top-K（LIMIT+OFFSET），
+        // 内存 O(K) 替代 O(N) 全排序；无 LIMIT 时回退原全排序（有 SORT_MAX_ROWS 守卫）。
+        let k = sel.offset + limit;
+        if sel.limit.is_some() && k > 0 {
+            return topk_sort(engine, &bitmap, &sel.order_by, k as usize, sel.offset, limit, &guard);
+        }
+        // 无 LIMIT：回退原全排序路径（守卫不变）
         if bitmap.len() as usize > SORT_MAX_ROWS {
             return Err(Error::QueryTooExpensive(format!(
                 "ORDER BY 候选集过大（{} 行，上限 {}），请加 WHERE 收敛或用 LIMIT",
@@ -3380,6 +3476,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows4.len(), 3, "INNER JOIN 仍 3 条（无匹配不出现）");
+    }
+
+    /// P0-B：Top-K 有界堆——大候选集 ORDER BY LIMIT 不再被拒绝。
+    #[test]
+    fn topk_order_by_large_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // 写入 30 万行（超过 SORT_MAX_ROWS=20 万）
+        for i in 0..300_000u64 {
+            let doc = serde_json::json!({"k": format!("key{i}"), "amount": i});
+            e.put_nosync(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e.flush_wal().unwrap();
+
+        // ORDER BY amount LIMIT 10 → Top-K 堆，不再拒绝
+        let rows = execute(&e, "SELECT * FROM t ORDER BY amount LIMIT 10", 1000).unwrap();
+        assert_eq!(rows.len(), 10, "Top-K 返回 10 行");
+        // 验证排序正确（amount 0~9 升序）
+        for (i, (_, doc)) in rows.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_slice(doc).unwrap();
+            assert_eq!(v["amount"].as_u64().unwrap(), i as u64, "第 {i} 行 amount={i}");
+        }
+
+        // ORDER BY amount DESC LIMIT 5 → 降序 top-5
+        let rows2 = execute(&e, "SELECT * FROM t ORDER BY amount DESC LIMIT 5", 1000).unwrap();
+        assert_eq!(rows2.len(), 5, "Top-K DESC 返回 5 行");
+        let v: serde_json::Value = serde_json::from_slice(&rows2[0].1).unwrap();
+        assert_eq!(v["amount"].as_u64().unwrap(), 299999, "DESC 首行 amount=299999");
     }
 }
 
