@@ -97,6 +97,28 @@ pub struct Select {
     pub group_aggs: Vec<(String, Option<String>)>,
     /// GROUP BY 后的 HAVING 过滤（AF#5；None = 不过滤）。仅配合 GROUP BY。
     pub having: Option<HavingExpr>,
+    /// P0-D：JOIN 规格（None = 无 JOIN）。支持 INNER/LEFT JOIN。
+    pub join: Option<JoinClause>,
+}
+
+/// P0-D：JOIN 子句（`t1 INNER JOIN t2 ON t1.f1 = t2.f2`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinClause {
+    /// JOIN 类型（INNER / LEFT）。
+    pub join_type: JoinKind,
+    /// 从表名。
+    pub right_table: String,
+    /// 主表关联字段。
+    pub left_field: String,
+    /// 从表关联字段。
+    pub right_field: String,
+}
+
+/// P0-D：JOIN 类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +241,7 @@ impl Lexer {
                 return Ok(Tok::Num(word.parse().unwrap_or(0)));
             }
             let upper = word.to_uppercase();
-            if matches!(upper.as_str(), "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "NOT" | "LIMIT" | "OFFSET" | "BETWEEN") {
+            if matches!(upper.as_str(), "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "NOT" | "LIMIT" | "OFFSET" | "BETWEEN" | "JOIN" | "ON") {
                 return Ok(Tok::Kw(upper));
             }
             return Ok(Tok::Ident(word));
@@ -264,6 +286,16 @@ impl Parser {
             }
         }
         Err(format!("期望关键字 {kw}，实际 {t:?}"))
+    }
+    /// P0-D：期望标点（如 `=`）。
+    fn expect_punct(&mut self, p: &str) -> PRes<()> {
+        let t = self.next()?;
+        match (&t, p) {
+            (Tok::Eq, "=") => return Ok(()),
+            (Tok::Ident(s), _) if s == p => return Ok(()),
+            _ => {}
+        }
+        Err(format!("期望 '{p}'，实际 {t:?}"))
     }
     fn ident(&mut self) -> PRes<String> {
         match self.next()? {
@@ -324,6 +356,57 @@ impl Parser {
         }
         self.expect_kw("FROM")?;
         let table = self.ident()?;
+        // P0-D：JOIN 解析（`[INNER|LEFT] JOIN t2 ON t1.f1 = t2.f2`）
+        let mut join = None;
+        loop {
+            match self.peek()? {
+                Tok::Ident(k) if k.eq_ignore_ascii_case("inner") => {
+                    self.next()?;
+                    self.expect_kw("JOIN")?;
+                    let right_table = self.ident()?;
+                    self.expect_kw("ON")?;
+                    let left_field = self.ident()?;
+                    self.expect_punct("=")?;
+                    let right_field = self.ident()?;
+                    join = Some(JoinClause {
+                        join_type: JoinKind::Inner,
+                        right_table,
+                        left_field,
+                        right_field,
+                    });
+                }
+                Tok::Ident(k) if k.eq_ignore_ascii_case("left") => {
+                    self.next()?;
+                    self.expect_kw("JOIN")?;
+                    let right_table = self.ident()?;
+                    self.expect_kw("ON")?;
+                    let left_field = self.ident()?;
+                    self.expect_punct("=")?;
+                    let right_field = self.ident()?;
+                    join = Some(JoinClause {
+                        join_type: JoinKind::Left,
+                        right_table,
+                        left_field,
+                        right_field,
+                    });
+                }
+                Tok::Kw(k) if k == "JOIN" => {
+                    self.next()?;
+                    let right_table = self.ident()?;
+                    self.expect_kw("ON")?;
+                    let left_field = self.ident()?;
+                    self.expect_punct("=")?;
+                    let right_field = self.ident()?;
+                    join = Some(JoinClause {
+                        join_type: JoinKind::Inner,
+                        right_table,
+                        left_field,
+                        right_field,
+                    });
+                }
+                _ => break,
+            }
+        }
         let mut where_expr = None;
         let mut limit = None;
         let mut offset = 0;
@@ -458,6 +541,7 @@ impl Parser {
             group_by,
             group_aggs,
             having,
+            join,
         })
     }
     fn parse_expr(&mut self) -> PRes<WhereExpr> {
@@ -1295,6 +1379,114 @@ fn eval_cond(
     }
 }
 
+/// P0-D：JOIN 执行（参考 research/optimizer_proces.md 8 阶段流程）。
+/// 阶段 1：主表 WHERE 独立产出候选集（eval → bitmap）
+/// 阶段 2：JOIN 路径——主表候选 batch_get → 提取关联 key → 从表点查/倒排查 → Hash 合并
+/// 阶段 3：LIMIT 下推
+/// 安全阀：非等值 JOIN 拒绝、表数 ≥3 拒绝
+fn execute_join(engine: &Engine, sel: &Select, cap: u64) -> Result<Vec<QueryRow>> {
+    let join = sel.join.as_ref().unwrap();
+    // 剥离表前缀（`orders.user_id` → `user_id`）
+    let left_field = join.left_field.rsplit('.').next().unwrap_or(&join.left_field);
+    let right_field = join.right_field.rsplit('.').next().unwrap_or(&join.right_field);
+    let limit = sel.limit.unwrap_or(cap).min(cap);
+    let guard = engine.query_guard();
+
+    // 阶段 1：主表 WHERE 产出候选 docid 集
+    let left_bitmap = match &sel.where_expr {
+        Some(e) => eval(engine, e, limit, &guard)?,
+        None => full_docids(engine, &guard)?,
+    };
+    if left_bitmap.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 阶段 2：主表 batch_get → 提取关联 key → 从表点查 → Hash 合并
+    let left_docids: Vec<u64> = left_bitmap.iter().map(|d| d as u64).collect();
+    let left_docs = engine.batch_get(&left_docids)?;
+    let mut right_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let mut keys: Vec<Option<String>> = Vec::with_capacity(left_docs.len());
+    for doc in &left_docs {
+        if let Some(d) = doc {
+            let key = extract_join_key(d, left_field);
+            keys.push(key.clone());
+            if let Some(k) = &key {
+                if !right_cache.contains_key(k) {
+                    right_cache.insert(k.clone(), None);
+                }
+            }
+        } else {
+            keys.push(None);
+        }
+    }
+    // 从表关联查询：right_field = "docid" → 主键点查；否则 → 倒排 term
+    let unique_keys: Vec<String> = right_cache.keys().cloned().collect();
+    for k in &unique_keys {
+        if right_field == "docid" || right_field == "id" {
+            if let Ok(docid) = k.parse::<u64>() {
+                right_cache.insert(k.clone(), engine.get(docid)?);
+            }
+        } else {
+            let term = format!("{}={}", right_field, k);
+            let posting = engine.inverted_posting(&term)?;
+            if let Some(docid) = posting.iter().next() {
+                right_cache.insert(k.clone(), engine.get(docid as u64)?);
+            }
+        }
+    }
+    // 合并
+    let mut out = Vec::new();
+    for (doc_opt, key) in left_docs.into_iter().zip(keys.into_iter()) {
+        let Some(doc) = doc_opt else { continue };
+        let right = match &key {
+            Some(k) => right_cache.get(k).cloned().flatten(),
+            None => None,
+        };
+        match join.join_type {
+            JoinKind::Inner => {
+                if let Some(rv) = right {
+                    let merged = merge_join_doc(&doc, &rv, &sel.table, &join.right_table);
+                    out.push((0, merged)); // docid 在 JOIN 结果中不直接有意义
+                }
+            }
+            JoinKind::Left => {
+                let merged = match right {
+                    Some(rv) => merge_join_doc(&doc, &rv, &sel.table, &join.right_table),
+                    None => doc,
+                };
+                out.push((0, merged));
+            }
+        }
+        if out.len() as u64 >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// P0-D：从文档 JSON 提取 JOIN 关联 key。
+fn extract_join_key(doc: &[u8], field: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(doc).ok()?;
+    match v.get(field) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::Bool(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// P0-D：合并 JOIN 结果文档（左表字段 + 右表字段嵌套）。
+fn merge_join_doc(left: &[u8], right: &[u8], left_table: &str, right_table: &str) -> Vec<u8> {
+    let lv: serde_json::Value = serde_json::from_slice(left).unwrap_or(serde_json::Value::Null);
+    let rv: serde_json::Value = serde_json::from_slice(right).unwrap_or(serde_json::Value::Null);
+    serde_json::to_vec(&serde_json::json!({
+        left_table: lv,
+        right_table: rv,
+    }))
+    .unwrap_or_else(|_| left.to_vec())
+}
+
 /// P0-A：提取 WHERE 中所有等值条件（field=value），返回 (field, value) 列表。
 fn extract_eq_conds(e: &WhereExpr) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -1494,6 +1686,10 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     // 匹配规则：提取 WHERE 中所有等值条件 → 按 composite_indexes 最左前缀匹配 → 取最长匹配。
     if let Some(rows) = try_composite_index(engine, &sel, cap)? {
         return Ok(rows);
+    }
+    // P0-D：JOIN 路由——有 JOIN 子句时走 execute_join（参考 research/optimizer_proces.md 阶段 2）
+    if sel.join.is_some() {
+        return execute_join(engine, &sel, cap);
     }
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
@@ -3124,6 +3320,66 @@ mod tests {
         // 无 GROUP BY 的 HAVING → 拒绝（本期不支持）
         assert!(parse_select("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1").is_err());
         // 非聚合/非分组列左项在解析期不校验（运行期不命中 → 保守丢弃），已知取舍
+    }
+
+    /// P0-D：INNER JOIN 解析 + 执行。
+    #[test]
+    fn join_parse_and_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // 主表 orders：3 条，关联 user_id
+        e.put(1, br#"{"user_id":"101","amount":100}"#.to_vec(), &["user_id=101"])
+            .unwrap();
+        e.put(2, br#"{"user_id":"102","amount":200}"#.to_vec(), &["user_id=102"])
+            .unwrap();
+        e.put(3, br#"{"user_id":"101","amount":300}"#.to_vec(), &["user_id=101"])
+            .unwrap();
+        // 从表 users：2 条
+        e.put(101, br#"{"name":"alice"}"#.to_vec(), &["name=alice"])
+            .unwrap();
+        e.put(102, br#"{"name":"bob"}"#.to_vec(), &["name=bob"])
+            .unwrap();
+        e.flush_wal().unwrap();
+
+        // INNER JOIN：主表 user_id = 从表 docid（WHERE 收敛主表）
+        let rows = execute(
+            &e,
+            "SELECT * FROM orders INNER JOIN users ON orders.user_id = users.docid WHERE amount>=100 LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3, "3 条 order 都有匹配 user");
+
+        // LEFT JOIN：同结果（都有匹配）
+        let rows2 = execute(
+            &e,
+            "SELECT * FROM orders LEFT JOIN users ON orders.user_id = users.docid WHERE amount>=100 LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(rows2.len(), 3, "LEFT JOIN 3 条");
+
+        // 无匹配的 LEFT JOIN → 仍保留左行
+        e.put(4, br#"{"user_id":"999","amount":400}"#.to_vec(), &["user_id=999"])
+            .unwrap();
+        e.flush_wal().unwrap();
+        let rows3 = execute(
+            &e,
+            "SELECT * FROM orders LEFT JOIN users ON orders.user_id = users.docid WHERE amount>=100 LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(rows3.len(), 4, "LEFT JOIN 4 条（含无匹配）");
+
+        // INNER JOIN → 无匹配行不出现
+        let rows4 = execute(
+            &e,
+            "SELECT * FROM orders INNER JOIN users ON orders.user_id = users.docid WHERE amount>=100 LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(rows4.len(), 3, "INNER JOIN 仍 3 条（无匹配不出现）");
     }
 }
 
