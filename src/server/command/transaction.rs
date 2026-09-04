@@ -1,0 +1,396 @@
+
+//! 会话级事务读与隔离级别（server/command/transaction.rs）：内容拆分自原 db_adapter.rs——
+//! parse_isolation_level、事务内 SELECT（txn_select / txn_select_by_predicate /
+//! txn_read_current / txn_scan_current）与窗口 / 目标 / 限额提取（extract_between_range /
+//! extract_target_ids / extract_limit）。
+
+use crate::engine::Engine;
+use crate::server::*;
+
+
+/// 解析 `SET [SESSION] TRANSACTION ISOLATION LEVEL <level>`（会话级，大写输入）。
+/// 返回 None = 非隔离级别 SET（调用方忽略，返回 OK 保持客户端兼容）。
+/// READ UNCOMMITTED 未单独实现：映射到 READ COMMITTED（我们的事务写提交前
+/// 不可见，天然无脏读，语义比真 RU 更严格、无副作用）。
+pub(crate) fn parse_isolation_level(upper: &str) -> Option<crate::txn::Isolation> {
+    let up = upper.trim();
+    let marker = "TRANSACTION ISOLATION LEVEL";
+    let idx = up.find(marker)?;
+    let tail = up[idx + marker.len()..].trim();
+    if tail.starts_with("READ UNCOMMITTED") || tail.starts_with("READ COMMITTED") {
+        Some(crate::txn::Isolation::ReadCommitted)
+    } else if tail.starts_with("REPEATABLE READ") {
+        Some(crate::txn::Isolation::RepeatableRead)
+    } else if tail.starts_with("SERIALIZABLE") {
+        Some(crate::txn::Isolation::Serializable)
+    } else {
+        None
+    }
+}
+
+/// 缺陷 A：事务内**单行当前读**取值（SELECT … FOR UPDATE）——同事务未提交写优先
+/// （read_own：`Some(Some(v))`=put 最新、`Some(None)`=本事务删除→行隐藏），否则读引擎
+/// **最新已提交**（`Engine::get`：含删除位图过滤 + Delta 覆盖 + HotCache）。
+/// 不写事务 snap 快照缓存（当前读结果不得污染 RR 一致读——C1 断言快照仍见旧值）。
+pub(crate) fn txn_read_current(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    docid: u64,
+) -> crate::error::Result<Option<Vec<u8>>> {
+    if txn.is_finished() {
+        return Err(crate::error::Error::TxnAborted(format!(
+            "txn#{} 已结束",
+            txn.id
+        )));
+    }
+    if let Some(own) = txn.read_own(docid) {
+        return Ok(own.map(|v| v.to_vec()));
+    }
+    let v = engine.get(docid)?;
+    // P1-4：FOR UPDATE 当前读命中 → 记录锁定版本（读取时引擎最新 seq）；提交时写该键
+    // 若期间无并发再改则放行（对齐 MySQL 当前读后写语义）。行不存在（None）不锁。
+    if v.is_some() {
+        let seq = engine.last_write_seq(docid)?;
+        txn.mark_current_lock(docid, seq);
+    }
+    Ok(v)
+}
+
+/// 缺陷 A：事务内**范围当前读**（SELECT … FOR UPDATE + id BETWEEN/范围）——基表 = 引擎
+/// **最新已提交**扫描（`Engine::scan_range`，含删除位图过滤），再叠加同事务写覆盖
+/// （read_own 值替换 / 本事务删除排除、write_set Put 新 docid 窗口并入）——语义与
+/// `Engine::scan_range_txn` 尾部一致，仅基表由快照视图换当前视图（引擎侧不动）。
+pub(crate) fn txn_scan_current(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> crate::error::Result<Vec<crate::engine::QueryRow>> {
+    if txn.is_finished() {
+        return Err(crate::error::Error::TxnAborted(format!(
+            "txn#{} 已结束",
+            txn.id
+        )));
+    }
+    let mut out: Vec<crate::engine::QueryRow> = engine.scan_range(start, end)?;
+    // P1-4：范围当前读命中行 → 记录锁定版本（引擎最新 seq；自写行 read_own 属写集，无需锁）
+    for row in &out {
+        if txn.read_own(row.0).is_none() {
+            let seq = engine.last_write_seq(row.0)?;
+            txn.mark_current_lock(row.0, seq);
+        }
+    }
+    // 同事务写覆盖：已出现的行用 read_own 最新值替换 / 本事务删除（None）置空 → 下方过滤
+    for row in out.iter_mut() {
+        if let Some(own) = txn.read_own(row.0) {
+            match own {
+                Some(v) => row.1 = v.to_vec(),
+                None => row.1.clear(),
+            }
+        }
+    }
+    out.retain(|(_, v)| !v.is_empty());
+    // 同事务未提交 Put 的新 docid（窗口内且基表未见——本事务写未落引擎）并入
+    let own_ids: Vec<u64> = txn
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            crate::txn::Op::Put { docid, .. } => Some(*docid),
+            crate::txn::Op::Delete { .. } => None,
+        })
+        .collect();
+    let present: std::collections::HashSet<u64> = out.iter().map(|(d, _)| *d).collect();
+    let mut added = false;
+    for d in own_ids {
+        if present.contains(&d) {
+            continue;
+        }
+        let in_win = start.map_or(true, |s| d >= s) && end.map_or(true, |e| d <= e);
+        if in_win {
+            if let Some(Some(v)) = txn.read_own(d) {
+                out.push((d, v.to_vec()));
+                added = true;
+            }
+        }
+    }
+    if added {
+        out.sort_by_key(|r| r.0); // 保持升序（自写并入后重排；事务窗口通常小）
+    }
+    Ok(out)
+}
+
+/// 事务内 SELECT：快照查询（含同事务未提交写可见）。
+/// sysbench 兼容（H-6 扩展）：`WHERE id=N` 点查 / `id BETWEEN A AND B` 范围 /
+/// `id IN (...)` 多点 / `SUM(k)` 聚合 / `ORDER BY ... LIMIT N`（简化为排序截断）。
+/// M 项优化（P0）：BETWEEN 范围走一次快照扫描（`scan_range_txn`），替代逐 id `txn_get`；
+/// 点查 / IN 保持逐 id（目标少，逐 id 更快）。
+/// 缺陷 A：`FOR UPDATE` 尾部修饰 → **当前读**（`txn_read_current` / `txn_scan_current`，
+/// 最新已提交 + 自写覆盖；不污染快照缓存）——RR 对照 C1/C3 修复。
+/// O 项第②步：`&Engine`（事务读在 RwLock 读锁下执行）。
+pub(crate) fn txn_select(
+    engine: &Engine,
+    session: &mut Session,
+    sql: &str,
+) -> QueryResponse {
+    // FOR UPDATE = 当前读标记：解析前剥离该尾部修饰（parser 只认查询核心；FOR UPDATE 语法
+    // 恒在 ORDER BY / LIMIT 之后）；读路径按标记分流。
+    let for_update = sql.to_uppercase().contains("FOR UPDATE");
+    let core: &str = if for_update {
+        match sql.to_lowercase().find("for update") {
+            Some(p) => &sql[..p],
+            None => sql, // 防御：出现在非尾部（字符串字面量误匹配）→ 保持原样
+        }
+    } else {
+        sql
+    };
+    let proj = parse_projection(core);
+    let limit = extract_limit(core);
+    let upper = core.to_uppercase();
+    // 聚合：`SELECT SUM(k) FROM ... WHERE id BETWEEN A AND B` → 单行单列数值
+    let is_sum = upper.contains("SUM(");
+    let txn = session.txn.as_mut().unwrap();
+    // 范围查询（BETWEEN）：快照扫描（M 项 P0，逐 id txn_get → scan_range_txn）；
+    // FOR UPDATE → 当前读（最新已提交扫描 + 同事务写覆盖）
+    let tid = table_id_for(&table_name_of(core));
+    if let Some((a, b)) = extract_between_range(core) {
+        // §26 M1：SQL row_id 窗口 → 本表 docid 窗口
+        let (da, db) = (docid_for(tid, a), docid_for(tid, b));
+        let rows = if for_update {
+            match txn_scan_current(engine, txn, Some(da), Some(db)) {
+                Ok(r) => r,
+                Err(e) => return QueryResponse::Err(3500, format!("事务范围当前读失败: {e}")),
+            }
+        } else {
+            match engine.scan_range_txn(txn, Some(da), Some(db)) {
+                Ok(r) => r,
+                Err(e) => return QueryResponse::Err(3500, format!("事务范围读失败: {e}")),
+            }
+        };
+        if is_sum {
+            // 聚合：扫描结果逐行解析 JSON 累加 k 字段（缺失视为 0）；返回单行单列
+            let mut sum: i64 = 0;
+            for (_, doc) in &rows {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
+                    if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
+                        sum += k;
+                    }
+                }
+            }
+            let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
+            return QueryResponse::Set {
+                columns: vec![sum_col],
+                rows: vec![vec![sum.to_string().into_bytes()]],
+            };
+        }
+        // 普通范围查询：按投影裁剪（字段列类型推断）+ ORDER BY / LIMIT
+        return build_result_set(proj.as_deref(), rows, upper.contains("ORDER BY"), limit);
+    }
+    // 点查 / IN：逐 id 快照 get（同事务写可见）/ FOR UPDATE 当前读
+    let ids: Vec<u64> = match extract_target_ids(core) {
+        Some(v) => v,
+        None => {
+            // b：非主键列谓词 → 主库候选 ∪ 同事务写集覆盖复检（缺陷 A：支持 FOR UPDATE 当前读）
+            if tid != 0 {
+                return QueryResponse::Err(
+                    1064,
+                    "事务内字段谓词仅支持默认表（§26 M1 边界，主键/窗口访问可用）".to_string(),
+                );
+            }
+            return txn_select_by_predicate(
+                engine, session, core, proj.as_deref(), limit, is_sum, &upper, for_update,
+            );
+        }
+    };
+    if is_sum {
+        // 聚合：逐 id 取 doc，解析 JSON 累加 k 字段（缺失视为 0）；返回单行单列
+        let mut sum: i64 = 0;
+        for id in &ids {
+            let r = if for_update {
+                txn_read_current(engine, txn, *id)
+            } else {
+                engine.txn_get(txn, *id)
+            };
+            if let Ok(Some(v)) = r {
+                if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&v) {
+                    if let Some(k) = doc.get("k").and_then(|x| x.as_i64()) {
+                        sum += k;
+                    }
+                }
+            }
+        }
+        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
+        return QueryResponse::Set {
+            columns: vec![sum_col],
+            rows: vec![vec![sum.to_string().into_bytes()]],
+        };
+    }
+    // 普通点查 / IN：逐 id 快照 get（同事务写可见）/ 当前读，按投影裁剪
+    let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let r = if for_update {
+            txn_read_current(engine, txn, *id)
+        } else {
+            engine.txn_get(txn, *id)
+        };
+        match r {
+            Ok(Some(v)) => raw.push((*id, v)),
+            Ok(None) => {}
+            Err(e) => return QueryResponse::Err(3500, format!("事务读失败: {e}")),
+        }
+    }
+    build_result_set(proj.as_deref(), raw, upper.contains("ORDER BY"), limit)
+}
+
+/// b：事务内**非主键列谓词** SELECT（普通 / SUM(k) 聚合）：
+/// 候选 = 主库当前视图命中（sqlish，事务持引擎写锁 → 视图稳定）∪ 同事务写集；
+/// 逐候选 `txn_get` 覆盖取值 + `sqlish::doc_matches_where` 谓词复检 → 结果与
+/// 快照+同事务写一致（自增后自见、删除即不可见、新增被收录）。
+pub(crate) fn txn_select_by_predicate(
+    engine: &Engine,
+    session: &mut Session,
+    sql: &str,
+    proj: Option<&[ProjCol]>,
+    limit: Option<usize>,
+    is_sum: bool,
+    upper: &str,
+    for_update: bool,
+) -> QueryResponse {
+    // 取 WHERE 谓词原文（ASCII 偏移与 lower 一致；按 rest 原样切片保字符串大小写语义）
+    let lower = sql.to_lowercase();
+    let pos = match lower.find("where") {
+        Some(p) => p,
+        None => return QueryResponse::Err(1064, "事务内无 WHERE 全表查询暂不支持".to_string()),
+    };
+    let rest = &sql[pos + 5..];
+    let ol = rest.to_lowercase();
+    let end = [
+        ol.find("order by"),
+        ol.find(" limit "),
+        ol.find(" limit)"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(rest.len());
+    let tail = rest[..end].trim();
+    if tail.is_empty() {
+        return QueryResponse::Err(1064, "事务内无 WHERE 全表查询暂不支持".to_string());
+    }
+    let cond_sql = format!("SELECT docid FROM t WHERE {tail}");
+    let txn = session.txn.as_mut().unwrap();
+    const CAP: u64 = 200_000;
+    let base = match crate::sqlish::execute(engine, &cond_sql, CAP) {
+        Ok(r) => r,
+        Err(e) => return QueryResponse::Err(3500, format!("事务谓词读失败: {e}")),
+    };
+    let mut set: std::collections::HashSet<u64> = base.into_iter().map(|r| r.0).collect();
+    set.extend(txn.write_set().iter().copied());
+    let mut ids: Vec<u64> = set.into_iter().collect();
+    ids.sort_unstable();
+    let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        // 缺陷 A：FOR UPDATE → 当前读取值（最新已提交 + 自写覆盖），其余走快照 txn_get
+        let r = if for_update {
+            txn_read_current(engine, txn, id)
+        } else {
+            engine.txn_get(txn, id)
+        };
+        match r {
+            Ok(Some(v)) => {
+                if crate::sqlish::doc_matches_where(&cond_sql, &v) {
+                    rows.push((id, v));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return QueryResponse::Err(3500, format!("事务读失败: {e}")),
+        }
+    }
+    if is_sum {
+        let mut sum: i64 = 0;
+        for (_, doc) in &rows {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
+                if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
+                    sum += k;
+                }
+            }
+        }
+        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
+        return QueryResponse::Set {
+            columns: vec![sum_col],
+            rows: vec![vec![sum.to_string().into_bytes()]],
+        };
+    }
+    build_result_set(proj, rows, upper.contains("ORDER BY"), limit)
+}
+
+/// 提取 `WHERE id BETWEEN A AND B` 闭区间 → (A, B)；非 id BETWEEN → None。
+pub(crate) fn extract_between_range(sql: &str) -> Option<(u64, u64)> {
+    let lower = sql.to_lowercase();
+    let w = lower.find("where")?;
+    let rest = &lower[w + 5..];
+    let rest = rest.split("order by").next()?;
+    let rest = rest.split("limit").next()?;
+    let rest = rest.trim();
+    // 仅限 `id between`（排除 k/其他列 BETWEEN）
+    let bp = rest.find("id between")?;
+    let after = &rest[bp + "id between".len()..];
+    let and = after.find("and")?;
+    let a: u64 = after[..and].trim().parse().ok()?;
+    let b: u64 = after[and + 3..].trim().parse().ok()?;
+    Some((a, b))
+}
+
+/// 提取 WHERE 目标 id 集合：`id=N` / `id BETWEEN A AND B`（闭区间，上限防爆）/ `id IN (a,b,...)`。
+pub(crate) fn extract_target_ids(sql: &str) -> Option<Vec<u64>> {
+    let lower = sql.to_lowercase();
+    let w = lower.find("where")?;
+    let rest = &lower[w + 5..];
+    let rest = rest.split("order by").next()?;
+    let rest = rest.split("limit").next()?;
+    let rest = rest.trim();
+    // id = N
+    if let Some(eq) = rest.find("id=") {
+        let after = rest[eq + 3..].trim();
+        let num: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !num.is_empty() {
+            return Some(vec![num.parse().ok()?]);
+        }
+    }
+    // id BETWEEN A AND B（仅限 id 字段——否则 amount/其他列 BETWEEN 会被误当 docid 窗口，7.93 定位）
+    if let Some(bp) = rest.find("id between") {
+        let after = &rest[bp + "id between".len()..];
+        let and = after.find("and")?;
+        let a: u64 = after[..and].trim().parse().ok()?;
+        let b: u64 = after[and + 3..].trim().parse().ok()?;
+        // 闭区间，上限保护（sysbench 范围 100 行内）
+        let hi = b.min(a.saturating_add(10_000));
+        return Some((a..=hi).collect());
+    }
+    // id IN (a,b,...)
+    if let Some(ip) = rest.find("id in") {
+        let after = &rest[ip + 5..];
+        let open = after.find('(')?;
+        let close = after.find(')')?;
+        let inner = &after[open + 1..close];
+        let ids: Vec<u64> = inner
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u64>().ok())
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+    }
+    None
+}
+
+/// 提取 `LIMIT N`。
+pub(crate) fn extract_limit(sql: &str) -> Option<usize> {
+    let lower = sql.to_lowercase();
+    let pos = lower.find("limit")?;
+    let rest = lower[pos + 5..].trim();
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
+}

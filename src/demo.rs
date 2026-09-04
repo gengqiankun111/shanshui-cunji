@@ -689,8 +689,8 @@ pub fn run(data_dir: &Path, cfg: &Config, scale: u64) -> Result<Vec<TestResult>>
     let restore_dir = data_dir.join("engine-restored");
     engine.prepare_backup()?;
     drop(engine);
-    crate::storage::backup(&engine_dir, &backup_file)?;
-    crate::storage::restore(&backup_file, &restore_dir)?;
+    crate::backup::backup(&engine_dir, &backup_file)?;
+    crate::backup::restore(&backup_file, &restore_dir)?;
     let mut restored = Engine::open(&restore_dir, cfg)?;
 
     // 验证：① 未删除文档可读 ② 步骤 8 已删除文档仍不可见（Tombstone 随备份/还原）③ 倒排词条计数一致（含落盘段）

@@ -198,7 +198,7 @@ fn run_backup(config_path: &Path, backup_file: &Path) {
     }
     drop(engine);
 
-    match shanshui_cunji::storage::backup(&data_dir, backup_file) {
+    match shanshui_cunji::backup::backup(&data_dir, backup_file) {
         Ok(rep) => {
             println!("✅ 备份完成: {}", backup_file.display());
             println!(
@@ -223,7 +223,7 @@ fn run_restore(config_path: &Path, backup_file: &Path) {
         }
     };
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
-    match shanshui_cunji::storage::restore(backup_file, &data_dir) {
+    match shanshui_cunji::backup::restore(backup_file, &data_dir) {
         Ok(rep) => {
             println!(
                 "✅ 还原完成: {} 个文件，{} 字节（{:.0} ms）",

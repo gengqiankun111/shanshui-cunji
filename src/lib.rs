@@ -18,12 +18,15 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 pub mod admin;
 pub mod affinity;
+pub mod backup;
 pub mod bitmap;
 pub mod blockcache;
 pub mod bloom;
-pub mod column_family;
 pub mod config;
-pub mod db_adapter;
+// 网络服务层（原 src/db_adapter.rs 拆分至 src/server/，见 reconstruct.md）；别名保持
+// 全仓既有 crate::db_adapter::* 引用路径不变（bin/export.rs、bin/mysql_server.rs）。
+pub mod server;
+pub use server as db_adapter;
 pub mod demo;
 pub mod docid_alloc;
 pub mod docset;
@@ -41,7 +44,6 @@ pub mod io_queue;
 pub mod io_scheduler;
 pub mod join;
 pub mod keys;
-pub mod memtable;
 pub mod meta;
 pub mod metrics;
 pub mod migrate;
@@ -61,19 +63,23 @@ pub mod scale_out;
 pub mod schema;
 pub mod sdk_cache;
 pub mod seqlock;
-pub mod server;
 pub mod shard_build;
 pub mod shard_inverted;
 pub mod shard_metrics;
 pub mod sharding;
-pub mod sstable;
-pub mod sqlish;
+// sql 层（原 src/sqlish.rs 拆分至 src/sql/，见 reconstruct.md）；sqlish 别名保持
+// 全仓既有 crate::sqlish::* 引用路径不变（db_adapter/demo/server 无需改动）。
+pub mod sql;
+pub use sql as sqlish;
 pub mod storage;
 pub mod tds;
 pub mod term_cache;
 pub mod txn;
 pub mod value;
-pub mod wal;
 pub mod watchdog;
+
+// reconstruct.md 目录规划：storage 引擎层已归入 src/storage/ 目录。
+// 根部 re-export 保持既有调用路径（crate::column_family / crate::sstable / ...）不变。
+pub use storage::{column_family, memtable, sstable, wal};
 
 pub use error::{Error, Result};
