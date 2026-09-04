@@ -2843,6 +2843,69 @@ impl ColumnFamily {
         self.memtable.mutable_bytes() + self.memtable.immutable_bytes()
     }
 
+    /// P90：列族是否完全无数据（内存双缓冲 + 磁盘段均空）——delta 列族"无 patch"判定。
+    pub fn data_empty(&self) -> bool {
+        if self.memtable_bytes() > 0 {
+            return false;
+        }
+        let snap = self.ssts.load();
+        snap.ssts.is_empty()
+    }
+
+    /// P90：块级 FieldZone 聚合（无 WHERE `COUNT(f)`/`SUM(f)` 下推候选）。
+    /// 快照 eligible：无未刷盘数据（memtable 空）+ **单一非空层**（层内文件互不重叠——
+    /// L1/L2 由 leveled 语义保证；L0 仅允许单文件），且扫描窗口内所有数据块均为 PAX
+    /// 列式（v6 `zones` 非空；行式块 = 非 JSON / Tombstone 混入 → 回退行级）且**整块**
+    /// 落在窗口内（部分块行级回退）。任一不满足 → None（调用方回退行级精确扫描）。
+    /// 返回 `(sum, present, null_count)`：
+    /// - `present - null_count` = COUNT(f)（字段存在且非 JSON null 行数，精确）；
+    /// - `sum` = 块内数值列累加和（列含任一非数值行时编码器清零 → 零和歧义由调用方处置）。
+    pub fn zone_field_aggregate(
+        &self,
+        lo_key: Option<&[u8]>,
+        hi_key: Option<&[u8]>,
+        field: &str,
+    ) -> Result<Option<(f64, u64, u64)>> {
+        if self.memtable_bytes() > 0 {
+            return Ok(None); // 未刷盘/版本折叠不可用 → 行级回退
+        }
+        let snap = self.ssts.load();
+        let non_empty: Vec<usize> = (0..snap.layer_indices.len())
+            .filter(|&lv| !snap.layer_indices[lv].is_empty())
+            .collect();
+        if non_empty.len() != 1 {
+            return Ok(None); // 多非空层 → 跨层版本可能遮蔽 → 行级回退
+        }
+        let lv = non_empty[0];
+        let idxs = &snap.layer_indices[lv];
+        if lv == 0 && idxs.len() > 1 {
+            return Ok(None); // L0 多段重叠 → 同 key 可能多版本 → 行级回退
+        }
+        let in_win = |k: &[u8]| lo_key.is_none_or(|lo| k >= lo) && hi_key.is_none_or(|hi| k <= hi);
+        let mut sum = 0f64;
+        let mut present = 0u64;
+        let mut nulls = 0u64;
+        for &i in idxs {
+            let sst = &snap.ssts[i];
+            for e in sst.index() {
+                // 仅块**完全**落在窗口内可信（含窗口边界的部分块 → 行级回退）
+                if !in_win(&e.first_key) || !in_win(&e.max_key) {
+                    return Ok(None);
+                }
+                if e.zones.is_empty() {
+                    return Ok(None); // 行式块（非 JSON / Tombstone 回退块）→ 行级
+                }
+                let Some(z) = e.zones.iter().find(|z| z.field == field) else {
+                    return Ok(None); // 块无该字段列（PAX 列集 = 块内行字段并集）→ 行级
+                };
+                present += z.present_count as u64;
+                nulls += z.null_count as u64;
+                sum += z.sum;
+            }
+        }
+        Ok(Some((sum, present, nulls)))
+    }
+
     /// DROP TABLE purge：清空本列族全部数据（MemTable + SST + WAL），重写空 Manifest。
     /// 调用方须持有引擎级写锁（与 flush/写路径互斥）；与无锁后台 compact 经 `sst_mutate`
     /// 互斥（store→persist→remove 原子一致，同 finalize_compact）。删除失败的旧段文件

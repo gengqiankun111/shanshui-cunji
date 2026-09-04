@@ -3168,46 +3168,70 @@ fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
         Ok((where_part, field, expr)) => {
             // §26 M1：SQL row_id / 字段候选 → 本表 docid
             let tid = table_id_for(&table_name_of(sql));
-            let ids = match resolve_where_ids(engine, &where_part)
-                .map(|v| route_where_ids(tid, &where_part, v))
-            {
-                Ok(v) => v,
-                Err(e) => return QueryResponse::Err(1064, format!("update where: {e}")),
+            // P88：写定位——主键形态（id=/docid=/id IN）保持 resolve+route（row → docid）；
+            // 字段/复合条件 → WhereExpr → get_docid_set（limit=None 不截断，防大命中漏行）
+            let ids = if where_is_primary_key(&where_part) {
+                match resolve_where_ids(engine, &where_part)
+                    .map(|v| route_where_ids(tid, &where_part, v))
+                {
+                    Ok(v) => v,
+                    Err(e) => return QueryResponse::Err(1064, format!("update where: {e}")),
+                }
+            } else {
+                match write_locate_table_ids(engine, tid, &where_part) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResponse::Err(1064, format!("update where: {e}")),
+                }
             };
             if ids.is_empty() {
                 return QueryResponse::Ok(0, 0); // MySQL：无匹配行 → 0 影响
             }
+            // P89：UPDATE 批量管道——分批 batch_get(1000) 取现值 → 逐行变换 →
+            // put_batch 攒批提交（倒排/组合索引/位图随 put_nosync 同步，批尾单次 flush_wal），
+            // 替代旧逐行 engine.get + engine.put（每行独立 WAL 提交/看门狗/热缓存开销）。
             let mut n = 0u64;
-            for id in ids {
-                // 整体替换（field=doc）
-                if field.eq_ignore_ascii_case("doc") {
-                    let raw = unquote(&expr);
-                    match put_doc(engine, id, &raw) {
-                        Ok(_) => n += 1,
-                        Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
-                    }
-                    continue;
-                }
-                // 读当前文档 → 字段级修改 → 覆盖写回（缺失 id 视为空文档：与旧单 id 语义一致）
-                let mut doc: serde_json::Value = match engine.get(id) {
-                    Ok(Some(v)) => serde_json::from_slice(&v)
-                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                    Ok(None) => serde_json::Value::Object(serde_json::Map::new()),
+            for chunk in ids.chunks(1000) {
+                let cur = match engine.batch_get(chunk) {
+                    Ok(v) => v,
                     Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                 };
-                if !doc.is_object() {
-                    doc = serde_json::Value::Object(serde_json::Map::new());
+                let mut items: Vec<(u64, Vec<u8>, Vec<String>)> = Vec::with_capacity(chunk.len());
+                for (&id, cur_opt) in chunk.iter().zip(cur.into_iter()) {
+                    // 整体替换（field=doc）
+                    if field.eq_ignore_ascii_case("doc") {
+                        let raw = unquote(&expr);
+                        let terms = match doc_terms(&raw) {
+                            Ok(t) => t,
+                            Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                        };
+                        items.push((id, raw.into_bytes(), terms));
+                        continue;
+                    }
+                    // 读当前文档 → 字段级修改 → 覆盖写回（缺失/删除 id 视为空文档：与旧单 id 语义一致）
+                    let mut doc: serde_json::Value = match cur_opt {
+                        Some(v) => serde_json::from_slice(&v)
+                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+                        None => serde_json::Value::Object(serde_json::Map::new()),
+                    };
+                    if !doc.is_object() {
+                        doc = serde_json::Value::Object(serde_json::Map::new());
+                    }
+                    let obj = doc.as_object_mut().unwrap();
+                    if let Some(inc) = parse_increment_expr(&field, &expr) {
+                        let cur_v = obj.get(&field).and_then(|v| v.as_i64()).unwrap_or(0);
+                        obj.insert(field.clone(), serde_json::Value::from(cur_v + inc));
+                    } else {
+                        obj.insert(field.clone(), serde_json::Value::String(unquote(&expr)));
+                    }
+                    let new_doc = serde_json::to_string(&doc).unwrap_or_default();
+                    let terms = match doc_terms(&new_doc) {
+                        Ok(t) => t,
+                        Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                    };
+                    items.push((id, new_doc.into_bytes(), terms));
                 }
-                let obj = doc.as_object_mut().unwrap();
-                if let Some(inc) = parse_increment_expr(&field, &expr) {
-                    let cur = obj.get(&field).and_then(|v| v.as_i64()).unwrap_or(0);
-                    obj.insert(field.clone(), serde_json::Value::from(cur + inc));
-                } else {
-                    obj.insert(field.clone(), serde_json::Value::String(unquote(&expr)));
-                }
-                let new_doc = serde_json::to_string(&doc).unwrap_or_default();
-                match put_doc(engine, id, &new_doc) {
-                    Ok(_) => n += 1,
+                match engine.put_batch(&items) {
+                    Ok(()) => n += items.len() as u64,
                     Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                 }
             }
@@ -3239,19 +3263,43 @@ fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
             if let Some((lo, hi)) = parse_pk_between(&where_part) {
                 return delete_pk_range(engine, tid, lo, hi);
             }
-            let ids = match resolve_where_ids(engine, &where_part)
-                .map(|v| route_where_ids(tid, &where_part, v))
-            {
-                Ok(v) => v,
-                Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
-            };
-            if ids.is_empty() {
-                return QueryResponse::Ok(0, 0);
-            }
-            // 批量删（B2：替代逐行 engine.delete——字段条件命中集也统一走 delete_batch 攒批提交）
-            match engine.delete_batch(ids.into_iter()) {
-                Ok(n) => QueryResponse::Ok(n, 0),
-                Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
+            // P88：写定位——主键形态（id=/docid=/id IN）保持 resolve+route（row → docid）；
+            // 字段/复合条件 → WhereExpr → get_docid_set（limit=None 不截断）→ **流式**
+            // delete_batch（免全量 Vec 物化；超大命中集 chunk 消费，防物化爆内存）。
+            if where_is_primary_key(&where_part) {
+                let ids = match resolve_where_ids(engine, &where_part)
+                    .map(|v| route_where_ids(tid, &where_part, v))
+                {
+                    Ok(v) => v,
+                    Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+                };
+                if ids.is_empty() {
+                    return QueryResponse::Ok(0, 0);
+                }
+                match engine.delete_batch(ids.into_iter()) {
+                    Ok(n) => QueryResponse::Ok(n, 0),
+                    Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
+                }
+            } else {
+                let w = where_part.trim().trim_end_matches(';').trim();
+                let we = match crate::sqlish::parse_where_expr(w) {
+                    Ok(we) => we,
+                    Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+                };
+                let guard = engine.query_guard();
+                let set = match crate::sqlish::get_docid_set(&*engine, Some(&we), None, &guard) {
+                    Ok(s) => s,
+                    Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+                };
+                if set.is_empty() {
+                    return QueryResponse::Ok(0, 0);
+                }
+                // 流式消费（Bitmap/SortedList 已是物化集合；docid 高位含表 → 按表过滤）
+                let del = engine.delete_batch(set.iter().filter(|d| ((*d >> 48) as u16) == tid));
+                match del {
+                    Ok(n) => QueryResponse::Ok(n, 0),
+                    Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
+                }
             }
         }
         Err(e) => QueryResponse::Err(1064, format!("delete syntax: {e}")),
@@ -3736,10 +3784,37 @@ fn resolve_where_ids(engine: &mut Engine, where_part: &str) -> Result<Vec<u64>> 
         }
         return Ok(ids);
     }
-    // 其余条件 → sqlish 匹配文档（SELECT 行 = (docid, doc)）
-    let q = format!("SELECT docid FROM t WHERE {w}");
-    let rows = crate::sqlish::execute(engine, &q, 200_000)?;
-    Ok(rows.into_iter().map(|r| r.0).collect())
+    // 其余条件 → 字段/复合 → P88：WHERE 段 → WhereExpr → get_docid_set 全阶梯收敛
+    // （倒排位图 / AND 快路径 / LIKE / 组合条件同 SELECT；**limit=None 写定位不截断**，
+    // 修复旧路径 sqlish execute cap=200_000 时 >20 万匹配被静默截断漏行）。
+    let we = crate::sqlish::parse_where_expr(w)?;
+    let guard = engine.query_guard();
+    let set = crate::sqlish::get_docid_set(&*engine, Some(&we), None, &guard)?;
+    Ok(set.iter().collect())
+}
+
+/// WHERE 段是否主键形态（`id=`/`docid=`/`id IN`/`docid IN`）——与 `route_where_ids`
+/// 的判定一致（主键形态返回 SQL row_id，字段形态返回引擎 docid）。
+fn where_is_primary_key(where_part: &str) -> bool {
+    let w = where_part.trim().to_lowercase();
+    w.starts_with("id=")
+        || w.starts_with("docid=")
+        || w.starts_with("id in")
+        || w.starts_with("docid in")
+}
+
+/// P88：字段/复合条件写定位——WHERE → WhereExpr → `get_docid_set`（写定位 limit=None
+/// 全收敛不截断）→ 本表 docid（升序）。倒排/组合索引/范围条件收敛路径与同条件 SELECT
+/// 一致（MySQL server 层聚合/分组已按表区间执行；此处按 tid 过滤防跨表写，D4）。
+fn write_locate_table_ids(engine: &mut Engine, tid: u16, where_part: &str) -> Result<Vec<u64>> {
+    let w = where_part.trim().trim_end_matches(';').trim();
+    let we = crate::sqlish::parse_where_expr(w)?;
+    let guard = engine.query_guard();
+    let set = crate::sqlish::get_docid_set(&*engine, Some(&we), None, &guard)?;
+    Ok(set
+        .iter()
+        .filter(|d| ((*d >> 48) as u16) == tid)
+        .collect())
 }
 
 /// 解析 `id = 123`（WHERE 子句内；事务内单点路径 parse_update/parse_delete 调用）。
@@ -4750,6 +4825,109 @@ mod tests {
             super::QueryResponse::Ok(n, _) => assert_eq!(n, 1),
             super::QueryResponse::Err(c, m) => panic!("delete 单点 BETWEEN 失败: {c} {m}"),
             super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+    }
+
+    // ---------- P88/P89：写路径 DocIdSet 定位整合 + UPDATE 批量管道 ----------
+
+    #[test]
+    fn p88_write_locate_field_cond_update_delete_full_cover() {
+        // P88：字段条件写定位走 get_docid_set（limit=None 不截断）；P89：UPDATE 批量管道
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        // 40 行（无倒排 term——字段等值走回退扫描定位，验证定位语义与不截断）
+        for i in 0..40u64 {
+            let status = if i % 2 == 0 { "active" } else { "idle" };
+            let doc = serde_json::json!({"i": i, "status": status, "n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e.flush_wal().unwrap();
+        // 字段条件 DELETE status='idle' → 20 行全删（不截断）
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE status='idle'") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 20, "idle 20 行全删（写定位不截断）"),
+            super::QueryResponse::Err(c, m) => panic!("delete field 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 0..40u64 {
+            if i % 2 == 1 {
+                assert!(e.get(i).unwrap().is_none(), "docid={i} 已删");
+            } else {
+                assert!(e.get(i).unwrap().is_some(), "docid={i} 保留");
+            }
+        }
+        // 字段条件 UPDATE status='done'（active 20 行）→ P89 批量管道
+        match super::update_response(&mut e, "UPDATE documents SET status='done' WHERE status='active'") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 20),
+            super::QueryResponse::Err(c, m) => panic!("update field 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in (0..40u64).step_by(2) {
+            let v: serde_json::Value = serde_json::from_slice(&e.get(i).unwrap().unwrap()).unwrap();
+            assert_eq!(v["status"], "done", "docid={i} 应更新为 done");
+            assert_eq!(v["n"], serde_json::json!(i), "docid={i} 其它字段保留");
+        }
+        // doc= 整文档整体替换分支（批量管道 doc 分支：AND 复合条件收敛定位）
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET doc='{\"i\":0,\"status\":\"replaced\"}' WHERE status='done' AND n<4",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 2, "n<4 的 active 行（0,2）整体替换"),
+            super::QueryResponse::Err(c, m) => panic!("update doc= 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 0..4u64 {
+            if i % 2 == 0 {
+                let v: serde_json::Value = serde_json::from_slice(&e.get(i).unwrap().unwrap()).unwrap();
+                assert_eq!(v["status"], "replaced", "docid={i} doc= 整体替换");
+                assert!(v.get("n").is_none(), "docid={i} 旧字段随整文档替换清除");
+            }
+        }
+    }
+
+    #[test]
+    fn p88_field_cond_write_isolated_by_table_and_multi_chunk() {
+        // P88：同字段值跨表 → 写定位按表隔离（只动目标表）；P89：>1000 命中跨多个
+        // batch_get/put_batch chunk（chunks(1000) 循环）不丢行不漏改。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let tid_a = super::table_id_for("t_a");
+        let tid_b = super::table_id_for("t_b");
+        assert_ne!(tid_a, 0);
+        assert_ne!(tid_a, tid_b);
+        // ① 两表同字段值：DELETE FROM t_a WHERE status='x' → 只删 t_a（t_b 保留）
+        for i in 0..6u64 {
+            let doc_a = serde_json::json!({"status": "x", "v": i});
+            let doc_b = serde_json::json!({"status": "x", "v": i});
+            e.put(super::docid_for(tid_a, i), serde_json::to_vec(&doc_a).unwrap(), &[]).unwrap();
+            e.put(super::docid_for(tid_b, i), serde_json::to_vec(&doc_b).unwrap(), &[]).unwrap();
+        }
+        e.flush_wal().unwrap();
+        match super::delete_response(&mut e, "DELETE FROM t_a WHERE status='x'") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 6, "仅删 t_a 6 行"),
+            super::QueryResponse::Err(c, m) => panic!("delete t_a field 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 0..6u64 {
+            assert!(e.get(super::docid_for(tid_a, i)).unwrap().is_none(), "t_a row={i} 已删");
+            assert!(e.get(super::docid_for(tid_b, i)).unwrap().is_some(), "t_b row={i} 保留");
+        }
+        // ② 2200 行字段条件 UPDATE（跨 3 个 chunk=1000）→ 全改不丢
+        let mut e2 = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        for i in 0..2200u64 {
+            let doc = serde_json::json!({"status": "s", "n": i});
+            e2.put_nosync(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e2.flush_wal().unwrap();
+        match super::update_response(&mut e2, "UPDATE documents SET n=0 WHERE status='s'") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 2200, "2200 行跨 chunk 全改"),
+            super::QueryResponse::Err(c, m) => panic!("update 2200 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in (0..2200u64).step_by(373) {
+            let v: serde_json::Value = serde_json::from_slice(&e2.get(i).unwrap().unwrap()).unwrap();
+            assert_eq!(v["n"], "0", "docid={i} 应更新 n=0（字段赋值 SQL 字面量为字符串）");
         }
     }
 

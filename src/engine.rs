@@ -1468,6 +1468,36 @@ impl Engine {
         Ok(out)
     }
 
+    /// P90：PAX 块级聚合下推入口（无 WHERE `SUM(f)`/`COUNT(f)` 快路径候选）。
+    /// eligible 前置：删除位图无置位 + delta 列族空（无字段 patch）+ 无活跃 RR 快照
+    /// （MVCC 保活多版本会污染块级单版本假设）+ primary 快照 eligible（单一非空层 /
+    /// 全 PAX 块 / memtable 空，见 `ColumnFamily::zone_field_aggregate`）。
+    /// 返回 `(sum, present, null_count)`：`present - null_count` = COUNT(f) 精确；
+    /// `sum` = 块内数值列累加和。任一条件不满足 → None（调用方回退行级精确扫描）。
+    /// SUM 的零和/列非数值歧义由调用方处置（zsum==0 时回退行级，保证 NULL/0 语义）。
+    pub fn zone_field_aggregate(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        field: &str,
+    ) -> Result<Option<(f64, u64, u64)>> {
+        if let Some(bm) = &self.deletion_bitmap {
+            if bm.deleted_count() > 0 {
+                return Ok(None); // 删除位图置位 → 文件内已删行不可见 → 行级回退
+            }
+        }
+        if !self.delta.data_empty() {
+            return Ok(None); // delta patch 混入 → 字段可能被覆盖 → 行级回退
+        }
+        if !self.active_snapshots.read().unwrap().is_empty() {
+            return Ok(None); // 活跃快照 → MVCC 保活多版本 → 行级回退
+        }
+        let lo = start.map(|s| crate::keys::encode_docid(s).to_vec());
+        let hi = end.map(|e| crate::keys::encode_docid(e).to_vec());
+        self.primary
+            .zone_field_aggregate(lo.as_deref(), hi.as_deref(), field)
+    }
+
     /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
     pub fn begin_snapshot(&self) -> u64 {
         self.primary.wal_next_seq().saturating_sub(1)

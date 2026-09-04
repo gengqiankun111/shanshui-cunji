@@ -1818,6 +1818,20 @@ pub fn docset_to_sorted(set: &crate::docset::DocIdSet) -> Vec<u64> {
     set.to_vec()
 }
 
+/// P88：WHERE 段（不带 WHERE 关键字）→ WhereExpr AST——写路径（UPDATE/DELETE 定位）
+/// 与读路径共用同一解析器（AND/OR/NOT/比较/BETWEEN/LIKE/IN 等文法一致）。
+/// 实现：复用 SELECT 解析（包装 `SELECT * FROM t WHERE <fragment>`），取 where_expr；
+/// 无 WHERE / 解析失败 → Error::Config（db_adapter 包装 1064）。
+pub fn parse_where_expr(fragment: &str) -> Result<WhereExpr> {
+    let f = fragment.trim().trim_end_matches(';').trim();
+    if f.is_empty() {
+        return Err(Error::Config("WHERE 条件为空".into()));
+    }
+    let sql = format!("SELECT * FROM t WHERE {f}");
+    let sel = parse_select(&sql)?;
+    sel.where_expr.ok_or_else(|| Error::Config("WHERE 条件解析为空".into()))
+}
+
 /// ORDER BY 候选集上限（防全库排序撑爆内存；超限报错提示 WHERE 收敛）。
 const SORT_MAX_ROWS: usize = 200_000;
 
@@ -2479,6 +2493,40 @@ pub fn execute_aggregate_window(
                             let arg = field.as_deref().unwrap_or("*");
                             let header = format!("{}({arg})", name.to_uppercase());
                             return Ok(Some(AggScalar { header, is_null: true, text: String::new() }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // P90：PAX 块级聚合下推——无 WHERE / 无排序 / 无 LIMIT 的 `SUM(f)`/`COUNT(f)`：
+    // 引擎快照 eligible（memtable/delta/删除位图/活跃快照全空 + 单一非空层 + 全 PAX 块）时
+    // 用块级 zones（sum/present/null）直接出数（跳过数据块读取与 25 列解码）。
+    // AVG/MIN/MAX 及零和 SUM（zones 无法区分"纯数值零和"与"含非数值行"，见 encode_pax_block）
+    // 回退行级精确扫描（语义不变）。
+    if sel.where_expr.is_none() && sel.order_by.is_empty() && sel.limit.is_none() {
+        if let Some(f) = field.as_ref() {
+            if matches!(name.as_str(), "count" | "sum") {
+                if let Some((zsum, present, nulls)) = engine.zone_field_aggregate(start, end, f)? {
+                    let arg = f.as_str();
+                    let header = format!("{}({arg})", name.to_uppercase());
+                    match name.as_str() {
+                        "count" => {
+                            return Ok(Some(AggScalar {
+                                header,
+                                is_null: false,
+                                text: (present - nulls).to_string(),
+                            }));
+                        }
+                        _ => {
+                            if zsum != 0.0 {
+                                return Ok(Some(AggScalar {
+                                    header,
+                                    is_null: false,
+                                    text: fmt_num(zsum),
+                                }));
+                            }
+                            // zsum==0：零和 / 列非数值不可判定 → 落行级保证 NULL/0 精确
                         }
                     }
                 }
@@ -4555,6 +4603,111 @@ mod tests {
             matches!(err, Error::QueryTooExpensive(_)),
             "到期 guard 应在分块处熔断，实际 {err:?}"
         );
+    }
+
+    // ---------- P90：PAX 块级聚合下推（块级 zones 免读数据块；版本混入回退行级） ----------
+
+    /// 行级参考实现（扫全表逐行解析字段）——与 SQL 聚合语义一致。
+    fn manual_agg(e: &Engine, field: &str) -> (u64, f64) {
+        let mut count = 0u64;
+        let mut sum = 0f64;
+        let mut need_serde = true;
+        e.scan_stream(None, None, |_d, doc| {
+            if let Some(lv) = light_top_field(doc, field) {
+                match lv {
+                    LightVal::Absent | LightVal::Null => {}
+                    LightVal::Num(bytes) => {
+                        count += 1;
+                        if let Some(x) = std::str::from_utf8(bytes).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            sum += x;
+                        }
+                    }
+                    _ => {
+                        count += 1;
+                    }
+                }
+                need_serde = false;
+            }
+            if need_serde {
+                if let Ok(v) = serde_json::from_slice::<Value>(doc) {
+                    if let Some(fv) = v.get(field) {
+                        if !fv.is_null() {
+                            count += 1;
+                            if let Some(x) = fv.as_f64() {
+                                sum += x;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        })
+        .unwrap();
+        (count, sum)
+    }
+
+    fn agg_scalar(e: &Engine, sql: &str) -> (String, bool, String) {
+        let a = execute_aggregate(e, sql).unwrap().unwrap();
+        (a.header, a.is_null, a.text)
+    }
+
+    #[test]
+    fn p90_pax_zone_aggregate_matches_scan() {
+        // P90：SUM/COUNT(f) 无 WHERE → PAX 块级 zones 快路径与行级扫描结果一致；
+        // memtable 未刷盘（版本混入）→ 自动回退行级，结果仍一致。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.hot_fields = vec!["amount".into(), "k".into(), "note".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // 199 行 amount=10i+5（数值纯列，和 != 0 → SUM 快路径生效）；1 行缺 amount
+        let mut sum_expected = 0f64;
+        for i in 0..199u64 {
+            let doc = serde_json::json!({"amount": 10 * i + 5, "k": i, "note": format!("n{i}")});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+            sum_expected += (10 * i + 5) as f64;
+        }
+        e.put(199, br#"{"k":199,"note":"missing"}"#.to_vec(), &[]).unwrap();
+        // ① 未刷盘（memtable 非空）→ 回退行级，先验参考
+        let (_, s) = manual_agg(&e, "amount");
+        assert_eq!(s, sum_expected, "行级参考");
+        let (h, isnull, t) = agg_scalar(&e, "SELECT SUM(amount) FROM t");
+        assert_eq!(h, "SUM(amount)");
+        assert!(!isnull);
+        assert_eq!(t.parse::<f64>().unwrap(), sum_expected);
+        let (_, _, c) = agg_scalar(&e, "SELECT COUNT(amount) FROM t");
+        assert_eq!(c, "199", "缺字段行不计 COUNT");
+        // ② flush 后（PAX 单 L0 段、memtable 空）→ 块级 zones 快路径，结果一致
+        e.flush_primary().unwrap();
+        let (h2, isnull2, t2) = agg_scalar(&e, "SELECT SUM(amount) FROM t");
+        assert_eq!(h2, "SUM(amount)");
+        assert!(!isnull2);
+        assert_eq!(t2.parse::<f64>().unwrap(), sum_expected, "块级 sum 下推 = 行级");
+        let (_, _, c2) = agg_scalar(&e, "SELECT COUNT(amount) FROM t");
+        assert_eq!(c2, "199", "块级 present-null 计数");
+        // AVG/MIN/MAX 不经块级（zones 无法判定数值行数）→ 仍走行级，语义不变
+        let (_, _, av) = agg_scalar(&e, "SELECT AVG(amount) FROM t");
+        assert!((av.parse::<f64>().unwrap() - sum_expected / 199.0).abs() < 1e-9, "AVG 行级精确");
+        // ③ memtable 再写入（未刷盘）→ 回退行级且含新行
+        e.put(200, br#"{"amount":777,"k":200}"#.to_vec(), &[]).unwrap();
+        let (_, _, t3) = agg_scalar(&e, "SELECT SUM(amount) FROM t");
+        assert_eq!(t3.parse::<f64>().unwrap(), sum_expected + 777.0, "回退行级含 memtable 新行");
+        let (_, _, c3) = agg_scalar(&e, "SELECT COUNT(amount) FROM t");
+        assert_eq!(c3, "200");
+        // ④ 块级快路径与行级在字段值全部为零和（歧义）时回退行级 → NULL/0 语义正确
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut cfg2 = Config::default();
+        cfg2.storage.hot_fields = vec!["z".into()];
+        let mut e2 = Engine::open(dir2.path(), &cfg2).unwrap();
+        for i in 0..50u64 {
+            let doc = serde_json::json!({"z": 0});
+            e2.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e2.flush_primary().unwrap();
+        let (_, isnull_z, tz) = agg_scalar(&e2, "SELECT SUM(z) FROM t");
+        assert!(!isnull_z);
+        assert_eq!(tz.parse::<f64>().unwrap(), 0.0, "全零行 SUM=0（行级回退不误报 NULL）");
+        let (_, _, cz) = agg_scalar(&e2, "SELECT COUNT(z) FROM t");
+        assert_eq!(cz, "50");
     }
 }
 
