@@ -952,6 +952,37 @@
 - **遗留**：JOIN 8 阶段全流程（主键 JOIN 直达/索引-索引 DocIdSet.intersect/广播哈希）需 SQL
   语法支持从表独立 WHERE 后才可完整接线（当前单表 JOIN + ON 关联形态已接入统一 DocIdSet）。
 
+### P91. 复测闭环发现 + 通用 scan 投影列（P85–P90 + P1-D + P1-C 后 10 万/110 万 37 探针复测）
+- **背景**：P85–P90 + P1-D + P1-C 落地后按用户排期复测闭环（重跑 10 万/110 万 37 探针，
+  对比报告 §五）。本轮同时执行 Ex-9.4 事务公平档位（`tmp-cfg-wide-2g.toml` 置
+  `flush_log_at_trx_commit=2`，对齐 MySQL 3316）。
+- **实测结论（110 万轮 cjserver mean）**：①-a #6/8/9（LIMIT 未下推回表）**消除**——729/97/1207ms →
+  3.50/3.52/3.62ms（208×/28×/333×，P85 collect_limited_rows 早停）；①-b #29（ORDER BY 全量候选
+  回表）**未消除**——17.9s → 13.1s（-27%），仍 25.3× MySQL：流式化消除 O(N) 物化峰值但取数仍逐
+  docid 投影点查（batch_get_fields ~11µs/docid）。② 剩余全扫聚合量化：#12 count_all 407ms
+  （keys-only 窗口扫，O(1) count 仅非窗口 sqlish 生效）、#13 sum_where 841ms（22 万候选逐 docid
+  投影点查）、#14 group_by_status 900ms / #27 group_by_multi 1044ms（无 WHERE 全扫整行解码）、
+  #11 1504ms。事务公平档位：#25/35/36 p50 = 0.42–0.50ms（对齐 §14 档位 2 基线），mean 1.5–2.1×
+  （首次 fsync p99 抖动）。
+- **根因（P91 立项）**：PAX（`storage.hot_fields`）布局下**通用全扫聚合整体回归 5–8s**——
+  `decode_pax_block` 逐行重建全列 serde `Map` + `serde_json::to_vec`（比行式原 JSON 直通多一次
+  全量 parse+serialize），而 SQL 层全扫聚合（group by / SUM 无候选 / #11 between 等）只读少数列
+  却被迫物化整行；#14/#27 无 WHERE 分组全扫 900–1044ms 的整行解码同理。
+- **修复（P91 通用 scan 投影列）**：① `sstable.rs` `decode_projected_block`（PAX 块经
+  `decode_pax_block_fields` 只解请求列 → `assemble_subset_json` 组装子集 JSON，免整行重构；
+  行式块直通原 JSON）+ `SstRangeIter.project`（`set_project_fields`）；② `ColumnFamily::scan_stream_at`
+  增 project 参数 + `scan_stream_fields` 包装；③ `Engine::scan_stream_fields`（删除位图语义同
+  scan_stream）；④ sqlish 全扫消费端接线——`execute_aggregate_window` 无候选全扫与
+  `execute_group_by_window` 改走投影扫描，needed = WHERE 引用 ∪ 分组列 ∪ 聚合列
+  （`aggregate_needed_fields`/新增 `group_scan_needed_fields`），PAX 子集含全部消费字段、
+  缺失 = 原文档缺失，语义与整行路径精确一致（子集/整行对 light 字节判定等价）。
+- **测试**（1 新增，`p91_scan_stream_fields_matches_scan_stream_row_and_pax`）：行式 + hot_fields
+  PAX × memtable/flush(SST)/覆盖写/删除位图/重开，请求列（a/c）逐行与全量 scan_stream 等值。
+  回归 690 全绿（基线 689 + 1）。
+- **收口关系**：② 剩余全扫聚合的**窗口快路径**（默认表 docid 窗口 [0,2^48) 直通 count_all_docs
+  O(1) / 倒排词典枚举 GROUP BY）与 ①-b #29 的**块流式 Top-K 接线**（scan 取数替代逐 docid 点查）
+  为 P92 候选（对比报告 §5.2/§5.3）；P91 提供其依赖的 scan 投影列基建并消除 PAX 布局聚合回归。
+
 
 ## 环境备忘（不入库）
 
