@@ -655,6 +655,11 @@ pub struct StorageConfig {
     /// Ex-8.7：单次 GC 触发的最小**新增**置位 docid 数（防小批量删除触发整段重写；
     /// 重启后初始基准 = 打开时位图置位数，历史置位不重复触发）。
     pub delete_density_min_docs: u64,
+    /// P0-A（2026-09-04）：声明式组合索引——每项为一组字段名（最左前缀匹配）。
+    /// 写路径自动提取字段值写入 cidx 列族；读路径 sqlish 匹配 WHERE 等值前缀后路由到
+    /// `query_by_composite_prefix`（引擎已具备，缺口在写路径 + SQL 层接线）。
+    /// 例：`[["status","ts"], ["region","k"]]` → `WHERE status='active' AND ts=?` 走组合索引。
+    pub composite_indexes: Vec<Vec<String>>,
 }
 
 impl Default for StorageConfig {
@@ -702,6 +707,7 @@ impl Default for StorageConfig {
             // （防小批量删除/历史置位误触发整段重写；删除密集负载空间回收依赖此路径）。
             delete_density_min_ratio: 0.10,
             delete_density_min_docs: 1000,
+            composite_indexes: Vec::new(),
         }
     }
 }

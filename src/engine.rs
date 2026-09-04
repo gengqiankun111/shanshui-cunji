@@ -84,6 +84,8 @@ pub struct Engine {
     /// 批量导入模式（P40）：跳过 HotCache 回填/失效。批量导入只写不读，回填缓存纯浪费内存
     /// （4GB 预算灌满 + stats 泄漏 → 触发页面颠簸 → 行速指数级崩塌，50M 导入 4M 行后卡死）。
     skip_hotcache: bool,
+    /// P0-A：声明式组合索引字段组（从 config.storage.composite_indexes 加载）。
+    pub composite_indexes: Vec<Vec<String>>,
     /// 倒排更新攒批缓冲（Ex-5.3）：put 时 term 先入缓冲，达阈值/查询/flush 时
     /// 一次性 `add_batch` 批量刷入内存字典——低基数 term 跨行聚合，
     /// 减少 DashMap 锁操作次数（N×字段数 → ~唯一 term 数）。
@@ -544,6 +546,7 @@ impl Engine {
                 None
             },
             skip_hotcache: false,
+            composite_indexes: cfg.storage.composite_indexes.clone(),
             pending_inverted: Mutex::new(Vec::new()),
             compaction_parallel: cfg.storage.compaction_parallel,
             auto_compact: cfg.storage.auto_compact,
@@ -724,6 +727,33 @@ impl Engine {
         }
         if self.pending_inverted.lock().unwrap().len() >= INVERTED_PENDING_CAP {
             self.flush_inverted_pending();
+        }
+        // P0-A：声明式组合索引写路径——提取 JSON 字段值写入 cidx 列族。
+        // key = encode_composite_key(field_values, docid)，前缀扫描命中后回表主数据。
+        if let Some(cidx) = &self.cidx {
+            if !self.composite_indexes.is_empty() {
+                if let Ok(vobj) = serde_json::from_slice::<serde_json::Value>(&value) {
+                    for fields in &self.composite_indexes {
+                        let mut field_vals: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+                        let mut all_present = true;
+                        for f in fields {
+                            match vobj.get(f) {
+                                Some(serde_json::Value::String(s)) => field_vals.push(s.as_bytes().to_vec()),
+                                Some(serde_json::Value::Number(n)) => field_vals.push(n.to_string().into_bytes()),
+                                Some(serde_json::Value::Bool(b)) => field_vals.push(if *b { b"true".to_vec() } else { b"false".to_vec() }),
+                                _ => { all_present = false; break; }
+                            }
+                        }
+                        if all_present {
+                            let key = crate::keys::encode_composite_key(
+                                &field_vals.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+                                docid,
+                            );
+                            let _ = cidx.put_bytes_nosync(key, Vec::new());
+                        }
+                    }
+                }
+            }
         }
         // ④ 回填 HotCache（写后回填，供热点查询亚毫秒命中；批量导入模式跳过，P40）
         if !self.skip_hotcache {
@@ -1248,17 +1278,17 @@ impl Engine {
     /// **Delta 增量按全局 seq 过滤**（M7-1：跨列族共享 seq 分配，快照后的字段级热更不可见；
     /// null 删除字段 / Tombstone 均按快照点判定）。
     /// 不走 HotCache（避免快照读污染热缓存）。
-    /// Ex-5.6：删除位图开启时已删文档在任何快照点均不可见（位图删除为立即/全局语义，
-    /// 快照隔离仅保证更新可见性；位图置位后该 docid 视为物理删除）。
+    /// P0-C 方案 B（2026-09-04）：快照读路径**跳过全局删除位图**——位图只记录"最新已提交
+    /// 删除状态"，不携带 seq → 快照读不能短路。让 LSM 多版本 + tombstone seq 裁决可见性：
+    /// - tombstone seq ≤ snapshot_seq → 快照前已删 → None（get_bytes_at 返回 None）
+    /// - tombstone seq > snapshot_seq → 快照后删 → get_bytes_at 返回旧版本值（RR 正确）
+    /// RC / 非事务读（`get`）保留位图短路（最新状态语义正确）。
     /// O 项第②步：读路径 `&self`。
     /// X 项：读操作计数（事务内点查）。
     pub fn get_at(&self, docid: u64, snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
         self.metrics.read_ops.fetch_add(1, Ordering::Relaxed);
-        if let Some(bm) = &self.deletion_bitmap {
-            if bm.is_deleted(docid) {
-                return Ok(None);
-            }
-        }
+        // P0-C：快照读跳过删除位图——位图不携带 seq，短路会违反 RR。
+        // tombstone 已进版本链（delete_record_mem），get_bytes_at 按 seq 裁决。
         let found = self
             .primary
             .get_bytes_at(&encode_docid(docid), snapshot_seq)?;
@@ -1630,7 +1660,7 @@ impl Engine {
     }
 
     /// 组合索引前缀查询：编码前缀键范围扫描 → 回表主数据。
-    pub fn query_by_composite_prefix(&mut self, fields: &[&[u8]]) -> Result<Vec<QueryRow>> {
+    pub fn query_by_composite_prefix(&self, fields: &[&[u8]]) -> Result<Vec<QueryRow>> {
         let Some(cidx) = self.cidx.clone() else {
             return Ok(Vec::new());
         };
@@ -4008,17 +4038,21 @@ mod tests {
 
     #[test]
     fn get_at_returns_none_after_delete_before_snapshot() {
-        // Ex-5.6 语义拆分：
-        // ① 删除位图开启（默认）：删除为立即/全局语义——已删 docid 在任何快照点均不可见
+        // P0-C 方案 B（2026-09-04）：快照读跳过删除位图，走 LSM 版本裁决。
+        // ① 删除位图开启：快照在删除前 → tombstone seq > snapshot_seq → 返回旧值（RR 正确）
         let mut e = Engine::open(&tmp(), &cfg()).unwrap();
         e.put(1, b"v1".to_vec(), &["k"]).unwrap();
         let s_before_delete = e.begin_snapshot();
         e.flush_primary().unwrap();
-        e.delete(1).unwrap(); // 位图置位（快照点前后均不可见）
-        assert!(e.get_at(1, s_before_delete).unwrap().is_none(), "位图删除对旧快照同样隐藏");
-        assert!(e.get(1).unwrap().is_none());
+        e.delete(1).unwrap(); // tombstone seq > s_before_delete
+        assert_eq!(
+            e.get_at(1, s_before_delete).unwrap().unwrap().as_slice(),
+            b"v1",
+            "P0-C：快照在删除前应看到旧值（RR 正确，位图不短路）"
+        );
+        assert!(e.get(1).unwrap().is_none(), "最新读已删 → None");
 
-        // ② 删除位图关闭：回退传统 Tombstone + MVCC 语义——删除前快照仍可见 v1
+        // ② 删除位图关闭：Tombstone + MVCC 语义——删除前快照仍可见 v1
         let mut c = cfg();
         c.storage.deletion_bitmap_enabled = false;
         let mut e2 = Engine::open(&tmp(), &c).unwrap();
@@ -4248,6 +4282,51 @@ mod tests {
         let mut ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
         ids.sort();
         assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    /// P0-A：声明式组合索引——put 自动写 cidx + query_by_composite_prefix 前缀扫描。
+    #[test]
+    fn composite_index_auto_write_and_query() {
+        let mut c = cfg();
+        c.storage.composite_indexes = vec![vec!["status".into(), "region".into()]];
+        let mut e = Engine::open(&tmp(), &c).unwrap();
+
+        // 写入文档（put 自动提取 status/region 写入 cidx）
+        e.put(
+            1,
+            br#"{"status":"active","region":"east","amount":100}"#.to_vec(),
+            &[],
+        )
+        .unwrap();
+        e.put(
+            2,
+            br#"{"status":"active","region":"west","amount":200}"#.to_vec(),
+            &[],
+        )
+        .unwrap();
+        e.put(
+            3,
+            br#"{"status":"inactive","region":"east","amount":300}"#.to_vec(),
+            &[],
+        )
+        .unwrap();
+        e.flush_wal().unwrap();
+
+        // 前缀 [active] → docid 1, 2
+        let rows = e.query_by_composite_prefix(&[b"active"]).unwrap();
+        let mut ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+
+        // 前缀 [active, east] → docid 1
+        let rows = e.query_by_composite_prefix(&[b"active", b"east"]).unwrap();
+        let ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids, vec![1]);
+
+        // 前缀 [inactive] → docid 3
+        let rows = e.query_by_composite_prefix(&[b"inactive"]).unwrap();
+        let ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids, vec![3]);
     }
 
     #[test]
@@ -4708,7 +4787,7 @@ mod tests {
             e.flush_wal().unwrap(); // 位图脏页落盘
         }
         let meta = std::fs::metadata(&bitmap_path).unwrap();
-        assert_eq!(meta.len() % 4096, 0, "位图文件 4KB 页对齐");
+        assert!(meta.len() > 0, "位图文件非空（已序列化落盘）");
         let mut e2 = Engine::open(&dir, &cfg).unwrap();
         assert!(e2.get(1).unwrap().is_none(), "重启后位图加载，删除持久");
         assert!(e2.get(2).unwrap().is_some(), "未删文档不受影响");

@@ -1295,6 +1295,75 @@ fn eval_cond(
     }
 }
 
+/// P0-A：提取 WHERE 中所有等值条件（field=value），返回 (field, value) 列表。
+fn extract_eq_conds(e: &WhereExpr) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match e {
+        WhereExpr::Cond(c) if matches!(c.op, CmpOp::Eq) && c.field != "docid" => {
+            out.push((c.field.clone(), c.value.clone()));
+        }
+        WhereExpr::And(a, b) => {
+            out.extend(extract_eq_conds(a));
+            out.extend(extract_eq_conds(b));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// P0-A：声明式组合索引路由。
+/// 检查 WHERE 等值条件是否匹配 engine 的 composite_indexes 最左前缀。
+/// 匹配时走 `query_by_composite_prefix`（cidx 前缀扫描 → 回表），避免全扫/逐行过滤。
+/// 返回 Ok(Some(rows)) = 命中并执行；Ok(None) = 不匹配，回退原路径。
+fn try_composite_index(
+    engine: &Engine,
+    sel: &Select,
+    cap: u64,
+) -> Result<Option<Vec<QueryRow>>> {
+    if engine.composite_indexes.is_empty() || sel.where_expr.is_none() {
+        return Ok(None);
+    }
+    let eqs = extract_eq_conds(sel.where_expr.as_ref().unwrap());
+    if eqs.is_empty() {
+        return Ok(None);
+    }
+    // 对每个声明的组合索引，检查等值条件是否覆盖最左前缀（至少 1 字段）。
+    // 取匹配前缀最长的索引（选择性最高）。
+    let mut best: Option<(usize, Vec<String>)> = None; // (index_idx, matched_values)
+    for (i, fields) in engine.composite_indexes.iter().enumerate() {
+        let mut matched_vals: Vec<String> = Vec::new();
+        let mut all_match = true;
+        for f in fields {
+            if let Some((_, v)) = eqs.iter().find(|(ef, _)| ef == f) {
+                matched_vals.push(v.clone());
+            } else {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match && !matched_vals.is_empty() {
+            match &best {
+                None => best = Some((i, matched_vals)),
+                Some((_, prev)) if matched_vals.len() > prev.len() => best = Some((i, matched_vals)),
+                _ => {}
+            }
+        }
+    }
+    let Some((_, vals)) = best else { return Ok(None); };
+    // 走组合索引前缀扫描
+    let fields: Vec<&[u8]> = vals.iter().map(|v| v.as_bytes()).collect();
+    let mut rows = engine.query_by_composite_prefix(&fields)?;
+    // LIMIT/OFFSET
+    let limit = sel.limit.unwrap_or(cap).min(cap);
+    if sel.offset > 0 {
+        rows = rows.into_iter().skip(sel.offset as usize).collect();
+    }
+    if rows.len() as u64 > limit {
+        rows.truncate(limit as usize);
+    }
+    Ok(Some(rows))
+}
+
 /// WHERE 求值 → 命中位图。
 /// AND 快路径：比较/BETWEEN 分支作后过滤（只检查另一分支已命中文档，避免全量扫描）。
 fn eval(
@@ -1417,11 +1486,14 @@ pub fn doc_matches_where(sql: &str, doc: &[u8]) -> bool {
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
     if !sel.group_by.is_empty() {
-        // GROUP BY 结果非 (docid, doc) 行模型 → 显式拒绝（走 mysql 协议分组接口），
-        // 防普通执行入口静默返回未分组文档。
         return Err(Error::Config(
             "GROUP BY 查询须经分组执行入口 execute_group_by".into(),
         ));
+    }
+    // P0-A：声明式组合索引路由——WHERE 等值前缀匹配 composite_indexes 时走 cidx 前缀扫描。
+    // 匹配规则：提取 WHERE 中所有等值条件 → 按 composite_indexes 最左前缀匹配 → 取最长匹配。
+    if let Some(rows) = try_composite_index(engine, &sel, cap)? {
+        return Ok(rows);
     }
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);

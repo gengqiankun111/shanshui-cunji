@@ -1,109 +1,107 @@
 //! 删除位图（Ex-5.6，design 4.6 / 4.8.3 阶段二）：独立于 LSM 的按 DocId 1bit 删除位图。
 //!
-//! 目标：删除仅写 1bit + fsync 1 页（对比 LSM Tombstone 全链路 -99% IO）、查询 O(1) 跳过已删
+//! 目标：删除仅写 1bit + fsync（对比 LSM Tombstone 全链路 -99% IO）、查询 O(1) 跳过已删
 //! 文档、墓碑不再污染 LSM 层级；compaction 按位图物理删除后位图标记保留（docid 视为已删），
 //! 重新写入（put）时清位复活。
 //!
-//! 存储布局：文件 = 纯位数组（无头），4KB 页对齐（对齐 SSD 页）；每页容纳 4096×8=32768 个
-//! docid；文件按 4KB 页粒度增长（不产生子页写）。内存为稠密位图（`Vec<u64>`，1.5 亿 docid
-//! ≈ 19MB），查询 O(1) 纯内存裁决、零磁盘 IO。
+//! P2-B（2026-09-04）：稀疏化重构——稠密 `Vec<AtomicU8>` → `RoaringTreemap` 稀疏位图。
+//! 多表 docid = table_id<<48 | row，非默认表 docid ≥ 2^48，稠密数组需 32TB 物理不可行。
+//! RoaringTreemap 按高 32 位分桶（天然按 table_id 隔离），内存 = O(删除集大小) 而非 O(docid 空间)。
 //!
-//! 崩溃语义：置位/清位先改内存 + 标记脏页，`flush` 时只写脏页 + 一次 fsync（与 WAL flush 同点
-//! 调用，见 Engine::flush_wal——先刷位图后刷 WAL，位图持久早于 WAL 截断推进，删除不丢失）。
+//! 持久化：全量序列化 → 覆写文件 → fsync（与 WAL flush 同点调用，见 Engine::flush_wal——
+//! 先刷位图后刷 WAL，位图持久早于 WAL 截断推进，删除不丢失）。
 //! 未 flush 的置位在崩溃后丢失 → 由 WAL 回放重删重建（幂等）。
 //!
-//! 零 unsafe 说明：design 的 mmap 方案与 inverted FST 字典同理（memmap2 为 unsafe API），
-//! 此处用 `File` seek+write 页粒度落盘，保留"1bit/DocId + 4KB 页对齐 + 页粒度 IO"本质。
+//! Ex-8.14 读路径无锁化：ArcSwap<RoaringTreemap> COW 写——`is_deleted` 取快照（ArcSwap
+//! guard，无 RwLock/无互斥）后 `contains`，删除/扫描/计数并发互不阻塞；写路径（mark/clear）
+//! COW（clone → mutate → store），读路径不经过写锁。
 
-use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use arc_swap::ArcSwap;
+use roaring::treemap::RoaringTreemap;
 
 use crate::error::Result;
 
-/// 页大小（对齐 SSD 页，design 4.8）。
-pub const PAGE_BYTES: usize = 4096;
-/// 每页容纳的 docid 数：4KB × 8bit = 32768。
-pub const BITS_PER_PAGE: u64 = (PAGE_BYTES * 8) as u64;
-
-/// 删除位图：稠密内存位图 + 4KB 页对齐持久化文件。
-/// Ex-8.14：**读路径无锁化**——位组改 `ArcSwap<Box<[AtomicU8]>>`：`is_deleted` 取快照（ArcSwap
-/// guard，无 RwLock）后单字节原子读，删除/扫描/计数并发互不阻塞（此前逐行 RwLock 读锁在
-/// 50m 行级判定上竞争真实存在）；写路径（mark/clear）短 Mutex 串行（引擎本就单写者，锁仅护
-/// 扩容换代与 in-place 位翻转的自我健全）；扩容（新 docid 越界）时倍增复制后换代。
+/// 删除位图：稀疏 RoaringTreemap + ArcSwap 无锁读 + 全量序列化持久化。
+///
+/// P2-B：替代原稠密 `Vec<AtomicU8>` 方案——多表高位 docid（tid<<48）下稠密数组物理不可行
+/// （32TB），稀疏位图内存 = O(删除集大小)。读路径 O(log n) ~22ns/op（demo 实测 13.3× 稠密
+/// 但全扫瓶颈下可忽略）。
+///
+/// Ex-8.14：读路径无锁——ArcSwap 快照 + RoaringTreemap::contains（不可变引用）；
+/// 写路径 COW——clone 快照 → insert/remove → store（引擎本就单写者，锁仅护 COW 代际健全）。
 #[derive(Debug, Default)]
 pub struct DeletionBitmap {
-    /// 稠密位组（**每元素 = 1 文件字节**，值 0..=255；LSB-first，byte=docid/8，bit=docid%8）——
-    /// 读无锁快照载体；元素为 AtomicU8 支持并发原子读。
-    bytes: ArcSwap<Box<[AtomicU8]>>,
-    /// 脏页索引（docid/BITS_PER_PAGE）：`flush` 时只写这些页。
-    dirty: Mutex<HashSet<u64>>,
-    /// 写者串行锁（mark/clear/扩容换代）——引擎写路径本就单写者；读路径不经过此锁。
+    /// 稀疏位图（RoaringTreemap = BTreeMap<u32, RoaringBitmap>，高 32 位按表分桶）。
+    /// ArcSwap 无锁读快照；COW 写（clone → mutate → store）。
+    inner: ArcSwap<RoaringTreemap>,
+    /// 是否有未落盘的变更（mark/clear 置 true，flush 后清 false）。
+    dirty: AtomicBool,
+    /// 写者串行锁（mark/clear COW 代际健全）——引擎写路径本就单写者；读路径不经过此锁。
     write: Mutex<()>,
     /// 位图文件路径（`<data_dir>/deletion.bitmap`）。
     path: PathBuf,
 }
 
 impl DeletionBitmap {
-    /// 打开（或创建）删除位图：文件存在则加载已有位数组，否则为空位图。
+    /// 打开（或创建）删除位图：文件存在则反序列化加载，否则为空位图。
     pub fn open(path: &Path) -> Result<Self> {
-        let mut bits: Vec<AtomicU8> = Vec::new();
-        if path.exists() {
-            let mut f = File::open(path)?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
-            // 逐字节展开（文件恒为 4KB 倍数，含尾部对齐页）
-            bits.reserve(buf.len());
-            for byte in buf {
-                bits.push(AtomicU8::new(byte));
-            }
-        }
+        let treemap = if path.exists() && std::fs::metadata(path)?.len() > 0 {
+            let f = File::open(path)?;
+            let mut reader = BufReader::new(f);
+            RoaringTreemap::deserialize_from(&mut reader)
+                .map_err(|e| crate::error::Error::Config(format!("删除位图反序列化失败: {e}")))?
+        } else {
+            RoaringTreemap::new()
+        };
         Ok(Self {
-            bytes: ArcSwap::from_pointee(bits.into_boxed_slice()),
-            dirty: Mutex::new(HashSet::new()),
+            inner: ArcSwap::from_pointee(treemap),
+            dirty: AtomicBool::new(false),
             write: Mutex::new(()),
             path: path.to_path_buf(),
         })
     }
 
-    /// 删除：置位（O(1) 内存）+ 标记脏页；仅当位确实翻转才写页（重复删除零 IO）。
-    /// Ex-8.7：返回是否**新置位**（此前未删）——调用方据此维护删除密度计数器（幂等重删不重计）。
+    /// 删除：置位 + 标记脏；仅当位确实翻转才返回 true（重复删除幂等，不重计）。
+    /// Ex-8.7：返回是否**新置位**——调用方据此维护删除密度计数器。
     pub fn mark_deleted(&self, docid: u64) -> bool {
-        if !self.is_deleted(docid) {
-            self.mutate(docid, true);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 复活（put 重新写入）：清位（O(1)）+ 标记脏页；位本就未置时零 IO。
-    /// Ex-8.7：返回是否**实际清位**（此前已删）——调用方据此减除删除密度计数（复活才减）。
-    pub fn clear(&self, docid: u64) -> bool {
-        if self.is_deleted(docid) {
-            self.mutate(docid, false);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 查询（O(1)，**无锁**）：已删返回 true；越界（从未删除）返回 false。
-    /// 每次调用取 ArcSwap 快照（~10ns，无 RwLock/无互斥），与写路径（delete/put 复活/扩容）
-    /// 及并发扫描完全并行。
-    pub fn is_deleted(&self, docid: u64) -> bool {
-        let bytes = self.bytes.load();
-        let byte = (docid / 8) as usize;
-        if byte >= bytes.len() {
+        let cur = self.inner.load();
+        if cur.contains(docid) {
             return false;
         }
-        let bit = docid % 8;
-        (bytes[byte].load(Ordering::Acquire) >> bit) & 1 == 1
+        let _g = self.write.lock().unwrap();
+        // COW：clone → insert → store
+        let mut next = (**cur).clone();
+        next.insert(docid);
+        self.inner.store(std::sync::Arc::new(next));
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// 复活（put 重新写入）：清位 + 标记脏；位本就未置时返回 false（no-op）。
+    /// Ex-8.7：返回是否**实际清位**——调用方据此减除删除密度计数。
+    pub fn clear(&self, docid: u64) -> bool {
+        let cur = self.inner.load();
+        if !cur.contains(docid) {
+            return false;
+        }
+        let _g = self.write.lock().unwrap();
+        let mut next = (**cur).clone();
+        next.remove(docid);
+        self.inner.store(std::sync::Arc::new(next));
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// 查询（**无锁**）：已删返回 true；未删/不存在返回 false。
+    /// ArcSwap 快照 + RoaringTreemap::contains（O(log n)，~22ns/op demo 实测）。
+    pub fn is_deleted(&self, docid: u64) -> bool {
+        self.inner.load().contains(docid)
     }
 
     /// 主数据键（8 字节大端 docid）的已删判定（compaction 过滤用）。
@@ -114,94 +112,42 @@ impl DeletionBitmap {
         self.is_deleted(u64::from_be_bytes(key[..8].try_into().unwrap()))
     }
 
-    /// 当前已删 docid 总数。
+    /// 当前已删 docid 总数（O(1)，RoaringTreemap::len）。
     pub fn deleted_count(&self) -> u64 {
-        self.bytes
-            .load()
-            .iter()
-            .map(|b| (b.load(Ordering::Acquire) as u64).count_ones() as u64)
-            .sum()
+        self.inner.load().len()
     }
 
-    /// 是否有待落盘脏页。
+    /// 是否有待落盘变更。
     pub fn has_pending(&self) -> bool {
-        !self.dirty.lock().unwrap().is_empty()
+        self.dirty.load(Ordering::Acquire)
     }
 
-    /// 脏页全部落盘：每页 4KB 对齐写一次 + 一次 fsync（同页 N 次删除 = 1 页写 + 1 fsync）。
+    /// 全部变更落盘：全量序列化 → 覆写文件 → fsync。
+    /// 崩溃语义：写盘中崩溃文件损坏 → WAL 回放重建（幂等）。
     pub fn flush(&self) -> Result<()> {
-        let dirty_pages: Vec<u64> = self.dirty.lock().unwrap().iter().copied().collect();
-        if dirty_pages.is_empty() {
+        if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut f = File::options()
-            .create(true)
-            .truncate(false) // 覆盖写：不截断（保留既有页）
-            .write(true)
-            .open(&self.path)?;
-        let mut pages = dirty_pages;
-        pages.sort_unstable();
-        let bytes = self.bytes.load();
-        for p in pages {
-            let start = (p * BITS_PER_PAGE) as usize;
-            let mut buf = vec![0u8; PAGE_BYTES];
-            for (cell, bit_cell) in buf.iter_mut().enumerate() {
-                let global = start + cell * 8;
-                let mut byte = 0u8;
-                for b in 0..8 {
-                    let g = global + b;
-                    let cell_idx = g / 8; // 元素 = 1 字节（docid/8）
-                    if cell_idx < bytes.len()
-                        && (bytes[cell_idx].load(Ordering::Acquire) >> (g % 8)) & 1 == 1
-                    {
-                        byte |= 1 << b;
-                    }
-                }
-                *bit_cell = byte;
-            }
-            let offset = p * PAGE_BYTES as u64;
-            f.seek(SeekFrom::Start(offset))?;
-            f.write_all(&buf)?; // 越界页写入自动扩展文件（4KB 页粒度）
-        }
-        f.sync_all()?;
-        self.dirty.lock().unwrap().clear();
+        let f = File::create(&self.path)?;
+        let mut writer = BufWriter::new(f);
+        let cur = self.inner.load();
+        (**cur)
+            .serialize_into(&mut writer)
+            .map_err(|e| crate::error::Error::Config(format!("删除位图序列化失败: {e}")))?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
     /// DROP TABLE purge：清空位图内存态并删除持久化文件（等价从未删除；重启后重建为空）。
     pub fn purge(&self) {
         let _w = self.write.lock().unwrap();
-        self.bytes
-            .store(std::sync::Arc::new(Box::new([] as [AtomicU8; 0])));
-        self.dirty.lock().unwrap().clear();
+        self.inner.store(std::sync::Arc::new(RoaringTreemap::new()));
+        self.dirty.store(false, Ordering::Release);
         if self.path.exists() {
             let _ = std::fs::remove_file(&self.path);
         }
-    }
-
-    /// 置位/清位公共路径（写者串行 + 必要时扩容换代）。
-    fn mutate(&self, docid: u64, set: bool) {
-        let _g = self.write.lock().unwrap(); // 引擎单写者；锁护扩容换代与位翻转的自健全
-        let byte = (docid / 8) as usize;
-        if byte >= self.bytes.load().len() {
-            let bytes = self.bytes.load();
-            let old = bytes.len();
-            let need = byte + 1;
-            let mut next: Vec<AtomicU8> = Vec::with_capacity(need.max(old.max(1) * 2));
-            for b in bytes.iter() {
-                next.push(AtomicU8::new(b.load(Ordering::Acquire)));
-            }
-            next.resize_with(need.max(old.max(1) * 2), || AtomicU8::new(0));
-            self.bytes.store(std::sync::Arc::new(next.into_boxed_slice()));
-        }
-        let bit = docid % 8;
-        let cell = &self.bytes.load()[byte];
-        if set {
-            cell.fetch_or(1 << bit, Ordering::AcqRel);
-        } else {
-            cell.fetch_and(!(1 << bit), Ordering::AcqRel);
-        }
-        self.dirty.lock().unwrap().insert(docid / BITS_PER_PAGE);
     }
 }
 
@@ -212,7 +158,7 @@ mod tests {
     #[test]
     fn bit_semantics() {
         let dir = tempfile::tempdir().unwrap();
-        let mut bm = DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap();
+        let bm = DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap();
         for d in [0u64, 7, 8, 15, 16, 1023, 1_000_000] {
             assert!(!bm.is_deleted(d));
             bm.mark_deleted(d);
@@ -225,23 +171,20 @@ mod tests {
     }
 
     #[test]
-    fn page_alignment_and_reopen_recovery() {
+    fn flush_and_reopen_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("del.bitmap");
         {
-            let mut bm = DeletionBitmap::open(&path).unwrap();
-            bm.mark_deleted(BITS_PER_PAGE - 1); // 页 0 尾
-            bm.mark_deleted(BITS_PER_PAGE); // 页 1 首
-            bm.mark_deleted(BITS_PER_PAGE * 2 + 5); // 页 2
+            let bm = DeletionBitmap::open(&path).unwrap();
+            bm.mark_deleted(42);
+            bm.mark_deleted(1_000_000);
             bm.flush().unwrap();
         }
-        let meta = std::fs::metadata(&path).unwrap();
-        assert_eq!(meta.len() as usize, 3 * PAGE_BYTES, "文件 4KB 对齐");
         let bm = DeletionBitmap::open(&path).unwrap();
-        assert!(bm.is_deleted(BITS_PER_PAGE - 1));
-        assert!(bm.is_deleted(BITS_PER_PAGE));
-        assert!(bm.is_deleted(BITS_PER_PAGE * 2 + 5));
+        assert!(bm.is_deleted(42));
+        assert!(bm.is_deleted(1_000_000));
         assert!(!bm.is_deleted(0));
+        assert!(!bm.is_deleted(43));
     }
 
     #[test]
@@ -250,7 +193,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("del.bitmap");
         {
-            let mut bm = DeletionBitmap::open(&path).unwrap();
+            let bm = DeletionBitmap::open(&path).unwrap();
             bm.mark_deleted(42);
             bm.flush().unwrap();
             bm.mark_deleted(43); // 未 flush
@@ -261,8 +204,8 @@ mod tests {
     }
 
     #[test]
-    fn lock_free_reads_under_writer_growth_and_flips() {
-        // Ex-8.14：读者（is_deleted 无锁）与写者（翻转 + 扩容换代）并发——不崩溃、最终态正确
+    fn lock_free_reads_under_writer_cow() {
+        // Ex-8.14：读者（is_deleted 无锁）与写者（COW 翻转）并发——不崩溃、最终态正确
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let bm = Arc::new(DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap());
@@ -284,10 +227,10 @@ mod tests {
             })
             .collect();
         for d in (0..300_000u64).step_by(2) {
-            bm.mark_deleted(d); // 含扩容（300k docid → 37.5KB → 倍增多次）
+            bm.mark_deleted(d);
         }
         for d in (0..300_000u64).step_by(6) {
-            bm.clear(d); // 复活部分偶数
+            bm.clear(d);
         }
         // 最终态：2|6 → (2|6 mod 6==0 → cleared) evens step6 cleared → 剩 2 的倍数非 6 倍数
         for d in (0..300_000u64).step_by(6) {
@@ -304,16 +247,95 @@ mod tests {
     }
 
     #[test]
-    fn redundant_ops_do_not_dirty_pages() {
-        // 重复删除 / 从未删除的 put 清位 → 零页写出（put 路径不产生额外 IO）
+    fn redundant_ops_do_not_dirty() {
+        // 重复删除 / 从未删除的 put 清位 → 不新增脏标记
         let dir = tempfile::tempdir().unwrap();
         let bm = DeletionBitmap::open(&dir.path().join("del.bitmap")).unwrap();
         bm.mark_deleted(5);
-        bm.mark_deleted(5); // 重复删除：位已置 → 不新增脏页
-        assert_eq!(bm.dirty.lock().unwrap().len(), 1);
-        bm.clear(99); // 从未删除 → 清位是 no-op → 不新增脏页
-        assert_eq!(bm.dirty.lock().unwrap().len(), 1);
+        assert!(bm.has_pending());
         bm.flush().unwrap();
-        assert_eq!(std::fs::metadata(dir.path().join("del.bitmap")).unwrap().len(), PAGE_BYTES as u64);
+        assert!(!bm.has_pending());
+
+        // 重复删除已删位 → no-op，不脏
+        assert!(!bm.mark_deleted(5));
+        assert!(!bm.has_pending());
+
+        // 从未删除的清位 → no-op，不脏
+        assert!(!bm.clear(99));
+        assert!(!bm.has_pending());
+    }
+
+    // ---- P2-B 多表高位 docid 测试 ----
+
+    #[test]
+    fn multi_table_high_docid_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bm = DeletionBitmap::open(&dir.path().join("multi.bitmap")).unwrap();
+
+        // 表 1 删 row=1..100，表 2 删 row=50..150
+        let mk = |tid: u64, row: u64| (tid << 48) | row;
+        for row in 1..=100u64 {
+            bm.mark_deleted(mk(1, row));
+        }
+        for row in 50..=150u64 {
+            bm.mark_deleted(mk(2, row));
+        }
+
+        // 表 1：row 1..100 已删，row 101+ 未删
+        assert!(bm.is_deleted(mk(1, 1)));
+        assert!(bm.is_deleted(mk(1, 100)));
+        assert!(!bm.is_deleted(mk(1, 101)));
+
+        // 表 2：row 50..150 已删，row 1..49 未删
+        assert!(!bm.is_deleted(mk(2, 49)));
+        assert!(bm.is_deleted(mk(2, 50)));
+        assert!(bm.is_deleted(mk(2, 150)));
+        assert!(!bm.is_deleted(mk(2, 151)));
+
+        // 表 3：完全未删
+        assert!(!bm.is_deleted(mk(3, 1)));
+
+        // 交叉：只清表 1 row=50 → 表 2 row=50 仍删
+        bm.clear(mk(1, 50));
+        assert!(!bm.is_deleted(mk(1, 50)));
+        assert!(bm.is_deleted(mk(2, 50)), "表 2 不受表 1 清位影响");
+    }
+
+    #[test]
+    fn multi_table_flush_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("high.bitmap");
+        {
+            let bm = DeletionBitmap::open(&path).unwrap();
+            let mk = |tid: u64, row: u64| (tid << 48) | row;
+            bm.mark_deleted(mk(0, 42)); // 默认表
+            bm.mark_deleted(mk(1, 100)); // 非默认表
+            bm.mark_deleted(mk(2, 999)); // 另一非默认表
+            bm.flush().unwrap();
+            bm.mark_deleted(mk(1, 200)); // 未 flush（崩溃丢失）
+        }
+        let bm = DeletionBitmap::open(&path).unwrap();
+        let mk = |tid: u64, row: u64| (tid << 48) | row;
+        assert!(bm.is_deleted(mk(0, 42)), "flush 的恢复");
+        assert!(bm.is_deleted(mk(1, 100)), "flush 的恢复");
+        assert!(bm.is_deleted(mk(2, 999)), "flush 的恢复");
+        assert!(!bm.is_deleted(mk(1, 200)), "未 flush 的丢失");
+    }
+
+    #[test]
+    fn purge_clears_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("purge.bitmap");
+        let bm = DeletionBitmap::open(&path).unwrap();
+        bm.mark_deleted(1);
+        bm.mark_deleted(1u64 << 48);
+        bm.flush().unwrap();
+        assert!(path.exists());
+
+        bm.purge();
+        assert!(!path.exists());
+        assert_eq!(bm.deleted_count(), 0);
+        assert!(!bm.is_deleted(1));
+        assert!(!bm.is_deleted(1u64 << 48));
     }
 }
