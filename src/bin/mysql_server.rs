@@ -78,16 +78,16 @@ fn main() {
             }
         }
     };
-    // MySQL 协议接入默认开启组提交：`group_commit_us=0`（默认关）→ 每次 put 独立 WAL fsync，
-    // 实测插入仅 ~1k rows/s（vs 引擎原生/组提交 14 万+）；2ms 攒批窗口一次 fsync 消除逐行落盘。
-    // 用户可在 config 显式指定（0 关闭需在 config 文件显式声明）。
-    if cfg.storage.group_commit_us == 0 {
-        cfg.storage.group_commit_us = 2000;
-        println!("[cjserver] 默认开启组提交（group_commit_us=2000µs，config 可覆盖）");
-    }
+    // 组提交默认已开（config `storage.group_commit_us` 默认 1000µs，2026-09-05 起）——
+    // MySQL 协议接入无需再强制：逐行 put 走组提交窗口一次 fsync（P75 根因修复随默认化生效）。
+    // 显式 `group_commit_us = 0` 表示用户选择逐条 fsync 强安全（尊重配置，不再覆盖）。
     // P2-A：事务 COMMIT 耐久档位（对齐 MySQL innodb_flush_log_at_trx_commit）。
     // 1 = 每次 COMMIT 显式 fsync（强安全默认）；0/2 = COMMIT 交组提交窗口（延迟耐久，
     // 并发事务基准建议 2，config `storage.flush_log_at_trx_commit` 可覆盖）。
+    println!(
+        "[cjserver] 组提交 group_commit_us={}µs（0 = 逐条 fsync 强安全）",
+        cfg.storage.group_commit_us
+    );
     println!(
         "[cjserver] 事务 COMMIT 耐久档位 flush_log_at_trx_commit={}（1 = 逐 COMMIT fsync 强安全；0/2 = 组提交窗口延迟落盘）",
         cfg.storage.flush_log_at_trx_commit

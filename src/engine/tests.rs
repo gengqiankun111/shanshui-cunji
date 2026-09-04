@@ -1414,12 +1414,32 @@ use crate::optimizer::QuerySpec;
     // ---------- 组提交（M8） ----------
 
     #[test]
-    fn group_commit_default_disabled_persists_each_put() {
-        // 默认 group_commit_us=0：put 逐条 fsync，drop 后重开数据完整
+    fn group_commit_disabled_fallback_persists_each_put() {
+        // 显式关闭组提交（旧默认，强安全）：put 逐条 fsync，drop 后重开数据完整
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut e = Engine::open(dir.path(), &cfg()).unwrap();
-            assert!(e.group_commit.is_none(), "默认应关闭组提交");
+            let mut c = cfg();
+            c.storage.group_commit_us = 0;
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            assert!(e.group_commit.is_none(), "group_commit_us=0 应关闭组提交");
+            for i in 0..50u64 {
+                e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+            }
+        }
+        let mut e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        assert_eq!(e2.get(49).unwrap().unwrap(), b"doc-49");
+    }
+
+    #[test]
+    fn group_commit_default_enabled_drop_persists_tail() {
+        // 组提交默认开（1000µs，Task-005 采纳）：drop 时窗口尾批必须 flush，
+        // 重开数据完整（崩溃恢复语义：进程内正常关闭不丢尾批）
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = cfg();
+            assert_eq!(c.storage.group_commit_us, 1000, "默认组提交窗口应为 1000µs");
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            assert!(e.group_commit.is_some(), "默认应开启组提交");
             for i in 0..50u64 {
                 e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
             }
@@ -1823,7 +1843,8 @@ use crate::optimizer::QuerySpec;
         // P2-A ②：档位 2 但组提交关闭（无后台落盘线程）——maybe_group_commit 回退
         // flush_wal → COMMIT 仍显式 fsync（强安全兜底，语义不劣化）。
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = cfg(); // group_commit_us = 0
+        let mut cfg = cfg();
+        cfg.storage.group_commit_us = 0; // 显式关组提交（兜底路径前提）
         cfg.storage.flush_log_at_trx_commit = 2;
         let mut e = Engine::open(dir.path(), &cfg).unwrap();
         let mut txn = e.txn_begin(crate::txn::Isolation::ReadCommitted);

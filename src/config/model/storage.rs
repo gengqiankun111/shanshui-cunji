@@ -44,8 +44,9 @@ pub struct StorageConfig {
     pub wal_mode: String,
     /// 环形 WAL 预分配大小（MB，默认 64）。环形满且未刷盘时强制 Flush 腾空。
     pub wal_ring_size_mb: u64,
-    /// 组提交窗口（µs，design 4.3 / M8）：0 = 关闭（保持逐条 fsync 强安全，默认）；
+    /// 组提交窗口（µs，design 4.3 / M8）：0 = 关闭（保持逐条 fsync 强安全）；
     /// >0 = 窗口内所有写入攒批，一次 fsync 覆盖（延迟耐久：崩溃最多丢 ≤ 窗口数据）。
+    /// **默认 1000µs（2026-09-05 Task-005 A/B 采纳：写混合负载 ~2k → ~48k ops/s，p99 ≈ 2.8ms）**。
     pub group_commit_us: u64,
     /// 组提交字节阈值：WAL 待刷缓冲 ≥ 此值立即 fsync（不等窗口）。
     pub group_commit_bytes: usize,
@@ -133,7 +134,9 @@ impl Default for StorageConfig {
             // Ex-5.5：环形 WAL 规模化默认（64→256MB）——减少小环频繁回绕强制 Flush；
             // 大容量预分配（GB 级）+ 环形覆盖均匀（SSD 磨损天然均衡）已由 RingWal 支持。
             wal_ring_size_mb: 256,
-            group_commit_us: 0,
+            // 组提交默认开（Task-005 A/B 采纳，2026-09-05）：1000µs 窗口批量一次 fsync，
+            // 写混合吞吐 ~24×；显式 0 = 逐条 fsync 强安全（旧默认）。
+            group_commit_us: 1000,
             group_commit_bytes: 256 * 1024,
             // P2-A：事务 COMMIT 默认逐次 fsync（强安全，同 MySQL innodb_flush_log_at_trx_commit=1）。
             flush_log_at_trx_commit: 1,
