@@ -1062,6 +1062,30 @@
   + MySQL 3316 / SCC 3317 资产的可复用完整步骤，供后续 10 万/110 万对比报告复用）。
 
 
+### P96. Task-021 COUNT 全包窗口直通 O(1)（#12，2026-09-05）+ 复测排期消化
+
+- **背景**：110 万复测 #12 count_all 405.68ms（MySQL 157.86ms = 2.6×，10 万 42.84ms = 3.1×）——
+  `execute_aggregate_window` scoped 整表窗口走 keys-only 线性扫（P1-C `count_all_docs` O(1) 仅
+  scoped=false 直连全库启用，跨表串表风险）。
+- **改动**：
+  - 引擎（engine/scan.rs）：新增 `count_docs_range(start,end)`——活跃 docid 位图（RoaringTreemap）
+    `rank` 差值闭区间基数（`rank(end)-rank(start-1)`，O(命中高位桶数)）；多表 docid 高 16 位即表号，
+    区间天然单表隔离；
+  - SQL（sql/executor/aggregate.rs）：新增 `full_table_window` 判定（窗口恰好覆盖某表
+    `[t<<48,(t<<48)+2^48-1]`），scoped `COUNT(*) 无 WHERE` 整表窗口直通 `count_docs_range`；
+    部分/半开窗口保持 keys-only。
+- **测试**：`task021_count_full_table_window_o1_parity_and_isolation`（整表 tid0=999、无窗口全库
+  =1006、tid1 整表=7、部分窗口 keys-only=101；含删除位图隐藏行）。全量 695 passed / 0 failed
+  （694 + 1）。
+- **验收预期**：10 万 #12 42.84ms、110 万 405.68ms → µs~<1ms 级（下次复测回填）。
+- **复测排期消化（110 万分级表）**：#12 → ✅（Task-021）；#29/#14/#27/#11 同根（默认行式全扫
+  整行 IO）合并为 **Task-024**（P0/P1，未开发）；#17-19 单行更新 → Per-CPU WAL（远期）；
+  4.2 范围查询结构提速四项（SSTable 重叠度/分区/块内索引/并行扫描）→ **Task-025（远期/合并）**。
+  内存结论：1.1M 行 MySQL 2G pool 充足暂不加大；公平对比按“缓存预算”口径或收紧 SCC 复测。
+- **归档**：`user_guide/性能对比-2026-09-05-P85-P92后-10万与110万.md`（10 万/110 万复测数据 +
+  根因转化 + 残余/内存观察）；一键复跑脚本 `user_guide/宽表SQL对比-基准.ps1`。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

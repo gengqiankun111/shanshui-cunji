@@ -6,6 +6,126 @@
 
 插队排期，优先开发：
 
+> 2026-09-05 追加：**10 万轮对比（results-sqlrun-compare-100k，P85~P92 生效后）37 探针 vs MySQL §2.3/2.4 根因转化**。
+> 逐项核对现状后**仅 3 项真实可修复缺口**，置顶于 Task-002 之前，各自单独排期执行（销项记录按 problem_solving P 序列续号 P96+）：
+> - Task-021：COUNT 全包窗口直通 O(1)（#12 3.1×）——报告 2.4「全包窗口 O(1)」对应项；P1-C 引擎 O(1) 已备、协议层窗口接线未做
+> - Task-022：点查/IN 投影列解码瘦身（#2 2.9× / #3 / #9）——P86② 字节级提取基建已备、点查输出路径未接
+> - Task-023：主键 IN 列表批量定位（#4 3.8×）——P92 稠密判定 + delete_range50 keys-only 基建复用
+> **不排说明（核对结论）**：全扫投影列解码（#12/#14/#27/#29）= P91 ✅ 已完成，本轮残余为行式 IO 地板（归远期 PAX 列 IO，P93-候选已消费给重构）；倒排回表早停（#6/8/9）= P85 ✅；写放大 Per-CPU WAL 已在「三、远期」Ex-13 触发链；#5 主键范围归并 / #16 窗口排序 = LSM 结构差接受；#32 1.2× 差距小不排；报告 2.4「动态缓存调整（阶段 3）」无现成设计，属评估项未立项。
+
+Task-021：COUNT 全包窗口直通 O(1)（#12 count_all，10 万 42.84ms vs MySQL 14.01ms = 3.1×）
+
+> 根因：`execute_aggregate_window`（src/sql/executor/aggregate.rs `scoped` 判定 + L55-67）对带表窗口的 `COUNT(*) 无 WHERE`
+> 强制窗口内 keys-only 全扫（`scoped=true` 禁引擎快路径，防跨表串表）；引擎 `count_all_docs`（P1-C ✅ O(1)：活跃 docid
+> RoaringTreemap 懒建基线 + put/delete/delete_batch/purge 增量记账，src/engine/scan.rs）仅 `scoped=false` 直连全库启用。
+> MySQL 协议层聚合一律带本表 docid 窗口 → 默认表 [0,2^48) **全包窗口**仍 keys-only 线性扫（~0.43µs/行；110 万 ~407ms，
+> P1-C 复测记录）——即报告 2.4「P92 全包窗口 O(1)」所指（dev_remain P92 为 Top-K 稠密窗口，未覆盖此接线）。
+属性	内容
+优先级	高（#12 全扫类根因唯一未落地项；10 万 27 落后项中收益最直接）
+工作量	1 天
+依赖	`Engine::count_all_docs` O(1)（P1-C ✅，src/engine/scan.rs L247）；活跃 docid 位图（含多表 docid）
+风险	中（窗口计数语义须与现 keys-only 口径一致；事务/活跃快照场景核对）
+具体工作：
+
+□ 引擎层：新增按表区间 O(1) 计数 `count_docs_range(start,end)` = 活跃 docid 位图区间基数（RoaringTreemap range 跳桶，O(命中桶)）；默认表全包窗口直通现有 `count_all_docs`，非默认表窗口 [tid<<48,(tid+1)<<48) 走区间基数（多表隔离正确）
+□ 接线：aggregate.rs scoped `COUNT(*) 无 WHERE` 分支（L55-67）——窗口覆盖整表（默认表 [0,2^48) / 非默认表整表区间）→ 直通 O(1)；部分窗口保持 keys-only；若现 keys-only 扫描为非版本化口径则活跃快照下亦直通（对齐现引擎快路径），若版本化则活跃快照存在时回退 keys-only（对齐 P90 块级下推 eligible 风格）
+□ 单测：整表窗口 = scan 口径 / 部分窗口 keys-only 不回退 / 非默认表区间计数 / 墓碑 + 删除位图 / 多表隔离 / 活跃快照回退（按上条口径）
+验收标准：
+
+- 10 万 #12 count_all 42.84ms → ≤1ms（MySQL 14.01ms）；110 万 ~407ms → ≤1ms
+- COUNT 语义与现 keys-only 逐行计数一致（同 key 最新版本、Tombstone 跳过）；P1-C/Ex-9.3 ⑤ 既有快路径单测不回退
+- 全量回归通过
+> ✅ 已完成（2026-09-05，P96）：Engine::count_docs_range（活跃 docid rank 差值区间基数）+ aggregate
+> 整表窗口 COUNT(*) 直通 + 单测（整表/部分窗口/多表隔离/删除）；全量 695 passed / 0 failed。
+
+Task-022：点查/IN 投影列解码瘦身（#2 pk_point_proj10 2.9× / #3 pk_in_5 2.2× / #9 field_in 5.5× 回表投影）
+
+> 根因：点查 `SELECT 10 列`（0.46ms）比 `SELECT *`（0.22ms）慢 2×——SELECT* 直出原字节零解析；投影需整行 serde parse +
+> 提取 10 成员 + 重序列化（解码开销随投影列数而非命中数）；MySQL 0.16ms 免投影解码。P86② 字节级单遍 MapAccess 只收目标
+> 成员基建已具（`row_sort_keys` / `light_top_field`，src/sql/executor/eval.rs），但仅接排序/Top-K/聚合路径；点查/IN 回表
+> 输出路径（executor/select.rs 点查分支 + P85 `collect_limited_rows` 消费端）未接。
+属性	内容
+优先级	中
+工作量	1 天
+依赖	P86② 字节级字段提取基建（✅ 已备）；P87③ 输出瘦身 / `decode_pax_block_fields`（✅ 已备）
+风险	低（缺失字段 / JSON null / 转义畸形语义复用 P86② 护栏，逐行等值单测兜底）
+具体工作：
+
+□ 定位点查/IN 输出组装点（点查分支 + `collect_limited_rows`/batch_get 消费端）：显式列清单（非 SELECT*）时对回表原字节做字节级只收目标成员提取 → 组装子集 JSON，替代整行 parse→重 serialize；缺失列 = 原文档缺失语义
+□ SELECT* 保持原字节直通零解析（#1 不回退）
+□ 存储布局分流：PAX 块走 `decode_pax_block_fields` 单块多列一次解码（P87 已接线复用）；行式块走 light 字节级提取
+□ 单测：点查投影与整行投影逐行等值（缺失 / null / 转义畸形护栏）+ 10 列投影 ≤ SELECT* 耗时（#2 语义）
+验收标准：
+
+- 10 万 #2 pk_point_proj10 0.46ms → ≤0.22ms（= #1 SELECT* 量级）；#3/#9 同步受益不回退
+- 全量回归通过
+
+Task-023：主键 IN 列表批量定位（#4 pk_in_50 1.73ms vs MySQL 0.46ms = 3.8×）
+
+> 根因：IN 50 主键**逐条** LSM 点查（memtable/delta/L0 层级 + 布隆 + 块定位逐键重复），MySQL 主键批量回表单次下探。
+> 复用 P92 topk 稠密判定 + delete_range50 keys-only 区间扫 + P2-D batch_get 基建：相邻同块键合并为顺序读（BlockCache
+> 局部性 + 批量取行），替代逐键随机定位。
+属性	内容
+优先级	中
+工作量	1~1.5 天
+依赖	P92 稠密判定（跨度 ≤4× 计数，✅）/ delete_range50 keys-only 区间扫（✅）/ P2-D batch_get（✅）/ P84 DocIdSet（✅）
+风险	中（墓碑/删除位图/多表隔离语义须与逐条 get 一致；稠密/稀疏边界判定）
+具体工作：
+
+□ IN docid 排序去重 → 稠密判定（跨度 ≤4× 计数，对齐 P92 topk）：稠密 → `engine.scan_stream_ids` 区间 keys-only 扫现存 + 可见行批量序读回表（P85/P92 消费端复用）；稀疏 → 维持分块 `batch_get`
+□ 可见性语义：墓碑/删除位图命中不占结果、offset/limit 计数与逐条 get 一致；多表 IN 按表 docid 区间隔离
+□ 消费端接线：读路径点查 IN（SELECT id IN …）对齐 P83/P88 写定位同源语义；不回退 P84 DocIdSet 消费
+□ A/B demo（src/demo/ 对应目录）+ 单测：稠密/稀疏边界、边界值含墓碑、offset/limit、多表区间
+验收标准：
+
+- 10 万 #4 pk_in_50 1.73ms → ≤0.5ms 量级（对齐 #1/#3）；#3 pk_in_5 不回退；删除/可见性语义回归
+- 全量回归通过
+
+Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09-05 分级表 P0/P1）
+
+> **分级（110 万复测）**：🔴 #29 orderby_multi 9.46s（不可用）｜🔴 #12 count_all 406ms → **Task-021
+> ✅ 已收口（O(1) 区间计数）**｜🟡 #14/#27 全扫分组 856~1057ms｜🟡 #11 全扫过滤 1425ms｜🟢 #17-19
+> 单行更新 ~1.2ms → Per-CPU WAL（远期，另列）。
+> **合并理由**：#29/#14/#27/#11 同根 = 默认行式布局下全扫对整行（25 列原文）取数/解码 IO——P91
+> 投影列下推（scan_stream_fields）与 P92 稠密窗口 Top-K 已接线，残余是**行式块整行读 + 子集抽取**
+> 的物理 IO（110 万 ~0.43µs/行 × 全扫）。合并为一执行项统一收口，避免逐条拆散重复做功。
+属性	内容
+优先级	P0（#29 不可用）→ 合并 P0/P1
+工作量	1.5~2 天
+依赖	P86② 字节级提取 / P87 decode_pax_block_fields / P91 scan_stream_fields / P92 稠密窗口（均 ✅）
+风险	中（列 IO 布局只对 PAX(hot_fields) 数据生效；行式默认布局回退正确性）
+具体工作：
+
+□ 排序残余 #29：无 WHERE ORDER BY k,amount LIMIT —— 默认行式布局把“排序键提取”改走行式块按需字段
+  直通（P86② 只收 k/amount 两列，免整行 parse→子集重排）；PAX(hot_fields) 数据（基准库重装时声明
+  hot_fields=[k,amount]）走 decode_pax_block_fields 列解码（P87 已接线路径复用）→ 消除整行 25 列 IO
+□ 全扫分组 #14/#27：group_scan_needed_fields 已只收 needed（WHERE∪分组∪聚合列），默认行式布局下对
+  每行原字节做 light 只收 needed 提取直通（复用 row_sort_keys 同款单遍 MapAccess），避免整行 Value
+  构造 + 丢弃；PAX 布局走列解码（P91 已接线）
+□ 全扫过滤 #11：cmp_between 无索引数值过滤——行式默认布局 needed=WHERE 引用列（1 列），按需字段
+  直通；PAX 列 IO 下推（P90/P91 基建）
+□ 单测：行式默认布局 全扫分组/排序/过滤 = 整行路径逐值一致（含缺失/转义畸形护栏）；PAX 两布局交叉
+□ 验收口径：110 万 #29 9.46s → ≤1.5s（对齐 MySQL ~0.53s 的 3× 内）；#11/14/27 各自 ≤ 现值的
+  0.5× 且比值对齐 MySQL 2~3× 内；回归全绿
+> 内存口径备注（2026-09-05）：1.1M 行 MySQL 2G pool 充足，暂不加大；公平对比应按“缓存预算”口径
+> 或把 SCC hotcache 收紧至实际 ~2G（如 512MB）复测（详见 user_guide/性能对比-2026-09-05-P85-P92后-10万与110万.md §4）。
+
+Task-025（远期）：范围查询结构提速（4.2 未做项，2026-09-05 加入排期——合并或放后）
+> 定位：#5 主键窗口 ~3.3ms（9×）/ #11 数值全扫等范围类；四项均为**结构/调度级**，与当前
+> Task-021~024（取数/解码收口）正交，全部放远期（不阻塞 021~024），按需合并：
+属性	内容
+优先级	远期（阶段 3 / 大库触发）
+合并建议：
+□ SSTable 重叠度控制 —— 已有 Leveled Compaction + Ex-8.11 l1_trigger 攒批收敛；可调参数已具
+  （l1/l2_trigger_files、compact_input_max_mb）→ **并入现有压缩参数实验**（放后，无独立开发）
+□ 分区（Partition）—— TTL 按天分桶已落地（O(1) 整文件删）；扩展为范围查询跨分区跳过 =
+  按表/按时间分桶粒度查询剪枝 → 放远期（与 #5 主键范围相关，可合并至远期“分桶分区查询剪枝”）
+□ 块内索引优化 —— Data Block 内已做块级稀疏索引（IndexEntry/两级索引 + Zone Map）；进一步细化
+  （块内稀疏索引/二分窗口）收益低 → 放后，仅在大块/长区间场景再评估
+□ 并行扫描 —— 多 SSTable 并发扫描 + k-way 归并 → **阶段 3 / 远期**（依赖无锁读/IO 预算成熟，
+  与 Ex-8.9/Ex-8.13 worker 调度并存评估）；可独立立项，放 Ex- 链
+> 处置：不新开 P 序列；随“远期 Ex-/阶段 3”链按触发条件执行。
+
 > 2026-09-04 收敛说明：原 20 项插队任务经与 development.md / 本文件其余内容逐项对照，**Task-001/003/004/006/008~020 已移除**——原因：与既有实现同主题重复（FST 字典 7.34+P4-B、倒排回表批量 P2-D/P85~P87、TTL 按天分桶整目录 O(1) 删除、WAL 延迟删除异步 unlink、组提交/环形 WAL、Bloom 分区布隆、基准/验收体系等，均已实现 ✅）或属随父项销项（Task-004/017→Task-002、Task-011/015/018→Task-007/Task-014、Task-012→Task-006~011）。**仅保留以下 3 项独立任务**（真实缺口，与插队族解耦，各自单独排期执行）：
 
 - Task-002：fxhash 局部替换（内部 Key）——真实缺口 ✅（Cargo.toml 全库无 fxhash）、验收（内部 Key 延迟 ≥15%）可控 ✅、工作量 1 天 ✅ → **执行**

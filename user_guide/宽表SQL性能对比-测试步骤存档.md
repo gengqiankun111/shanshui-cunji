@@ -114,3 +114,25 @@ D:\shanshui-cunji-target\release\rr-conformance.exe --sql-run `
 
 - `user_guide/性能对比-优化器大项后-10万与110万_v0.md`（37 探针、10 万 + 110 万两轮）
 - `user_guide/宽表SQL性能基准记录.md`（同方法早期版本 + 组合索引实验 + 装载/结果时间线）
+
+## 9. 一键复用脚本
+
+配套脚本 `user_guide/宽表SQL对比-基准.ps1`（Windows PowerShell，UTF-8 带 BOM）把 §2~§6
+封装为参数化流程：
+
+```powershell
+# 110 万全流程（构建 + 起 MySQL/SCC + 两侧装载 + 跑 37 探针 + 合表）
+powershell -ExecutionPolicy Bypass -File user_guide\宽表SQL对比-基准.ps1 -Rows 1098342 -Build
+
+# 10 万，数据已装好只跑探针 + 合表（服务已在运行）
+powershell -ExecutionPolicy Bypass -File user_guide\宽表SQL对比-基准.ps1 -Rows 100000 `
+  -SkipMySqlStart -SkipSccStart -SkipMySqlLoad -SkipSccReload
+
+# 只准备数据不跑探针
+powershell -ExecutionPolicy Bypass -File user_guide\宽表SQL对比-基准.ps1 -Rows 100000 -SkipProbes
+```
+
+常用开关：`-Build`（先 cargo build release cjserver + rr-conformance）、`-MyPort/-SccPort`、
+`-SkipMySqlStart/-SkipSccStart`（服务已在运行）、`-SkipMySqlLoad/-SkipSccReload`（数据已装）、
+`-SkipProbes`、`-ResultsBase`（结果目录前缀，默认 `results-sqlrun`，gitignore）。
+结果目录：`results-sqlrun-{mysql|scc}-{100k|1100k}`，合表输出 `results-sqlrun-compare-{100k|1100k}/summary.md`。
