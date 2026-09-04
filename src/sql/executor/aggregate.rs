@@ -32,6 +32,27 @@ pub struct AggScalar {
 /// P1-3：带 docid 区间窗口的标量聚合（非默认表按表区间执行；`start/end` 均为 None = 全库）。
 /// 窗口非空时禁用倒排统计快路径与 `count_all_docs` 快路径（两者为引擎全库口径，跨表会
 /// 串表）——强制窗口内全扫，语义与按表区间聚合一致。
+
+/// Task-021：整表 docid 窗口判定——窗口恰好覆盖某表全区间 `[t<<48, (t<<48)+2^48-1]`
+/// 时返回 `(start, end)`；部分窗口/半开窗口 → None（保持 keys-only 线性扫）。
+fn full_table_window(start: Option<u64>, end: Option<u64>) -> Option<(u64, u64)> {
+    let s = start?;
+    let e = end?;
+    if e < s {
+        return None;
+    }
+    let span: u64 = 1u64 << 48;
+    if s % span != 0 {
+        return None;
+    }
+    let table_max = s.checked_add(span - 1)?;
+    if e == table_max {
+        Some((s, e))
+    } else {
+        None
+    }
+}
+
 pub fn execute_aggregate_window(
     engine: &Engine,
     sql: &str,
@@ -53,8 +74,19 @@ pub fn execute_aggregate_window(
         return Err(Error::Config(format!("{name}(*) 不支持（仅 COUNT(*)）")));
     }
     if field.is_none() && sel.where_expr.is_none() {
+        // Task-021：整表 docid 窗口（覆盖某表全区间）COUNT(*) 无 WHERE → 引擎活跃 docid
+        // 区间基数 O(1)（引擎活跃集 docid 高 16 位即表号，区间计数天然单表隔离），
+        // 替代窗口 keys-only 线性扫（10 万 42.8ms / 110 万 ~407ms → µs 级）。
+        if let Some((ws, we)) = full_table_window(start, end) {
+            let n = engine.count_docs_range(ws, we)?;
+            return Ok(Some(AggScalar {
+                header: "COUNT(*)".into(),
+                is_null: false,
+                text: n.to_string(),
+            }));
+        }
         if scoped {
-            // COUNT(*) 无 WHERE（表区间版）：docid 窗口 keys-only 计数（免文档值反序列化）
+            // COUNT(*) 无 WHERE（表区间版，非整表窗口）：docid 窗口 keys-only 计数（免文档值反序列化）
             let mut n = 0u64;
             engine.scan_stream_ids(start, end, |_| {
                 n += 1;

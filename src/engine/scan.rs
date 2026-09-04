@@ -250,6 +250,25 @@ impl Engine {
         Ok(g.as_ref().map(|b| b.len()).unwrap_or(0))
     }
 
+    /// Task-021：活跃 docid 位图**闭区间基数**（`[start, end]` 内现存行数）。
+    /// 活跃集 docid 为引擎全局（多表 = docid 高 16 位表号），区间即可覆盖单表/整表窗口；
+    /// 删除位图/墓碑隐藏的 docid 已被剔除（put/delete/delete_batch/purge 记账）→ 计数与
+    /// keys-only 扫描口径一致。实现用 `RoaringTreemap::rank`（≤x 元素数）差值：
+    /// `rank(end) - rank(start-1)`，开销 O(命中高位桶数)，远快于逐行 keys-only 扫。
+    /// 活跃快照存在时亦直通（非版本化口径对齐现快路径）。
+    pub fn count_docs_range(&self, start: u64, end: u64) -> Result<u64> {
+        self.live_ensure()?;
+        let g = self.live_docids.lock().unwrap();
+        let Some(b) = g.as_ref() else {
+            return Ok(0);
+        };
+        if start > end {
+            return Ok(0);
+        }
+        let before = if start == 0 { 0 } else { b.rank(start - 1) };
+        Ok(b.rank(end) - before)
+    }
+
     /// 导出共享后台 IO 限速（design 20.5）：启用/关闭顺序扫描路径限速（MB/s；0 = 关闭）。
     /// 与 Compaction 的 `io_limiter` 同 Token Bucket 策略（默认低于前台读写）——导出读 SST
     /// 与后台合并共享同一后台 IO 预算语义，对在线业务影响 <5% 目标。

@@ -1598,6 +1598,51 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         }
     }
 
+    // ---------- Task-021：COUNT 全包窗口直通 O(1) ----------
+
+    #[test]
+    fn task021_count_full_table_window_o1_parity_and_isolation() {
+        // 整表窗口（默认表 [0,2^48) / 非默认表 [tid<<48, tid<<48+2^48-1]）COUNT(*) 无 WHERE
+        // → 引擎活跃 docid 区间 O(1)；与无窗口 count_all_docs / keys-only 部分窗口口径一致；
+        // 删除位图隐藏行不计；多表 docid 高位隔离。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        for i in 1..=1000u64 {
+            e.put(i, serde_json::to_vec(&serde_json::json!({"k": i})).unwrap(), &[])
+                .unwrap();
+        }
+        e.delete(77).unwrap(); // 删除位图隐藏 → 不计数
+        e.flush_primary().unwrap();
+        let t1: u64 = 1u64 << 48;
+        for x in 0..7u64 {
+            e.put(t1 + x, serde_json::to_vec(&serde_json::json!({"k": "t1"})).unwrap(), &[])
+                .unwrap();
+        }
+        let mask: u64 = (1u64 << 48) - 1;
+        // 整表 tid0 窗口：1000 - 删除 77 = 999（tid1 不计）
+        let a = execute_aggregate_window(&e, "SELECT COUNT(*) FROM t", Some(0), Some(mask))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.text, "999", "tid0 整表窗口 O(1) 计数");
+        assert_eq!(e.count_docs_range(0, mask).unwrap(), 999);
+        // 无窗口（全库）：999 + 7 = 1006（保持 count_all_docs 语义）
+        let b = execute_aggregate_window(&e, "SELECT COUNT(*) FROM t", None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.text, "1006");
+        // 非默认表整表窗口隔离 = 7
+        let c = execute_aggregate_window(&e, "SELECT COUNT(*) FROM t", Some(t1), Some(t1 + mask))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.text, "7");
+        // 部分窗口（非整表）保持 keys-only：现有行 100..=200 → 101
+        let d = execute_aggregate_window(&e, "SELECT COUNT(*) FROM t", Some(100), Some(200))
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.text, "101");
+    }
+
     // ---------- P92：Top-K 稠密窗口投影流式 vs 稀疏点查路径 ----------
 
     #[test]
