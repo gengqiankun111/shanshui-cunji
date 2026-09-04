@@ -236,3 +236,34 @@ mean/p50/p99/max，单位 ms）。
   事务 1.6–2.4 · 锁等待 ~4.0s（等锁超时，同 MySQL 形态）。
 - 该轮同时验证：cjserver 连接/握手正常（rust mysql crate），删除区间/事务/多语句均可。
 
+## §12 SCC↔MySQL 37 探针正式对比（同量 1,098,342 行，均 2G 内存）
+
+- 内核：仓库根 `cjserver.exe`（2026-09-04 08:24，P79 64 位化后），数据目录 `D:\shanshui-data\db-wide-scc`；
+  配置 `tmp/tmp-cfg-wide-2g.toml`（2G = hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB）。
+- MySQL：3316（8.0.45，innodb_buffer_pool_size=2G），库 wide 表 t，**初始 N=1,098,342**（确定性装载 185.7s）。
+- SCC：默认表 documents，**初始 N=1,098,342**（与 MySQL 同量，wide-load 装载 60.4s）。
+- 方法论：**装载即热（写入刚落 memtable/倒排内存），装载后直接实测一轮**；
+  不叠加"预热轮"——实测发现 sqlrun 预留大区（insert_batch_10000 的 3 万行）区间清理
+  （DELETE BETWEEN 预留区）**未生效**（历史遗留：多次 sqlrun 后 N 会漂移 +3 万+），
+  采用"每轮前重置 + 重装载"保证口径一致（该清理缺口另记，非本内核 64 位化引入）。
+- 对比表：[results-sqlrun-compare-2g/summary.md](../../results-sqlrun-compare-2g/summary.md)
+  两侧明细：`results-sqlrun-mysql-2g-v2b/summary.md`、`results-sqlrun-scc-1m-2g/summary.md`；
+  SCC 10 万轮（阶段 A）另见 `results-sqlrun-scc-100k-v3/summary.md`（37/37 通过）。
+
+**结论速览（mean，SCC/MySQL 比值）**
+1. **SCC 显著领先**：enum_count 倒排 COUNT 载荷（0.66ms vs 64.39ms，快 ~98×）；
+   写入同档或略慢（单点/批量 10-100 行 0.9–1.5×，事务 8× 因 fsync 组提交语义）；
+2. **同档（~1×）**：点查 * 0.27 vs 0.21（1.3×）、数值>早停 1.2×、delete_id 0.9×、
+   批量插 10/100 行 1.1×；
+3. **SCC 明显慢（无覆盖式二级索引/存算直扫）**：pk_between 100 行窗口 14×、
+   枚举等值取行 4.5–8.1×、**全表无索引扫（count_all/sum/group/cmp_between）13–32×**（MySQL 走
+   5 个二级索引/紧凑 InnoDB 页；SCC 全扫需解 25 列宽文档）、事务性写路径 3–8×；
+4. **SCC 安全阀拒绝**：orderby_multi（ORDER BY k,amount LIMIT 100）在 110 万行上触发
+   "候选集过大（>200,000）"守卫（1064 拒绝，MySQL 649ms 可跑）——SCC 全表排序需显式
+   WHERE 收敛；10 万行下则能跑（~1136ms）；
+5. **组合索引语义不对等**：SCC 无 ts/status 复合索引，#30/#31 实为
+   "status 位图倒排候选 + ts 逐行过滤"（110 万行 → 921ms / 7300ms），而 MySQL 加
+   `(status,ts)` 后为 0.30ms/1.40ms（A/B 见 §10，测试后已 DROP）。SCC 侧等值/范围列的
+   倒排能力仅覆盖 status/region/k 等字段位图；ts/amount 等未索引字段的过滤为全扫。
+6. 数据漂移口径：每轮 sqlrun 尾部 +200 upd 预留行（N 以轮起始计），与 MySQL 侧一致。
+
