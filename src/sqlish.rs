@@ -357,55 +357,47 @@ impl Parser {
         self.expect_kw("FROM")?;
         let table = self.ident()?;
         // P0-D：JOIN 解析（`[INNER|LEFT] JOIN t2 ON t1.f1 = t2.f2`）
+        // review 修复（2026-09-04）：多 JOIN 解析期拒绝——当前仅支持单表 JOIN；
+        // 若第二个 JOIN 出现（静默覆盖只留最后一个）→ Err，防错结果。
         let mut join = None;
         loop {
-            match self.peek()? {
-                Tok::Ident(k) if k.eq_ignore_ascii_case("inner") => {
-                    self.next()?;
-                    self.expect_kw("JOIN")?;
-                    let right_table = self.ident()?;
-                    self.expect_kw("ON")?;
-                    let left_field = self.ident()?;
-                    self.expect_punct("=")?;
-                    let right_field = self.ident()?;
-                    join = Some(JoinClause {
-                        join_type: JoinKind::Inner,
-                        right_table,
-                        left_field,
-                        right_field,
-                    });
+            let kind = {
+                match self.peek()? {
+                    Tok::Ident(k) if k.eq_ignore_ascii_case("left") => {
+                        let kind = JoinKind::Left;
+                        self.next()?; // 消费 left
+                        match self.peek()? {
+                            Tok::Kw(kw) if kw == "JOIN" => kind,
+                            _ => return Err("LEFT 后须跟 JOIN".into()),
+                        }
+                    }
+                    Tok::Ident(k) if k.eq_ignore_ascii_case("inner") => {
+                        let kind = JoinKind::Inner;
+                        self.next()?; // 消费 inner
+                        match self.peek()? {
+                            Tok::Kw(kw) if kw == "JOIN" => kind,
+                            _ => return Err("INNER 后须跟 JOIN".into()),
+                        }
+                    }
+                    Tok::Kw(kw) if kw == "JOIN" => JoinKind::Inner,
+                    _ => break,
                 }
-                Tok::Ident(k) if k.eq_ignore_ascii_case("left") => {
-                    self.next()?;
-                    self.expect_kw("JOIN")?;
-                    let right_table = self.ident()?;
-                    self.expect_kw("ON")?;
-                    let left_field = self.ident()?;
-                    self.expect_punct("=")?;
-                    let right_field = self.ident()?;
-                    join = Some(JoinClause {
-                        join_type: JoinKind::Left,
-                        right_table,
-                        left_field,
-                        right_field,
-                    });
-                }
-                Tok::Kw(k) if k == "JOIN" => {
-                    self.next()?;
-                    let right_table = self.ident()?;
-                    self.expect_kw("ON")?;
-                    let left_field = self.ident()?;
-                    self.expect_punct("=")?;
-                    let right_field = self.ident()?;
-                    join = Some(JoinClause {
-                        join_type: JoinKind::Inner,
-                        right_table,
-                        left_field,
-                        right_field,
-                    });
-                }
-                _ => break,
+            };
+            if join.is_some() {
+                return Err("暂不支持多表 JOIN（>1 个 JOIN 子句）".into());
             }
+            self.next()?; // 消费 JOIN
+            let right_table = self.ident()?;
+            self.expect_kw("ON")?;
+            let left_field = self.ident()?;
+            self.expect_punct("=")?;
+            let right_field = self.ident()?;
+            join = Some(JoinClause {
+                join_type: kind,
+                right_table,
+                left_field,
+                right_field,
+            });
         }
         let mut where_expr = None;
         let mut limit = None;
@@ -1383,7 +1375,7 @@ fn eval_cond(
 /// 阶段 1：主表 WHERE 独立产出候选集（eval → bitmap）
 /// 阶段 2：JOIN 路径——主表候选 batch_get → 提取关联 key → 从表点查/倒排查 → Hash 合并
 /// 阶段 3：LIMIT 下推
-/// 安全阀：非等值 JOIN 拒绝、表数 ≥3 拒绝
+/// 安全阀：非等值 JOIN 拒绝、表数 ≥3 拒绝（解析期）、从表非 docid 字段倒排空 = 无匹配
 fn execute_join(engine: &Engine, sel: &Select, cap: u64) -> Result<Vec<QueryRow>> {
     let join = sel.join.as_ref().unwrap();
     // 剥离表前缀（`orders.user_id` → `user_id`）
@@ -1401,10 +1393,12 @@ fn execute_join(engine: &Engine, sel: &Select, cap: u64) -> Result<Vec<QueryRow>
         return Ok(Vec::new());
     }
 
-    // 阶段 2：主表 batch_get → 提取关联 key → 从表点查 → Hash 合并
+    // 阶段 2：主表 batch_get → 提取关联 key → 从表批量查 → Hash 合并
     let left_docids: Vec<u64> = left_bitmap.iter().map(|d| d as u64).collect();
     let left_docs = engine.batch_get(&left_docids)?;
-    let mut right_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
+    // review 修复（2026-09-04）：right_cache 值改为 Vec——从表 1:N（同一关联 key 多行）
+    // 时逐右行展开产出多结果行；修复前只取 posting 首行 → INNER 缺行 / LEFT 只拼首行。
+    let mut right_cache: std::collections::HashMap<String, Vec<Vec<u8>>> =
         std::collections::HashMap::new();
     let mut keys: Vec<Option<String>> = Vec::with_capacity(left_docs.len());
     for doc in &left_docs {
@@ -1413,53 +1407,83 @@ fn execute_join(engine: &Engine, sel: &Select, cap: u64) -> Result<Vec<QueryRow>
             keys.push(key.clone());
             if let Some(k) = &key {
                 if !right_cache.contains_key(k) {
-                    right_cache.insert(k.clone(), None);
+                    right_cache.insert(k.clone(), Vec::new());
                 }
             }
         } else {
             keys.push(None);
         }
     }
-    // 从表关联查询：right_field = "docid" → 主键点查；否则 → 倒排 term
+    // 从表关联查询（review：逐批 watchdog 熔断）：
+    //   right_field = "docid" → 主键点查（1:1）；
+    //   否则 → 倒排 term 全 posting 展开（1:N），batch_get 批量回表
     let unique_keys: Vec<String> = right_cache.keys().cloned().collect();
-    for k in &unique_keys {
+    for (ki, k) in unique_keys.iter().enumerate() {
+        if ki % 64 == 0 && guard.is_expired() {
+            return Err(Error::QueryTooExpensive(format!(
+                "JOIN 从表关联查询超时（已查 {ki} 个关联 key，熔断中止）"
+            )));
+        }
         if right_field == "docid" || right_field == "id" {
             if let Ok(docid) = k.parse::<u64>() {
-                right_cache.insert(k.clone(), engine.get(docid)?);
+                if let Some(v) = engine.get(docid)? {
+                    right_cache.insert(k.clone(), vec![v]);
+                }
             }
         } else {
             let term = format!("{}={}", right_field, k);
             let posting = engine.inverted_posting(&term)?;
-            if let Some(docid) = posting.iter().next() {
-                right_cache.insert(k.clone(), engine.get(docid as u64)?);
+            if !posting.is_empty() {
+                let docids: Vec<u64> = posting.iter().map(|d| d as u64).collect();
+                let docs = engine.batch_get(&docids)?;
+                right_cache.insert(
+                    k.clone(),
+                    docs.into_iter().flatten().collect(),
+                );
             }
         }
     }
-    // 合并
+    // 合并（review：1:N 展开——每左行 × 每右行；watchdog 逐批熔断）
     let mut out = Vec::new();
+    let mut done = 0u64;
     for (doc_opt, key) in left_docs.into_iter().zip(keys.into_iter()) {
         let Some(doc) = doc_opt else { continue };
-        let right = match &key {
-            Some(k) => right_cache.get(k).cloned().flatten(),
-            None => None,
+        let rights: Vec<Vec<u8>> = match &key {
+            Some(k) => right_cache.get(k).cloned().unwrap_or_default(),
+            None => Vec::new(),
         };
         match join.join_type {
             JoinKind::Inner => {
-                if let Some(rv) = right {
-                    let merged = merge_join_doc(&doc, &rv, &sel.table, &join.right_table);
+                for rv in &rights {
+                    let merged = merge_join_doc(&doc, rv, &sel.table, &join.right_table);
                     out.push((0, merged)); // docid 在 JOIN 结果中不直接有意义
+                    done += 1;
+                    if done % 4096 == 0 && guard.is_expired() {
+                        return Err(Error::QueryTooExpensive(format!(
+                            "JOIN 合并超时（已产出 {done} 行，熔断中止）"
+                        )));
+                    }
+                    if out.len() as u64 >= limit {
+                        return Ok(out);
+                    }
                 }
             }
             JoinKind::Left => {
-                let merged = match right {
-                    Some(rv) => merge_join_doc(&doc, &rv, &sel.table, &join.right_table),
-                    None => doc,
-                };
-                out.push((0, merged));
+                if rights.is_empty() {
+                    out.push((0, doc));
+                    if out.len() as u64 >= limit {
+                        return Ok(out);
+                    }
+                } else {
+                    for rv in &rights {
+                        let merged = merge_join_doc(&doc, rv, &sel.table, &join.right_table);
+                        out.push((0, merged));
+                        if out.len() as u64 >= limit {
+                            return Ok(out);
+                        }
+                    }
+                }
             }
-        }
-        if out.len() as u64 >= limit {
-            break;
         }
     }
     Ok(out)
@@ -1545,6 +1569,15 @@ fn try_composite_index(
     // 走组合索引前缀扫描
     let fields: Vec<&[u8]> = vals.iter().map(|v| v.as_bytes()).collect();
     let mut rows = engine.query_by_composite_prefix(&fields)?;
+    // review 修复（2026-09-04）stale 键防护：cidx 前缀命中后回表的是**最新**文档值——
+    // put 更新字段变更/delete 不删旧复合键，旧键仍会命中并带回不满足条件的文档。
+    // 用完整 WHERE 表达式对回表值复筛，杜绝错行（匹配开销 O(命中集)，远小于全扫）。
+    if let Some(we) = &sel.where_expr {
+        rows.retain(|(_, v)| match serde_json::from_slice::<serde_json::Value>(v) {
+            Ok(doc) => we.matches_doc(&doc),
+            Err(_) => false,
+        });
+    }
     // LIMIT/OFFSET
     let limit = sel.limit.unwrap_or(cap).min(cap);
     if sel.offset > 0 {
@@ -1938,6 +1971,21 @@ pub fn execute_aggregate_window(
             is_null: false,
             text: n.to_string(),
         }));
+    }
+    // P1-C：COUNT(*) WHERE field='value'（裸倒排等值）→ posting 长度直接计数，免全扫。
+    // 仅无窗口、裸等值条件（无 AND/OR/NOT）时启用；多条件回落全扫。
+    if !scoped && name == "count" && field.is_none() {
+        if let Some(WhereExpr::Cond(c)) = sel.where_expr.as_ref() {
+            if c.op == CmpOp::Eq && c.field != "docid" {
+                let term = format!("{}={}", c.field, c.value);
+                let posting = engine.inverted_posting(&term)?;
+                return Ok(Some(AggScalar {
+                    header: "COUNT(*)".into(),
+                    is_null: false,
+                    text: posting.len().to_string(),
+                }));
+            }
+        }
     }
     // Ex-9.3 第③步：`SUM/AVG/MIN/MAX(stats_field) ... WHERE f='v'`（裸等值、无排序/分组）
     // → 倒排 term 统计载荷免全扫（内存累积 + v5 段载荷；仅 stats_fields 声明字段可路由；
@@ -3476,6 +3524,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows4.len(), 3, "INNER JOIN 仍 3 条（无匹配不出现）");
+    }
+
+    /// review 修复（2026-09-04）：组合索引 stale 键防护——cidx 只插不删，put 更新字段变更后
+    /// 旧复合键仍命中；try_composite_index 须用完整 WHERE 对回表值复筛，防返回不满足条件的错行。
+    #[test]
+    fn composite_index_stale_key_refiltered_by_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.composite_indexes = vec![vec!["status".into(), "region".into()]];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        e.put(1, br#"{"status":"active","region":"east","amount":100}"#.to_vec(), &[])
+            .unwrap();
+        e.put(2, br#"{"status":"active","region":"west","amount":200}"#.to_vec(), &[])
+            .unwrap();
+        // 更新 doc1：status active → inactive（cidx 旧键 (active,east,1) 残留）
+        e.put(1, br#"{"status":"inactive","region":"east","amount":100}"#.to_vec(), &[])
+            .unwrap();
+        e.flush_wal().unwrap();
+
+        // 前缀 [active,east] 命中残留旧键 (active,east,1) → 复筛剔除 → 空结果（修复前错返 doc1）
+        let rows = execute(
+            &e,
+            "SELECT * FROM t WHERE status='active' AND region='east'",
+            1000,
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "doc1 已 inactive，不得因 stale 复合键返回");
+
+        // 前缀 [active] 命中 doc1（残留）与 doc2 → 只留 doc2
+        let rows2 = execute(&e, "SELECT * FROM t WHERE status='active'", 1000).unwrap();
+        let ids: Vec<u64> = rows2.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids, vec![2], "只有 doc2 满足 status=active");
+    }
+
+    /// review 修复（2026-09-04）：JOIN 从表 1:N——从表倒排字段同一关联 key 多行时逐行展开。
+    #[test]
+    fn join_one_to_many_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // 主表 1 行（amount 过滤隔离；user_city 关联字段不含 "city"，避免污染从表 term）
+        e.put(1, br#"{"amount":100,"user_city":"bj","name":"order1"}"#.to_vec(), &["user_city=bj"])
+            .unwrap();
+        // 从表 3 行（同一 city=bj → 1:N）
+        for (i, n) in [(11u64, "u1"), (12, "u2"), (13, "u3")] {
+            let doc = format!(r#"{{"city":"bj","name":"{n}"}}"#);
+            e.put(i, doc.into_bytes(), &["city=bj"]).unwrap();
+        }
+        // 无匹配 city=gz 的从表行
+        e.put(14, br#"{"city":"gz","name":"other"}"#.to_vec(), &["city=gz"])
+            .unwrap();
+        e.flush_wal().unwrap();
+
+        // INNER JOIN：orders.user_city = users.city（users 侧走倒排 1:N）→ 3 结果行
+        let rows = execute(
+            &e,
+            "SELECT * FROM orders INNER JOIN users ON orders.user_city = users.city WHERE amount>=100 LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3, "1:N 展开为 3 行（修复前只取 posting 首行 = 1 行）");
+        for (_, doc) in &rows {
+            let v: serde_json::Value = serde_json::from_slice(doc).unwrap();
+            assert!(v.get("users").is_some(), "每行须含从表嵌套");
+        }
+    }
+
+    /// review 修复（2026-09-04）：多 JOIN 解析期拒绝——A JOIN B JOIN C 静默覆盖只留最后一个。
+    #[test]
+    fn multi_join_rejected_at_parse() {
+        assert!(parse_select(
+            "SELECT * FROM a INNER JOIN b ON a.x=b.x INNER JOIN c ON b.y=c.y"
+        )
+        .is_err());
+    }
+
+    /// review 修复（2026-09-04）：JOIN 路由须先于组合索引——主表 WHERE 命中 composite_indexes
+    /// 时不得走纯主表组合索引短路（会静默丢弃 JOIN）。
+    #[test]
+    fn join_not_shorted_by_composite_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        // 主表 orders 的 city 命中组合索引前缀 → 修复前 try_composite_index 直接返回主表行
+        cfg.storage.composite_indexes = vec![vec!["city".into()]];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        e.put(1, br#"{"user_id":"101","city":"bj","amount":100}"#.to_vec(), &["city=bj"])
+            .unwrap();
+        e.put(2, br#"{"user_id":"102","city":"sh","amount":200}"#.to_vec(), &["city=sh"])
+            .unwrap();
+        e.put(101, br#"{"name":"alice"}"#.to_vec(), &["name=alice"])
+            .unwrap();
+        e.put(102, br#"{"name":"bob"}"#.to_vec(), &["name=bob"])
+            .unwrap();
+        e.flush_wal().unwrap();
+
+        // WHERE city='bj' 命中组合索引 [city]；修复前此查询被组合索引短路返回纯主表 1 行（无 users）
+        let rows = execute(
+            &e,
+            "SELECT * FROM orders INNER JOIN users ON orders.user_id = users.docid WHERE city='bj' LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "JOIN 应产出 1 行合并结果");
+        let v: serde_json::Value =
+            serde_json::from_slice(&rows[0].1).expect("JOIN 结果为嵌套文档");
+        assert!(
+            v.get("users").is_some() && v["users"].get("name") == Some(&serde_json::json!("alice")),
+            "结果须含从表 users 合并（未被组合索引短路）"
+        );
     }
 
     /// P0-B：Top-K 有界堆——大候选集 ORDER BY LIMIT 不再被拒绝。

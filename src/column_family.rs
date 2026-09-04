@@ -138,6 +138,12 @@ pub struct ColumnFamily {
     cooldown: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
     /// X 项：累计刷盘次数（switch_and_flush 成功 +1；/metrics 指标）。
     flush_counter: AtomicU64,
+    /// R4（review 2026-09-04）：MVCC 保活水位（seq floor）。compact_merge 去重时，
+    /// 最新 seq > floor 的 key 保留多版本（活跃旧快照可回读到删除/覆盖前旧值）；
+    /// 位图物理回收（drop_key）亦仅当无活跃快照（floor=0）或最新 seq ≤ floor 时执行。
+    /// 0 = 关闭（现状：后写覆盖先写、GC 按位图物理回收）。引擎在 compact 前设置活跃
+    /// 快照低水位，compact 后复位。
+    mvcc_keep_floor: AtomicU64,
     /// Ex-8.11 A/B：累计**写入磁盘的 SST 字节**（flush/compact 每新建一个文件计一次该文件
     /// 字节；覆盖被合并删除的旧文件——总写入 = 数据量 × 写放大；/metrics 与写放大实验数据源）。
     sst_written: AtomicU64,
@@ -379,6 +385,7 @@ impl ColumnFamily {
             cooldown: Mutex::new(std::collections::HashMap::new()),
             flush_counter: AtomicU64::new(0),
             sst_written: AtomicU64::new(0),
+            mvcc_keep_floor: AtomicU64::new(0),
             memtable: MemTableBuffer::new(),
             ssts: {
                 let loaded: Vec<Arc<SstReader>> = ssts.into_iter().map(Arc::new).collect();
@@ -1529,6 +1536,12 @@ impl ColumnFamily {
             .store(p.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
+    /// R4：设置 MVCC 保活水位（seq floor，0 = 关闭）。引擎在 compact 前按活跃快照
+    /// 低水位设置；compact 结束后调用方复位 0。
+    pub fn set_mvcc_keep_floor(&self, floor: u64) {
+        self.mvcc_keep_floor.store(floor, Ordering::Release);
+    }
+
     /// L 项：有效 L0 阈值 = 基础阈值 ± 压力调整（clamp 在 [min, max]）。
     /// 滞回由压力平滑（Ex-7.4 每次写后按水位重算）保证，防窗口振荡。
     fn effective_l0_threshold(&self) -> usize {
@@ -1770,14 +1783,49 @@ impl ColumnFamily {
                 rows.push((k.to_vec(), seq, v.map(|x| x.to_vec())));
             })?;
         }
-        // ② 排序 + 去重：key 升序、seq 降序，同 key 保留首个（最高 seq）
+        // ② 排序 + 分组保活去重：key 升序、seq 降序。
+        // R4（review 2026-09-04）：默认同 key 保留最高 seq（后写覆盖先写）；当存在活跃
+        // 快照（mvcc_keep_floor > 0）且 key 最新 seq > floor 时保留多版本——全部 seq>floor
+        // 版本 + seq≤floor 的最新一条，使删除/覆盖前旧快照可回读旧值。
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         let kept_keys = rows.len();
-        rows.dedup_by(|a, b| a.0 == b.0);
-        // ②.5 Ex-5.6：位图已删 key 物理丢弃（去重后全版本同删）
-        let dropped_keys = rows.len();
-        rows.retain(|(k, _, _)| !drop_key(k));
-        let dropped_keys = dropped_keys - rows.len();
+        let floor = self.mvcc_keep_floor.load(Ordering::Acquire);
+        let mut kept: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(rows.len());
+        let mut dropped_keys = 0usize;
+        let mut i = 0usize;
+        while i < rows.len() {
+            let key = rows[i].0.clone();
+            let mut j = i + 1;
+            while j < rows.len() && rows[j].0 == key {
+                j += 1;
+            }
+            let latest_seq = rows[i].1; // 组内首个 = 最高 seq
+            // ②.5 Ex-5.6：位图已删 key 物理丢弃——R4 约束：仅当无活跃快照（floor=0）或
+            // 最新 seq ≤ floor（活跃快照全在删除之后，无旧快照引用）才整 key 丢弃；
+            // 否则保活（该删除可能被更早活跃快照读取 → 快照读需要删除前的旧版本）。
+            let deleted = drop_key(&key);
+            if deleted && !(floor > 0 && latest_seq > floor) {
+                dropped_keys += 1; // 整 key 物理丢弃（含全部版本）
+                i = j;
+                continue;
+            }
+            if floor > 0 && latest_seq > floor {
+                // 保活：seq > floor 的全部版本 + seq ≤ floor 的最新一条
+                let mut pushed_floor = false;
+                for r in &rows[i..j] {
+                    if r.1 > floor {
+                        kept.push(r.clone());
+                    } else if !pushed_floor {
+                        kept.push(r.clone());
+                        pushed_floor = true;
+                    }
+                }
+            } else {
+                kept.push(rows[i].clone()); // 常规：只留最新版本
+            }
+            i = j;
+        }
+        rows = kept;
 
         // ③ 写输出段（读路径新文件插最前）。
         // M3（§26 多表，实施清单②）：归并后 key 升序、同表键天然连续 → 按 `docid >> 48`

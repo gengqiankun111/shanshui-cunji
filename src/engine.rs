@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
@@ -131,6 +131,10 @@ pub struct Engine {
     /// 删除密度触发阈值（`storage.delete_density_min_ratio` / `_min_docs`）。
     dd_min_ratio: f32,
     dd_min_docs: u64,
+    /// R4（review 2026-09-04）：活跃快照 seq 集合（RR/Serializable 事务注册，commit/rollback
+    /// 注销）——compact 前取其最小值作 MVCC 保活水位（见 ColumnFamily::mvcc_keep_floor）：
+    /// 最新 seq > floor 的 key 保留多版本，使删除/覆盖前旧快照在 compaction 后仍可回读。
+    active_snapshots: RwLock<std::collections::BTreeSet<u64>>,
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     affinity: crate::affinity::CpuPartition,
@@ -195,6 +199,9 @@ pub struct CompactTargets {
     /// Ex-8.7：本轮到 `gc_single` 是否允许**单段重写**（删除密度触发时 true——
     /// 收敛后单底层段无常规合并候选，需重写才能物理回收已删数据）。
     pub gc_single: bool,
+    /// R4：MVCC 保活水位（seq floor）——compact 时该 CF 保留最新 seq > floor 的多版本
+    /// （活跃旧快照可回读删除/覆盖前值）；0 = 无活跃快照（现状收敛/GC 物理回收）。
+    pub mvcc_floor: u64,
 }
 
 /// Ex-8.7：主列族压实反馈——按删除位图实际**物理丢弃 >0** → 继续删除密度排空；
@@ -227,6 +234,13 @@ impl CompactTargets {
         let mut rep = empty;
         let bm = self.deletion_bitmap.as_ref();
         let needs_filter = bm.is_some_and(|b| b.deleted_count() > 0);
+        // R4：按活跃快照低水位设置 MVCC 保活（compact 期间各 CF 保留旧版本）；
+        // 结束后统一复位 0（无活跃快照恢复现状版本收敛/GC 物理回收）。
+        self.primary.set_mvcc_keep_floor(self.mvcc_floor);
+        if let Some(c) = &self.cidx {
+            c.set_mvcc_keep_floor(self.mvcc_floor);
+        }
+        self.delta.set_mvcc_keep_floor(self.mvcc_floor);
         if self.do_primary {
             // Ex-8.7：过滤压实（多段常规合并等价 compact_filtered；删除密度触发时
             // `gc_single=true` 允许收敛后单底层段重写回收）→ 按 dropped 回写排空状态
@@ -249,6 +263,12 @@ impl CompactTargets {
             let r = self.delta.compact()?;
             merge_report(&mut rep, &r);
         }
+        // R4：复位保活水位
+        self.primary.set_mvcc_keep_floor(0);
+        if let Some(c) = &self.cidx {
+            c.set_mvcc_keep_floor(0);
+        }
+        self.delta.set_mvcc_keep_floor(0);
         Ok(rep)
     }
 }
@@ -561,6 +581,7 @@ impl Engine {
             max_docid_loaded: AtomicBool::new(false),
             dd_min_ratio: cfg.storage.delete_density_min_ratio,
             dd_min_docs: cfg.storage.delete_density_min_docs,
+            active_snapshots: RwLock::new(std::collections::BTreeSet::new()),
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,
@@ -803,8 +824,14 @@ impl Engine {
     }
 
     /// E/F：开启事务。快照 seq = 当前已分配最大全局 seq（RR/SERIALIZABLE 一致读基准）。
+    /// R4：RR/SERIALIZABLE（uses_snapshot）注册为活跃快照（compact 保活水位依据）。
     pub fn txn_begin(&mut self, isolation: crate::txn::Isolation) -> crate::txn::Transaction {
-        crate::txn::Transaction::new(isolation, self.begin_snapshot())
+        let seq = self.begin_snapshot();
+        let txn = crate::txn::Transaction::new(isolation, seq);
+        if isolation.uses_snapshot() {
+            self.register_active_snapshot(seq);
+        }
+        txn
     }
 
     /// E/F：事务读。RC = 最新已提交（`get`）；RR/SERIALIZABLE = 快照一致读（`get_at`）；
@@ -917,6 +944,10 @@ impl Engine {
             txn.mark_finished();
         }
         self.txn_locks.lock().unwrap().release(txn.id);
+        // R4：快照事务终结注销活跃快照（保活水位让出）
+        if txn.isolation.uses_snapshot() {
+            self.unregister_active_snapshot(txn.snapshot());
+        }
         result
     }
 
@@ -927,6 +958,10 @@ impl Engine {
         }
         txn.mark_finished();
         self.txn_locks.lock().unwrap().release(txn.id);
+        // R4：快照事务终结注销活跃快照
+        if txn.isolation.uses_snapshot() {
+            self.unregister_active_snapshot(txn.snapshot());
+        }
     }
 
     /// docid 当前最新提交版本 seq（删除位图已删 → 返回 current_seq 视为已删的"最新"）。
@@ -1271,6 +1306,22 @@ impl Engine {
     /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
     pub fn begin_snapshot(&self) -> u64 {
         self.primary.wal_next_seq().saturating_sub(1)
+    }
+
+    /// R4：注册活跃快照 seq（RR/Serializable 事务 begin 时调用；commit/rollback 注销）。
+    /// 集合最小值 = compact 时 MVCC 保活水位。空集合 = 无活跃快照（floor 0 = 现状回收）。
+    pub fn register_active_snapshot(&self, seq: u64) {
+        self.active_snapshots.write().unwrap().insert(seq);
+    }
+
+    /// R4：注销活跃快照 seq（事务 commit/rollback）。
+    pub fn unregister_active_snapshot(&self, seq: u64) {
+        self.active_snapshots.write().unwrap().remove(&seq);
+    }
+
+    /// R4：当前活跃快照低水位（0 = 无活跃快照 → compact 不保活，现状版本收敛/物理回收）。
+    fn snapshot_floor(&self) -> u64 {
+        self.active_snapshots.read().unwrap().first().copied().unwrap_or(0)
     }
 
     /// 快照读（design 4.7 MVCC）：返回 **seq ≤ `snapshot_seq`** 的文档视图。
@@ -1908,7 +1959,34 @@ impl Engine {
     /// 并按压实**实际丢弃数**回写排空状态（drop>0 继续 / 0 收敛，见 `apply_gc_feedback`）。
     /// O 项第③步：`&self`——后台合并 worker 在引擎**读锁**下执行（合并不阻塞读；
     /// 与写互斥由 Engine RwLock 保证，快照 store 无并发丢失）。
+    /// R4：wrapper——compact 前按活跃快照低水位设 MVCC 保活，结束后复位。
     pub fn compact(&self) -> Result<crate::column_family::CompactReport> {
+        self.apply_mvcc_floor();
+        let r = self.compact_inner();
+        self.clear_mvcc_floor();
+        r
+    }
+
+    /// R4：compact 前置 MVCC 保活水位（活跃快照低水位 → 各 CF）。
+    fn apply_mvcc_floor(&self) {
+        let f = self.snapshot_floor();
+        self.primary.set_mvcc_keep_floor(f);
+        if let Some(c) = &self.cidx {
+            c.set_mvcc_keep_floor(f);
+        }
+        self.delta.set_mvcc_keep_floor(f);
+    }
+
+    /// R4：compact 后复位保活水位（0 = 无活跃快照，恢复现状收敛/GC 物理回收）。
+    fn clear_mvcc_floor(&self) {
+        self.primary.set_mvcc_keep_floor(0);
+        if let Some(c) = &self.cidx {
+            c.set_mvcc_keep_floor(0);
+        }
+        self.delta.set_mvcc_keep_floor(0);
+    }
+
+    fn compact_inner(&self) -> Result<crate::column_family::CompactReport> {
         // W 项：紧迫度 = 列族 compaction_urgency（L0 段数×10 + 大小超限 +8）+ 删除密度权重
         let pu = self.primary.compaction_urgency() + self.delete_garbage_urgency();
         let du = self.delta.compaction_urgency();
@@ -2079,6 +2157,8 @@ impl Engine {
             garbage_done: Arc::clone(&self.garbage_done),
             garbage_draining: Arc::clone(&self.garbage_draining),
             gc_single: self.delete_garbage_pending(),
+            // R4：活跃快照低水位（compact 保活依据）
+            mvcc_floor: self.snapshot_floor(),
         })
     }
 
@@ -4062,6 +4142,60 @@ mod tests {
         e2.delete(1).unwrap(); // Tombstone seq > s2
         assert_eq!(e2.get_at(1, s2).unwrap().unwrap(), b"v1", "关闭位图保留 Tombstone 快照语义");
         assert!(e2.get(1).unwrap().is_none(), "删除后最新读 → 不存在");
+    }
+
+    /// R4（review 2026-09-04）：RR 快照读跨 compaction 保活——活跃快照在删除之前时，
+    /// compact 保留旧版本（mvcc_keep_floor），快照读仍见 v1；无活跃快照时 compact 物理回收。
+    #[test]
+    fn rr_snapshot_survives_compaction_with_active_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        e.flush_primary().unwrap(); // v1 落 SST（seq s1）
+
+        // RR 事务 A 开始（活跃快照在删除之前）
+        let mut txn_a = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        let snap_a = txn_a.snapshot();
+
+        // 并发事务 B 删除 docid=1 并提交
+        {
+            let mut txn_b = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+            txn_b.delete(1);
+            e.txn_commit(txn_b).unwrap();
+        }
+        // 删除 tombstone 落盘 + compaction（修复前：旧版本被收敛丢弃 → A 读 None）
+        e.flush_primary().unwrap();
+        assert!(e.compact().unwrap().merged_ssts > 0, "compact 应执行多段合并");
+
+        // A 快照读（snapshot < tombstone seq）→ compact 保活后仍见 v1
+        assert!(snap_a <= e.begin_snapshot(), "快照 seq 有效");
+        assert_eq!(
+            e.txn_get(&mut txn_a, 1).unwrap().as_deref(),
+            Some(b"v1".as_slice()),
+            "R4：活跃快照期间 compact 保活旧版本，快照读仍见 v1"
+        );
+        e.txn_commit(txn_a).unwrap();
+
+        // 事务 A 结束（无活跃快照）后 GC：compact 物理回收 → 最新读仍 None
+        let mut txn_c = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        assert!(e.txn_get(&mut txn_c, 1).unwrap().is_none(), "删除后最新读 None");
+        e.txn_commit(txn_c).unwrap();
+    }
+
+    /// R4：无活跃快照时 compact 收敛丢旧版本（现状语义）——旧 seq 快照读返回 None。
+    #[test]
+    fn rr_no_active_snapshot_compaction_drops_old_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &["k"]).unwrap();
+        let s_old = e.begin_snapshot();
+        e.flush_primary().unwrap();
+        e.delete(1).unwrap();
+        e.flush_primary().unwrap();
+        // 无活跃快照 → compact 物理回收（删除位图 GC 路径）
+        assert!(e.compact().unwrap().merged_ssts > 0);
+        // 修复语义边界：GC 后旧版本已回收；快照读走 LSM 无旧版本 → None
+        assert!(e.get_at(1, s_old).unwrap().is_none());
     }
 
     // ---------- 增量备份（design 20，M6-5） ----------

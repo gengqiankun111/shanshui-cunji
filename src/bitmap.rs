@@ -17,7 +17,7 @@
 //! COW（clone → mutate → store），读路径不经过写锁。
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -26,6 +26,28 @@ use arc_swap::ArcSwap;
 use roaring::treemap::RoaringTreemap;
 
 use crate::error::Result;
+
+/// review 修复（2026-09-04）：删除位图文件版本魔法头。
+/// 兼容链：旧稠密裸位数组（无头，4KB 页对齐）→ P2-B RoaringTreemap（无头）→ 本版 magic+Roaring。
+/// 新格式 = `MAGIC`（8B）++ RoaringTreemap 序列化。open 时按 头/尝试反序列化/裸数组 三级兼容；
+/// 损坏（半截写）→ 重建为空位图（WAL 回放幂等补位）。
+const MAGIC: &[u8; 8] = b"CJDBMBM1";
+
+/// review 修复：旧稠密裸位数组解析——LSB-first，byte=docid/8，bit=docid%8，4KB 页对齐。
+/// 逐非零字节展开置位 docid（零字节跳过，大文件启动一次性成本可接受）。
+fn parse_legacy_dense(buf: &[u8], out: &mut RoaringTreemap) {
+    for (i, &b) in buf.iter().enumerate() {
+        if b == 0 {
+            continue;
+        }
+        let base = (i as u64).wrapping_mul(8);
+        for bit in 0..8 {
+            if b & (1u8 << bit) != 0 {
+                out.insert(base + bit);
+            }
+        }
+    }
+}
 
 /// 删除位图：稀疏 RoaringTreemap + ArcSwap 无锁读 + 全量序列化持久化。
 ///
@@ -49,22 +71,49 @@ pub struct DeletionBitmap {
 }
 
 impl DeletionBitmap {
-    /// 打开（或创建）删除位图：文件存在则反序列化加载，否则为空位图。
+    /// 打开（或创建）删除位图。三级兼容：
+    /// 1. 文件以 `MAGIC` 开头 → 新格式（magic ++ RoaringTreemap 序列化）；
+    /// 2. 否则尝试整体反序列化为 RoaringTreemap（P2-B 生成的无头旧格式）；
+    /// 3. 仍失败 → 旧稠密裸位数组（无头 4KB 页对齐，LSB-first）逐位迁移；
+    /// 4. 全失败（半截写损坏）→ 空位图重建并删除损坏文件（WAL 回放幂等补位）。
+    /// 迁移/重建后立即以新格式重写落盘（下次启动直接走 magic 快路径）。
     pub fn open(path: &Path) -> Result<Self> {
-        let treemap = if path.exists() && std::fs::metadata(path)?.len() > 0 {
-            let f = File::open(path)?;
-            let mut reader = BufReader::new(f);
-            RoaringTreemap::deserialize_from(&mut reader)
-                .map_err(|e| crate::error::Error::Config(format!("删除位图反序列化失败: {e}")))?
-        } else {
-            RoaringTreemap::new()
-        };
-        Ok(Self {
+        let mut treemap = RoaringTreemap::new();
+        let mut rewrote = false;
+        if path.exists() && std::fs::metadata(path)?.len() > 0 {
+            let mut buf = Vec::new();
+            File::open(path)?.read_to_end(&mut buf)?;
+            if buf.len() >= MAGIC.len() && &buf[..MAGIC.len()] == MAGIC {
+                // 新格式：magic 后为 Roaring 数据
+                match RoaringTreemap::deserialize_from(&mut &buf[MAGIC.len()..]) {
+                    Ok(t) => treemap = t,
+                    Err(_) => {
+                        // 头正常但数据半截（写中崩溃）→ 空重建（WAL 回放幂等）
+                        treemap = RoaringTreemap::new();
+                        rewrote = true;
+                    }
+                }
+            } else if let Ok(t) = RoaringTreemap::deserialize_from(&mut &buf[..]) {
+                // P2-B 旧格式：无头 RoaringTreemap → 直接采用 + 迁移重写
+                treemap = t;
+                rewrote = true;
+            } else {
+                // 旧稠密裸位数组（Ex-5.6 格式）→ 逐位迁移
+                parse_legacy_dense(&buf, &mut treemap);
+                rewrote = true;
+            }
+        }
+        let bm = Self {
             inner: ArcSwap::from_pointee(treemap),
             dirty: AtomicBool::new(false),
             write: Mutex::new(()),
             path: path.to_path_buf(),
-        })
+        };
+        if rewrote {
+            // 迁移/重建后立即落盘新格式（含 magic 头）；失败不阻断打开（下次再试）
+            let _ = bm.flush_force();
+        }
+        Ok(bm)
     }
 
     /// 删除：置位 + 标记脏；仅当位确实翻转才返回 true（重复删除幂等，不重计）。
@@ -122,14 +171,21 @@ impl DeletionBitmap {
         self.dirty.load(Ordering::Acquire)
     }
 
-    /// 全部变更落盘：全量序列化 → 覆写文件 → fsync。
-    /// 崩溃语义：写盘中崩溃文件损坏 → WAL 回放重建（幂等）。
+    /// 全部变更落盘：magic 头 + RoaringTreemap 序列化 → 覆写文件 → fsync。
+    /// 崩溃语义：写盘中崩溃文件损坏/半截 → open 时识别 magic 但反序列化失败 → 空重建
+    /// （WAL 回放幂等，见 review 修复）。
     pub fn flush(&self) -> Result<()> {
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.flush_force()
+    }
+
+    /// 无条件落盘（review 修复：open 迁移/重建后立即以新格式重写）。
+    fn flush_force(&self) -> Result<()> {
         let f = File::create(&self.path)?;
         let mut writer = BufWriter::new(f);
+        writer.write_all(MAGIC)?;
         let cur = self.inner.load();
         (**cur)
             .serialize_into(&mut writer)
@@ -201,6 +257,64 @@ mod tests {
         let bm = DeletionBitmap::open(&path).unwrap();
         assert!(bm.is_deleted(42));
         assert!(!bm.is_deleted(43));
+    }
+
+    /// review 修复：旧稠密裸位数组（无头 4KB 页对齐，LSB-first）迁移。
+    /// docid = byte_index*8 + bit_index（bit 0 = 0x01）。
+    #[test]
+    fn migrate_legacy_dense_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("del.bitmap");
+        // 手工构造旧格式：4096 页对齐；docid 0/7/8/1_000_000 置位
+        // byte=docid/8，bit=docid%8
+        let mut buf = vec![0u8; ((1_000_000usize / 8) / 4096 + 1) * 4096]; // 4KB 页对齐覆盖 1M
+        buf[0] = 0b1000_0001; // docid 0 (bit0) + docid 7 (bit7)
+        buf[1] = 0b0000_0001; // docid 8 (bit0)
+        let mb = 1_000_000usize;
+        buf[mb / 8] |= 1u8 << (mb % 8); // docid 1_000_000
+        std::fs::write(&path, &buf).unwrap();
+
+        let bm = DeletionBitmap::open(&path).unwrap();
+        assert!(bm.is_deleted(0));
+        assert!(bm.is_deleted(7));
+        assert!(bm.is_deleted(8));
+        assert!(bm.is_deleted(1_000_000));
+        assert!(!bm.is_deleted(1));
+        assert!(!bm.is_deleted(9));
+        assert_eq!(bm.deleted_count(), 4);
+
+        // open 已迁移重写为新格式（magic 头）→ 重开仍正确
+        let bm2 = DeletionBitmap::open(&path).unwrap();
+        assert!(bm2.is_deleted(8));
+        assert!(bm2.is_deleted(1_000_000));
+        assert!(!bm2.is_deleted(9));
+    }
+
+    /// review 修复：旧无头 RoaringTreemap（P2-B 格式）兼容 + 损坏文件重建不 Err。
+    #[test]
+    fn migrate_headless_roaring_and_corrupt_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        // ① 无头 Roaring（P2-B 旧格式）→ open 成功迁移
+        let path = dir.path().join("headless.bitmap");
+        {
+            let mut t = RoaringTreemap::new();
+            t.insert(5);
+            t.insert(2_u64.pow(48) + 9); // 多表高位
+            let mut f = File::create(&path).unwrap();
+            t.serialize_into(&mut f).unwrap();
+        }
+        let bm = DeletionBitmap::open(&path).unwrap();
+        assert!(bm.is_deleted(5));
+        assert!(bm.is_deleted(2_u64.pow(48) + 9));
+        // 已迁移为 magic 格式
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[..MAGIC.len()], MAGIC, "迁移后应带 magic 头");
+
+        // ② 半截损坏（magic + 截断 Roaring）→ open 不 Err，空重建
+        let corrupt = dir.path().join("corrupt.bitmap");
+        std::fs::write(&corrupt, b"CJDBMBM1\xff\xff\xff\xff").unwrap();
+        let bm2 = DeletionBitmap::open(&corrupt).unwrap();
+        assert!(!bm2.is_deleted(0), "损坏文件应空重建（WAL 回放幂等）");
     }
 
     #[test]

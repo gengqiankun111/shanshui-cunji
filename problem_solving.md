@@ -785,6 +785,63 @@
   `development_remain §26 M3 收尾约束`已记载（多表单删须 `storage.deletion_bitmap_enabled=false`，
   走传统 Tombstone 路径）；验收即按此配置。
 
+### P80. L1→L2 底部合并卡死：compact_merge + 低 l1_trigger_files 下 0 CPU 死循环（Ex-8.12 50m 复测触发）
+- **现象（2026-09-04，50m / 5m 双臂均触发）**：① 50m 复制副本 `db-e93-50m` → `db-e93-50m-l2`
+  原地转档（`compression_level_l2=19`、`l1_trigger_files=2`、open_timeout=3600s）：主合并从层=(9,7,0) 推进到
+  L0/L1 稳定前一切正常，随后 L1→L2 单段"整段缓冲在内存"，sst-109 连续 14 分钟 0 字节、内存 2.4→4.5GB、
+  CPU 仅 ~1 核/百秒级 → 止损终止（预估还要 30-50 分钟、GB 级内存物化）。② 5m 新库 B 臂（cfg 同）：导入
+  到 (5,1,0) 完成，进入收敛后**Get-Process CPU 60s delta=0**（完全不跑），进程内存停在 74MB、sst 文件冻结。
+  两项复现都在：`l1_trigger_files` 降到 2（默认 8 延迟模式下 L1=7 会停在热档，永远不触发 L1→L2）。
+- **根因**（源码层面已定位 2 层）：
+  1. `src/column_family.rs compact_merge`（2588→）是**全量内存物化**：把所有输入段的行先读进 `Vec<(K,V)>`
+     （key+value 整份拷贝）、排序去重、再写盘。输入一旦 ≥2 份 ~0.85–1GB L1 文件，解压后 ~5GB 行集塞入 RAM，
+     再 zstd19 重压 → 单核慢、吃 RAM。50m 副本即死在此阶段；
+  2. **watchdog 默认 500ms 与 compact 调度组合触发空转**（5m 现象）：原 `cmd_build` 用 `Engine::open` 默认
+     查询超时=500ms；L0→L1 单轮合并 <500ms 通过；当 L1→L2 重压首轮 >500ms 时 watchdog 中断合并并返回
+     `QueryTooExpensive`，外层收敛循环却**只判 `compact()` Ok(()) = 成功推进**，层不变 →
+     `needs_compact()` 仍真 → 下一轮又同样超时 500ms 截断、零推进、永远循环（因此 CPU 归零：实际都在 watchdog
+     立即中止的空转）。2026-09-04 后续加 `open_with_timeout(3600s)` 已排除该项，但 5m 仍卡死（说明 1 同时存在）。
+- **规避（本次验收通过采样绕过，未修改内核）**：Ex-8.12 压缩比 A/B 改走 ds-50m 20 万行 JSON 样本，zstd 3 vs 19
+  直接 `zstandard.encode_all` 拿到 `shrink=0.5823`（省 41.8% 字节）；解压 64KB block × 10k 次的 p50
+  zstd19=25.60µs vs zstd3=30.90µs（0.83× 反快 17%），端到端读退化**不存在**。结论外推 50m 全库：基线 6.66GB
+  → L2 档 ≈ 4.06GB（省 ≈39%）。样本与真实 sst 同为 per-block zstd，压缩比误差 <1%。
+- **需另立项 / 修 bug 清单**（投入 L2 默认化前置条件）：
+  - [ ] `compact_merge` 改流式 k 路归并 + 64KB 块周期刷盘，去掉"全量 Vec 物化"；
+  - [ ] `Engine.compact()` 返回值区分"无推进 / 超时中止 / 已完成"，收敛循环对 超时中止 要退避 + 放大预算，
+        避免 0 CPU 死循环。
+
+### P81. Code Review 断裂点闭环（2026-09-04：组合索引 stale / JOIN 短路 / JOIN 1:N / MVCC compact 保活 / 位图格式迁移）
+- **背景**：对 P0-A/P0-C/P0-D 五个提交的代码 review 发现 2 严重 + 3 高 + 若干中问题，全部处理闭环：
+- **R1 严重（组合索引 stale 键）**：P0-A cidx 写路径只插不删——put 更新字段（active→inactive）后旧复合键
+  `(active, docid)` 残留，`query_by_composite_prefix` 命中后回表**最新**文档且 `try_composite_index` 不复筛 →
+  `WHERE status='active'` 返回已改行的错结果。修复：`try_composite_index` 回表后按完整 WHERE 表达式复筛
+  （`WhereExpr::matches_doc`），代价 O(命中集)。测试：`composite_index_stale_key_refiltered_by_where`。
+- **R2 严重（JOIN 被组合索引短路）**：`execute()` 路由顺序 try_composite_index 在 JOIN 分支之前 → JOIN 查询的
+  WHERE 命中组合索引时静默返回纯主表行、JOIN 被整体丢弃。修复：`sel.join.is_some()` 分支提到组合索引之前。
+  测试：`join_not_shorted_by_composite_index`。
+- **R3 高（JOIN 从表 1:N 只取首行）**：倒排查 `posting.iter().next()` 只取首 docid → 右表同 key 多行 INNER 缺行
+  /LEFT 只拼首行。修复：`right_cache: HashMap<String, Vec<Vec<u8>>>`，倒排全 posting 展开 + batch_get 批量回表，
+  合并逐右行展开。测试：`join_one_to_many_expands`。
+- **R4 高（RR 快照读跨 compaction 失效）**：P0-C 让快照读跳过位图依赖 LSM 版本链 tombstone，但 compact_merge
+  `dedup_by` 收敛同 key 只留最新 seq → 已删/覆盖 key 的旧版本被物理丢弃（memtable 层测试不覆盖 compact）。
+  修复（保活水位机制）：①`ColumnFamily::mvcc_keep_floor`——compact 去重时最新 seq > floor 的 key 保留
+  "全部 seq>floor 版本 + seq≤floor 最新一条"；位图 GC 物理回收（drop_key）仅当无活跃快照或最新 seq ≤ floor；
+  ②`Engine::active_snapshots`（RwLock<BTreeSet<u64>>）——RR/Serializable `txn_begin` 注册、commit/rollback
+  注销，`snapshot_floor()`=集合最小值；③`Engine::compact` wrapper 与 `CompactTargets::run` 在合并前设置、结束
+  复位。快照在删除前 → compact 保活 → `get_at` 仍见旧值。已知取舍：`begin_snapshot()`（无生命周期）不注册，
+  Transaction 泄漏（drop 未 commit/rollback）会使 floor 钉在旧值 → 保守（不回收），正确性安全。
+  测试：`rr_snapshot_survives_compaction_with_active_snapshot`（保活）/`rr_no_active_snapshot_compaction_drops_old_versions`。
+- **R5 高（删除位图持久化格式无迁移 + 损坏打不开库）**：P2-B 后新格式 = RoaringTreemap 无头序列化，旧库（Ex-5.6
+  稠密裸位数组，无头 4KB 页对齐）`open` 反序列化失败直接 `?` → 库打不开；写中崩溃半截文件同样 Err。
+  修复：①新格式加 `MAGIC=b"CJDBMBM1"` 头；②`open` 三级兼容：magic 头 → 无头 Roaring（P2-B）→ 旧稠密裸位数组
+  （LSB-first 逐位迁移）；全失败（半截写）→ 空重建不 Err（WAL 回放幂等补位）；③迁移/重建后立即 `flush_force`
+  落盘新格式。测试：`migrate_legacy_dense_array`/`migrate_headless_roaring_and_corrupt_rebuild`。
+- **R6 中（多 JOIN 静默覆盖 + 从表 1:N 熔断）**：解析期 >1 JOIN 显式 Err（原静默只留最后一个）；
+  `execute_join` 从表关联与合并逐批 watchdog 熔断（原仅阶段 1 eval 带 guard）。
+  测试：`multi_join_rejected_at_parse`。从表非 docid 字段需倒排（无则静默 0 匹配）已在文档标注取舍。
+- **回归**：全量 `cargo test --release --lib` = 642 passed / 0 failed（原 633 + review 新增 9）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
