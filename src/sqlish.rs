@@ -1669,6 +1669,32 @@ fn try_composite_index(
     if engine.composite_indexes.is_empty() || sel.where_expr.is_none() {
         return Ok(None);
     }
+    // P92/#31：单字段 `BETWEEN` + 声明**单列**组合索引 `[field]` → cidx 范围路由
+    // （#31 形态：ts BETWEEN 无等值前缀，等值分支不命中 → 此前全扫 ~700-900ms）。
+    // 范围扫描命中即回表；边界字节序误命中由下方 WHERE 复筛兜底（语义=全扫 BETWEEN）。
+    if let Some(WhereExpr::Between { field, low, high }) = sel.where_expr.as_ref() {
+        let has_single_col = engine
+            .composite_indexes
+            .iter()
+            .any(|f| f.len() == 1 && &f[0] == field);
+        if has_single_col {
+            let mut rows = engine.query_by_composite_range(field, low, high)?;
+            if let Some(we) = &sel.where_expr {
+                rows.retain(|(_, v)| match serde_json::from_slice::<serde_json::Value>(v) {
+                    Ok(doc) => we.matches_doc(&doc),
+                    Err(_) => false,
+                });
+            }
+            let limit = sel.limit.unwrap_or(cap).min(cap);
+            if sel.offset > 0 {
+                rows = rows.into_iter().skip(sel.offset as usize).collect();
+            }
+            if rows.len() as u64 > limit {
+                rows.truncate(limit as usize);
+            }
+            return Ok(Some(rows));
+        }
+    }
     let eqs = extract_eq_conds(sel.where_expr.as_ref().unwrap());
     if eqs.is_empty() {
         return Ok(None);
@@ -2085,83 +2111,118 @@ fn topk_sort(
     let fields: Vec<String> = order_by.iter().map(|(f, _)| f.clone()).collect();
     let mut heap: Vec<SortLite> = Vec::with_capacity(k + 1);
     let mut scanned = 0u64;
-    // P87①：分块流式扫描（Roaring iter 惰性；产出 top-K 即停，块内 watchguard 熔断）
-    const CHUNK: usize = 512;
-    let mut chunk: Vec<u64> = Vec::with_capacity(CHUNK);
-    let mut it = bitmap.iter();
-    loop {
-        chunk.clear();
-        let mut got = 0usize;
-        for _ in 0..CHUNK {
-            match it.next() {
-                Some(d) => {
-                    chunk.push(d);
-                    got += 1;
+    let mut insert = |heap: &mut Vec<SortLite>, row: SortLite| {
+        if heap.len() < k {
+            heap.push(row);
+            // 上浮
+            let mut i = heap.len() - 1;
+            while i > 0 {
+                let parent = (i - 1) / 2;
+                if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
+                    heap.swap(i, parent);
+                    i = parent;
+                } else {
+                    break;
                 }
-                None => break,
             }
-        }
-        if got == 0 {
-            break;
-        }
-        scanned += got as u64;
-        if guard.is_expired() {
-            return Err(Error::QueryTooExpensive(format!(
-                "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
-            )));
-        }
-        // P87②：只取排序键列（PAX 列解码 / 行式按需字段提取），免整行物化
-        let fvals = engine.batch_get_fields(&chunk, &fields)?;
-        for (docid, f_opt) in chunk.iter().copied().zip(fvals.into_iter()) {
-            let Some(vals) = f_opt else { continue };
-            let keys: Vec<SortKey> = vals
-                .iter()
-                .map(|b| match b {
-                    Some(bytes) => field_bytes_to_sort_key(bytes),
-                    None => SortKey::Null,
-                })
-                .collect();
-            let row = SortLite { docid, keys };
-            if heap.len() < k {
-                heap.push(row);
-                // 上浮
-                let mut i = heap.len() - 1;
-                while i > 0 {
-                    let parent = (i - 1) / 2;
-                    if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
-                        heap.swap(i, parent);
-                        i = parent;
-                    } else {
+        } else {
+            // 堆满：比堆顶（最差）更好 → 替换
+            if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
+                heap[0] = row;
+                // 下沉
+                let mut i = 0;
+                let n = heap.len();
+                loop {
+                    let mut smallest = i;
+                    let l = 2 * i + 1;
+                    let r = 2 * i + 2;
+                    if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater {
+                        smallest = l;
+                    }
+                    if r < n && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater {
+                        smallest = r;
+                    }
+                    if smallest == i {
                         break;
                     }
+                    heap.swap(i, smallest);
+                    i = smallest;
                 }
-            } else {
-                // 堆满：比堆顶（最差）更好 → 替换
-                if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
-                    heap[0] = row;
-                    // 下沉
-                    let mut i = 0;
-                    let n = heap.len();
-                    loop {
-                        let mut smallest = i;
-                        let l = 2 * i + 1;
-                        let r = 2 * i + 2;
-                        if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater
-                        {
-                            smallest = l;
-                        }
-                        if r < n
-                            && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater
-                        {
-                            smallest = r;
-                        }
-                        if smallest == i {
-                            break;
-                        }
-                        heap.swap(i, smallest);
-                        i = smallest;
+            }
+        }
+    };
+    // P92：候选**稠密**（窗口跨度 ≤ 4× 候选数）→ 投影列流式窗口扫描替代逐 docid
+    // 点查定位（P87①/② 的点查 batch_get_fields ~11µs/docid 是 #29 13.5s 残余瓶颈：
+    // 升序稠密 docid 逐点回表仍按 key 二分定位每行）。流式扫描经 scan_stream_fields
+    // 顺序读块、PAX 列解码/行式按需只解排序键列；非候选/墓碑行跳过，语义与点查等价
+    // （点查对不可见候选返回 None 跳过 ⇔ 扫描对墓碑/删除行不产出）。
+    // 注：扫描语义与 execute 聚合/分组全扫一致——不经 HotCache/delta 覆盖（字段级
+    // 热补丁在排序键上的可见性取舍同既有 scan 路径）。
+    let len = bitmap.len() as u64;
+    let dense = len > 0
+        && match (bitmap.min(), bitmap.max()) {
+            (Some(lo), Some(hi)) => {
+                let span = (hi as u64) - (lo as u64) + 1;
+                span <= len * 4
+            }
+            _ => false,
+        };
+    if dense {
+        let lo = bitmap.min().unwrap() as u64;
+        let hi = bitmap.max().unwrap() as u64;
+        engine.scan_stream_fields(Some(lo), Some(hi), fields.clone(), |docid, doc| {
+            if !bitmap.contains(docid) {
+                return Ok(true);
+            }
+            scanned += 1;
+            // 看门狗逐行检查（原子，开销可忽略）：保 P87 熔断语义（首个候选即中止）
+            if guard.is_expired() {
+                return Err(Error::QueryTooExpensive(format!(
+                    "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
+                )));
+            }
+            let keys = row_sort_keys(doc, &fields);
+            insert(&mut heap, SortLite { docid, keys });
+            Ok(true)
+        })?;
+    } else {
+        // P87①：分块流式扫描（Roaring iter 惰性；产出 top-K 即停，块内 watchguard 熔断）
+        const CHUNK: usize = 512;
+        let mut chunk: Vec<u64> = Vec::with_capacity(CHUNK);
+        let mut it = bitmap.iter();
+        loop {
+            chunk.clear();
+            let mut got = 0usize;
+            for _ in 0..CHUNK {
+                match it.next() {
+                    Some(d) => {
+                        chunk.push(d);
+                        got += 1;
                     }
+                    None => break,
                 }
+            }
+            if got == 0 {
+                break;
+            }
+            scanned += got as u64;
+            if guard.is_expired() {
+                return Err(Error::QueryTooExpensive(format!(
+                    "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
+                )));
+            }
+            // P87②：只取排序键列（PAX 列解码 / 行式按需字段提取），免整行物化
+            let fvals = engine.batch_get_fields(&chunk, &fields)?;
+            for (docid, f_opt) in chunk.iter().copied().zip(fvals.into_iter()) {
+                let Some(vals) = f_opt else { continue };
+                let keys: Vec<SortKey> = vals
+                    .iter()
+                    .map(|b| match b {
+                        Some(bytes) => field_bytes_to_sort_key(bytes),
+                        None => SortKey::Null,
+                    })
+                    .collect();
+                insert(&mut heap, SortLite { docid, keys });
             }
         }
     }
@@ -4970,6 +5031,120 @@ mod tests {
             let b = execute_aggregate_window(&px, sql, Some(0), None).unwrap().unwrap();
             assert_eq!((a.header.clone(), a.is_null, a.text.clone()), (b.header.clone(), b.is_null, b.text.clone()), "聚合 行式=PAX: {sql}");
         }
+    }
+
+    // ---------- P92：Top-K 稠密窗口投影流式 vs 稀疏点查路径 ----------
+
+    #[test]
+    fn p92_topk_dense_stream_and_sparse_point_match_ground_truth() {
+        // 稠密（无 WHERE 全表 span==len）→ topk_sort 走 scan_stream_fields 投影流式；
+        // 稀疏（WHERE k=7，密度 ~1/17 <25%）→ 保持 P87 分块点查。两路径输出必须与
+        // 引擎全量扫描 + 手动排序的地面真值一致（行式 + PAX(hot_fields) 两布局）。
+        fn build(hot: bool) -> (Engine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            if hot {
+                cfg.storage.hot_fields = vec!["k".into(), "amount".into()];
+            }
+            let mut e = Engine::open(dir.path(), &cfg).unwrap();
+            for i in 0..2000u64 {
+                let doc = serde_json::json!({"k": i % 17, "amount": (i * 37) % 9973, "note": format!("n{i}")});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+            }
+            e.flush_primary().unwrap();
+            for i in 2000..2100u64 {
+                let doc = serde_json::json!({"k": i % 17, "amount": (i * 37) % 9973, "note": format!("n{i}")});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+            }
+            (e, dir)
+        }
+        fn top10(e: &Engine, sql: &str) -> Vec<(i64, i64)> {
+            let rows = execute(e, sql, 100_000).unwrap();
+            rows.into_iter()
+                .map(|(_, doc)| {
+                    let v: serde_json::Value = serde_json::from_slice(&doc).unwrap();
+                    (v["k"].as_i64().unwrap(), v["amount"].as_i64().unwrap())
+                })
+                .collect()
+        }
+        fn ground(e: &Engine, k_sel: Option<i64>) -> Vec<(i64, i64)> {
+            let mut sel: Vec<(i64, i64)> = Vec::new();
+            e.scan_stream(None, None, |_, doc| {
+                let v: serde_json::Value = serde_json::from_slice(doc).unwrap();
+                let k = v["k"].as_i64().unwrap();
+                let am = v["amount"].as_i64().unwrap();
+                if k_sel.is_none_or(|x| k == x) {
+                    sel.push((k, am));
+                }
+                Ok(true)
+            })
+            .unwrap();
+            // (k asc, amount desc) top10
+            sel.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            sel.truncate(10);
+            sel
+        }
+        for hot in [false, true] {
+            let (e, _dir) = build(hot);
+            // 稠密全表（无 WHERE）→ 投影流式窗口路径
+            assert_eq!(
+                top10(&e, "SELECT * FROM t ORDER BY k, amount DESC LIMIT 10"),
+                ground(&e, None),
+                "p92 稠密流式 hot={hot}"
+            );
+            // 单键降序（amount）全表
+            let mut g2: Vec<(i64, i64)> = Vec::new();
+            e.scan_stream(None, None, |_, doc| {
+                let v: serde_json::Value = serde_json::from_slice(doc).unwrap();
+                g2.push((v["k"].as_i64().unwrap(), v["amount"].as_i64().unwrap()));
+                Ok(true)
+            })
+            .unwrap();
+            g2.sort_by(|a, b| b.1.cmp(&a.1));
+            g2.truncate(10);
+            assert_eq!(top10(&e, "SELECT * FROM t ORDER BY amount DESC LIMIT 10"), g2, "p92 单键 DESC hot={hot}");
+            // 稀疏（k=7，密度低）→ 点查路径
+            assert_eq!(
+                top10(&e, "SELECT * FROM t WHERE k=7 ORDER BY k, amount DESC LIMIT 10"),
+                ground(&e, Some(7)),
+                "p92 稀疏点查 hot={hot}"
+            );
+        }
+    }
+
+    #[test]
+    fn p92_composite_range_routing_matches_scan() {
+        // #31 形态：单列组合索引 ["ts"] + WHERE ts BETWEEN（无等值前缀）→
+        // try_composite_index 范围路由（query_by_composite_range）命中行集 =
+        // 全扫 BETWEEN 语义；边界字节序误命中被 WHERE 复筛剔除。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.composite_indexes = vec![vec!["ts".into()]];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let base = 1_700_000_000u64;
+        for i in 0..500u64 {
+            let doc = serde_json::json!({
+                "ts": base + i * 10,
+                "status": if i % 3 == 0 { "active" } else { "closed" },
+                "k": i % 17,
+            });
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        // 窗口 [base+100, base+300]（含端点；等宽 10 位数值 → 字节序=数值序）
+        let sql = format!("SELECT id,ts FROM t WHERE ts BETWEEN {} AND {}", base + 100, base + 300);
+        let rows = execute(&e, &sql, 10_000).unwrap();
+        let mut got: Vec<u64> = rows.into_iter().map(|(d, _)| d).collect();
+        got.sort_unstable();
+        let mut want: Vec<u64> = (10..=30).collect(); // i 满足 100<=10i<=300
+        assert_eq!(got, want, "cidx 范围路由命中集 = BETWEEN 全扫语义");
+        // 残余：BETWEEN 端点外不误命中
+        let sql2 = format!("SELECT id FROM t WHERE ts BETWEEN {} AND {}", base + 45, base + 55);
+        let rows2 = execute(&e, &sql2, 10_000).unwrap();
+        let mut got2: Vec<u64> = rows2.into_iter().map(|(d, _)| d).collect();
+        got2.sort_unstable();
+        // ts 步长 10：base+50 命中（i=5），base+45/55 无整点值 → 仅 i=5
+        assert_eq!(got2, vec![5], "边界半开不误命中（字节序区间下界语义）");
     }
 }
 

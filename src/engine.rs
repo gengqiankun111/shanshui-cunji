@@ -2024,6 +2024,37 @@ impl Engine {
         Ok(out)
     }
 
+    /// P92/#31：单列组合索引**范围**路由——首字段值 ∈ [low, high]（编码字节序区间）→
+    /// cidx 范围扫描 + 回表。仅当 `composite_indexes` 声明了单列 `[field]` 时使用
+    /// （前缀等值走 `query_by_composite_prefix`）。字段值以十进制/字符串字节落 cidx，
+    /// 等宽数值序 = 字节序；边界误命中由调用方对回表行复筛 BETWEEN 兜底（见
+    /// `try_composite_index`），语义与全扫 `BETWEEN` 精确一致。
+    pub fn query_by_composite_range(
+        &self,
+        field: &str,
+        low: &str,
+        high: &str,
+    ) -> Result<Vec<QueryRow>> {
+        let Some(cidx) = self.cidx.clone() else {
+            return Ok(Vec::new());
+        };
+        let start = crate::keys::encode_composite_key(&[low.as_bytes()], 0);
+        let end = crate::keys::encode_composite_key(&[high.as_bytes()], u64::MAX);
+        let hits = cidx.scan_raw_range(Some(&start), Some(&end))?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (key, _) in hits {
+            let (_fields, docid) = crate::keys::decode_composite_key(&key)?;
+            if !seen.insert(docid) {
+                continue;
+            }
+            if let Some(v) = self.get(docid)? {
+                out.push((docid, v));
+            }
+        }
+        Ok(out)
+    }
+
     /// 查询执行器：按 QuerySpec 静态路由到访问路径并执行（design 7.1 最小集枚举）。
     /// 看门狗：查询超时熔断（逐行检查 QueryGuard，超时返回 QueryTooExpensive）。
     pub fn execute(&mut self, spec: &QuerySpec) -> Result<Vec<QueryRow>> {
