@@ -24,7 +24,9 @@ mod compare;
 mod init;
 mod ops;
 mod rr_cases;
+mod sqlrun;
 mod tx;
+mod wide_load;
 
 use ops::{Table, Op};
 use tx::{conn, exec_stmt, run_txn, WorkerCx};
@@ -112,6 +114,25 @@ fn main() {
             reinit,
         );
         std::process::exit(rc);
+    }
+
+    // SQL 性能探针（--sql-run --url <mysql://...> --out <dir>）：对单端宽表跑典型负载。
+    // --table：默认 t；SCC 位图倒排仅兼容默认表 documents，SCC 侧请传 documents。
+    if has(&args, "--sql-run") {
+        let url = arg(&args, "--url", "mysql://root@127.0.0.1:3308");
+        let out = arg(&args, "--out", "results-sqlrun");
+        let table = arg(&args, "--table", "t");
+        std::process::exit(sqlrun::run(&url, &out, &table));
+    }
+
+    // 宽表数据集装载（--wide-load --url <mysql://...> --rows N --procs P [--table T]）：
+    // rust mysql crate 版 tmp_wide_load，pymysql 握手与 SCC 不兼容故用此装载。
+    if has(&args, "--wide-load") {
+        let url = arg(&args, "--url", "mysql://root@127.0.0.1:3317");
+        let rows = arg(&args, "--rows", "1098342").parse().unwrap_or(1_098_342);
+        let procs = arg(&args, "--procs", "4").parse().unwrap_or(4);
+        let table = arg(&args, "--table", "t");
+        std::process::exit(wide_load::run(&url, rows, procs, &table));
     }
 
     std::fs::create_dir_all(&cfg.out).expect("创建输出目录");
