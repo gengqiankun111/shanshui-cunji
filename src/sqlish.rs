@@ -2617,6 +2617,8 @@ pub fn execute_aggregate_window(
     // 免全表扫（残余条件在候选 doc 上整表达式判定，与全扫等价、结果精确）。
     // 适用如 `SUM(amount) WHERE status='active' AND ts BETWEEN ...`（status 收敛候选后范围过滤）。
     let mut scanned = 0u64;
+    // P91：全扫所需列（WHERE 引用 + 聚合列）——`scan_stream_fields` 投影解码用
+    let needed = aggregate_needed_fields(sel.where_expr.as_ref(), field.as_deref());
     let candidate = candidate_posting(engine, sel.where_expr.as_ref(), start, end)?;
     match candidate {
         Some(post) => {
@@ -2624,7 +2626,6 @@ pub fn execute_aggregate_window(
             // 字段 + 聚合字段（PAX 列解码 / 行式按需字段提取，P86②/P87② 基建），替代整行
             // `engine.get` 全 25 列解码；残余范围/BETWEEN 条件在**子集文档**上判定
             // （缺失 = 原文档缺失语义，结果与整行路径精确一致）。512/块批量回表。
-            let needed = aggregate_needed_fields(sel.where_expr.as_ref(), field.as_deref());
             let mut chunk: Vec<u64> = Vec::with_capacity(512);
             for docid in post {
                 chunk.push(docid);
@@ -2678,7 +2679,9 @@ pub fn execute_aggregate_window(
             }
         }
         None => {
-            engine.scan_stream(start, end, |_docid, doc| {
+            // P91：全扫聚合投影解码——只解 WHERE/聚合所需列（PAX 块列解码），
+            // 行式/内存直通原 JSON（消费端 acc 本就只读所需列，语义不变）
+            engine.scan_stream_fields(start, end, needed, |_docid, doc| {
                 scanned += 1;
                 if scanned % 4096 == 0 && guard.is_expired() {
                     return Err(Error::QueryTooExpensive(
@@ -2774,6 +2777,31 @@ fn aggregate_needed_fields(where_expr: Option<&WhereExpr>, agg: Option<&str>) ->
     }
     if let Some(f) = agg {
         push(f, &mut out);
+    }
+    out
+}
+
+/// P91：GROUP BY 全扫所需列 = WHERE 引用 ∪ 分组列 ∪ 聚合列（顶层键、去重）。
+/// 供 `scan_stream_fields` 投影解码（PAX 块只解这些列；消费端也只读这些列）。
+fn group_scan_needed_fields(
+    where_expr: Option<&WhereExpr>,
+    group_fields: &[String],
+    specs: &[(String, Option<String>)],
+) -> Vec<String> {
+    let mut out = aggregate_needed_fields(where_expr, None);
+    let mut push = |s: &str| {
+        let top = s.split('.').next().unwrap_or(s);
+        if !top.is_empty() && !out.iter().any(|x| x == top) {
+            out.push(top.to_string());
+        }
+    };
+    for f in group_fields {
+        push(f);
+    }
+    for (_n, f) in specs {
+        if let Some(f) = f {
+            push(f);
+        }
     }
     out
 }
@@ -3213,11 +3241,13 @@ pub fn execute_group_by_window(
         }
     }
     let guard = engine.query_guard();
+    // P91：GROUP BY 全扫投影列 = WHERE 引用 ∪ 分组列 ∪ 聚合列（PAX 块只解这些列）
+    let needed = group_scan_needed_fields(sel.where_expr.as_ref(), &fields, &specs);
     // 复合组键 = 各分组 level 键向量；每组持每聚合列一个累积器（与 specs 对齐）。
     let mut groups: std::collections::HashMap<Vec<GroupKey>, Vec<AggState>> =
         std::collections::HashMap::new();
     let mut scanned = 0u64;
-    engine.scan_stream(start, end, |_docid, doc| {
+    engine.scan_stream_fields(start, end, needed, |_docid, doc| {
         scanned += 1;
         if scanned % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(

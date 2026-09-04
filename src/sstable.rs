@@ -1393,6 +1393,10 @@ pub struct SstRangeIter<'a> {
     cache: Option<std::sync::Arc<crate::blockcache::BlockCache>>,
     /// P1-E：字段级 Zone Map 谓词——块级 min/max 检查，不相交块跳过。
     zone_pred: Option<ZonePredicate>,
+    /// P91：通用 scan 投影列——非空时块解码只物化/输出请求列的子集 JSON：
+    /// PAX 块走列解码（免整行 25 列重构）；行式块直通原 JSON（消费端按需取列，
+    /// 与既有语义一致）。供无 WHERE 全扫聚合 / GROUP BY / 排序键扫描等只读所需列。
+    project: Option<Vec<String>>,
 }
 
 impl<'a> SstRangeIter<'a> {
@@ -1457,12 +1461,18 @@ impl<'a> SstRangeIter<'a> {
             keys_only,
             cache,
             zone_pred: None,
+            project: None,
         })
     }
 
     /// P1-E：设置字段级 Zone Map 谓词（扫描路径用，默认 None 无剪枝）。
     pub fn set_zone_pred(&mut self, zp: ZonePredicate) {
         self.zone_pred = Some(zp);
+    }
+
+    /// P91：设置投影列（扫描只解/输出这些列；默认 None = 整行直通）。
+    pub fn set_project_fields(&mut self, fields: Vec<String>) {
+        self.project = Some(fields);
     }
 
     /// 推进到下一个候选块（Zone Map 剪枝），加载并解码；无更多块返回 false。
@@ -1545,6 +1555,8 @@ impl<'a> SstRangeIter<'a> {
                     .into_iter()
                     .map(|(k, is_put, seq)| (k, is_put.then_some(Vec::new()), seq))
                     .collect()
+            } else if let Some(fields) = self.project.clone() {
+                decode_projected_block(&block, self.reader.format, &fields)?
             } else {
                 decode_data_block(&block, self.reader.format)?
             };
@@ -2010,6 +2022,51 @@ pub fn decode_pax_block_fields(
         rows.push((keys[i].clone(), vals, seq));
     }
     Ok(rows)
+}
+
+/// P91：scan 投影列块解码——PAX 块只解请求列并组装**子集 JSON**（免整行 25 列重构
+/// 与重序列化）；行式块直通整行原 JSON 字节（零额外开销，消费端 light 按需取列）。
+/// 返回行序列 `(key, value, seq)`，语义与 `decode_data_block` 对齐（Tombstone → None）。
+pub fn decode_projected_block(
+    data: &[u8],
+    format: u16,
+    fields: &[String],
+) -> Result<Vec<DecodedRow>> {
+    // PAX 列式块（v4+）：列解码只取请求列 → 每行组装子集 JSON
+    if format >= SST_VERSION && data.first() == Some(&BLOCK_KIND_PAX) {
+        let mut rows = Vec::new();
+        for (k, vals, seq) in decode_pax_block_fields(data, fields)? {
+            let value = assemble_subset_json(fields, &vals);
+            rows.push((k, Some(value), seq));
+        }
+        return Ok(rows);
+    }
+    // 行式块（含 v3）：值即整行原 JSON 字节，直通（消费端只读其所需列）
+    decode_data_block(data, format)
+}
+
+/// P91：请求列字节 → 子集 JSON 对象字节（`{"f1":<v1>,"f2":null}`）。
+/// - `None` = 原文档缺失该键 → 子集省略（与整行文档缺键语义一致）；
+/// - `Some(b"null")` = JSON null（PAX null 哨兵解码结果）；
+/// - 其余 = 值已为 JSON 片段（字符串带引号/数字原样/布尔）→ 直接嵌入。
+/// 字段名 JSON 转义由 `serde_json::to_string` 处理（含引号/反斜杠/控制符）。
+fn assemble_subset_json(fields: &[String], vals: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(64);
+    out.push(b'{');
+    let mut first = true;
+    for (f, v) in fields.iter().zip(vals.iter()) {
+        let Some(b) = v else { continue };
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        // 字段名：JSON 双引号 + 转义
+        out.extend_from_slice(&serde_json::to_string(f).unwrap_or_default().into_bytes());
+        out.push(b':');
+        out.extend_from_slice(b);
+    }
+    out.push(b'}');
+    out
 }
 
 /// P87②/P86②：整行 JSON → 指定顶层字段的 JSON 值字节（serde 语义：缺键 → None；

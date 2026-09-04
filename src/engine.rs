@@ -1774,6 +1774,32 @@ impl Engine {
         })
     }
 
+    /// P91：投影列流式扫描（最新视图）——语义同 `scan_stream`，但 SST 端按 `fields`
+    /// 投影解码（PAX 块只解所需列 → 子集 JSON；行式/内存直通原 JSON 字节）。
+    /// 消费端只读 `fields` 覆盖列（须含 WHERE 引用 + 分组 + 聚合字段全集）。
+    pub fn scan_stream_fields<F: FnMut(u64, &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        fields: Vec<String>,
+        mut f: F,
+    ) -> Result<()> {
+        let sk = start.map(|s| encode_docid(s).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        self.primary
+            .scan_stream_fields(sk.as_deref(), ek.as_deref(), fields, |key, val| {
+                let docid = decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan fields key 非 docid 编码".into())
+                })?;
+                if let Some(bm) = &self.deletion_bitmap {
+                    if bm.is_deleted(docid) {
+                        return Ok(true);
+                    }
+                }
+                f(docid, val)
+            })
+    }
+
     /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
     /// 但额外在 SST 块级检查 `zone_pred` 的 min/max，不相交块跳过（免 IO/解压）。
     /// 适用于 SQL 范围查询（`ts BETWEEN`、`amount > N`）的扫描下推路径。
@@ -3212,6 +3238,102 @@ mod tests {
         // 值取最新版本
         let rows: std::collections::HashMap<u64, Vec<u8>> = e.scan_range(None, None).unwrap().into_iter().collect();
         assert_eq!(rows.get(&15).unwrap(), b"v1-15", "覆盖写应返回最新版本");
+    }
+
+    #[test]
+    fn p91_scan_stream_fields_matches_scan_stream_row_and_pax() {
+        // P91：投影列扫描（scan_stream_fields）语义与全量 scan_stream + 按需取列一致——
+        // 行式块直通原 JSON；PAX 块（storage.hot_fields）只解请求列并组装子集 JSON。
+        // 覆盖 memtable / flush(SST) / 覆盖写 / 删除 / 重开 两布局。
+        for pax in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = cfg();
+            if pax {
+                c.storage.hot_fields = vec!["a".into(), "c".into()];
+            }
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            for i in 0..3000u64 {
+                let doc = serde_json::json!({"a": format!("a{i}"), "b": i, "c": i % 7});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &["b"]).unwrap();
+            }
+            // 覆盖写（同 docid 二次 put）+ 删除（位图）
+            e.put(5, br#"{"a":"a5v2","b":-1,"c":99}"#.to_vec(), &["b"]).unwrap();
+            e.delete(9).unwrap();
+            // 与 scan_stream 全量扫描对比（memtable 期）
+            let full: std::collections::HashMap<u64, serde_json::Value> = {
+                let mut m = std::collections::HashMap::new();
+                e.scan_stream(None, None, |d, v| {
+                    m.insert(d, serde_json::from_slice(v).unwrap());
+                    Ok(true)
+                })
+                .unwrap();
+                m
+            };
+            let proj: Vec<(u64, serde_json::Value)> = {
+                let mut v = Vec::new();
+                e.scan_stream_fields(None, None, vec!["a".into(), "c".into()], |d, s| {
+                    v.push((d, serde_json::from_slice(s).unwrap()));
+                    Ok(true)
+                })
+                .unwrap();
+                v
+            };
+            assert_eq!(full.len(), proj.len(), "pax={pax} 投影扫描行数与全扫一致（memtable）");
+            for (d, sub) in proj {
+                let f = &full[&d];
+                assert_eq!(sub.get("a"), f.get("a"), "pax={pax} docid={d} 列 a 一致");
+                assert_eq!(sub.get("c"), f.get("c"), "pax={pax} docid={d} 列 c 一致");
+            }
+            // flush 后（SST 行式/PAX 块路径）再验
+            e.flush_primary().unwrap();
+            let full2: std::collections::HashMap<u64, serde_json::Value> = {
+                let mut m = std::collections::HashMap::new();
+                e.scan_stream(None, None, |d, v| {
+                    m.insert(d, serde_json::from_slice(v).unwrap());
+                    Ok(true)
+                })
+                .unwrap();
+                m
+            };
+            let proj2: Vec<(u64, serde_json::Value)> = {
+                let mut v = Vec::new();
+                e.scan_stream_fields(None, None, vec!["a".into(), "c".into()], |d, s| {
+                    v.push((d, serde_json::from_slice(s).unwrap()));
+                    Ok(true)
+                })
+                .unwrap();
+                v
+            };
+            assert_eq!(full2.len(), proj2.len(), "pax={pax} 投影扫描行数与全扫一致（flush 后）");
+            for (d, sub) in proj2 {
+                let f = &full2[&d];
+                assert_eq!(sub.get("a"), f.get("a"), "pax={pax} flush 后 docid={d} 列 a 一致");
+                assert_eq!(sub.get("c"), f.get("c"), "pax={pax} flush 后 docid={d} 列 c 一致");
+            }
+            drop(e);
+            // 重开再验（SST 路径 + 懒基线）
+            let e2 = Engine::open(dir.path(), &c).unwrap();
+            let full3: std::collections::HashMap<u64, serde_json::Value> = {
+                let mut m = std::collections::HashMap::new();
+                e2.scan_stream(None, None, |d, v| {
+                    m.insert(d, serde_json::from_slice(v).unwrap());
+                    Ok(true)
+                })
+                .unwrap();
+                m
+            };
+            let mut proj3: Vec<(u64, serde_json::Value)> = Vec::new();
+            e2.scan_stream_fields(None, None, vec!["a".into(), "c".into()], |d, s| {
+                proj3.push((d, serde_json::from_slice(s).unwrap()));
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(full3.len(), proj3.len(), "pax={pax} 重开后行数一致");
+            for (d, sub) in proj3 {
+                assert_eq!(sub.get("a"), full3[&d].get("a"), "pax={pax} 重开 docid={d} a 一致");
+                assert_eq!(sub.get("c"), full3[&d].get("c"), "pax={pax} 重开 docid={d} c 一致");
+            }
+        }
     }
 
     #[test]

@@ -946,7 +946,7 @@ impl ColumnFamily {
         let start_key = start.map(|s| encode_docid(s).to_vec());
         let end_key = end.map(|e| encode_docid(e).to_vec());
         let mut out = Vec::new();
-        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), None, |key, val| {
+        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), None, None, |key, val| {
             let docid = decode_docid(key)
                 .map_err(|_| Error::Corrupted("scan_at key 非 docid 编码".into()))?;
             out.push((docid, val.to_vec()));
@@ -1001,7 +1001,20 @@ impl ColumnFamily {
         f: F,
     ) -> Result<()> {
         // 最新视图 = 快照 seq 无上限（取最大版本）
-        self.scan_stream_at(u64::MAX, start, end, None, f)
+        self.scan_stream_at(u64::MAX, start, end, None, None, f)
+    }
+
+    /// P91：投影列流式扫描（最新视图）——语义同 `scan_stream`，但请求列非空时
+    /// SST 端 PAX 块只解码请求列并输出**子集 JSON**（行式块/内存直通原 JSON）。
+    /// 消费端须只读 `fields` 覆盖的列（请求列须含 WHERE 引用 + 分组 + 聚合全部字段）。
+    pub fn scan_stream_fields<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        fields: Vec<String>,
+        f: F,
+    ) -> Result<()> {
+        self.scan_stream_at(u64::MAX, start, end, None, Some(fields), f)
     }
 
     /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
@@ -1014,7 +1027,7 @@ impl ColumnFamily {
         f: F,
     ) -> Result<()> {
         // 最新视图 = 快照 seq 无上限（取最大版本）
-        self.scan_stream_at(u64::MAX, start, end, zone_pred, f)
+        self.scan_stream_at(u64::MAX, start, end, zone_pred, None, f)
     }
 
     /// 快照范围流式扫描（M 项，事务类查询优化 P0）：同 key 多版本取
@@ -1026,6 +1039,7 @@ impl ColumnFamily {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         zone_pred: Option<crate::sstable::ZonePredicate>,
+        project: Option<Vec<String>>,
         mut f: F,
     ) -> Result<()> {
         // 源：memtable（immutable + mutable）+ SST。P72：memtable 迭代器借用内部 RwLock 读锁
@@ -1051,6 +1065,10 @@ impl ColumnFamily {
                 )?;
                 if let Some(ref zp) = zone_pred {
                     it.set_zone_pred(zp.clone());
+                }
+                // P91：投影列（PAX 块只解请求列；行式直通）——scan 只物化/输出所需列
+                if let Some(fields) = project.clone() {
+                    it.set_project_fields(fields);
                 }
                 sst_iters.push(it);
             }
