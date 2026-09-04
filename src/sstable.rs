@@ -1140,6 +1140,43 @@ impl SstReader {
         Ok(hits)
     }
 
+    /// P87②：块内批量等值扫描（投影版）——只解码 `fields` 指定列：
+    /// - PAX 块 → `decode_pax_block_fields` 单次多列解码（免整行 25 列重构）；
+    /// - 行式块 → 整块解码后逐行按需字段提取（P86② 语义）。
+    /// 返回 `(key, fields_values, seq)`：`fields_values` = 该行各请求字段的 JSON 值字节
+    /// （缺列 → None）；`fields_values` 整体为 None 表示 Tombstone（语义同
+    /// `scan_block_for_keys` 的 `value=None`）。
+    pub fn scan_block_for_keys_fields(
+        &self,
+        block: &[u8],
+        targets: &std::collections::HashSet<Vec<u8>>,
+        fields: &[String],
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<Option<Vec<u8>>>>, u64)>> {
+        // PAX 块（v4+ 块首 kind）：列解码直取，免整行重构
+        if self.format >= SST_VERSION && block.first() == Some(&BLOCK_KIND_PAX) {
+            let mut hits = Vec::new();
+            for (k, vals, seq) in decode_pax_block_fields(block, fields)? {
+                if targets.contains(&k) {
+                    hits.push((k, Some(vals), seq));
+                }
+            }
+            return Ok(hits);
+        }
+        // 行式块（含 v3）：整块解码后逐行按需提取字段
+        let mut hits = Vec::new();
+        for (k, v, seq) in decode_data_block(block, self.format)? {
+            if !targets.contains(&k) {
+                continue;
+            }
+            let vals = match v {
+                Some(row) => Some(extract_fields_from_json_row(&row, fields)),
+                None => None, // Tombstone
+            };
+            hits.push((k, vals, seq));
+        }
+        Ok(hits)
+    }
+
     /// 定位包含 key 的数据块（二分首个 first_key <= key 的块）。触发 Level 2 懒加载。
     fn locate_block(&self, key: &[u8]) -> Result<Option<IndexEntry>> {
         self.ensure_index()?;
@@ -1884,6 +1921,113 @@ pub fn decode_pax_block_column(data: &[u8], column: &str) -> Result<Vec<(Vec<u8>
     Ok(rows)
 }
 
+/// P87②：从 PAX 块中读取**多个**指定列——单次解析列偏移量表后逐请求列解码，
+/// 对比 `decode_pax_block_column`（每列一调）免重复解析表头，对比 `decode_pax_block`
+/// 免整行 25 列 JSON 重构。与逐列解码等值。
+///
+/// 返回 `(key, fields_values, seq)` 行序列：`fields_values[j]` = `fields[j]` 的 JSON 值
+/// 字节（`b"null"` = JSON null；None = 该行缺列）。块中不存在的列 → 全行 None。
+pub fn decode_pax_block_fields(
+    data: &[u8],
+    fields: &[String],
+) -> Result<Vec<(Vec<u8>, Vec<Option<Vec<u8>>>, u64)>> {
+    let mut cur = 1usize; // 跳过 kind
+    if cur + 4 > data.len() {
+        return Err(Error::Corrupted("PAX 块行数越界".into()));
+    }
+    let row_count = u32::from_le_bytes(data[cur..cur + 4].try_into().unwrap()) as usize;
+    cur += 4;
+
+    // Keys
+    let mut keys = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        keys.push(decode_varlen(data, &mut cur)?.to_vec());
+    }
+    // 列偏移量表
+    if cur + 2 > data.len() {
+        return Err(Error::Corrupted("PAX 列计数越界".into()));
+    }
+    let col_count = u16::from_le_bytes(data[cur..cur + 2].try_into().unwrap()) as usize;
+    cur += 2;
+    let mut col_meta: Vec<(String, usize, usize)> = Vec::with_capacity(col_count);
+    for _ci in 0..col_count {
+        let field = String::from_utf8(decode_varlen(data, &mut cur)?.to_vec())
+            .map_err(|_| Error::Corrupted("PAX 列名非法 UTF-8".into()))?;
+        let _is_hot = data[cur];
+        cur += 1;
+        if cur + 8 > data.len() {
+            return Err(Error::Corrupted("PAX 列表越界".into()));
+        }
+        let offset = u32::from_le_bytes(data[cur..cur + 4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(data[cur + 4..cur + 8].try_into().unwrap()) as usize;
+        cur += 8;
+        col_meta.push((field, offset, len));
+    }
+    // 逐请求列解码（每列与行序对齐；列不存在 → 全行 None = 缺列）
+    let mut col_vals: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(fields.len());
+    for f in fields {
+        let mut vals: Vec<Option<Vec<u8>>> = vec![None; row_count];
+        if let Some((_, offset, len)) = col_meta.iter().find(|(name, _, _)| name == f) {
+            let col_data = &data[*offset..*offset + *len];
+            let mut ccur = 0usize;
+            for v in vals.iter_mut() {
+                if ccur >= col_data.len() {
+                    return Err(Error::Corrupted("PAX 列数据越界".into()));
+                }
+                let present = col_data[ccur];
+                ccur += 1;
+                if present == 1 {
+                    let vlen = decode_varint(col_data, &mut ccur)? as usize;
+                    if ccur + vlen > col_data.len() {
+                        return Err(Error::Corrupted("PAX 列值越界".into()));
+                    }
+                    let vbytes = &col_data[ccur..ccur + vlen];
+                    ccur += vlen;
+                    *v = if vbytes == b"n" {
+                        Some(b"null".to_vec()) // null
+                    } else {
+                        Some(vbytes.to_vec())
+                    };
+                }
+                // present=0 → 保持 None（缺失）
+            }
+        }
+        col_vals.push(vals);
+    }
+    // Seqs（块尾：row_count × u64，紧邻列数据区之后）
+    if data.len() < row_count * 8 {
+        return Err(Error::Corrupted("PAX seq 区越界".into()));
+    }
+    let seqs_start = data.len() - row_count * 8;
+    let mut rows = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let seq = u64::from_le_bytes(
+            data[seqs_start + i * 8..seqs_start + (i + 1) * 8]
+                .try_into()
+                .unwrap(),
+        );
+        let vals: Vec<Option<Vec<u8>>> = col_vals.iter().map(|cv| cv[i].clone()).collect();
+        rows.push((keys[i].clone(), vals, seq));
+    }
+    Ok(rows)
+}
+
+/// P87②/P86②：整行 JSON → 指定顶层字段的 JSON 值字节（serde 语义：缺键 → None；
+/// 键存在且值为 JSON null → Some(b"null")）。非 JSON / 非对象行 → 全部 None（对齐
+/// `sort_key` 解析失败返回 Null 的语义——行式块回退按需字段提取，正确性护栏保留）。
+pub fn extract_fields_from_json_row(row: &[u8], fields: &[String]) -> Vec<Option<Vec<u8>>> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(row) else {
+        return vec![None; fields.len()];
+    };
+    let Some(map) = v.as_object() else {
+        return vec![None; fields.len()];
+    };
+    fields
+        .iter()
+        .map(|f| map.get(f).map(|x| serde_json::to_vec(x).unwrap_or_default()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2183,6 +2327,74 @@ mod tests {
         );
         // 至少一个 PAX 块（带字段级 Zone Map）
         assert!(r.index().iter().any(|e| !e.zones.is_empty()));
+    }
+
+    #[test]
+    fn decode_pax_block_fields_matches_full_row_and_single_column() {
+        // P87②：单块多列解码与整行解码（逐字段）及逐列解码三方等值
+        let path = tmp();
+        let hot = vec!["status".to_string(), "city".to_string()];
+        let mut w =
+            SstWriter::new_with_pax(&path, Compression::None, 0, 1024, 10, &hot, 0.01).unwrap();
+        w.add(b"k1", br#"{"status":"active","city":"beijing","amount":100}"#, 1)
+            .unwrap();
+        w.add(b"k2", br#"{"status":"inactive","city":"shanghai"}"#, 2)
+            .unwrap();
+        w.add(b"k3", br#"{"status":"active","city":null,"extra":1}"#, 3)
+            .unwrap();
+        w.add(b"k4", br#"{"status":"active","city":"shenzhen","amount":200,"note":"n1"}"#, 4)
+            .unwrap();
+        w.finish().unwrap();
+        let r = SstReader::open(&path).unwrap();
+        let block = r.read_block(&r.index()[0]).unwrap();
+        let fields: Vec<String> = ["status", "city", "amount", "note", "missing"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = decode_pax_block_fields(&block, &fields).unwrap();
+        assert_eq!(rows.len(), 4, "块内 4 行");
+        for (i, (key, vals, _seq)) in rows.iter().enumerate() {
+            let full = decode_pax_block(&block).unwrap()[i].1.clone().unwrap();
+            let expect = extract_fields_from_json_row(&full, &fields);
+            assert_eq!(vals, &expect, "row {i} 多列解码 = 整行按字段提取");
+            for (j, f) in fields.iter().enumerate() {
+                let col = decode_pax_block_column(&block, f).unwrap();
+                assert_eq!(vals[j], col[i].1, "row {i} col {f} 与逐列解码等值");
+            }
+            assert_eq!(key.as_slice(), format!("k{}", i + 1).as_bytes());
+        }
+        // 语义抽查：缺失列全 None；JSON null（city 行 3）→ Some(b"null")
+        assert!(rows[0].1[4].is_none(), "missing 列 → None");
+        assert_eq!(rows[2].1[1].as_deref(), Some(&b"null"[..]), "city=null → b\"null\"");
+        assert!(rows[2].1[0].is_some() && rows[2].1[3].is_none(), "extra 非请求列不解");
+        // 行式块回退路径：SstReader::scan_block_for_keys_fields 处理行式块
+        let row_path = tmp();
+        let mut rw = SstWriter::new(&row_path, Compression::None, 0, 1024, 4).unwrap();
+        rw.add(b"a", br#"{"x":1,"y":"b"}"#, 5).unwrap();
+        rw.add(b"b", b"raw-bytes", 6).unwrap();
+        rw.finish().unwrap();
+        let rr = SstReader::open(&row_path).unwrap();
+        let rb = rr.read_block(&rr.index()[0]).unwrap();
+        let mut targets = std::collections::HashSet::new();
+        targets.insert(b"a".to_vec());
+        targets.insert(b"b".to_vec());
+        let want = vec!["x".to_string(), "y".to_string()];
+        let hits = rr
+            .scan_block_for_keys_fields(&rb, &targets, &want)
+            .unwrap();
+        assert_eq!(hits.len(), 2, "行式块命中 2 key");
+        for (k, vals, seq) in hits {
+            if k == b"a" {
+                assert_eq!(seq, 5);
+                let v0 = vals.unwrap();
+                assert_eq!(v0[0].as_deref(), Some(&b"1"[..]), "x=1");
+                assert_eq!(v0[1].as_deref(), Some(&b"\"b\""[..]), "y=\"b\"（含引号）");
+            } else {
+                assert_eq!(seq, 6);
+                let v0 = vals.unwrap();
+                assert!(v0.iter().all(|x| x.is_none()), "非 JSON 行 → 字段全 None");
+            }
+        }
     }
 
     #[test]

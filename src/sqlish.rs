@@ -1822,7 +1822,7 @@ pub fn docset_to_sorted(set: &crate::docset::DocIdSet) -> Vec<u64> {
 const SORT_MAX_ROWS: usize = 200_000;
 
 /// 排序键：Null(缺省/非数值非字符串) < Num < Str。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum SortKey {
     Null,
     Num(f64),
@@ -1830,6 +1830,7 @@ enum SortKey {
 }
 
 /// 从文档 JSON 顶层字段取排序键（数值→Num，字符串→Str，其余/缺省→Null）。
+/// P86② 单字段回退路径（`row_sort_keys` 无法轻量遍历时的 serde 正确性护栏）。
 fn sort_key(doc: &[u8], field: &str) -> SortKey {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) else {
         return SortKey::Null;
@@ -1841,6 +1842,175 @@ fn sort_key(doc: &[u8], field: &str) -> SortKey {
         Some(serde_json::Value::String(s)) => SortKey::Str(s.clone()),
         Some(_) => SortKey::Null,
     }
+}
+
+/// P86②：单遍字节级提取多个顶层排序键（跳其余 23 列 Value 构造与丢弃；对比逐字段
+/// `sort_key` 每字段一次 serde 整行 parse）。结构无法轻量遍历（转义/嵌套 key/畸形）→
+/// None，调用方回退 serde 逐字段（正确性护栏）。缺失字段 = Null（MySQL 语义）。
+fn light_sort_keys(doc: &[u8], fields: &[&str]) -> Option<Vec<SortKey>> {
+    let b = doc;
+    let n = b.len();
+    let mut i = ws(b, 0);
+    if i >= n || b[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    let mut out: Vec<Option<SortKey>> = vec![None; fields.len()];
+    loop {
+        i = ws(b, i);
+        if i >= n {
+            return None;
+        }
+        if b[i] == b'}' {
+            break;
+        }
+        if b[i] != b'"' {
+            return None;
+        }
+        i += 1;
+        let ks = i;
+        let mut esc = false;
+        loop {
+            if i >= n {
+                return None;
+            }
+            let c = b[i];
+            if c == b'\\' {
+                esc = true;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            if c == b'"' {
+                break;
+            }
+        }
+        if esc {
+            return None; // 转义 key → 回退 serde
+        }
+        let key = &b[ks..i - 1];
+        i = ws(b, i);
+        if i >= n || b[i] != b':' {
+            return None;
+        }
+        i = ws(b, i + 1);
+        if i >= n {
+            return None;
+        }
+        if let Some(slot) = fields.iter().position(|f| f.as_bytes() == key) {
+            let sk = match read_target_value(b, i)? {
+                LightVal::Absent | LightVal::Complex | LightVal::Null | LightVal::Bool(_) => {
+                    SortKey::Null
+                }
+                LightVal::Num(bytes) => match std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    Some(v) => SortKey::Num(v),
+                    None => return None,
+                },
+                LightVal::Str(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => SortKey::Str(s.to_string()),
+                    Err(_) => return None,
+                },
+            };
+            out[slot] = Some(sk);
+        }
+        // 消费掉整个值（目标字段的 read_target_value 未推进游标，skip_value 从值头扫过）
+        if !skip_value(b, &mut i) {
+            return None;
+        }
+        i = ws(b, i);
+        if i >= n {
+            return None;
+        }
+        if b[i] == b',' {
+            i += 1;
+        } else if b[i] == b'}' {
+            break;
+        } else {
+            return None;
+        }
+    }
+    Some(out.into_iter().map(|k| k.unwrap_or(SortKey::Null)).collect())
+}
+
+/// P86②：一行多排序键——单遍轻量提取；无法轻量 → 逐字段 serde 回退（语义等值）。
+fn row_sort_keys(doc: &[u8], fields: &[String]) -> Vec<SortKey> {
+    let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+    if let Some(keys) = light_sort_keys(doc, &refs) {
+        return keys;
+    }
+    fields.iter().map(|f| sort_key(doc, f)).collect()
+}
+
+/// P87②：字段 JSON 值字节 → 排序键（serde 解析标量；缺失/null/非标量 → Null）。
+/// 与 `sort_key` 从整行取字段的语义等值（缺失与 JSON null 均 Null）。
+fn field_bytes_to_sort_key(b: &[u8]) -> SortKey {
+    let v: Value = match serde_json::from_slice(b) {
+        Ok(v) => v,
+        Err(_) => return SortKey::Null,
+    };
+    match v {
+        Value::Number(x) => x.as_f64().map(SortKey::Num).unwrap_or(SortKey::Null),
+        Value::String(s) => SortKey::Str(s),
+        _ => SortKey::Null,
+    }
+}
+
+/// P85：DocIdSet 消费端 LIMIT 早停——候选 docid 分块（512）批量回表。复刻全量物化消费的
+/// 精确语义：offset 跳过**候选位置**（墓碑/未命中也占 offset 占位），limit 只计**可见行**
+/// （墓碑/未命中不占 limit）；产出 offset+limit 行即终止，剩余块零拉取。内存 O(chunk)。
+/// `fetch` 抽象批量取行以便单测注入迭代计数（Bitmap/SortedList/All 三分支共用）。
+fn collect_limited_rows<F>(
+    mut fetch: F,
+    docids: impl Iterator<Item = u64>,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<QueryRow>>
+where
+    F: FnMut(&[u64]) -> Result<Vec<Option<Vec<u8>>>>,
+{
+    let mut rows: Vec<QueryRow> = Vec::new();
+    if limit == 0 {
+        return Ok(rows);
+    }
+    const CHUNK: usize = 512;
+    let mut buf: Vec<u64> = Vec::with_capacity(CHUNK);
+    let mut skipped = 0u64;
+    let mut it = docids;
+    loop {
+        buf.clear();
+        let mut got = 0usize;
+        for _ in 0..CHUNK {
+            match it.next() {
+                Some(d) => {
+                    buf.push(d);
+                    got += 1;
+                }
+                None => break,
+            }
+        }
+        if got == 0 {
+            break;
+        }
+        let batch = fetch(&buf)?;
+        for (d, v_opt) in buf.iter().copied().zip(batch.into_iter()) {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if rows.len() as u64 >= limit {
+                break;
+            }
+            let Some(v) = v_opt else { continue };
+            rows.push((d, v));
+        }
+        if rows.len() as u64 >= limit {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
@@ -1863,8 +2033,18 @@ struct SortRow {
     keys: Vec<SortKey>,
 }
 
+/// Top-K 流式堆条目（P87①）：只存 docid + 排序键——候选扫描不再持有整行 JSON，
+/// 峰值内存 O(k+chunk)；输出期对 top-K docid 整行回表（P87③）。
+struct SortLite {
+    docid: u64,
+    keys: Vec<SortKey>,
+}
+
 /// P0-B：Top-K 有界堆排序——BinaryHeap 保持 top-K，内存 O(K) 替代 O(N) 全排序。
-/// 堆存储"最差的 K 个"（max-heap by reverse order），超 K 时弹最差 → 留最优 K 个。
+/// P87①流式化：候选 docid 分块（512）→ `batch_get_fields` 只解排序键列入堆；
+/// P87②排序键解码下推：batch_get_fields 内部 PAX 块列解码 / 行式块按需字段提取；
+/// P87③输出瘦身：top-K 确定后仅对胜出 docid 整行回表（SELECT * 语义），候选扫期间
+/// 不物化整行（原实现全量 batch_get 110 万行 ≈1GB+ 峰值物化消除）。
 fn topk_sort(
     engine: &Engine,
     bitmap: &RoaringBitmap,
@@ -1875,7 +2055,7 @@ fn topk_sort(
     guard: &crate::watchdog::QueryGuard,
 ) -> Result<Vec<QueryRow>> {
     // 比较函数：按 order_by 排序键比较（含 DESC）
-    let cmp_rows = |a: &SortRow, b: &SortRow| -> std::cmp::Ordering {
+    let cmp_rows = |a: &SortLite, b: &SortLite| -> std::cmp::Ordering {
         for (((_, desc), k1), k2) in order_by.iter().zip(&a.keys).zip(&b.keys) {
             let mut ord = cmp_sort_key(k1, k2);
             if *desc {
@@ -1888,66 +2068,106 @@ fn topk_sort(
         std::cmp::Ordering::Equal
     };
     // 简化：直接用 Vec + 手动管理 top-K（避免 Ord trait 复杂性）
-    // P2-D：batch_get 批量取行替代逐行 get（利用 LSM 有序性 + BlockCache 局部性）
-    let docids: Vec<u64> = bitmap.iter().map(|d| d as u64).collect();
-    let batch = engine.batch_get(&docids)?;
-    let mut heap: Vec<SortRow> = Vec::with_capacity(k + 1);
-    let mut n = 0u64;
-    for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
-        n += 1;
-        if n % 4096 == 0 && guard.is_expired() {
+    let fields: Vec<String> = order_by.iter().map(|(f, _)| f.clone()).collect();
+    let mut heap: Vec<SortLite> = Vec::with_capacity(k + 1);
+    let mut scanned = 0u64;
+    // P87①：分块流式扫描（Roaring iter 惰性；产出 top-K 即停，块内 watchguard 熔断）
+    const CHUNK: usize = 512;
+    let mut chunk: Vec<u64> = Vec::with_capacity(CHUNK);
+    let mut it = bitmap.iter();
+    loop {
+        chunk.clear();
+        let mut got = 0usize;
+        for _ in 0..CHUNK {
+            match it.next() {
+                Some(d) => {
+                    chunk.push(d);
+                    got += 1;
+                }
+                None => break,
+            }
+        }
+        if got == 0 {
+            break;
+        }
+        scanned += got as u64;
+        if guard.is_expired() {
             return Err(Error::QueryTooExpensive(format!(
-                "Top-K 排序超时（已扫 {n} 条，熔断中止）"
+                "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
             )));
         }
-        let Some(v) = v_opt else { continue };
-        let keys: Vec<SortKey> = order_by.iter().map(|(f, _)| sort_key(&v, f)).collect();
-        let row = SortRow { docid, doc: v, keys };
-        if heap.len() < k {
-            heap.push(row);
-            // 上浮
-            let mut i = heap.len() - 1;
-            while i > 0 {
-                let parent = (i - 1) / 2;
-                if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
-                    heap.swap(i, parent);
-                    i = parent;
-                } else {
-                    break;
+        // P87②：只取排序键列（PAX 列解码 / 行式按需字段提取），免整行物化
+        let fvals = engine.batch_get_fields(&chunk, &fields)?;
+        for (docid, f_opt) in chunk.iter().copied().zip(fvals.into_iter()) {
+            let Some(vals) = f_opt else { continue };
+            let keys: Vec<SortKey> = vals
+                .iter()
+                .map(|b| match b {
+                    Some(bytes) => field_bytes_to_sort_key(bytes),
+                    None => SortKey::Null,
+                })
+                .collect();
+            let row = SortLite { docid, keys };
+            if heap.len() < k {
+                heap.push(row);
+                // 上浮
+                let mut i = heap.len() - 1;
+                while i > 0 {
+                    let parent = (i - 1) / 2;
+                    if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
+                        heap.swap(i, parent);
+                        i = parent;
+                    } else {
+                        break;
+                    }
                 }
-            }
-        } else {
-            // 堆满：比堆顶（最差）更好 → 替换
-            if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
-                heap[0] = row;
-                // 下沉
-                let mut i = 0;
-                let n = heap.len();
-                loop {
-                    let mut smallest = i;
-                    let l = 2 * i + 1;
-                    let r = 2 * i + 2;
-                    if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater {
-                        smallest = l;
+            } else {
+                // 堆满：比堆顶（最差）更好 → 替换
+                if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
+                    heap[0] = row;
+                    // 下沉
+                    let mut i = 0;
+                    let n = heap.len();
+                    loop {
+                        let mut smallest = i;
+                        let l = 2 * i + 1;
+                        let r = 2 * i + 2;
+                        if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater
+                        {
+                            smallest = l;
+                        }
+                        if r < n
+                            && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater
+                        {
+                            smallest = r;
+                        }
+                        if smallest == i {
+                            break;
+                        }
+                        heap.swap(i, smallest);
+                        i = smallest;
                     }
-                    if r < n && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater {
-                        smallest = r;
-                    }
-                    if smallest == i { break; }
-                    heap.swap(i, smallest);
-                    i = smallest;
                 }
             }
         }
     }
-    // 排序 top-K
+    // 排序 top-K → 输出切片 docid（skip offset / take limit）
     heap.sort_by(|a, b| cmp_rows(a, b));
+    let win: Vec<u64> = heap
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|r| r.docid)
+        .collect();
+    if win.is_empty() {
+        return Ok(Vec::new());
+    }
+    // P87③：仅对胜出行整行回表（SELECT * 消费端需完整文档）
+    let batch = engine.batch_get(&win)?;
     let mut out = Vec::new();
-    for r in heap.into_iter().skip(offset as usize) {
-        if out.len() as u64 >= limit {
-            break;
-        }
-        out.push((r.docid, r.doc));
+    for (d, v_opt) in win.into_iter().zip(batch.into_iter()) {
+        let Some(v) = v_opt else { continue };
+        out.push((d, v));
     }
     Ok(out)
 }
@@ -2100,16 +2320,14 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
             )));
         }
         // P2-D：batch_get 批量取行替代逐行 get
+        let order_fields: Vec<String> = sel.order_by.iter().map(|(f, _)| f.clone()).collect();
         let docids: Vec<u64> = bitmap.iter().map(|d| d as u64).collect();
         let batch = engine.batch_get(&docids)?;
         let mut srows: Vec<SortRow> = Vec::with_capacity(docids.len());
         for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
             let Some(v) = v_opt else { continue };
-            let keys = sel
-                .order_by
-                .iter()
-                .map(|(f, _)| sort_key(&v, f))
-                .collect();
+            // P86②：单遍按需提取全部排序键（跳其余列 Value 构造；逐字段 serde parse 改为一次轻量扫）
+            let keys = row_sort_keys(&v, &order_fields);
             srows.push(SortRow { docid, doc: v, keys });
         }
         srows.sort_by(|a, b| {
@@ -2133,27 +2351,20 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
         }
         return Ok(out);
     }
-    // 非 sort 分支：DocIdSet 统一迭代消费（Bitmap 升序 / Empty 空 / All 全库 docid 位图）。
-    // P2-D：batch_get 批量取行替代逐行 get
+    // 非 sort 分支：DocIdSet 分块迭代消费（P85：LIMIT 早停——Bitmap/SortedList/All
+    // 三分支只回表 offset+limit 行即终止，剩余块零拉取；内存 O(chunk)，消除
+    // "22 万 posting 全量 batch_get 解码后才切片" 的 LIMIT 未下推瓶颈）。
     let mut rows = Vec::new();
     if !set.is_empty() {
-        let docids: Vec<u64> = match &set {
-            crate::docset::DocIdSet::All => full_docids(engine, &guard)?.iter().collect(),
-            other => other.to_vec(),
+        let it: Box<dyn Iterator<Item = u64>> = match &set {
+            crate::docset::DocIdSet::All => {
+                let bm = full_docids(engine, &guard)?;
+                let v: Vec<u64> = bm.iter().collect();
+                Box::new(v.into_iter())
+            }
+            other => other.iter(),
         };
-        let batch = engine.batch_get(&docids)?;
-        let mut skipped = 0u64;
-        for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
-            if rows.len() as u64 >= limit {
-                break;
-            }
-            if skipped < sel.offset {
-                skipped += 1;
-                continue;
-            }
-            let Some(v) = v_opt else { continue };
-            rows.push((docid, v));
-        }
+        rows = collect_limited_rows(|chunk| engine.batch_get(chunk), it, sel.offset, limit)?;
     }
     Ok(rows)
 }
@@ -4158,6 +4369,192 @@ mod tests {
         // 不匹配的等值条件：status='unknown' → 组合索引返回空，回退到原路径
         let rows5 = execute(&e, "SELECT * FROM t WHERE status='unknown'", 1000).unwrap();
         assert!(rows5.is_empty(), "unknown 应返回空结果");
+    }
+
+    // ---------- P85：DocIdSet 消费端 LIMIT 早停（分块批量回表） ----------
+
+    /// mock 取行：`even_only=true` 时奇数 docid = 墓碑/未命中（返回 None，不占 limit 占 offset）；
+    /// false = 全部可见。统计拉取次数与总量。
+    fn run_collect(cand: Vec<u64>, offset: u64, limit: u64, even_only: bool) -> (Vec<(u64, Vec<u8>)>, usize, usize) {
+        let mut calls = 0usize;
+        let mut pulled = 0usize;
+        let rows = collect_limited_rows(
+            |chunk: &[u64]| {
+                calls += 1;
+                pulled += chunk.len();
+                Ok(chunk
+                    .iter()
+                    .map(|&d| {
+                        if !even_only || d % 2 == 0 {
+                            Some(format!("v{d}").into_bytes())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect())
+            },
+            cand.into_iter(),
+            offset,
+            limit,
+        )
+        .unwrap();
+        (rows, calls, pulled)
+    }
+
+    #[test]
+    fn p85_limited_rows_early_stop_chunk_branches() {
+        // Bitmap 升序消费（模拟 2000 posting，全部可见）：offset+limit=1020 → 2 块（1024）即止，
+        // 后续块零拉取（若全量物化应拉 2000/512≈4 块）
+        let cand: Vec<u64> = (0..2000).collect();
+        let (rows, calls, pulled) = run_collect(cand, 1000, 20, false);
+        let ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids, (1000..1020).collect::<Vec<u64>>(), "offset 后可见行恰好 limit");
+        assert_eq!(calls, 2, "1020 候选 → 2 块即终止");
+        assert_eq!(pulled, 1024, "终止后剩余块零拉取（全量需 ~4 块）");
+        for (i, (_, v)) in rows.iter().enumerate() {
+            assert_eq!(v, format!("v{}", 1000 + i).as_bytes(), "回表字节与 docid 对应");
+        }
+
+        // SortedList 语义：墓碑/未命中占 offset 占位、不占 limit（偶数可见）→ offset5 后
+        // 前 3 可见行 6/8/10（5.. 位置中 d5/d7/d9 为 None 不计 limit）
+        let (rows2, calls2, _) = run_collect((0..60).collect(), 5, 3, true);
+        let ids2: Vec<u64> = rows2.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids2, vec![6, 8, 10], "墓碑不占 limit，offset 占候选位");
+        assert_eq!(calls2, 1, "60 候选单块即止");
+
+        // limit=0 → 零拉取零回表
+        let (rows3, calls3, pulled3) = run_collect((0..100).collect(), 0, 0, false);
+        assert!(rows3.is_empty());
+        assert_eq!(calls3, 0);
+        assert_eq!(pulled3, 0);
+
+        // 可见行恰好 limit（offset 0）
+        let (rows4, _, _) = run_collect((0..40).collect(), 0, 4, true);
+        let ids4: Vec<u64> = rows4.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids4, vec![0, 2, 4, 6], "可见行恰好 limit=4");
+
+        // 候选耗尽不足 limit → 返回全部可见
+        let (rows5, _, _) = run_collect((0..5).collect(), 1, 100, true);
+        let ids5: Vec<u64> = rows5.iter().map(|(d, _)| *d).collect();
+        assert_eq!(ids5, vec![2, 4], "1 个占位后剩余可见行（d2/d4）");
+    }
+
+    #[test]
+    fn p85_execute_limit_not_fetch_beyond_page() {
+        // 端到端：倒排命中 34 行，LIMIT 3 OFFSET 5 → 只取 8 个候选行
+        let e = engine_with_docs();
+        let rows = execute(
+            &e,
+            "SELECT * FROM t WHERE status='active' LIMIT 3 OFFSET 5",
+            1000,
+        )
+        .unwrap();
+        // status='active' 34 行 docid：0,3,6,...,99（非排序位图升序）→ offset5 = 15 起 3 行
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![15, 18, 21]);
+    }
+
+    // ---------- P86②：排序键按需字段提取（单遍 vs serde 逐字段等值） ----------
+
+    #[test]
+    fn p86_row_sort_keys_matches_per_field_serde() {
+        let docs: Vec<&[u8]> = vec![
+            br#"{"amount":42,"note":"note-1","city":"beijing"}"#,
+            br#"{"amount":-3.5,"note":"hello"}"#,
+            br#"{"amount":null,"note":"x\"y","city":"shanghai"}"#,
+            br#"{"note":"note-0","city":""}"#,
+            br#"{"amount":1e3,"note":"n1","city":"\u4e2d"}"#, // JSON 转义串值 → 回退 serde（正确性护栏）
+            br#"{"amount":true,"note":"n","city":["a"]}"#,
+            br#"not-json"#,
+        ];
+        let fields: Vec<String> = vec!["amount".into(), "note".into(), "city".into()];
+        for doc in &docs {
+            let got = row_sort_keys(doc, &fields);
+            let expect: Vec<SortKey> = fields.iter().map(|f| sort_key(doc, f)).collect();
+            for (i, (g, ex)) in got.iter().zip(expect.iter()).enumerate() {
+                let same = match (g, ex) {
+                    (SortKey::Null, SortKey::Null) => true,
+                    (SortKey::Num(a), SortKey::Num(b)) => a == b,
+                    (SortKey::Str(a), SortKey::Str(b)) => a == b,
+                    _ => false,
+                };
+                assert!(same, "doc {:?} field {} 等值：got={:?} expect={:?}", doc, fields[i], g, ex);
+            }
+        }
+        // 显式语义抽查：数值→Num、字符串→Str、缺失/null/嵌套/布尔→Null
+        let doc = br#"{"a":10,"s":"x","n":null,"miss":1}"#;
+        assert_eq!(row_sort_keys(doc, &vec!["a".into()]), vec![SortKey::Num(10.0)]);
+        assert_eq!(row_sort_keys(doc, &vec!["s".into()]), vec![SortKey::Str("x".into())]);
+        assert!(matches!(row_sort_keys(doc, &vec!["n".into()])[0], SortKey::Null));
+        assert!(matches!(row_sort_keys(doc, &vec!["no_such".into()])[0], SortKey::Null));
+    }
+
+    // ---------- P87：ORDER BY Top-K 流式化（分块 + 排序键解码下推） ----------
+
+    /// P87：Top-K 流式结果与全量排序一致（多键/DESC/OFFSET），数据落 SST（PAX 热字段
+    /// 列式 → batch_get_fields 列解码路径）——端到端验证 ② 与 ③。
+    #[test]
+    fn p87_topk_streaming_matches_full_sort_over_pax() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        // hot_fields → flush 落 PAX 列式块（P87② 列解码消费端接线）
+        cfg.storage.hot_fields = vec!["amount".into(), "city".into(), "note".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let cities = ["beijing", "shanghai", "shenzhen"];
+        for i in 0..100u64 {
+            let doc = serde_json::json!({
+                "docid": i,
+                "status": if i % 3 == 0 { "active" } else { "inactive" },
+                "city": cities[(i % 3) as usize],
+                "amount": i * 10,
+                "note": format!("note-{i}"),
+            });
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e.flush_primary().unwrap(); // MemTable → SST（PAX 块）
+
+        // 全量排序参考（无 LIMIT → 全排序路径）
+        let full = execute(&e, "SELECT * FROM t ORDER BY amount ASC", 1000).unwrap();
+        let full_ids: Vec<u64> = full.iter().map(|r| r.0).collect();
+        assert_eq!(full_ids.len(), 100);
+        // Top-K（LIMIT 6 OFFSET 4）应与全排序切片一致
+        let topk = execute(&e, "SELECT * FROM t ORDER BY amount ASC LIMIT 6 OFFSET 4", 1000).unwrap();
+        let topk_ids: Vec<u64> = topk.iter().map(|r| r.0).collect();
+        assert_eq!(topk_ids, full_ids[4..10].to_vec(), "Top-K 切片 = 全排序切片");
+        // 行内容（amount）随 docid 正确
+        for (i, (_, doc)) in topk.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_slice(doc).unwrap();
+            assert_eq!(v["amount"].as_u64().unwrap(), (full_ids[4 + i]) * 10);
+        }
+        // 多键 DESC（city ASC + amount DESC → beijing 组内降序 99/96/93）
+        let rows = execute(
+            &e,
+            "SELECT * FROM t ORDER BY city ASC, amount DESC LIMIT 3",
+            1000,
+        )
+        .unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![99, 96, 93]);
+    }
+
+    /// P87：Top-K 块看门狗熔断——guard 到期后首个分块即中止（防大候选无限解码）。
+    #[test]
+    fn p87_topk_chunk_watchdog_fuses() {
+        let e = engine_with_docs();
+        let guard = e.query_guard();
+        // 构造已到期 guard（零超时引擎）
+        let dir0 = tempfile::tempdir().unwrap();
+        let ge = Engine::open_with_timeout(dir0.path(), &Config::default(), std::time::Duration::ZERO)
+            .unwrap();
+        let dead = ge.query_guard();
+        assert!(dead.is_expired(), "零超时 guard 应立即到期");
+        let bm = full_docids(&e, &guard).unwrap();
+        let order_by = vec![("amount".to_string(), false)];
+        let err = topk_sort(&e, &bm, &order_by, 10, 0, 10, &dead).unwrap_err();
+        assert!(
+            matches!(err, Error::QueryTooExpensive(_)),
+            "到期 guard 应在分块处熔断，实际 {err:?}"
+        );
     }
 }
 

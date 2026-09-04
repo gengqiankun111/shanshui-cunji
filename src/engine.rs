@@ -1359,6 +1359,14 @@ impl Engine {
             let Some((bv, _seq)) = &found[j] else {
                 continue;
             };
+            // P86①：无 Delta 覆盖 → 直通短路（跳 parse/reserialize 等值空转）。
+            // 键序差异不影响 JSON 消费端语义；hotcache 缓存原字节（保持 get 同构缓存）。
+            if !overrides.contains_key(&d) {
+                let v = bv.clone();
+                self.hotcache.put(d, v.clone());
+                out[i] = Some(v);
+                continue;
+            }
             let obj: serde_json::Value = match serde_json::from_slice(bv) {
                 Ok(v) => v,
                 Err(_) => {
@@ -1387,6 +1395,75 @@ impl Engine {
                 .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
             self.hotcache.put(d, merged.clone());
             out[i] = Some(merged);
+        }
+        Ok(out)
+    }
+
+    /// P87②：投影字段批量回表——每个 docid 只返回请求的顶层字段值（倒排候选
+    /// Top-K 排序键解码下推：PAX 块列解码 / 行式块按需字段提取，免整行 25 列解码）。
+    /// 语义与 `batch_get` 一致（删除位图 O(1) 过滤 / HotCache 命中 / Delta 字段级覆盖 /
+    /// Tombstone → None），但输出为 `Vec<Option<Vec<Option<Vec<u8>>>>>`：
+    /// `out[i] = Some(vals)` 表示 docid 存在，`vals[j]` = `fields[j]` 的 JSON 值字节
+    /// （`b"null"` = JSON null；None = 缺字段/行不存在）。非 JSON 基行 → 字段全 None
+    /// （对齐 get 的"非 JSON 直接返回 base、不合并 delta"语义）。
+    /// 输入要求：docids 升序且无重复；fields 为空 → 全部 None（调用方不应如此调用）。
+    pub fn batch_get_fields(
+        &self,
+        docids: &[u64],
+        fields: &[String],
+    ) -> Result<Vec<Option<Vec<Option<Vec<u8>>>>>> {
+        let n = docids.len();
+        let mut out: Vec<Option<Vec<Option<Vec<u8>>>>> = vec![None; n];
+        if n == 0 || fields.is_empty() {
+            return Ok(out);
+        }
+        // ① 删除位图 + ② HotCache（缓存整行 → 按需提取）
+        let mut need_primary: Vec<usize> = Vec::new();
+        for (i, &d) in docids.iter().enumerate() {
+            if let Some(bm) = &self.deletion_bitmap {
+                if bm.is_deleted(d) {
+                    continue;
+                }
+            }
+            if let Some(v) = self.hotcache.get(d) {
+                out[i] = Some(crate::sstable::extract_fields_from_json_row(&v, fields));
+            } else {
+                need_primary.push(i);
+            }
+        }
+        if need_primary.is_empty() {
+            return Ok(out);
+        }
+        let sub: Vec<u64> = need_primary.iter().map(|&i| docids[i]).collect();
+        // ③ primary 投影批量点查（PAX 列解码 / 行式按需提取）
+        let found = self.primary.get_many_fields(&sub, fields)?;
+        // ④ Delta 字段级覆盖（单次范围扫描按 docid 分组；仅覆盖请求字段生效）
+        let overrides = batch_delta_overrides(&self.delta, &sub)?;
+        for (j, &i) in need_primary.iter().enumerate() {
+            let d = docids[i];
+            let Some((base_vals, _seq)) = &found[j] else {
+                continue;
+            };
+            let vals: Vec<Option<Vec<u8>>> = match overrides.get(&d) {
+                Some(ov) if !ov.is_empty() => {
+                    let mut v2 = base_vals.clone();
+                    for (fi, f) in fields.iter().enumerate() {
+                        for (of, oval) in ov {
+                            if of == f {
+                                v2[fi] = if oval.is_null() {
+                                    None // delta null = 删除该字段
+                                } else {
+                                    Some(serde_json::to_vec(oval).unwrap_or_default())
+                                };
+                                break;
+                            }
+                        }
+                    }
+                    v2
+                }
+                _ => base_vals.clone(), // 无覆盖 → 直通（P86① 同构短路）
+            };
+            out[i] = Some(vals);
         }
         Ok(out)
     }
@@ -3316,6 +3393,104 @@ mod tests {
         assert!(e.get(4).unwrap().is_none());
         let idx4 = ids.iter().position(|&x| x == 4).unwrap();
         assert!(batch[idx4].is_none());
+    }
+
+    #[test]
+    fn batch_get_no_delta_short_circuit_returns_stored_bytes() {
+        // P86①：无 Delta 覆盖 → 直通短路（原字节返回，跳 parse/reserialize 等值空转）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        // 非规范键序原始字节（若走 parse+reserialize，serde Map 会重排序/规范化）
+        let raw: &[u8] = br#"{"z":1,"a":2}"#;
+        e.put(7, raw.to_vec(), &[]).unwrap();
+        // docid 8 有 Delta 覆盖 → 仍走合并路径
+        e.put(8, br#"{"z":1}"#.to_vec(), &[]).unwrap();
+        e.patch(8, &[("w", serde_json::json!(9))]).unwrap();
+        let out = e.batch_get(&[7, 8]).unwrap();
+        assert_eq!(
+            out[0].as_deref(),
+            Some(&raw[..]),
+            "无覆盖 → 原字节直通（未 parse/reserialize 重排）"
+        );
+        let v8: &serde_json::Value = &serde_json::from_slice(out[1].as_ref().unwrap()).unwrap();
+        assert_eq!(v8["w"], 9, "覆盖行合并 w=9");
+        assert_eq!(v8["z"], 1);
+        // JSON 语义与单行 get 等值
+        let single = e.get(7).unwrap().unwrap();
+        let sm: serde_json::Value = serde_json::from_slice(&single).unwrap();
+        let om: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert_eq!(sm, om, "短路返回与 get 规范化字节 JSON 等值");
+    }
+
+    #[test]
+    fn batch_get_fields_matches_get_semantics_with_delta_and_delete() {
+        // P87②：投影字段批量回表与 get 整行语义一致（含 Delta 覆盖 / null 删字段 / 删除位图）
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 0..30u64 {
+            let doc = serde_json::json!({"k": format!("d{i}"), "n": i, "s": format!("s{i}")});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["t"]).unwrap();
+        }
+        // Delta 覆盖请求字段 k + 覆盖非请求字段 s（不应影响 n 提取）；null 删除字段 k
+        e.patch(1, &[("k", serde_json::json!("patched")), ("s", serde_json::json!("s-patched"))])
+            .unwrap();
+        e.patch(2, &[("k", serde_json::Value::Null)]).unwrap();
+        e.delete(3).unwrap();
+        let ids: Vec<u64> = (0..30).collect();
+        let fields: Vec<String> = vec!["k".into(), "n".into(), "missing".into()];
+        // 两轮：① MemTable 命中；② flush 后 SST 行式块按需字段提取路径
+        for round in 0..2 {
+            if round == 1 {
+                e.flush_primary().unwrap();
+            }
+            let got = e.batch_get_fields(&ids, &fields).unwrap();
+            assert_eq!(got.len(), 30);
+            for (i, &d) in ids.iter().enumerate() {
+                let expect = e.get(d).unwrap().map(|v| {
+                    let m: serde_json::Map<String, serde_json::Value> =
+                        serde_json::from_slice(&v).unwrap();
+                    fields
+                        .iter()
+                        .map(|f| m.get(f).cloned())
+                        .collect::<Vec<_>>()
+                });
+                match (&got[i], &expect) {
+                    (None, None) => {}
+                    (Some(g), Some(ex)) => {
+                        assert_eq!(g.len(), ex.len());
+                        for (gi, ev) in g.iter().zip(ex.iter()) {
+                            match (gi, ev) {
+                                (Some(gb), Some(ev)) => {
+                                    let gv: serde_json::Value =
+                                        serde_json::from_slice(gb).unwrap();
+                                    assert_eq!(gv, *ev, "round{round} docid {d} 字段值");
+                                }
+                                (None, None) => {}
+                                (g, ev) => panic!(
+                                    "round{round} docid {d} 字段存在性不一致 got={g:?} exp={ev:?}"
+                                ),
+                            }
+                        }
+                    }
+                    (g, ev) => panic!(
+                        "round{round} docid {d} 行存在性不一致 got={g:?} exp={ev:?}"
+                    ),
+                }
+            }
+            // 语义抽查
+            let k1: serde_json::Value =
+                serde_json::from_slice(got[1].as_ref().unwrap()[0].as_ref().unwrap()).unwrap();
+            assert_eq!(k1, "patched", "round{round} docid1 k 覆盖生效");
+            assert!(
+                got[2].as_ref().unwrap()[0].is_none(),
+                "round{round} docid2 k 被 delta null 删除"
+            );
+            assert!(got[3].is_none(), "round{round} docid3 已删");
+            assert!(got[0].as_ref().unwrap()[2].is_none(), "round{round} 缺字段");
+            let n1: serde_json::Value =
+                serde_json::from_slice(got[1].as_ref().unwrap()[1].as_ref().unwrap()).unwrap();
+            assert_eq!(n1, 1, "round{round} 非请求字段 s 覆盖不影响 n");
+        }
     }
 
     #[test]
