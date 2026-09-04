@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roaring::RoaringBitmap;
+use roaring::treemap::RoaringTreemap;
 use tracing::{info, warn};
 
 use crate::bitmap::DeletionBitmap;
@@ -1795,9 +1796,9 @@ impl Engine {
             .map(|(f, a, b)| (f.as_str(), a.as_str(), b.as_str()))
     }
 
-    /// 倒排某词条命中的 docid 集合（不回表，供测试/监控/sqlish 等值筛选）。
+    /// 倒排某词条命中的 docid 集合（不回表，供测试/监控/sqlish 等值筛选；64 位 docid）。
     /// O 项第②步：读路径 `&self`（查询前刷入攒批缓冲保证一致性）。
-    pub fn inverted_posting(&self, term: &str) -> Result<RoaringBitmap> {
+    pub fn inverted_posting(&self, term: &str) -> Result<RoaringTreemap> {
         self.flush_inverted_pending();
         self.inverted.search(term)
     }

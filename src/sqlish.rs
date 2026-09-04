@@ -19,7 +19,8 @@
 
 use crate::engine::{Engine, QueryRow};
 use crate::error::{Error, Result};
-use roaring::RoaringBitmap;
+// 64 位 docid 域（多表 docid = table_id<<48|row，查询层位图必须 u64）
+use roaring::treemap::RoaringTreemap as RoaringBitmap;
 use serde_json::Value;
 
 /// 解析器内部结果（错误为人类可读 String，入口统一转 crate::Error::Config）。
@@ -662,7 +663,7 @@ fn full_docids(engine: &Engine, guard: &crate::watchdog::QueryGuard) -> Result<R
             return Err(Error::QueryTooExpensive("类 SQL 全量扫描超时（熔断中止），建议用倒排等值条件收敛范围".into()));
         }
         if docid < u32::MAX as u64 {
-            bm.insert(docid as u32);
+            bm.insert(docid);
         }
     }
     Ok(bm)
@@ -1159,8 +1160,8 @@ fn scan_backfill_bitmap(
                 "类 SQL 等值回退扫描超时（已扫 {scanned} 条，熔断中止），建议改用倒排字段/枚举值"
             )));
         }
-        if scan_row_matches(doc, leaf) && docid < u32::MAX as u64 {
-            bm.insert(docid as u32);
+        if scan_row_matches(doc, leaf) {
+            bm.insert(docid);
         }
         Ok(true)
     })?;
@@ -1258,9 +1259,7 @@ fn eval_cond(
             if c.field == "docid" {
                 let mut bm = RoaringBitmap::new();
                 if let Ok(d) = c.value.parse::<u64>() {
-                    if d < u32::MAX as u64 {
-                        bm.insert(d as u32);
-                    }
+                    bm.insert(d);
                 }
                 Ok(bm)
             } else {
@@ -1279,9 +1278,7 @@ fn eval_cond(
                 let full = full_docids(engine, guard)?;
                 let mut bm = RoaringBitmap::new();
                 if let Ok(d) = c.value.parse::<u64>() {
-                    if d < u32::MAX as u64 {
-                        bm.insert(d as u32);
-                    }
+                    bm.insert(d);
                 }
                 return Ok(full - bm);
             }

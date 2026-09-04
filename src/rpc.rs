@@ -309,7 +309,7 @@ pub fn register_shard_handlers(server: &RpcServer, engine: Arc<Mutex<Engine>>) {
                 .ok_or_else(|| "shard.search_docids 缺少 term".to_string())?;
             let mut eng = engine.lock().unwrap();
             let posting = eng.inverted_posting(term).map_err(|e| e.to_string())?;
-            let docids: Vec<u32> = posting.iter().collect();
+            let docids: Vec<u64> = posting.iter().collect();
             Ok(json!({"docids": docids}))
         }
     });

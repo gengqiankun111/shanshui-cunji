@@ -220,7 +220,13 @@ mod tests {
     }
     impl LocalInvertedSource for EngineLocalInvertedSource {
         fn search_local(&self, term: &str) -> Result<RoaringBitmap> {
-            self.engine.lock().unwrap().inverted_posting(term)
+            // Engine 倒排现为 64 位（多表 docid）；本地分片模拟仅用 <2^32 局部 id → 截断兼容
+            let p = self.engine.lock().unwrap().inverted_posting(term)?;
+            let mut bm = RoaringBitmap::new();
+            for d in p.iter() {
+                bm.insert(d as u32);
+            }
+            Ok(bm)
         }
         fn doc_count_local(&self, term: &str) -> Result<u64> {
             Ok(self.engine.lock().unwrap().inverted_posting(term)?.len() as u64)

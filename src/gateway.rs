@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use roaring::RoaringBitmap;
+use roaring::treemap::RoaringTreemap;
 use serde_json::json;
 use serde_json::Value;
 
@@ -181,8 +182,18 @@ impl<E: ShardEndpoint> Gateway<E> {
             };
             chunks.push(chunk);
         }
-        let merged = InvertedIndex::concatenate_chunks(&chunks);
-        Ok(merged.iter().collect())
+        // 聚合各分片 Chunk（本地缓存为 32 位位图 → 升 64 位后直拼 → 转回 32 位输出，
+        // 与分布式单机 docid<2^32 的既有协议一致）
+        let mut pchunks: Vec<RoaringTreemap> = Vec::with_capacity(chunks.len());
+        for c in &chunks {
+            let mut t = RoaringTreemap::new();
+            for v in c.iter() {
+                t.insert(v as u64);
+            }
+            pchunks.push(t);
+        }
+        let merged = InvertedIndex::concatenate_chunks(&pchunks);
+        Ok(merged.iter().map(|v| v as u32).collect())
     }
 
     /// 全部节点健康探活（返回失活节点列表）。

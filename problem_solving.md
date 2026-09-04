@@ -765,6 +765,26 @@
 
 ---
 
+### P79. 倒排/位图 32 位 docid 上限 vs §26 多表高位 docid（docid=table_id<<48|row）——全链 64 位化
+- **问题**：`INSERT INTO t`（非默认表）装载到 ~2k–6k 行时内核 panic `inverted.rs:498 docid 超出
+  RoaringBitmap 支持范围`（随后毒锁连锁）。根因：engine docid 全链 u64，多表用 `table_id<<48|row`
+  高位编码后非默认表 docid ≥2^48，而倒排 posting/位图从内存字典、磁盘段（v2–v5）、
+  `search_paged`/`doc_count`/分片 Chunk 每层都按 **u32（RoaringBitmap）** 实现（大量 `as u32` 截断）；
+  development_remain §26 原判"倒排/位图 docid 带表后天然隔离，无需表粒度改动"被实测证伪。
+- **修复（全链 64 位化，2026-09-04）**：`src/inverted.rs` 内部统一为 `RoaringTreemap`
+  （`type Posting`，低 docid 容器同构、开销相当）；**段格式 SEG_VERSION 5→6**（posting 改 treemap
+  序列化；v2–v5 旧段读取按版本解码为 32 位后经 `bm32()` 升 64 位——默认表 tid=0 docid 不变，零迁移）；
+  `add/add_batch` 去 2^32 断言与截断；`search`/`doc_count`/`search_paged`（返回 `Vec<u64>`）/
+  `iter_terms`/位图 AND/GC/游标（`merge_distinct` u64）全升位；引擎 `inverted_posting` → `RoaringTreemap`；
+  查询层 `sqlish`（别名整域换 treemap）、`rpc`（docid `Vec<u64>`）、`gateway` 分片拼装、`shard_inverted`
+  测试适配做兼容转换。
+- **验证**：lib+bins `cargo check` 绿、tests 编译绿；inverted 模块单测 46/46 过（v3 分页/v4 计数载荷/
+  GC/mmap/并发全保留）；端到端：新内核（`cjserver`）对**非默认表 t + status/region 位图**装载 2 万行
+  不再 panic，37 探针全过（含枚举等值/组合 AND/批量增删改/事务）。
+- **遗留（独立已知约束，非本项）**：多表单删在删除位图开启下按 docid 稠密寻址会爆内存——
+  `development_remain §26 M3 收尾约束`已记载（多表单删须 `storage.deletion_bitmap_enabled=false`，
+  走传统 Tombstone 路径）；验收即按此配置。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
