@@ -1012,6 +1012,33 @@
   storage/sstable/merge.rs、写定位→server/sqlparse.rs），避免大文件回流。
 
 
+### P94. >19K 顶层生产模块建包拆分 + Task-005 性能基线采集（2026-09-05）
+
+- **A. 建包拆分（接 P93，纯结构重构）**：把 >19KB 顶层生产模块逐一改为“同名包目录 + 主题小文件 +
+  mod.rs pub use 汇总”，`crate::*` 路径不变：inverted（mod/segment/query/write/gc/stats）、
+  config/model（12 文件按配置主题分）、saga（mod/core/steps/topology）、gateway（route/batch/
+  broadcast/migration/local/rpc）、migrate（mod/parser/loader）、raft_rpc（mod/transport/runtime）、
+  watchdog（mod/budget/disk/cpu/stall/heartbeat）、hotcache（mod/policy/entry）、optimizer（mod/stats/
+  cost/route）、txn（mod/isolation/write_batch/lock）、join（mod/merge/route/enrich）、scale_out（mod/
+  raft）、server/http（mod/saga_api/doc_api/admin_api/json/tokenize）；main.rs(786→9) 子命令迁入
+  src/cli/（mod/serve/ops/data/query/demo/backup_restore）。提交 develop `5214386`（95 files）。
+  回归：cargo test 693 passed / 0 failed（重构全程每轮全量绿）。
+- **B. Task-005 性能基准基线采集（口径并入既有 YCSB 体系，Windows 本机 release）**：
+  - CLI 命令面：shanshui-cunji 0.6.0 支持 18 子命令（server 默认 / check / demo / backup / restore /
+    put / get / patch / search / range / count / groupby / admin / reload / compact / explain / delete /
+    version），version/check 冒烟通过，其余分发路径正常（put/patch 的 JSON 参数在 Windows PS 引号剥离
+    环境下手动传参受限，属环境备忘记录的 shell 传参问题，非代码缺陷）。
+  - YCSB（30k 记录 load + 80k ops、4 线程、默认 append+逐提交 fsync）：
+    - load 写吞吐 ≈ 205k~249k w/s（0.12~0.15s）；
+    - run：a(50/50)=1997 ops/s p50 871µs｜b(95/5)=20221 ops/s p50 2.2µs｜c(100% 读)=432k ops/s
+      p50 1.3µs｜f(50/50 RMW)=1075 ops/s p50 879µs（a/f 被逐提交 fsync 主导）；
+    - run + `--group-commit-us 1000`：a=47789 ops/s（23.9×）p50 7.6µs｜f=51607 ops/s（48×）p50 8.2µs。
+  - 结论/决策输入：①重构后读路径无回归（b/c 为 µs 级/数十万 ops/s），命令面完整支持；②写混合负载的
+    速度上限=逐提交 fsync，组提交 1ms 档即 4.7~5.2 万 ops/s（24~48×）——后续决策候选：默认
+    group-commit 档位、Task-002(fxhash) 边际收益评估（读已极快）、Task-007 时间轮基建优先级。
+  - 临时基准数据与误启 server 的数据目录已清理（均在 data/ 忽略目录内）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
