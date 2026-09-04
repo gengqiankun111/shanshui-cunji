@@ -984,6 +984,34 @@
   为 P92 候选（对比报告 §5.2/§5.3）；P91 提供其依赖的 scan 投影列基建并消除 PAX 布局聚合回归。
 
 
+### P93. 四核心大文件目录化重构（research/reconstruct.md 落地，2026-09-05）
+
+- **背景**：`src/` 四个超大单文件 —— column_family.rs(5264) / engine.rs(5827) / sqlish.rs(5150) /
+  db_adapter.rs(6886) —— 单文件滚动困难、主题混杂，按 research/reconstruct.md 的目标目录拆分为
+  分层小文件（纯结构重构，逻辑零改动）。
+- **落地清单**：
+  - `storage/`：column_family 拆为 `column_family/{mod,open,write,read,scan,flush,io,table_ops}.rs` +
+    tests.rs；memtable 归位；sstable 拆 `{reader,iter,writer,block,compaction,merge}.rs`；wal 拆
+    `{writer,reader,ring}.rs`；新增 `manifest.rs`；原备份模块 storage.rs → `backup.rs`；
+  - `engine/`：engine.rs 拆为 `engine/{engine,open,read,scan,write,query,compact,txn,mvcc}.rs` +
+    tests.rs（txn 事务方法族 / mvcc 快照族独立成文件）；
+  - `sql/`：sqlish.rs 拆为 `parser/{ast,lexer,parser}.rs` + `executor/{select,join,aggregate,group_by,eval}.rs` +
+    tests.rs；
+  - `server/`：db_adapter.rs 拆为 `server.rs` / `session.rs` / `client.rs` / `sqlparse.rs` +
+    `protocol/{packet,handshake,response}.rs` + `command/{query,select,dml,transaction,txn_dml,stmt}.rs` +
+    tests.rs；原 server.rs(HTTP 网关) 并入 `server/http.rs`。
+  - 生产文件最大 ~830 行（sstable/merge.rs、sql/executor/eval.rs），多数 200~600 行；各层测试外移
+    独立 tests.rs。
+- **兼容保障**：lib.rs 根部 re-export/别名保持 `crate::column_family/sstable/wal/memtable/engine/sqlish/
+  db_adapter/server` 等旧路径不变（bin/demo/rr-conformance 零改动）；跨文件访问仅做最小 `pub(crate)`
+  提升，未扩对外可见性。
+- **测试回归**：`cargo check --all-targets` 零 error；`cargo test` 693 passed / 0 failed / 3 ignored，
+  与重构前基线一致（每阶段拆分后均单独跑全量）。
+- **提交**：develop `76f5709`（73 files，+24750/−23909，含 rename 保历史）。
+- **备注**：拆分边界与存储格式/数据资产无涉；后续 feature 改动应定位到对应主题文件（如压缩→
+  storage/sstable/merge.rs、写定位→server/sqlparse.rs），避免大文件回流。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
