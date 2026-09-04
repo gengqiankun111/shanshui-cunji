@@ -2031,14 +2031,9 @@ pub fn execute_aggregate_window(
     let mut sum = 0f64;
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
-    let mut scanned = 0u64;
-    engine.scan_stream(start, end, |_docid, doc| {
-        scanned += 1;
-        if scanned % 4096 == 0 && guard.is_expired() {
-            return Err(Error::QueryTooExpensive(
-                "类 SQL 聚合全量扫描超时（熔断中止）".into(),
-            ));
-        }
+    // 单文档：WHERE 整表达式判定（字节级 light，含点路径回退 serde）+ 聚合累积。
+    // 全表扫与 P1-D 候选集共用同一累积逻辑（结果精确一致）。
+    let mut acc = |doc: &[u8]| -> Result<bool> {
         if let Some(wh) = &sel.where_expr {
             // 7.96/7.97：表达式（含 AND/OR/NOT 复合）字节级 light 判定；
             // 含点路径/转义等无法轻量 → serde 回退
@@ -2109,7 +2104,49 @@ pub fn execute_aggregate_window(
             }
         }
         Ok(true)
-    })?;
+    };
+    // P1-D（2026-09-04）：WHERE = AND 组合且含可倒排等值条件 → posting 候选收敛聚合，
+    // 免全表扫（残余条件在候选 doc 上整表达式判定，与全扫等价、结果精确）。
+    // 适用如 `SUM(amount) WHERE status='active' AND ts BETWEEN ...`（status 收敛候选后范围过滤）。
+    let mut scanned = 0u64;
+    let candidate = candidate_posting(engine, sel.where_expr.as_ref(), start, end)?;
+    match candidate {
+        Some(post) => {
+            for docid in post {
+                scanned += 1;
+                if scanned % 4096 == 0 && guard.is_expired() {
+                    return Err(Error::QueryTooExpensive(
+                        "类 SQL 聚合候选扫描超时（熔断中止）".into(),
+                    ));
+                }
+                // 窗口外候选跳过（posting 为全库口径，多表窗口交集在此过滤）
+                if let Some(s) = start {
+                    if (docid as u64) < s {
+                        continue;
+                    }
+                }
+                if let Some(e) = end {
+                    if (docid as u64) > e {
+                        continue;
+                    }
+                }
+                if let Some(v) = engine.get(docid as u64)? {
+                    acc(&v)?;
+                }
+            }
+        }
+        None => {
+            engine.scan_stream(start, end, |_docid, doc| {
+                scanned += 1;
+                if scanned % 4096 == 0 && guard.is_expired() {
+                    return Err(Error::QueryTooExpensive(
+                        "类 SQL 聚合全量扫描超时（熔断中止）".into(),
+                    ));
+                }
+                acc(doc)
+            })?;
+        }
+    }
     let arg = field.as_deref().unwrap_or("*");
     let header = format!("{}({arg})", name.to_uppercase());
     let (is_null, text) = match name.as_str() {
@@ -2135,6 +2172,30 @@ fn fmt_num(x: f64) -> String {
     } else {
         x.to_string()
     }
+}
+
+/// P1-D（2026-09-04）：聚合候选收敛——WHERE 为 AND 组合且含**可倒排等值**子条件时，
+/// 取其首个倒排命中的 posting 作候选 docid 集（免全表扫）。残余条件（范围/BETWEEN 等）
+/// 在候选 doc 上整表达式判定（与全扫等价、结果精确）。
+/// 返回 None = 无可用等值候选（回退全表扫）。窗口参数仅用于接收（窗口过滤在消费循环做）。
+fn candidate_posting(
+    engine: &Engine,
+    where_expr: Option<&WhereExpr>,
+    _start: Option<u64>,
+    _end: Option<u64>,
+) -> Result<Option<RoaringBitmap>> {
+    let Some(we) = where_expr else { return Ok(None) };
+    if !matches!(we, WhereExpr::And(_, _)) {
+        return Ok(None); // 裸等值已走倒排统计快路径；非 AND 组合无收敛价值
+    }
+    for (f, v) in extract_eq_conds(we) {
+        let term = format!("{f}={v}");
+        let post = engine.inverted_posting(&term)?;
+        if !post.is_empty() {
+            return Ok(Some(post));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -2807,6 +2868,19 @@ mod tests {
         assert_eq!(agg("SELECT SUM(amount) FROM t").text, "49500");
         assert_eq!(agg("SELECT AVG(amount) FROM t").text, "495");
         assert_eq!(agg("SELECT MIN(amount) FROM t").text, "0");
+        // P1-D（2026-09-04）：AND(可倒排等值, 范围) → posting 候选收敛聚合（免全表扫）
+        // status='active'（34 行）+ amount>400（active 且 i≥42）：SUM = 10·Σi, i=42..99 step3 = 14100
+        assert_eq!(
+            agg("SELECT SUM(amount) FROM t WHERE status='active' AND amount>400").text,
+            "14100",
+            "P1-D 候选收敛聚合精确（与全扫一致）"
+        );
+        assert_eq!(
+            agg("SELECT COUNT(*) FROM t WHERE status='active' AND amount>400").text,
+            "20"
+        );
+        // 对照：无等值条件（amount>400 全扫）SUM = 10·Σi, i=41..99 = 41300
+        assert_eq!(agg("SELECT SUM(amount) FROM t WHERE amount>400").text, "41300");
         assert_eq!(agg("SELECT MAX(amount) FROM t").text, "990");
         assert_eq!(agg("SELECT SUM(amount) FROM t WHERE status='active'").text, "16830");
         // 空集：COUNT → 0；SUM/AVG → NULL
