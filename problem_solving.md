@@ -841,6 +841,44 @@
   测试：`multi_join_rejected_at_parse`。从表非 docid 字段需倒排（无则静默 0 匹配）已在文档标注取舍。
 - **回归**：全量 `cargo test --release --lib` = 642 passed / 0 failed（原 633 + review 新增 9）。
 
+### P82. 事务 COMMIT fsync 语义对等（P2-A：逐 COMMIT 等 fsync 根因 + 提交耐久档位可配）
+- **背景**：宽表基准（user_guide/宽表SQL性能基准记录.md §12）事务探针 cjserver 8× 慢于 MySQL
+  （MySQL #25/#35-36 ≈0.4-0.65ms）。development_remain §一.4 P2-A 立项三件事：①核对 sqlrun/
+  rr-conformance 事务是否落组提交路径；②config 可配提交耐久档位（对齐 MySQL
+  `innodb_flush_log_at_trx_commit`）；③档位语义写入基准文档。
+- **根因核对（①，结论：未落组提交路径）**：事务 COMMIT 链路 = sqlrun/rr-conformance（MySQL
+  协议）→ `db_adapter::dispatch_query` COMMIT → `engine.txn_commit` → 尾部**无条件
+  `flush_wal()`**（删除位图 flush + primary/delta/outbox 三路 `sync_wal` fsync）。cjserver
+  启动默认 `group_commit_us=2000` 只摊薄**非事务 put**（`put` → `maybe_group_commit`），
+  事务 COMMIT 从不走组提交——每次 COMMIT 持引擎写锁做完整 fsync，无任何攒批 → 8×。
+  对比 MySQL：`innodb_flush_log_at_trx_commit=1` 下同样每 COMMIT fsync，但 InnoDB 组提交把
+  同刻并发 COMMIT 合并一次 fsync，且单 redo 文件 fsync 成本低于 cjserver 双 WAL + 位图。
+- **修复（② config 可配档位）**：
+  1. `StorageConfig` 新增 `flush_log_at_trx_commit: u8`（默认 1，对齐 MySQL 命名/语义）；
+     `Config::validate` 校验 0..=2（越界 Err）。旧 config 缺失字段经 `#[serde(default)]` 兼容。
+  2. `Engine` 新增字段 `flush_log_at_trx_commit`（open 时自 cfg 拷贝）+ `commit_persist()`：
+     - 档位 1 = `flush_wal()`（现状强安全：位图 + WAL + outbox 全 fsync，COMMIT ack = 已落盘）；
+     - 档位 0/2 = `maybe_group_commit()`（组提交开 → 零同步 fsync、后台线程窗口/字节阈值落盘，
+       并发 COMMIT 共享一次 fsync；组提交关 → `maybe_group_commit` 内回退 `flush_wal` 强兜底）。
+  3. `txn_commit` 尾部落盘由硬编码 `flush_wal` 改走 `commit_persist()`。
+  4. mysql_server 启动打印档位（config 可覆盖）。
+- **取舍（档位 0 与 2 当前等价）**：InnoDB 档位 2 = "COMMIT 写 OS page cache → 进程崩溃不丢，
+  每秒 fsync"；本引擎 WAL 攒批缓冲在进程内存、落盘 write+fsync 一体，无 OS-cache-only 写层
+  → 0/2 均表现为"COMMIT 交组提交窗口延迟落盘（进程崩溃丢 ≤ 窗口）"。窗口毫秒级远小于 InnoDB
+  1s 周期；语义差异已写入基准文档 §13.2，需要更强保护用档位 1。非事务写不受档位影响
+  （仍由 group_commit_us 控制），保持既有插入吞吐语义。
+- **测试**（4 新增，全绿）：`txn_commit_durability1_fsyncs_each_commit_even_with_group_commit`
+  （档位 1 + 组提交开 60ms：COMMIT 后 WAL pending=0——逐 COMMIT 强 fsync 代码证据）；
+  `txn_commit_durability2_defers_to_group_commit_window`（档位 2：COMMIT 后 pending>0 攒批
+  → 后台窗口兜底落盘 → drop 重开数据完整）；`txn_commit_durability2_falls_back_when_group_commit_off`
+  （档位 2 + 组提交关：回退显式 fsync pending=0）；`flush_log_at_trx_commit_invalid_rejected_by_validate`
+  （档位 3 拒绝 / 0、2 通过）。
+- **验收映射**：单连接结构差 4-5× = 档位 1（每 COMMIT 双 WAL + 位图 fsync 物理差，难消，排期接受）；
+  并发 ≤2-3× = cjserver 配档位 2 复测（fsync 摊薄），待用户跑基准确认。③已写入
+  user_guide/宽表SQL性能基准记录.md §13。
+- **回归**：`cargo test --lib` engine::tests 102 + db_adapter::tests 53 全绿；release 全量见
+  `feat(P2-A)` 提交记录。
+
 
 ## 环境备忘（不入库）
 

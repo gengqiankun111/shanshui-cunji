@@ -205,6 +205,12 @@ impl Config {
         if self.storage.wal_ring_size_mb == 0 {
             return Err(Error::Config("storage.wal_ring_size_mb 必须 > 0".into()));
         }
+        if !(0..=2).contains(&self.storage.flush_log_at_trx_commit) {
+            return Err(Error::Config(format!(
+                "storage.flush_log_at_trx_commit 非法: {}（0/1/2，对齐 MySQL innodb_flush_log_at_trx_commit）",
+                self.storage.flush_log_at_trx_commit
+            )));
+        }
         if !matches!(self.enrich.fail_policy.as_str(), "reject" | "degrade") {
             return Err(Error::Config(format!(
                 "enrich.fail_policy 非法: {}（reject / degrade）",
@@ -611,6 +617,12 @@ pub struct StorageConfig {
     pub group_commit_us: u64,
     /// 组提交字节阈值：WAL 待刷缓冲 ≥ 此值立即 fsync（不等窗口）。
     pub group_commit_bytes: usize,
+    /// P2-A（2026-09-04）：事务 COMMIT 提交耐久档位——对齐 MySQL `innodb_flush_log_at_trx_commit`：
+    /// 1 = 每次 COMMIT 显式 fsync（强安全，默认）；
+    /// 0/2 = COMMIT 不单独 fsync，落盘交给组提交窗口统一执行（延迟耐久：崩溃最多丢 ≤ 窗口数据，
+    /// 并发事务共享窗口内一次 fsync——事务基准对比配此档位可把逐 COMMIT fsync 的 8× 拉到 ~2-3×；
+    /// 本引擎无 InnoDB 独立 redo/OS-cache 层，档位 0/2 当前均为此语义，见 problem_solving P82）。
+    pub flush_log_at_trx_commit: u8,
     /// Compaction 并行度（Ex-5.4，design 4.8.3）：并行压实 primary/cidx/delta 三列族
     /// （SSD 并发 IO 强，demo 实测 3 CF 并行 2.14×）；0 = 自动（min(4, 核数/2)）；
     /// 1 = 串行；>1 = 指定并行数。
@@ -685,6 +697,8 @@ impl Default for StorageConfig {
             wal_ring_size_mb: 256,
             group_commit_us: 0,
             group_commit_bytes: 256 * 1024,
+            // P2-A：事务 COMMIT 默认逐次 fsync（强安全，同 MySQL innodb_flush_log_at_trx_commit=1）。
+            flush_log_at_trx_commit: 1,
             compaction_parallel: 0, // 0 = 自动（并行）
             // Ex-5.6（design 4.6）：SSD 原生删除位图默认开启——删除 1bit+1 页 fsync（-99% IO），
             // 查询 O(1) 跳过，墓碑不污染 LSM；关闭回退传统 Tombstone 路径。

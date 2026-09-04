@@ -85,6 +85,13 @@ fn main() {
         cfg.storage.group_commit_us = 2000;
         println!("[cjserver] 默认开启组提交（group_commit_us=2000µs，config 可覆盖）");
     }
+    // P2-A：事务 COMMIT 耐久档位（对齐 MySQL innodb_flush_log_at_trx_commit）。
+    // 1 = 每次 COMMIT 显式 fsync（强安全默认）；0/2 = COMMIT 交组提交窗口（延迟耐久，
+    // 并发事务基准建议 2，config `storage.flush_log_at_trx_commit` 可覆盖）。
+    println!(
+        "[cjserver] 事务 COMMIT 耐久档位 flush_log_at_trx_commit={}（1 = 逐 COMMIT fsync 强安全；0/2 = 组提交窗口延迟落盘）",
+        cfg.storage.flush_log_at_trx_commit
+    );
     let engine = Engine::open_with_timeout(
         &data_dir,
         &cfg,

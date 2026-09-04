@@ -61,6 +61,10 @@ pub struct Engine {
     /// 组提交（M8）：Some((窗口, 字节阈值)) = 开启；None = 关闭（逐条 fsync 强安全）。
     /// 窗口内写入攒批一次 fsync（design 4.3 / M8，`storage.group_commit_us`）。
     group_commit: Option<(Duration, usize)>,
+    /// P2-A：事务 COMMIT 落盘档位（`storage.flush_log_at_trx_commit`）——1 = 每次 COMMIT
+    /// `flush_wal`（强安全）；0/2 = COMMIT 走组提交窗口（`maybe_group_commit`：延迟耐久，
+    /// 组提交关闭时自动回退强安全）。与 `group_commit`（非事务写窗口）正交。
+    flush_log_at_trx_commit: u8,
     /// 组提交后台线程停止标志（窗口尾部落盘兜底）。
     gc_stop: Option<Arc<AtomicBool>>,
     /// 组提交后台线程句柄。
@@ -545,6 +549,7 @@ impl Engine {
             group_commit: None,
             gc_stop: None,
             gc_thread: None,
+            flush_log_at_trx_commit: cfg.storage.flush_log_at_trx_commit,
             inverted_include: if cfg.inverted.inverted_fields.is_empty() {
                 None
             } else {
@@ -652,6 +657,21 @@ impl Engine {
             self.flush_wal()?;
         }
         Ok(())
+    }
+
+    /// P2-A（development_remain P2-A ②）：事务 COMMIT 的落盘语义按
+    /// `storage.flush_log_at_trx_commit` 档位执行（对齐 MySQL `innodb_flush_log_at_trx_commit`）：
+    /// - **1**（默认）：每次 COMMIT 显式 `flush_wal`（位图 + WAL + outbox 全 fsync，强安全；
+    ///   COMMIT ack = 已落盘）。
+    /// - **0 / 2**：COMMIT 不单独 fsync——落盘交给组提交窗口（与单条 put 同一攒批路径，
+    ///   并发 COMMIT 共享窗口内一次 fsync；ack 后最多延迟 ≤ 窗口落盘）。组提交关闭（无后台
+    ///   落盘线程）时 `maybe_group_commit` 回退 `flush_wal`（强安全兜底）。
+    fn commit_persist(&mut self) -> Result<()> {
+        if self.flush_log_at_trx_commit == 1 {
+            self.flush_wal()
+        } else {
+            self.maybe_group_commit()
+        }
     }
 
     /// 更新内存使用率估算（OOM Guardian 输入，由监控/统计层刷新）。
@@ -880,7 +900,8 @@ impl Engine {
 
     /// E/F：事务提交。写锁（write_set 全目标排他，含共享→排他升级）→
     /// 写写冲突检测（RR/SERIALIZABLE：目标在快照后被并发事务修改 → `TxnConflict` abort）→
-    /// 应用 ops + 单次 flush_wal → 释放全部锁（失败路径同样释放，防锁泄漏）。
+    /// 应用 ops + 提交落盘（P2-A：档位 1 = 单次 `flush_wal` 崩溃原子；
+    /// 档位 0/2 = 组提交窗口攒批，见 `commit_persist`）→ 释放全部锁（失败路径同样释放，防锁泄漏）。
     pub fn txn_commit(&mut self, mut txn: crate::txn::Transaction) -> Result<()> {
         if txn.is_finished() {
             return Err(crate::error::Error::TxnAborted(format!(
@@ -923,7 +944,7 @@ impl Engine {
                     }
                 }
             }
-            // ③ 应用 + 单次 flush_wal（崩溃原子）
+            // ③ 应用 + 提交落盘（P2-A：档位感知——1 = 每次 COMMIT fsync；0/2 = 组提交窗口）
             for op in txn.ops() {
                 match op {
                     crate::txn::Op::Put {
@@ -937,7 +958,7 @@ impl Engine {
                     crate::txn::Op::Delete { docid } => self.delete(*docid)?,
                 }
             }
-            self.flush_wal()?;
+            self.commit_persist()?;
             Ok(())
         })();
         if result.is_ok() {
@@ -3862,6 +3883,88 @@ mod tests {
         }
         // 60ms 窗口 + 4KB 阈值：快速 50 条 put（远快于窗口）绝大部分应攒批
         assert!(missed >= 40, "窗口内应攒批（攒批 {missed}，同步 {synced}）");
+    }
+
+    // ---------- P2-A：事务 COMMIT 耐久档位（flush_log_at_trx_commit）----------
+
+    fn wal_pending(e: &Engine) -> usize {
+        e.primary.wal_handle().lock().unwrap().pending_bytes()
+            + e.delta.wal_handle().lock().unwrap().pending_bytes()
+    }
+
+    #[test]
+    fn txn_commit_durability1_fsyncs_each_commit_even_with_group_commit() {
+        // P2-A ① 核对结论的代码证据（原逐 COMMIT 等 fsync 的根因）：档位 1（默认）下
+        // 事务 COMMIT 不落组提交攒批——即使组提交开启（后台窗口 60ms），COMMIT 后
+        // WAL 待刷缓冲必为 0（每次显式 fsync，组提交仅并发摊薄）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = gc_cfg(60_000);
+        cfg.storage.flush_log_at_trx_commit = 1;
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        txn.put(7, b"txn-7".to_vec(), vec!["t".into()]);
+        e.txn_commit(txn).unwrap();
+        assert_eq!(
+            wal_pending(&e),
+            0,
+            "档位 1：COMMIT 必须显式 fsync（绕开组提交攒批，逐 COMMIT 落盘）"
+        );
+    }
+
+    #[test]
+    fn txn_commit_durability2_defers_to_group_commit_window() {
+        // P2-A ②：档位 2 下 COMMIT 落组提交路径（不再逐 COMMIT 等 fsync）——大窗口内
+        // COMMIT 后 WAL 仍攒批（未 fsync），由后台线程窗口到期兜底落盘；窗口后重开完整。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = gc_cfg(60_000);
+        cfg.storage.flush_log_at_trx_commit = 2;
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        txn.put(7, b"txn-7".to_vec(), vec!["t".into()]);
+        e.txn_commit(txn).unwrap();
+        let pending = wal_pending(&e);
+        assert!(pending > 0, "档位 2：COMMIT 应落组提交攒批（实际 pending={pending}）");
+        // 有界轮询等后台线程兜底落盘（避免固定 sleep flaky）
+        let mut pending = pending;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            pending = wal_pending(&e);
+            if pending == 0 {
+                break;
+            }
+        }
+        assert_eq!(pending, 0, "后台线程应在窗口内兜底落盘");
+        drop(e);
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(e2.get(7).unwrap().unwrap(), b"txn-7", "窗口落盘后重开数据完整");
+    }
+
+    #[test]
+    fn txn_commit_durability2_falls_back_when_group_commit_off() {
+        // P2-A ②：档位 2 但组提交关闭（无后台落盘线程）——maybe_group_commit 回退
+        // flush_wal → COMMIT 仍显式 fsync（强安全兜底，语义不劣化）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg(); // group_commit_us = 0
+        cfg.storage.flush_log_at_trx_commit = 2;
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let mut txn = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        txn.put(7, b"txn-7".to_vec(), vec!["t".into()]);
+        e.txn_commit(txn).unwrap();
+        assert_eq!(wal_pending(&e), 0, "档位 0/2 + 组提交关：应回退显式 fsync");
+    }
+
+    #[test]
+    fn flush_log_at_trx_commit_invalid_rejected_by_validate() {
+        // P2-A ②：config 校验——档位仅接受 0/1/2（对齐 MySQL innodb_flush_log_at_trx_commit）
+        let mut bad = Config::default();
+        bad.storage.flush_log_at_trx_commit = 3;
+        assert!(bad.validate().is_err(), "档位 3 应被校验拒绝");
+        let mut ok2 = Config::default();
+        ok2.storage.flush_log_at_trx_commit = 2;
+        assert!(ok2.validate().is_ok());
+        let mut ok0 = Config::default();
+        ok0.storage.flush_log_at_trx_commit = 0;
+        assert!(ok0.validate().is_ok());
     }
 
     // ---------- 倒排字段白名单/黑名单/长文本（M8-P4） ----------

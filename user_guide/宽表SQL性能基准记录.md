@@ -267,3 +267,43 @@ mean/p50/p99/max，单位 ms）。
    倒排能力仅覆盖 status/region/k 等字段位图；ts/amount 等未索引字段的过滤为全扫。
 6. 数据漂移口径：每轮 sqlrun 尾部 +200 upd 预留行（N 以轮起始计），与 MySQL 侧一致。
 
+## §13 事务/写路径 fsync 语义对等（P2-A，2026-09-04；development_remain §一.4 P2-A）
+
+### 13.1 根因核对（P2-A ①：sqlrun/rr-conformance 事务是否落组提交路径）
+
+事务探针（#25/#26/#35-37，MySQL ≈0.4–0.65ms vs cjserver 8×）的根因代码定位：
+
+- MySQL 侧：`innodb_flush_log_at_trx_commit=1`（默认）——每次 COMMIT 对 redo fsync，但 InnoDB
+  组提交把**同刻进入提交的并发事务合并为一次 fsync**，并发事务延迟不随连接数线性放大；
+- cjserver 侧（本项核对结论）：COMMIT → `db_adapter::dispatch_query` → `engine.txn_commit`
+  尾部**无条件 `flush_wal()`**（删除位图 flush + primary/delta/outbox 三路 WAL fsync）——
+  即使 cjserver 默认 `group_commit_us=2000`，组提交也只摊薄**非事务 put**（`maybe_group_commit`），
+  事务 COMMIT **不落组提交攒批、逐次显式 fsync** → 事务对比 8× 的直接原因；
+  sqlrun/rr-conformance 经 MySQL 协议连 cjserver，其事务探针全部命中上述路径。
+
+### 13.2 提交耐久档位语义（P2-A ②：`storage.flush_log_at_trx_commit`）
+
+config 新增 `storage.flush_log_at_trx_commit`（0/1/2，**默认 1**，对齐 MySQL
+`innodb_flush_log_at_trx_commit`；越界值校验拒绝），只管辖**事务 COMMIT** 的落盘语义：
+
+| 档位 | MySQL（InnoDB）语义 | cjserver 实现（txn_commit 尾部） | 崩溃丢失 |
+|---|---|---|---|
+| 0 | 不随 COMMIT 落盘，后台每秒 flush+fsync | 与 2 同路径（本引擎无 InnoDB 独立 redo / OS-cache-only 写层，0/2 当前等价，见下） | ≤ 窗口（进程崩 / 断电） |
+| 1（默认） | 每次 COMMIT fsync | `commit_persist()` = `flush_wal()`（位图 + WAL + outbox 全 fsync，COMMIT ack = 已落盘） | 无 |
+| 2 | 每次 COMMIT 写 OS cache（不 fsync），后台每秒 fsync | `commit_persist()` = `maybe_group_commit()`：组提交开启（有后台落盘线程）→ 零同步 fsync，窗口/字节阈值统一落盘；组提交关闭 → **回退档位 1**（强安全兜底） | ≤ 窗口（断电；进程崩同窗口级） |
+
+- 组提交窗口 = `group_commit_us`（cjserver 默认 2000µs）+ `group_commit_bytes`（默认 256KB）。
+- **档位 0 与 2 的差异说明**：InnoDB 档位 2 的"COMMIT 写 OS page cache → 进程崩溃不丢"在本引擎
+  无对应单层（WAL 攒批缓冲在进程内存，落盘即 write+fsync 一体）；档位 0/2 均表现为"COMMIT 交组
+  提交窗口延迟落盘"。窗口毫秒级（远小于 InnoDB 的 1s 周期），需要更强保护用档位 1 或缩小窗口。
+- 非事务单条写（autocommit INSERT/UPDATE/DELETE 的隐式提交）**不受本档位影响**，仍由
+  `group_commit_us` 控制（保持既有插入吞吐语义）。
+
+### 13.3 基准对比调档建议
+
+- 对齐 MySQL 默认档位 1（强安全）：cjserver 配 1 → 单连接逐 COMMIT fsync 结构差 ~4-5×
+  （每 COMMIT 双 WAL + 位图 fsync，与 MySQL 单 redo fsync 的物理差，排期接受为"难消"）；
+- 并发事务对比：cjserver config 配 `flush_log_at_trx_commit = 2`（组提交默认开启）→ 并发
+  COMMIT 共享窗口内一次 fsync（同 MySQL 组提交效果），目标 **≤2-3×**；
+- 相关提交：`feat(P2-A)`（config 字段 + `commit_persist` + 4 单测），详见 problem_solving P82。
+
