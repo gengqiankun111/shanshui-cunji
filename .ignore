@@ -1,0 +1,11 @@
+# count_lines.py 忽略规则（本文件供 count_lines.py 读取，非 git 忽略配置）
+# 临时脚本/数据与测试产物不纳入代码统计
+
+# 临时目录与临时脚本（探针/一次性报告）
+tmp/
+tmp_*
+
+# 测试结果目录与日志（results-* / results-dbg / rr-conformance/results-*）
+results*
+results-*/
+rr-conformance/results*/
