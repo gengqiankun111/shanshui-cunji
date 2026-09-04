@@ -1039,6 +1039,29 @@
   - 临时基准数据与误启 server 的数据目录已清理（均在 data/ 忽略目录内）。
 
 
+### P95. 组提交默认化（A/B）+ 宽表对比测试步骤存档（2026-09-05）
+
+- **背景**：Task-005 瓶颈定位确认写混合负载（a/f）被“逐提交 fsync”钉在 ~2k ops/s（p50≈0.9ms =
+  单次 fsync），组提交 0.5~1ms 档即 3.7~5.3 万 ops/s。决策：把组提交设为默认（旧默认 0 = 强安全）。
+- **改动（A/B 后采纳）**：
+  - `config/model/storage.rs`：`group_commit_us` 默认 0 → **1000µs**（注释同步）；
+  - `bin/mysql_server.rs`：移除“0 时强制 2000”分支（P75 根因随默认化消除），尊重显式 `0` = 逐条
+    fsync 强安全，并打印实际档位；
+  - `engine/tests.rs`：原“默认关”用例改 `group_commit_disabled_fallback_persists_each_put`（显式 0 +
+    drop 重开持久）；新增 `group_commit_default_enabled_drop_persists_tail`（默认 1000µs 开启 +
+    drop 尾批 flush 后重开完整）。
+- **A/B 实测**（50k load + 40k ops、4 线程、Windows release）：
+  - A（`group_commit_us=0`，旧默认）：a=1959 / f=1932 ops/s，p50≈0.88~0.89ms；
+  - B（=1000µs，新默认）：a=42851（**21.9×**）/ f=36979（**19.1×**）ops/s，p50 7.3~8.6µs，
+    p99 ≈ 2.8~3.1ms；0.5ms 档（gc500）p99≈1.2ms 更优（若追求低尾延迟可下调默认）。
+  - 注：ycsb `--group-commit-us` 未传时取 0 并**覆盖** config（验证默认档须显式传值或走服务端路径）。
+- **回归（崩溃恢复/持久性）**：`cargo test --lib group_commit` 8/8、`recovery` 3/3、`reopen` 14/14、
+  `wal` 21/21、全量 **694 passed / 0 failed / 3 ignored**（693 + 新增 1），WAL 截断回放/环形/重开/
+  默认尾批落盘用例全绿。
+- **存档**：新增 `user_guide/宽表SQL性能对比-测试步骤存档.md`（rr-conformance `--sql-run/--wide-load`
+  + MySQL 3316 / SCC 3317 资产的可复用完整步骤，供后续 10 万/110 万对比报告复用）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
