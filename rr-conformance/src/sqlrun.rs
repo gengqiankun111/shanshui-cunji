@@ -317,7 +317,7 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
     let env_note = if url.contains("3316") {
         "MySQL 8.0（独立实例 3316，innodb_buffer_pool_size = 2G）"
     } else if url.contains("3317") {
-        "SCC（3317，2G 内存预算 = hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB）"
+        "cjserver（shanshui-cunji，3317，2G 内存预算 = hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB）"
     } else {
         "目标端"
     };

@@ -8,7 +8,7 @@
 //! - H-3 SQL 映射：INSERT（→ put + docid）、UPDATE（→ put 覆盖）、DELETE（→ engine.delete）、
 //!   SELECT（→ sqlish 引擎，返回 id + doc 两列）。
 //!
-//! 数据模型映射：单库 `scc`，固定表 `documents`——行 = docid（BIGINT 主键），
+//! 数据模型映射：单库 `cjserver`，固定表 `documents`——行 = docid（BIGINT 主键），
 //! 列 = `id`（LONGLONG）+ `doc`（文档 JSON 文本）。
 
 use std::io::{Read, Write};
@@ -28,7 +28,7 @@ const PROTOCOL_VERSION: u8 = 10;
 const SERVER_VERSION: &str = "8.0.0-shanshui-cunji";
 /// 固定表名（文档库无表语义，SQL 层映射为单表）。
 pub const DEFAULT_TABLE: &str = "documents";
-pub const DEFAULT_DB: &str = "scc";
+pub const DEFAULT_DB: &str = "cjserver";
 
 // 能力位（仅声明已支持子集）
 const CLIENT_PROTOCOL_41: u32 = 1 << 9;
@@ -5330,7 +5330,7 @@ mod tests {
         assert_eq!(plugin, "mysql_native_password");
         c.authenticate("root", "secret", &scramble);
 
-        // SHOW DATABASES → ResultSet 含 scc
+        // SHOW DATABASES → ResultSet 含 cjserver
         let packets = c.query("SHOW DATABASES");
         assert_eq!(packets[0][0], 1, "列数 = 1");
         // 解析末行首列

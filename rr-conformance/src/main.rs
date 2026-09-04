@@ -74,7 +74,7 @@ fn main() {
         mysql_url: arg(&args, "--mysql-url", "mysql://root:123456@127.0.0.1:3306"),
         my_url: arg(&args, "--my-url", "mysql://root@127.0.0.1:3308"),
         mysql_db: arg(&args, "--mysql-db", "mysql"),
-        my_db: arg(&args, "--my-db", "scc"),
+        my_db: arg(&args, "--my-db", "cjserver"),
         txns: arg(&args, "--txns", "20000").parse().unwrap_or(20_000),
         threads: arg(&args, "--threads", "8").parse().unwrap_or(8),
         rows: arg(&args, "--rows", "2000").parse().unwrap_or(2000),

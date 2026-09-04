@@ -1,18 +1,18 @@
 # 宽表 SQL 性能基准记录（MySQL 2G，2026-09-04）
 
-> 范围按用户指示收口：**MySQL 侧测试完整执行并记录**；SCC 侧对比因内核多表改造
-> 兼容问题**未能执行**，受阻详情见「§6 SCC 侧记录（未完成，供修复会话）」。
+> 范围按用户指示收口：**MySQL 侧测试完整执行并记录**；cjserver 侧对比因内核多表改造
+> 兼容问题**未能执行**，受阻详情见「§6 cjserver 侧记录（未完成，供修复会话）」。
 
 ---
 
 ## §1 结论摘要
 
-- 目标：在「100 万多字段宽表」上分别跑 MySQL 与 SCC（各 2G 内存预算）同一套 ≥20 种
+- 目标：在「100 万多字段宽表」上分别跑 MySQL 与 cjserver（各 2G 内存预算）同一套 ≥20 种
   SQL 负载（含 group by / order by / 范围查询 / 批量查询 / 批量插入（不同批）/ 批量
   更新 / 批量删除 / 事务），对比平均耗时、p95、p99、最大耗时。
 - **MySQL 侧已完整跑完**：26/26 探针通过，初始行数 **N=1,098,342**（25 列宽表 `wide.t`），
   结果归档于 `results-sqlrun-mysql-2g/summary.md`，全表见 §5。
-- **SCC 侧未完成**：现运行实例为另一任务编译中的新内核（§26 真多表 M1~M3 +
+- **cjserver 侧未完成**：现运行实例为另一任务编译中的新内核（§26 真多表 M1~M3 +
   `src/mysql.rs` 未提交改动）；旧格式宽表数据在新内核下 `COUNT(*) FROM t` 返回 0
   （多表命名空间导致旧数据不可见）；按指示重建数据集时触发内核 panic
   `src/inverted.rs:490 docid 超出 RoaringBitmap 支持范围` 及毒锁
@@ -20,7 +20,7 @@
   未在本会话修复（用户指示只跑测试）。
 - 收尾状态：独立 MySQL 实例 3316 已停止（数据与配置保留在 D 盘，可随时复用）；
   3317 已停止且数据目录已清空为初始空库；3306（系统 MySQL）与 3309/3310（RR 测试
-  SCC 实例）保持运行。
+  cjserver 实例）保持运行。
 
 ## §2 测试环境
 
@@ -28,10 +28,10 @@
 |---|---|
 | 机器 | Windows，RAM 15.8 GB（空闲 ~11.6 GB），C 盘余 1.5 GB，D 盘余 34 GB |
 | MySQL 被测端 | **独立实例 3316**（MySQL 8.0.45 Community，D 盘 datadir，专用 my.ini，`innodb_buffer_pool_size=2G`、4 实例），配置 `tmp/my-wide-3316.ini` |
-| SCC 被测端 | 3317（`tmp/tmp-cfg-wide-2g.toml`：hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB ≈ 2G）——**未测成**，见 §6 |
+| cjserver 被测端 | 3317（`tmp/tmp-cfg-wide-2g.toml`：hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB ≈ 2G）——**未测成**，见 §6 |
 | 数据 | 宽表 `t`：25 列（id + 9 数值/枚举 k,amount,score,ts,user_id,age,active_days,visit_count,balance,flag + 枚举 status/region/channel/tag + 长字符串 note/title/url/email/phone/ip/desc_a/desc_b/txt_a/txt_b），单行约 1 KB |
-| 行数 | 装载 **1,098,342 行**（id 1..1,098,342），MySQL 与（计划中的）SCC 相同参数、相同确定性种子 |
-| 工具 | `rr-conformance`（rust mysql crate 客户端，仅依赖 mysql/rand/anyhow，**不编译 SCC**）扩展子命令 `--sql-run` / `--wide-load`；exe 位于 `D:\shanshui-cunji-target\release\rr-conformance.exe` |
+| 行数 | 装载 **1,098,342 行**（id 1..1,098,342），MySQL 与（计划中的）cjserver 相同参数、相同确定性种子 |
+| 工具 | `rr-conformance`（rust mysql crate 客户端，仅依赖 mysql/rand/anyhow，**不编译 cjserver**）扩展子命令 `--sql-run` / `--wide-load`；exe 位于 `D:\shanshui-cunji-target\release\rr-conformance.exe` |
 
 > 为什么新起 3316 实例：系统 MySQL 3306 的 datadir 在 C 盘（仅余 1.5 GB，装不下 ~1.3 GB
 > 宽表数据），且其 `innodb_buffer_pool_size` 仅 128M、上面跑着其它业务库 → 按用户确认
@@ -52,8 +52,8 @@
 - **新增**（覆盖用户要求的批量类）：`pk_in_50`（批量查询）、`insert_batch10`（10 行/语句）、
   `insert_batch100`（100 行/语句）、`update_in50`（批量更新）、`delete_range50`（批量删除）；
 - **修正**：`group_by_sum_having` 去掉列别名（sqlish 不支持 `HAVING c>0`，改为
-  `HAVING COUNT(*) > 0`），保证 MySQL/SCC 同一 SQL；
-- **移除** SCC 特有 `SELECT id,doc`（MySQL `wide.t` 无 doc 列）；
+  `HAVING COUNT(*) > 0`），保证 MySQL/cjserver 同一 SQL；
+- **移除** cjserver 特有 `SELECT id,doc`（MySQL `wide.t` 无 doc 列）；
 - 写探针只作用于 `id > N+200000` 预留区（upd 200 行保留 / del 100 / delb 500 / ins 1500），
   结束后整区清理，不污染主数据。
 
@@ -98,14 +98,14 @@ mean/p50/p99/max，单位 ms）。
 
 - 点查/主键类（#1–5）：0.18–0.50 ms；`IN 50` 批量查询 ~0.5 ms（≈50 次点查的索引查找开销合批）；
 - 枚举/倒排等值（#6,8,9，命中 idx_status / idx_status_region 二级索引）：0.55–0.67 ms；
-- **无索引字段全扫**（amount，表无 amount 索引，模拟 SCC 无对应倒排）：`BETWEEN` #11 500 ms、
+- **无索引字段全扫**（amount，表无 amount 索引，模拟 cjserver 无对应倒排）：`BETWEEN` #11 500 ms、
   `SUM WHERE` #13 516 ms、GROUP BY #14 328 ms、COUNT #12 175 ms——符合二级索引读 1.1M 行量级；
 - `enum_count` #7 63 ms：二级索引覆盖计数（idx_status 扫描统计 ~22 万行/值）；
 - 写：单行 UPDATE/DELETE 0.25–0.28 ms；**批量写提升明显**——INSERT 100 行/语句 3.8 ms
   ≈ 单行 0.24 ms×100 的 ~1/6；UPDATE IN 50 0.74 ms；DELETE 50 行区间 1.21 ms；
 - 事务块（autocommit 关 + BEGIN/COMMIT）：0.4–0.5 ms 级。
 
-## §6 SCC 侧记录（未完成，供修复会话）
+## §6 cjserver 侧记录（未完成，供修复会话）
 
 ### 6.1 背景
 
@@ -129,7 +129,7 @@ mean/p50/p99/max，单位 ms）。
 
 - 按用户指示“重新构建 scc 的数据集”：清空 `D:\shanshui-data\db-wide-scc` → 重启 3317 →
   用 rust mysql crate 装载（`rr-conformance --wide-load --rows 1098342 --procs 4`，与
-  MySQL 同源同参；pymysql 与 SCC 握手不兼容故弃用 python loader）。
+  MySQL 同源同参；pymysql 与 cjserver 握手不兼容故弃用 python loader）。
 - 约 2k–6k 行后服务端 panic：
   - `src\inverted.rs:490`：`assert!(*docid < u32::MAX as u64, "docid 超出 RoaringBitmap 支持范围")`；
   - 随后 `src\mysql.rs:825`：`engine.write().unwrap()` 毒锁 `PoisonError` 连锁 panic。
@@ -152,7 +152,7 @@ mean/p50/p99/max，单位 ms）。
   `"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe" --defaults-file=d:\traeprojs\shanshui-cunji\tmp\my-wide-3316.ini --console`
 - 复跑 MySQL：`D:\shanshui-cunji-target\release\rr-conformance.exe --sql-run --url "mysql://root@127.0.0.1:3316/wide" --out results-sqlrun-mysql-2g`
   （root 空密码；mysql 8 该实例默认 mysql_native_password）。
-- SCC 侧待内核修复（§26 docid 高位 vs 32 位 RoaringBitmap / 旧数据归属）后，
+- cjserver 侧待内核修复（§26 docid 高位 vs 32 位 RoaringBitmap / 旧数据归属）后，
   再按 §6 流程重建数据集并跑 `--sql-run --url mysql://root@127.0.0.1:3317 --out results-sqlrun-scc-2g`，
   用 `tmp/tmp_compare_sqlrun.py` 合表出 mean/p95/p99/max 对比。
 
@@ -161,11 +161,11 @@ mean/p50/p99/max，单位 ms）。
 | 时间 | 事件 |
 |---|---|
 | 23:51 | 旧内核 3317 实例启动（20:35 二进制） |
-| 00:00 前后 | 旧 22 探针 SCC 首轮结果（N=1,098,242） |
+| 00:00 前后 | 旧 22 探针 cjserver 首轮结果（N=1,098,242） |
 | 00:30 | 另一任务提交 M3（HEAD 19745a6） |
-| 00:41 | 本会话编译新 SCC 内核（含未提交 mysql.rs 改动） |
+| 00:41 | 本会话编译新 cjserver 内核（含未提交 mysql.rs 改动） |
 | ~00:46 | MySQL 3316 建实例（2G）→ 装载 1,098,342 行（185.7s）→ 26 探针全过（记录本文） |
-| ~01:0x | SCC 新内核读旧数据 COUNT=0；重建数据触发 inverted.rs panic（未修复，收尾） |
+| ~01:0x | cjserver 新内核读旧数据 COUNT=0；重建数据触发 inverted.rs panic（未修复，收尾） |
 | 02:1x | 第二轮：探针扩至 37 项，MySQL 重测（基线 v2b / 组合索引对照 idx）并做 EXPLAIN |
 
 ## §9 第二轮：MySQL 37 探针（2026-09-04 02:1x，N=1,098,342）
@@ -211,59 +211,59 @@ mean/p50/p99/max，单位 ms）。
   3. 若 ts 独立范围查询为更高频路径，更稳妥是 `idx_ts` 或把 ts 放前置 `(ts, status)`
      （skip scan 估算行数 ~9.8 万，数据量更大/索引更宽时会退化）；
   4. 测试后已 **DROP** 该索引恢复原 schema（PRIMARY + idx_k/status/region/status_region），
-      便于与 SCC 侧（无组合索引、status/region 走位图倒排）公平对照；需要时重加仅 5s。
+      便于与 cjserver 侧（无组合索引、status/region 走位图倒排）公平对照；需要时重加仅 5s。
 
-## §11 cjserver（最新产物 2026-09-04 07:40）10 万行冒烟（SCC/documents）
+## §11 cjserver（最新产物 2026-09-04 07:40）10 万行冒烟（cjserver/documents）
 
 - 产物：`D:\traeprojs\shanshui-cunji\cjserver.exe`（release 4.3 MB，07:40）。
-- **装载路径修正（关键）**：SCC 单库 `scc`、默认表 `documents`（`db_adapter.rs`：
+- **装载路径修正（关键）**：cjserver 单库 `cjserver`、默认表 `documents`（`db_adapter.rs`：
   `docid = table_base(tid)<<48 | row`，`documents` tid=0 → docid=row 落在 32 位内；
   其它表 tid≠0 → docid ≥2⁴⁸）。而 status/region 走 **RoaringBitmap（32 位）位图倒排**
   （`inverted.rs` 断言 `docid < u32::MAX`）——**非默认表 + bitmap_fields 会触发内核
   panic**（0:41/0:57/7:40 三版在 `INSERT INTO t` 装载 ~2.5k–6k 行后均复现：
   `docid 超出 RoaringBitmap 支持范围` + PoisonError）。
-  → SCC 多表支持本身没问题（§26 M1~M3 表路由/按表 docid 区间），缺口在**位图倒排对
+  → cjserver 多表支持本身没问题（§26 M1~M3 表路由/按表 docid 区间），缺口在**位图倒排对
   非默认表高位 docid 的兼容**（内核侧待修；现以默认表 `documents` 承载单宽表语义，
   与 MySQL `wide.t` 对齐）。
-  → 工具侧新增 `--table`（默认 `t`，SCC 用 `documents`），sqlrun 与 wide_load 均支持。
+  → 工具侧新增 `--table`（默认 `t`，cjserver 用 `documents`），sqlrun 与 wide_load 均支持。
 - 装载：`rr-conformance --wide-load --table documents --rows 100000 --procs 4`
   → **100,000 行 · 4.9s**，无 panic。
 - 37 探针全部通过（OK 100%，N=100,000，见 `results-sqlrun-scc-100k/summary.md`）关键均值(ms)：
   点查 0.29 · IN50 2.81 · BETWEEN100 4.0 · 枚举等值~3.8 · enum_count 0.22 · count_all 55.7 ·
   全扫(amount/cmp) 60.8 · group_by 69–97 · having_avg 80 · orderby(窗口) 5.9 ·
   orderby_multi(全表) 1231 · 写 0.2–3.6 · insert_batch_10000 311（10k行/语句可用）·
-  upsert 单行 0.53 / 批量100行 3.33（SCC 已支持 ON DUPLICATE KEY UPDATE）·
+  upsert 单行 0.53 / 批量100行 3.33（cjserver 已支持 ON DUPLICATE KEY UPDATE）·
   事务 1.6–2.4 · 锁等待 ~4.0s（等锁超时，同 MySQL 形态）。
 - 该轮同时验证：cjserver 连接/握手正常（rust mysql crate），删除区间/事务/多语句均可。
 
-## §12 SCC↔MySQL 37 探针正式对比（同量 1,098,342 行，均 2G 内存）
+## §12 cjserver↔MySQL 37 探针正式对比（同量 1,098,342 行，均 2G 内存）
 
 - 内核：仓库根 `cjserver.exe`（2026-09-04 08:24，P79 64 位化后），数据目录 `D:\shanshui-data\db-wide-scc`；
   配置 `tmp/tmp-cfg-wide-2g.toml`（2G = hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB）。
 - MySQL：3316（8.0.45，innodb_buffer_pool_size=2G），库 wide 表 t，**初始 N=1,098,342**（确定性装载 185.7s）。
-- SCC：默认表 documents，**初始 N=1,098,342**（与 MySQL 同量，wide-load 装载 60.4s）。
+- cjserver：默认表 documents，**初始 N=1,098,342**（与 MySQL 同量，wide-load 装载 60.4s）。
 - 方法论：**装载即热（写入刚落 memtable/倒排内存），装载后直接实测一轮**；
   不叠加"预热轮"——实测发现 sqlrun 预留大区（insert_batch_10000 的 3 万行）区间清理
   （DELETE BETWEEN 预留区）**未生效**（历史遗留：多次 sqlrun 后 N 会漂移 +3 万+），
   采用"每轮前重置 + 重装载"保证口径一致（该清理缺口另记，非本内核 64 位化引入）。
 - 对比表：[results-sqlrun-compare-2g/summary.md](../../results-sqlrun-compare-2g/summary.md)
   两侧明细：`results-sqlrun-mysql-2g-v2b/summary.md`、`results-sqlrun-scc-1m-2g/summary.md`；
-  SCC 10 万轮（阶段 A）另见 `results-sqlrun-scc-100k-v3/summary.md`（37/37 通过）。
+  cjserver 10 万轮（阶段 A）另见 `results-sqlrun-scc-100k-v3/summary.md`（37/37 通过）。
 
-**结论速览（mean，SCC/MySQL 比值）**
-1. **SCC 显著领先**：enum_count 倒排 COUNT 载荷（0.66ms vs 64.39ms，快 ~98×）；
+**结论速览（mean，cjserver/MySQL 比值）**
+1. **cjserver 显著领先**：enum_count 倒排 COUNT 载荷（0.66ms vs 64.39ms，快 ~98×）；
    写入同档或略慢（单点/批量 10-100 行 0.9–1.5×，事务 8× 因 fsync 组提交语义）；
 2. **同档（~1×）**：点查 * 0.27 vs 0.21（1.3×）、数值>早停 1.2×、delete_id 0.9×、
    批量插 10/100 行 1.1×；
-3. **SCC 明显慢（无覆盖式二级索引/存算直扫）**：pk_between 100 行窗口 14×、
+3. **cjserver 明显慢（无覆盖式二级索引/存算直扫）**：pk_between 100 行窗口 14×、
    枚举等值取行 4.5–8.1×、**全表无索引扫（count_all/sum/group/cmp_between）13–32×**（MySQL 走
-   5 个二级索引/紧凑 InnoDB 页；SCC 全扫需解 25 列宽文档）、事务性写路径 3–8×；
-4. **SCC 安全阀拒绝**：orderby_multi（ORDER BY k,amount LIMIT 100）在 110 万行上触发
-   "候选集过大（>200,000）"守卫（1064 拒绝，MySQL 649ms 可跑）——SCC 全表排序需显式
+   5 个二级索引/紧凑 InnoDB 页；cjserver 全扫需解 25 列宽文档）、事务性写路径 3–8×；
+4. **cjserver 安全阀拒绝**：orderby_multi（ORDER BY k,amount LIMIT 100）在 110 万行上触发
+   "候选集过大（>200,000）"守卫（1064 拒绝，MySQL 649ms 可跑）——cjserver 全表排序需显式
    WHERE 收敛；10 万行下则能跑（~1136ms）；
-5. **组合索引语义不对等**：SCC 无 ts/status 复合索引，#30/#31 实为
+5. **组合索引语义不对等**：cjserver 无 ts/status 复合索引，#30/#31 实为
    "status 位图倒排候选 + ts 逐行过滤"（110 万行 → 921ms / 7300ms），而 MySQL 加
-   `(status,ts)` 后为 0.30ms/1.40ms（A/B 见 §10，测试后已 DROP）。SCC 侧等值/范围列的
+   `(status,ts)` 后为 0.30ms/1.40ms（A/B 见 §10，测试后已 DROP）。cjserver 侧等值/范围列的
    倒排能力仅覆盖 status/region/k 等字段位图；ts/amount 等未索引字段的过滤为全扫。
 6. 数据漂移口径：每轮 sqlrun 尾部 +200 upd 预留行（N 以轮起始计），与 MySQL 侧一致。
 

@@ -4,7 +4,7 @@
 //! 用法：
 //!   cjserver --data-dir <dir> [--config config.toml] [--bind 0.0.0.0:3307] [--user root] [--password 密码]
 //!
-//! 数据模型：库 `scc`，表 `documents`，列 `id`（BIGINT 主键）+ `doc`（JSON 文档）。
+//! 数据模型：库 `cjserver`，表 `documents`，列 `id`（BIGINT 主键）+ `doc`（JSON 文档）。
 //! 支持：握手 + mysql_native_password 认证 + SHOW DATABASES/TABLES/VARIABLES +
 //! SELECT/INSERT/UPDATE/DELETE（映射到文档引擎）+ SET/BEGIN/COMMIT/ROLLBACK（放行）。
 

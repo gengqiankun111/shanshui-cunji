@@ -1,10 +1,10 @@
-# MySQL ↔ SCC 宽表 SQL 性能对比（sqlrun，均 2G 内存预算）
+# MySQL ↔ cjserver 宽表 SQL 性能对比（sqlrun，均 2G 内存预算）
 
 - MySQL：`mysql://root@127.0.0.1:3316/wide` 初始行数 N=1098342（MySQL 8.0.45，innodb_buffer_pool_size=2G）
-- SCC ：`?` 初始行数 N=0（2G = hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB）
-- 单位 ms；每探针各自 OK/n 见两侧 summary；mean=SCC/MySQL 为该行平均耗时比值。
+- cjserver ：`?` 初始行数 N=0（2G = hotcache 1024 + blockcache 512 + inverted 256 + memtable 256 MB）
+- 单位 ms；每探针各自 OK/n 见两侧 summary；mean=cjserver/MySQL 为该行平均耗时比值。
 
-| # | 类别 | 探针 | 说明 | MySQL mean | MySQL p50 | MySQL p99 | MySQL max | SCC mean | SCC p50 | SCC p99 | SCC max | SCC/MySQL(mean) |
+| # | 类别 | 探针 | 说明 | MySQL mean | MySQL p50 | MySQL p99 | MySQL max | cjserver mean | cjserver p50 | cjserver p99 | cjserver max | cjserver/MySQL(mean) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | 点查 | pk_point_star | SELECT * | 0.21 | 0.19 | 0.31 | 0.66 | 0.27 | 0.24 | 0.51 | 0.56 | 1.3× |
 | 2 | 点查 | pk_point_proj10 | 10 列投影 | 0.16 | 0.16 | 0.26 | 0.29 | 0.49 | 0.48 | 0.67 | 0.69 | 3.1× |
@@ -34,7 +34,7 @@
 | 26 | 事务 | txn_for_update_read | BEGIN→FOR UPDATE→COMMIT | 0.38 | 0.37 | 0.53 | 0.53 | 0.58 | 0.54 | 0.86 | 0.86 | 1.5× |
 | 27 | 聚合 | group_by_multi | GROUP BY status,region | 513.44 | 535.97 | 547.24 | 547.24 | 6894.26 | 6905.43 | 6961.14 | 6961.14 | 13.4× |
 | 28 | 聚合 | having_avg_gt | GROUP BY+HAVING AVG>阈值 | 2116.48 | 2133.33 | 2139.83 | 2139.83 | 6701.29 | 6692.81 | 6825.02 | 6825.02 | 3.2× |
-| 29 | 排序 | orderby_multi | ORDER BY k,amount LIMIT 100 | 648.94 | 651.25 | 714.36 | 714.36 | 0.00 | 0.00 | 0.00 | 0.00 | **失败（SCC 安全阀拒绝）** ❌ MySqlError { ERROR 1064 (HY000): query error: query too expensive: ORDER BY 候选集过大（1100481 行，上限 200000），请加 WHERE 收敛或用 LIMIT } |
+| 29 | 排序 | orderby_multi | ORDER BY k,amount LIMIT 100 | 648.94 | 651.25 | 714.36 | 714.36 | 0.00 | 0.00 | 0.00 | 0.00 | **失败（cjserver 安全阀拒绝）** ❌ MySqlError { ERROR 1064 (HY000): query error: query too expensive: ORDER BY 候选集过大（1100481 行，上限 200000），请加 WHERE 收敛或用 LIMIT } |
 | 30 | 索引 | composite_idx_point | status= + ts= 点查 | 411.07 | 407.49 | 662.83 | 662.83 | 921.46 | 839.29 | 5191.41 | 5191.41 | 2.2× |
 | 31 | 索引 | composite_idx_range | ts 范围（非前置列） | 433.62 | 430.17 | 498.24 | 498.24 | 7300.89 | 7340.78 | 9632.46 | 9632.46 | 16.8× |
 | 32 | 批量写 | insert_batch_10000 | INSERT 10000 行/语句 | 260.21 | 249.62 | 287.91 | 287.91 | 396.07 | 401.93 | 442.32 | 442.32 | 1.5× |
