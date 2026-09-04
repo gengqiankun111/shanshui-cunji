@@ -4895,5 +4895,81 @@ mod tests {
             vec!["status".to_string(), "amount".to_string()]
         );
     }
+
+    // ---------- P91：投影列扫描 SQL 层等价（PAX 投影 vs 行式整行） ----------
+
+    #[test]
+    fn p91_projected_scan_sql_equivalence_row_vs_pax() {
+        // P91：同一逻辑数据分别入 行式（默认）与 PAX（hot_fields）两库并 flush 落 SST，
+        // 加部分 memtable 未刷盘行（版本混入）→ scoped 窗口全扫走 scan_stream_fields 投影
+        // 路径（PAX 只解请求列组装子集 JSON）——GROUP BY / 聚合结果必须与行式逐值一致。
+        fn build(hot: bool) -> (Engine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            if hot {
+                cfg.storage.hot_fields = vec!["status".into(), "amount".into(), "city".into()];
+            }
+            let mut e = Engine::open(dir.path(), &cfg).unwrap();
+            for i in 0..200u64 {
+                let mut doc = serde_json::Map::new();
+                let status = match i % 3 {
+                    0 => "active",
+                    1 => "closed",
+                    _ => "pending",
+                };
+                doc.insert("status".into(), serde_json::Value::String(status.into()));
+                doc.insert("amount".into(), serde_json::Value::from(i * 10u64));
+                let city = ["beijing", "shanghai", "shenzhen"][(i % 3) as usize];
+                doc.insert("city".into(), serde_json::Value::String(city.into()));
+                doc.insert("note".into(), serde_json::Value::String(format!("n{i}")));
+                if i % 7 == 0 {
+                    doc.remove("status"); // 缺字段行（NULL 组路径）
+                }
+                if i % 11 == 0 {
+                    doc.insert("amount".into(), serde_json::Value::Null); // JSON null
+                }
+                e.put(i, serde_json::to_vec(&serde_json::Value::Object(doc)).unwrap(), &[]).unwrap();
+            }
+            e.flush_primary().unwrap();
+            // flush 后追加（memtable 未刷盘 → 与 SST 投影行共存于 merge 赢家路径）
+            for i in 200..260u64 {
+                let doc = serde_json::json!({
+                    "status": if i % 2 == 0 { "active" } else { "closed" },
+                    "amount": i * 10,
+                    "city": "chengdu",
+                });
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+            }
+            (e, dir)
+        }
+        fn group_snapshot(e: &Engine, sql: &str) -> Vec<(Vec<Option<String>>, Vec<Option<String>>)> {
+            let r = execute_group_by_window(e, sql, 100_000, Some(0), None)
+                .unwrap()
+                .unwrap();
+            r.rows
+                .into_iter()
+                .map(|g| (g.keys, g.cells))
+                .collect()
+        }
+        let (rm, _rm_dir) = build(false);
+        let (px, _px_dir) = build(true);
+        for sql in [
+            "SELECT status, COUNT(*) FROM t GROUP BY status",
+            "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status",
+            "SELECT city, COUNT(*) FROM t GROUP BY city",
+        ] {
+            assert_eq!(group_snapshot(&rm, sql), group_snapshot(&px, sql), "GROUP BY 行式=PAX: {sql}");
+        }
+        for sql in [
+            "SELECT SUM(amount) FROM t WHERE status='active'",
+            "SELECT COUNT(*) FROM t WHERE status='active' AND amount>=1500",
+            "SELECT AVG(amount) FROM t WHERE city='beijing'",
+            "SELECT COUNT(amount) FROM t",
+        ] {
+            let a = execute_aggregate_window(&rm, sql, Some(0), None).unwrap().unwrap();
+            let b = execute_aggregate_window(&px, sql, Some(0), None).unwrap().unwrap();
+            assert_eq!((a.header.clone(), a.is_null, a.text.clone()), (b.header.clone(), b.is_null, b.text.clone()), "聚合 行式=PAX: {sql}");
+        }
+    }
 }
 
