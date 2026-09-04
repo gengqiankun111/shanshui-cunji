@@ -37,3 +37,10 @@ __pycache__/
 # 仓库根编译产物（构建后替换的服务器可执行文件，不入库）
 /cjserver.exe
 /shanshui-cunji-mysql-server.exe
+
+# ---- 临时/中间产物（不入库）----
+# 误入 src/ 的截图
+src/sqlish.jpg
+# 临时目录与临时 Python 脚本
+tmp/
+tmp_*.py
