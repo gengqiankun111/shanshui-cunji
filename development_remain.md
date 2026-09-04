@@ -4,6 +4,448 @@
 > **明确不开发**项 → development_givenup.md；
 > 本文件仅保留 **未完成 / 进行中 / 待评估 / 远期触发**。开发路线入口 = development.md §13 + 本文件。
 
+插队排期，优先开发：
+
+一、任务总览（按阶段分组）
+阶段	任务数	总工作量	核心交付
+立即执行（当前 Sprint）	5 项	3 天	字段注册表 Vec 化 + fxhash 局部替换 + Read Reorder
+阶段 1.5（核心优化）	7 项	3 周	FST 倒排字典 + 时间轮（TTL/Compaction/WAL）
+阶段 3（深度优化）	4 项	4 周	Ribbon Filter + Per-CPU WAL
+测试与验收	4 项	贯穿	性能基准 + 混沌测试
+二、立即执行任务（当前 Sprint，3 天）
+Task-001：字段注册表 Vec 化
+属性	内容
+优先级	P0
+工作量	0.5 天
+依赖	无
+风险	低
+具体工作：
+
+□ 将 HashMap<u16, FieldMeta> 替换为 Vec<FieldMeta>
+□ 新增 field_id 校验：确保 ID 连续无空洞（或支持稀疏 Vec 占位）
+□ 修改所有 registry.get(&id) → registry.get(id as usize)
+□ 删除相关锁（Vec 不可变读无需锁）
+□ 更新序列化/反序列化逻辑（字段 ID 直接作为索引存储）
+验收标准：
+
+单元测试全部通过
+
+基准测试：字段查找延迟降低 ≥30%
+
+Task-002：fxhash 局部替换（内部 Key）
+属性	内容
+优先级	P0
+工作量	1 天
+依赖	无
+风险	中（需区分内外 Key）
+具体工作：
+
+□ 在 Cargo.toml 引入 fxhash = "0.2"
+□ 替换以下模块的 HashMap：
+HotCache: DashMap<u64, Document> → 换 FxBuildHasher
+
+BlockCache: HashMap<(u64, u64), Block> → FxHashMap
+
+Manifest: HashMap<u64, SSTMeta> → FxHashMap
+
+□ 保留倒排字典的 DashMap<String, TermMeta> 使用默认 ahash（抗 HashDoS）
+□ 保留组合索引前缀缓存使用 ahash（Key 来自用户输入）
+□ 聚合临时表使用 FxHashMap<String, u64>（内部使用，不暴露）
+验收标准：
+
+所有单元测试通过（注意遍历顺序不确定性）
+
+基准测试：内部 Key 查找延迟降低 ≥15%
+
+安全测试：构造 HashDoS 攻击字符串，倒排字典不受影响
+
+Task-003：倒排回表 Read Reorder（排序预取）
+属性	内容
+优先级	P0
+工作量	1 天
+依赖	无
+风险	低
+具体工作：
+
+□ 在倒排查询回表阶段，收集所有 (FileID, BlockID, DocID) 三元组
+□ 按 (FileID, BlockID) 排序分组合并
+□ 每组一次性 preadv 批量读取（或异步批量提交）
+□ 实现 BlockCache 预取：排序后优先从缓存命中
+验收标准：
+
+压测：随机点查 IOPS 降低 ≥50%
+
+pre 系统调用次数减少 ≥60%
+
+Task-004：移除 HashMap 遍历顺序依赖（测试修复）
+属性	内容
+优先级	P0
+工作量	0.5 天
+依赖	Task-002
+风险	低
+具体工作：
+
+□ 全局搜索测试代码中的 assert_eq!(map.iter().collect(), vec![...])
+□ 替换为 assert!(map.contains_key(...)) 或排序后比较
+□ 修复倒排字典导出 Term 列表的测试用例
+验收标准：
+
+cargo test 全部通过（无顺序依赖失败）
+
+Task-005：性能基准基线采集
+属性	内容
+优先级	P0
+工作量	0.5 天
+依赖	无
+风险	低
+具体工作：
+
+□ 在执行任何优化前，运行完整性能基准套件
+□ 记录关键指标：
+点查 QPS / P95 延迟
+
+写入 TPS / P95 延迟
+
+倒排单 Term 查询 QPS
+
+TTL 删除扫描耗时（当前基准）
+
+冷启动时间
+
+□ 保存基线数据用于后续对比
+验收标准：
+
+基线数据已保存到 benchmarks/baseline_20260904.json
+
+三、阶段 1.5 核心优化（3 周）
+Task-006：FST 倒排字典（核心改造）
+属性	内容
+优先级	P0
+工作量	10 天
+依赖	无（可并行）
+风险	高（核心模块改动）
+具体工作：
+
+□ 引入 fst crate 或自研 FST 实现
+□ 设计双 FST 结构：base.fst（只读）+ delta.fst（可写）
+□ 实现 TermMeta 序列化到 FST Value（存储 (file_id, offset, length, doc_count)）
+□ 替换 DashMap<String, TermMeta> 查找逻辑
+□ 实现 FST Checkpoint：base.fst 固化 + delta.fst 合并
+□ Mmap 映射 base.fst 实现零拷贝读
+□ 构建期：从旧 HashMap 迁移到 FST（后台异步，双写过渡）
+□ 实现前缀搜索接口：search(prefix: &str) -> Vec<TermMeta>
+验收标准：
+
+冷启动时间：15s → <50ms（Mmap 直接映射）
+
+单 Term 查找 QPS 不下降（持平或略升）
+
+前缀查询性能：当前无法做 → >10 万 QPS
+
+内存占用：FST 比 HashMap 降低 ≥40%
+
+Task-007：层级时间轮基础框架
+属性	内容
+优先级	P0
+工作量	2 天
+依赖	无
+风险	低
+具体工作：
+
+□ 实现层级时间轮（秒/分/时/天 四级）
+□ 总桶数：60 + 60 + 24 + 365 = 509 个桶
+□ 实现接口：
+schedule(delay: Duration, task: Task)：注册延迟任务
+
+tick()：推进指针，执行到期任务
+
+□ 支持任务取消（返回 TaskHandle）
+□ 持久化检查点：每 10 分钟记录当前指针位置到磁盘
+□ 冷启动恢复：从检查点恢复 + 扫描元数据重建未完成任务
+验收标准：
+
+单元测试覆盖所有层级跃迁
+
+时间加速测试（MockClock）：验证 1 年 TTL 正确触发
+
+重启后任务不丢失（检查点恢复）
+
+Task-008：TTL 分区删除（时间轮集成）
+属性	内容
+优先级	P0
+工作量	2 天
+依赖	Task-007
+风险	低
+具体工作：
+
+□ SSTable Flush 时计算过期时间点：expire_at = max_timestamp + ttl
+□ 将 (file_id, bucket_path) 注册到时间轮对应槽位
+□ 时间轮 tick 触发时，检查到期 FileID 列表
+□ 验证文件全部过期后，删除整个目录（O(1)）
+□ 删除前更新 Manifest（原子操作）
+□ 支持 TTL 配置动态变更（已存在文件的 TTL 变更需重新计算）
+验收标准：
+
+10 亿数据场景：TTL 删除扫描耗时 <1 秒/次（原 5-10 分钟）
+
+删除延迟误差：≤ tick 精度（如 1 小时）
+
+删除过程不阻塞正常读写
+
+Task-009：Compaction 延迟重试（时间轮集成）
+属性	内容
+优先级	P1
+工作量	1 天
+依赖	Task-007
+风险	低
+具体工作：
+
+□ Compaction 失败（资源不足/锁冲突）时不 sleep 阻塞线程
+□ 改为注册到时间轮：schedule(Duration::from_secs(5), || retry_compaction(file_id))
+□ 指数退避：失败重试间隔 5s → 10s → 20s → ...
+□ 最大重试次数限制（如 10 次后告警）
+验收标准：
+
+Compaction 重试不阻塞后台线程池
+
+失败重试间隔精确可控
+
+Task-010：WAL 旧文件延迟删除（时间轮集成）
+属性	内容
+优先级	P1
+工作量	0.5 天
+依赖	Task-007
+风险	低
+具体工作：
+
+□ WAL 文件刷盘完成后，不立即 unlink
+□ 注册到时间轮：延迟 5 分钟后删除（确保所有读取完成）
+□ 删除前检查：last_read_timestamp 是否已超过安全窗口
+验收标准：
+
+无 "WAL 文件正在使用却被删除" 的报错
+
+旧 WAL 文件在安全延迟后自动清理
+
+Task-011：时间轮监控指标
+属性	内容
+优先级	P2
+工作量	0.5 天
+依赖	Task-007
+风险	低
+具体工作：
+
+□ 暴露时间轮指标：
+timewheel.current_slot
+
+timewheel.pending_tasks（各层级待执行任务数）
+
+timewheel.tasks_executed_total
+
+timewheel.tasks_failed_total
+
+□ 集成到 SHOW STATUS 命令
+验收标准：
+
+SHOW STATUS 能看到时间轮运行状态
+
+Task-012：阶段 1.5 集成测试
+属性	内容
+优先级	P0
+工作量	2 天
+依赖	Task-006 ~ Task-011
+风险	中
+具体工作：
+
+□ 端到端测试：写入带 TTL 数据 → 等待过期 → 时间轮触发删除
+□ 混沌测试：模拟重启（检查点恢复）
+□ 性能基准对比（vs 阶段 1.5 前）
+□ 回归测试：确保 FST 替换后查询结果一致
+验收标准：
+
+所有集成测试通过
+
+性能基准：整体 QPS 提升 ≥20%
+
+四、阶段 3 深度优化（4 周）
+Task-013：Ribbon Filter 替换 Bloom Filter
+属性	内容
+优先级	P1
+工作量	1 周
+依赖	无
+风险	中（需验证正确性）
+具体工作：
+
+□ 研究 Ribbon Filter 实现（参考 RocksDB 或 ribbon-filter crate）
+□ 在 SSTable Builder 中替换标准 Bloom 构建逻辑
+□ 保持 API 兼容（might_contain(key) -> bool）
+□ 支持从旧 Bloom 在线升级（读取时同时检查两种，写入时只写 Ribbon）
+□ 同内存配置下对比假阳性率
+验收标准：
+
+同内存配置：假阳性率降低 ≥30%
+
+构建速度不低于标准 Bloom
+
+查询性能不下降（CPU 缓存友好）
+
+Task-014：Per-CPU WAL RingBuffer
+属性	内容
+优先级	P2
+工作量	2 周
+依赖	无（可并行）
+风险	高（写入路径核心改动）
+具体工作：
+
+□ 为每个 CPU Core 绑定独立 WAL 写入队列（crossbeam::queue::ArrayQueue）
+□ 写入请求根据当前线程 CPU 亲缘性路由到对应队列
+□ 每个队列由独立后台线程消费（刷盘 + fsync）
+□ 全局 gseq 分配器确保跨队列序（或容忍乱序 + 恢复时重排序）
+□ 实现队列背压（队列满时阻塞或返回 503）
+□ 实现 io_uring 异步提交（阶段 3 目标）
+验收标准：
+
+写入 TPS 提升 ≥30%（vs 全局组提交）
+
+P99 延迟降低 ≥20%
+
+无锁竞争（perf lock 检查）
+
+Task-015：写路径多队列监控
+属性	内容
+优先级	P2
+工作量	0.5 天
+依赖	Task-014
+风险	低
+具体工作：
+
+□ 暴露每个队列的深度、消费速率、延迟
+□ 检测队列倾斜（某些核过载）
+□ 支持动态调整队列数（SIGHUP 重载）
+验收标准：
+
+SHOW STATUS 显示各队列健康度
+
+Task-016：阶段 3 性能压测与调优
+属性	内容
+优先级	P0
+工作量	1 周
+依赖	Task-013 ~ Task-015
+风险	中
+具体工作：
+
+□ 16 核 / 64G / NVMe 目标硬件复测
+□ 对比阶段 1.5 基准：
+写入：22 万 TPS → ≥32 万 TPS
+
+点查：85 万 QPS → ≥85 万 QPS（持平或略升）
+
+倒排：4 万 QPS → ≥5 万 QPS
+
+□ 调优参数（队列深度、批次大小、fsync 间隔）
+验收标准：
+
+所有性能目标达成（design.md §九 性能目标）
+
+P95 延迟不劣化
+
+五、测试与验收（贯穿）
+Task-017：HashDoS 安全测试
+属性	内容
+优先级	P0
+工作量	0.5 天
+依赖	Task-002
+风险	低
+具体工作：
+
+□ 构造 HashDoS 攻击字符串（fxhash 碰撞集）
+□ 验证倒排字典（ahash）不受影响
+□ 验证内部 Key（u64）不受影响
+验收标准：
+
+攻击下 CPU 不飙升，QPS 下降 <10%
+
+Task-018：时间轮混沌测试
+属性	内容
+优先级	P1
+工作量	1 天
+依赖	Task-007
+风险	低
+具体工作：
+
+□ 模拟时间跳跃（系统时间调整）
+□ 模拟重启（检查点恢复）
+□ 模拟高频任务注册（10 万/秒）
+□ 验证任务不丢失、不重复执行
+验收标准：
+
+所有混沌场景通过
+
+Task-019：升级兼容性测试
+属性	内容
+优先级	P1
+工作量	1 天
+依赖	所有优化
+风险	中
+具体工作：
+
+□ 老版本数据（旧 Bloom + HashMap 倒排）加载到新版本
+□ 验证查询结果一致
+□ 验证 TTL 时间轮能从老元数据重建
+□ 验证 WAL 恢复兼容
+验收标准：
+
+数据零丢失
+
+查询结果 100% 一致
+
+Task-020：最终验收报告
+属性	内容
+优先级	P0
+工作量	0.5 天
+依赖	所有任务
+风险	低
+具体工作：
+
+□ 汇总所有性能对比数据（优化前 vs 优化后）
+□ 编写验收报告（含硬件配置、压测参数、结论）
+□ 更新 design.md §23 设计决策归档
+□ 标记 opti_proj.md 中所有任务为 ✅ 完成
+验收标准：
+
+验收报告通过评审
+
+六、甘特图（时间线）
+text
+Week 1  | Task-001 ████▌ Task-002 ████████▌ Task-003 ████████▌ Task-004 ████▌ Task-005 ████▌
+Week 2  | Task-006 ████████████████████████████████████████████████████████████████████████
+Week 3  | Task-006 ████████████████████████████████████████████████████████████████████████
+Week 4  | Task-006 ████████████████████████████████▌ Task-007 ████████████▌ Task-008 ████████▌
+Week 5  | Task-009 ████████▌ Task-010 ████▌ Task-011 ████▌ Task-012 ████████████████▌
+Week 6  | Task-013 ██████████████████████████████████████████████
+Week 7  | Task-013 ████████████▌ Task-014 ██████████████████████████████████████████████████
+Week 8  | Task-014 ██████████████████████████████████████████████████
+Week 9  | Task-014 ████████████████████▌ Task-015 ████▌ Task-016 ████████████████████████████
+Week 10 | Task-016 ██████████████████████████████████▌ Task-017 ████▌ Task-018 ████████▌ 
+        | Task-019 ████████▌ Task-020 ████▌
+总工期：10 周（约 2.5 个月）
+
+七、风险与依赖总结
+风险	影响任务	缓解措施
+FST 实现复杂度超预期	Task-006	先用 fst crate，后续自研
+Per-CPU WAL 乱序问题	Task-014	全局 gseq 分配器兜底
+时间轮检查点恢复不一致	Task-007	启动时全量扫描重建（可接受慢启动）
+Ribbon Filter 正确性存疑	Task-013	并行验证（新旧同时检查 1 周）
+fxhash 分片负载不均	Task-002	仅对 u64 内部 Key 替换，String 保留 ahash
+八、里程碑
+里程碑	时间	关键交付
+M1: 立即优化	Week 1 结束	Vec 注册表 + fxhash 局部替换 + Read Reorder
+M2: 阶段 1.5 完成	Week 5 结束	FST 倒排 + 时间轮（TTL/Compaction/WAL）
+M3: 阶段 3 完成	Week 9 结束	Ribbon Filter + Per-CPU WAL
+M4: 验收完成	Week 10 结束	验收报告 + 所有性能目标达成
+
+插队完成
+----------
 ## 一、进行中（P0/P1 已立项，2026-09-03）
 
 ### 1. 真多表支持（表级主键空间隔离，用户 2026-09-03 确认语义并排期，commit 9d3e155 已建 M1 起点）
@@ -110,8 +552,8 @@
 |---|---|---|---|---|
 | P2-B | 删除位图稀疏化（多表 docid 主题最后硬伤） | DeletionBitmap 现按 docid 稠密 `Vec<u8>` 寻址（bitmap.rs）→ 非默认表高位 docid（tid<<48）下 delete/DROP 内存爆炸（理论 32TB），M3 收尾只能关 `storage.deletion_bitmap_enabled` 降级 Tombstone。**demo 已验证方案 a（RoaringTreemap）+ kernel 已整合（src/bitmap.rs 重写）：** 稠密 Vec<AtomicU8> → RoaringTreemap 稀疏位图 + ArcSwap COW 无锁读 + 全量序列化持久化；21 单测 + 7 引擎测试全绿；API 完全兼容（mark_deleted/clear/is_deleted/is_deleted_key/deleted_count/has_pending/flush/purge 签名不变） | 非默认表开 deletion_bitmap 跑 rr-conformance 双表 DELETE/DROP 不 OOM；默认表单删回归不退化 | ✅ 已完成 |
 | **P80** | **compact_merge 流式 k 路归并修复（高阻塞）** | 当前 compact_merge 全量 Vec 物化 + watchdog 500ms 空转 → 大表合并卡死，阻塞 Ex-8.12 L2 压缩默认化。**已完成：** 流式 k 路归并（逐行推进不提前物化所有堆节点）+ 合并推进语义修正（watchdog 不重复空转） | 5M/50m 双规模复现不卡死；合并推进语义正确；验收线通过 | ✅ 已完成 |
-| **P0-A (高)** | **SQL 组合索引：混合扫描兜底 + 声明式路由（用户选"两者都做"）** | 阶段 1 混合扫描兜底：status 位图倒排候选 + ts/amount 范围条件进倒排/位图（数值范围位图或行过滤降载），先收敛 #30/#31 全扫过滤；阶段 2 声明式路由：schema `composite_indexes` → sqlish `try_composite_index` 提取 WHERE 等值条件匹配最左前缀 → `query_by_composite_prefix`（cidx 前缀扫描 + 回表）。**已完成：** engine.rs `query_by_composite_prefix()` 写+读路径 + optimizer.rs `QuerySpec.index_prefix` + sqlish.rs `try_composite_index` 声明式路由 + stale 键复筛 + 8 单测（引擎层 1 + 优化器层 2 + SQL 层 4 + CF 层 1） | #30 status='active' AND ts=? 921ms → <10ms（30M 外推 ~25s → <1s）；#31 ts BETWEEN 7300ms → 同量级收敛（MySQL 对照 0.30 / 1.40ms）。注：MySQL 覆盖索引免回表，cjserver cidx+回表非覆盖，全平需 cidx 存全部查询列。**复测回填（2026-09-04，配置声明无代码改动）：** `composite_indexes=[["status","ts"]]` 下 #30 110 万 **0.25ms**（≈ MySQL 0.30ms，验收 <10ms 超额越过）；#31（ts 非前置列范围）706ms 不收敛——MySQL skip scan 语义不在 cjserver 优化器能力内，该形态需另声明单列 `["ts"]`（同样无代码改动） | ✅ 已完成 |
-| **P0-B (高)** | **ORDER BY Top-K 有界堆** | sqlish `SORT_MAX_ROWS=200_000` 守卫对含 ORDER BY 全量物化、忽略 LIMIT → 110 万行 + LIMIT 100 被 1064 拒。改 LIMIT k（小 k）走 BinaryHeap 部分有序（内存 O(k)）；无 LIMIT 保留全量守卫 | #29 ORDER BY k,amount LIMIT 100：1064 拒绝 → 可跑（110 万 ~1.2s；30M 外推 2-4s）；窗口/早停路径不回归 | ⏳（Top-K 有界堆 ✅ + P87 流式化 ✅；**复测闭环 2026-09-04：#29 110 万 17.9s → 13.1s**（行式默认布局，-27%，仍 25.3× MySQL），未达 ≤1.5s 验收线——残余瓶颈 = 1.1M 候选**逐 docid 投影点查定位**（batch_get_fields ~11µs/docid）；PAX(hot_fields) 轮 18.9s 亦未达且拖慢全扫聚合（PAX 通用扫描未接线）→ **收口续作 P91（通用 scan 投影列 + 块流式取数）**，2026-09-04） |
+| **P0-A (高)** | **SQL 组合索引：混合扫描兜底 + 声明式路由（用户选"两者都做"）** | 阶段 1 混合扫描兜底：status 位图倒排候选 + ts/amount 范围条件进倒排/位图（数值范围位图或行过滤降载），先收敛 #30/#31 全扫过滤；阶段 2 声明式路由：schema `composite_indexes` → sqlish `try_composite_index` 提取 WHERE 等值条件匹配最左前缀 → `query_by_composite_prefix`（cidx 前缀扫描 + 回表）。**已完成：** engine.rs `query_by_composite_prefix()` 写+读路径 + optimizer.rs `QuerySpec.index_prefix` + sqlish.rs `try_composite_index` 声明式路由 + stale 键复筛 + 8 单测（引擎层 1 + 优化器层 2 + SQL 层 4 + CF 层 1） | #30 status='active' AND ts=? 921ms → <10ms（30M 外推 ~25s → <1s）；#31 ts BETWEEN 7300ms → 同量级收敛（MySQL 对照 0.30 / 1.40ms）。注：MySQL 覆盖索引免回表，cjserver cidx+回表非覆盖，全平需 cidx 存全部查询列。**复测回填（2026-09-04）：** v3 声明 `(status,ts)` 下 #30 110 万 **0.25ms**；v4 增 `["ts"]`：#30 0.33ms、#31 仍 902ms（**仅声明不收敛——`try_composite_index` 只路由 WHERE 等值，BETWEEN 属代码缺口**）；**v5（P92 范围路由代码）**：#30 **0.30ms**（≈ MySQL 0.30ms）、#31 **15.24ms**（v4 902ms → 59×，368 行 cidx 范围扫描+回表+复筛；MySQL 1.40ms 为覆盖索引免回表） | ✅ 已完成 |
+| **P0-B (高)** | **ORDER BY Top-K 有界堆** | sqlish `SORT_MAX_ROWS=200_000` 守卫对含 ORDER BY 全量物化、忽略 LIMIT → 110 万行 + LIMIT 100 被 1064 拒。改 LIMIT k（小 k）走 BinaryHeap 部分有序（内存 O(k)）；无 LIMIT 保留全量守卫 | #29 ORDER BY k,amount LIMIT 100：1064 拒绝 → 可跑（110 万 ~1.2s；30M 外推 2-4s）；窗口/早停路径不回归 | ⏳（Top-K 有界堆 ✅ + P87 流式化 ✅；**复测闭环 2026-09-04：#29 110 万 17.9s → 13.1s**（行式默认布局，-27%，仍 25.3× MySQL），未达 ≤1.5s 验收线——残余瓶颈 = 1.1M 候选**逐 docid 投影点查定位**（batch_get_fields ~11µs/docid）；PAX(hot_fields) 轮 18.9s 亦未达且拖慢全扫聚合（PAX 通用扫描未接线）→ **收口 P91/P92 已落地**（scan 投影列 + 稠密窗口流式，2026-09-04）：复测 17.9→13.1（P87）→**10.0s（P92，-26% vs v4）**——逐 docid 点查定位已消除，残余 = 行式全量读 ~1.1GB IO 地板；破 ≤1.5s 需 PAX 列 IO 排序键扫描（P93 候选） |
 | **P1-C (中)** | **无索引聚合加速** | COUNT(*)/SUM(amount)/GROUP BY（无索引列）现全扫解 25 列宽行：①COUNT 走 keys-only 扫描（复用 count_keys_range 基建不解行值，**已接线**）；②声明式统计载荷（Ex-9.3 ⑤ SUM/AVG/MIN/MAX 随 term 载荷）推广到高频数值列默认启用。**已完成部分（2026-09-04）：** `Engine::count_all_docs` **O(1)**——活跃 docid 集（RoaringTreemap）懒建基线（首次 COUNT 全键扫一次，重启恢复）+ put/delete/delete_batch/purge 增量记账（新 docid/复活 +1、覆盖不变、删除幂等 -1、purge 复位 0），COUNT(*) 从全键扫 O(N) → 增量读 O(1)；1 新增单测（put/覆盖/删除/复活/delete_batch/purge/重开全路径 = scan 口径）。**Ex-9.3 ⑤ 默认化前置阻塞解除**。剩余 ② 载荷默认启用随 Ex-9.3 ⑤ 默认化执行 | 110 万行 count_all 5869ms → keys-only ~1800ms（~3×）；30M 外推 ~50s。5-10s 需 zonemap/列存配合（远期）。**复测回填（2026-09-04）：count_all_docs O(1) 已生效（sqlish 直连，单测覆盖）；但 MySQL 协议层聚合按"本表 docid 窗口"执行 → 默认表 [0,2^48) 窗口仍走 keys-only 全扫（110 万 407ms，2.6× MySQL）——窗口全包直通 count_all_docs 待接线（随 P91）** | ⏳（剩 ② 载荷默认启用，随 Ex-9.3 ⑤ 默认化执行） |
 | **P1-D (中)** | **倒排统计载荷范围条件扩展（design_goal 断裂点 G3）** | **引擎已实现** engine.rs `inverted_term_stats()` 支持随 term 的 SUM/AVG/MIN/MAX 载荷聚合。**协议层断裂：** sqlish.rs 仅裸 `field=value` 等值条件才走统计载荷路径（`execute_aggregate_window` 等值分支）；`BETWEEN`/范围条件或 `status='active' AND ts>?` 组合条件回退全扫解行。需扩展统计载荷路由至范围/组合条件（倒排候选 ∩ 范围过滤后走载荷，而非全扫）。**已完成（2026-09-04，P1-D 扩展）：** `status='active' AND ts>?` / `BETWEEN` 组合聚合路由——`candidate_posting` 倒排候选收敛后**按需解列**：`aggregate_needed_fields`（WHERE 引用 + 聚合列的顶层字段集，点路径取顶层键、去重）→ 候选 512/块 `engine.batch_get_fields`（PAX 列解码 / 行式按需字段提取，P86②/P87② 基建）→ `subset_doc` 子集对象 → 残余范围/BETWEEN/复合条件在子集上判定 → 聚合累积——替代原整行 `engine.get` 全 25 列解码。**语义等价说明：** 含范围/组合过滤时 term 级统计载荷不可直接取（须逐行判范围），投影解列承载同一"免全扫解 25 列"目标；行缺失/JSON null/非数值语义与整行路径精确一致（子集缺失 = 原文档缺失）。**1 新增单测：** SUM/COUNT/AVG × AND(等值,`>=`)/BETWEEN × 多字段组合 + 无命中 NULL + 字段集去重。回归 688 全绿 | 110 万行 sum_where_enum 6524ms → 倒排候选+载荷 ~500ms（~13×）；30M 外推从 ~180s → ~15s（回归 688 全绿）。**复测回填（2026-09-04）：sum_where_enum 110 万 839→841ms 持平未降——残余 = 22 万候选逐 docid 投影点查定位（batch_get_fields ~3.8µs/docid），解码瘦身被定位开销淹没 → 随 P91 块流式取数收口** | ✅ 已完成（2026-09-04） |
 | P2-A | 事务/写路径 fsync 语义对等 | **根因核对（①）：** sqlrun/rr-conformance 事务经 MySQL 协议 → db_adapter COMMIT → engine.txn_commit 尾部**无条件 flush_wal()**（位图 + primary/delta/outbox 三路 fsync）——组提交（mysql_server 默认 2000µs）只摊薄非事务 put，事务 COMMIT **不落攒批、逐次显式 fsync**（8× 直接原因）。**config 可配档位（②，已完成）：** 新增 `storage.flush_log_at_trx_commit`（0/1/2 默认 1，validate 校验；对齐 MySQL innodb_flush_log_at_trx_commit）——txn_commit 落盘改走 `commit_persist()`：档位 1 = 每次 COMMIT flush_wal（强安全，现状保持）；档位 0/2 = COMMIT 交组提交窗口（`maybe_group_commit`：并发 COMMIT 共享一次 fsync；组提交关自动回退强安全）。4 新增单测（durability1 pending=0 / durability2 攒批+后台兜底+重开完整 / durability2+组提交关回退 / 档位 3 拒绝）。**③档位语义已写入** user_guide/宽表SQL性能基准记录.md §13。0/2 当前等价（无 InnoDB redo 的 OS-cache-only 层）已在文档标注 | 并发场景 ≤2-3×；单连接结构差 4-5×（每 COMMIT fsync 语义差难消） | ✅ 已完成（代码+单测+文档；**2026-09-04 档位 2 实测：1.1M 事务探针 vs MySQL 全部 1.0-1.4×（#25 8.4×→1.4×、#35/#36 ~6×→~1×），验收线全部越过**，见基准记录 §14） |
@@ -146,6 +588,7 @@
 | **P90 (中，独立立项)** | **PAX 聚合接线（optimizer_integration_design §9.6，独立立项，不并入写路径重构）** | **现状：** P3-B SST v6 已落 PAX 列存 + FieldZone.sum（sstable.rs），但 `decode_pax_block_column` **零调用点**、`FieldZone.sum`/`present_count` **无生产消费方**——SUM/AVG 等聚合仍全扫解全行。**开发：** ① CF 层 scan 投影列 API（只解所需列：PAX 块走列解码 / 行式块按需字段提取，复用 P86② 基建）；② 块级 `sum`/`present_count` 下推——SUM/AVG 聚合免读数据块（索引 zones 已含块级统计）；③ tombstone/delta 混入块回退行级精确聚合（版本敏感场景禁用块级近似）；④ 与 P1-C/P1-D 统计载荷路径经 cost_route 选路协同。**已完成（2026-09-04，P90）：** ② 块级下推接线——CF `zone_field_aggregate`（eligible：memtable 空 + 单一非空层（L0 仅单文件 / L1/L2 层内不重叠）+ 窗口内全 PAX v6 块且整块落窗 + 块 zones 含目标字段）+ Engine `zone_field_aggregate` 前置（删除位图无置位 / delta 空 / 无活跃快照）+ sqlish `execute_aggregate_window` 无 WHERE `SUM(f)`/`COUNT(f)` 快路径（present-null 计 COUNT(f) 精确；`zsum!=0` 时 SUM 精确——**零和/列非数值歧义回退行级**保证 NULL/0 语义）。③ 版本混入回退：memtable/delta/删除位图/活跃快照任一非空 → None 回退行级精确（语义不变）。**新增单测：** SUM/COUNT 块级与行级等值（PAX 单段）、memtable 写入回退且含新行、全零和回退不误报 NULL、AVG/MIN/MAX 行级精确。**已知边界（写入排期行）：** AVG/MIN/MAX 未走块级——FieldZone 无"数值行数/列纯数值"信息（含非数值行时编码器清零 sum），无法精确导出 avg/min/max 语义 → 保持行级（正确性优先；如需块级 AVG 需 v6+ 格式增 numeric_count，另行评估）。回归 687 全绿 | SUM(amount)/AVG(amount) 无 WHERE 全扫：块级 sum 下推跳过数据块读取、命中块仅解单列；版本混入/位图删除场景正确回退行级；与 Ex-9.3⑤ 载荷、P1-D 范围扩展不冲突（SUM/COUNT(f) 已块级；AVG/MIN/MAX 行级精确）。**复测回填（2026-09-04）：行式默认布局（无 hot_fields）下块级路径不 eligible（要求全 PAX 块）→ 走行级精确路径，语义正确无回退误报；PAX(hot_fields) 布局下通用全扫聚合回归 5-8s 属"PAX 通用扫描未接线"（P91 收口），非块级下推本身问题** | ✅ 已完成（2026-09-04，P90） |
 
 | **P91 (中，2026-09-04 排期追加)** | **通用 scan 投影列（收口 ② 剩余全扫聚合 / 复测闭环 ①-b 残余）** | **背景：** 复测闭环（2026-09-04）量化 ② 剩余全扫聚合 #12 407ms/#13 841/#14 900/#27 1044/#11 1504ms（均行式默认布局、IO/整行解码受限）且发现 PAX(hot_fields) 布局下**通用全扫聚合整体回归 5-8s**（PAX 块整行重构 + 重序列化逐行 25 列，decode_pax_block 为每行构建全列 serde Map + to_vec）。**开发：** ① sstable `decode_projected_block`（PAX 块只解请求列 → 组装子集 JSON，免整行重构；行式块直通原 JSON 零开销）+ `SstRangeIter.project`（`set_project_fields`）；② CF `scan_stream_at` 增 project 参数 + `scan_stream_fields` 包装；③ Engine `scan_stream_fields`（删除位图语义同 scan_stream）；④ sqlish 全扫消费端接线——`execute_aggregate_window` 无候选全扫 & `execute_group_by_window` 全扫改走投影扫描（needed = WHERE 引用 ∪ 分组列 ∪ 聚合列：`aggregate_needed_fields`/`group_scan_needed_fields`），语义与整行路径精确一致（PAX 子集含全部消费字段；缺失 = 原文档缺失）。**1 新增单测：** `p91_scan_stream_fields_matches_scan_stream_row_and_pax`（行式 + hot_fields PAX × memtable/flush/覆盖写/删除/重开，请求列与全量扫描逐行等值）。回归 690 全绿 | PAX 布局下全扫聚合不再整行重构回归（预期回到 ≤ 行式量级或更快——只解所需列）；行式默认布局 #14/#27/#11 等 IO 受限项语义不变（不回归）；#12/#13/#14 的窗口快路径（count O(1) / 倒排词典枚举）与 #29 块流式 Top-K 接线为 P92 候选（见对比报告 §5.3 判定） | ✅ 已完成（代码+单测 2026-09-04；PAX 全轮实测数值随后续基准轮回填） |
+| **P92 (中，2026-09-04 追加，收口 ①-b #29 与 #31 范围形态)** | **Top-K 稠密窗口投影流式 + 单列组合索引范围路由** | **背景：** 复测闭环①-b #29 残余 = 1.1M 候选逐 docid 投影点查定位（batch_get_fields ~11µs/docid，P87 流式化未省定位）；#31 ts BETWEEN 经 v3/v4 两轮证明**纯配置（声明 ["ts"]）不收敛**——`try_composite_index` 只路由 WHERE 等值，范围/BETWEEN 属代码缺口。**开发：** ① sqlish `topk_sort` 候选**稠密**（跨度 ≤4× 候选数）→ 走 `engine.scan_stream_fields` 投影流式顺序读块（PAX 列解码/行式按需只解排序键），替代逐 docid 点查；稀疏保持 P87 分块点查；看门狗逐行熔断（保 P87 语义）。② engine `query_by_composite_range`（单列组合索引首字段值 ∈[low,high] 字节序区间 cidx 范围扫描+回表去重）+ sqlish `try_composite_index` BETWEEN 分支（WHERE 复筛兜底边界字节序误命中）。**3 新增单测：** topk 稠密流式/稀疏点查/单键 DESC × 行式+PAX = 全扫地面真值、cidx 范围路由命中集 = BETWEEN 全扫语义（含边界）。回归 693 全绿。**v5 实测（110 万，重装后立即跑）：** #29 13.5→10.0s（-26%，点查定位消除，残余=行式全量读 ~1.1GB IO 地板）；#31 902→15.24ms（59×，368 行 cidx 回表+复筛）；#30 0.30ms（≈MySQL） | #29 点查定位消除（破 ≤1.5s 需 PAX 列 IO 排序键扫描 = P93 候选）；#31 收敛 15ms 级（MySQL 1.40ms 为覆盖索引免回表）；**已知边界：cidx nosync 未刷盘重启丢键（v5 首测 #31=0 行即此），基准轮须重装后立即跑** | ✅ 已完成（代码+单测+v5 实测 2026-09-04） |
 
 ## 二、待办 / 排期（P2/P3 与受控实验）
 
