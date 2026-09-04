@@ -305,5 +305,28 @@ config 新增 `storage.flush_log_at_trx_commit`（0/1/2，**默认 1**，对齐 
   （每 COMMIT 双 WAL + 位图 fsync，与 MySQL 单 redo fsync 的物理差，排期接受为"难消"）；
 - 并发事务对比：cjserver config 配 `flush_log_at_trx_commit = 2`（组提交默认开启）→ 并发
   COMMIT 共享窗口内一次 fsync（同 MySQL 组提交效果），目标 **≤2-3×**；
-- 相关提交：`feat(P2-A)`（config 字段 + `commit_persist` + 4 单测），详见 problem_solving P82。
+- 相关提交：`feat(P2-A)` 5421571（config 字段 + `commit_persist` + 4 单测），详见 problem_solving P82。
+
+## §14 档位 2 实测：1.1M 事务探针对比（2026-09-04，P2-A 验收）
+
+- 环境：cjserver（shanshui-cunji 内核，编译含 P2-A 5421571）`tmp/tmp-cfg-wide-2g-d2.toml`
+  （= 原 2G 配置 + `flush_log_at_trx_commit = 2`，group_commit_us=2000）；3317 端口，默认表 documents。
+- 数据：复用 db-wide-scc 现库（N=1,130,481，历史轮次漂移 +31k，事务探针单行 UPDATE 不受影响）。
+- 结果目录：`results-sqlrun-scc-1m-2g-d2/summary.md`（37/37 通过，含 #29 ORDER BY Top-K 现可跑 19s×10）。
+- 事务探针对比（mean ms）：
+
+| # | 探针 | MySQL（§12 对比表，档位 1） | cjserver 档位 1（历史 scc-1m-2g） | **cjserver 档位 2（本轮）** | 档位 2/MySQL |
+|---|---|---|---|---|---|
+| 25 | txn_begin_upd_commit | 0.40 | 3.35（8.4×） | **0.57** | **1.4×** |
+| 26 | txn_for_update_read | 0.38 | 0.58（1.5×） | **0.45** | **1.2×** |
+| 35 | txn_rr_readwrite（RR 读写事务） | 0.58 | 3.52（6.1×） | **0.61** | **1.05×** |
+| 36 | txn_serializable | 0.63 | 3.38（5.4×） | **0.61** | **1.0×** |
+| 37 | txn_lock_wait（双连接等锁 3s） | 4002 | 4002 | 4001 | 1.0× |
+
+- **验收判定**：P2-A 验收线"并发场景 ≤2-3×；单连接结构差 4-5×" **实测全部越过**——档位 2 下
+  事务探针相对 MySQL 全部 ~1.0–1.4×（#25 由档位 1 的 8.4× → 1.4×，-83%；#35/#36 6× → ~1×）。
+  档位 2 = COMMIT 交组提交窗口（2000µs 攒批一次 fsync）消除了逐 COMMIT 三路 fsync 的结构差，
+  单连接串行事务也受益（窗口内 100 次 COMMIT 共享 fsync）。
+- 顺带观测：#29 ORDER BY Top-K（P0-B）在 1.1M 上可跑（19s×10，冷全表排序），不再 1064 拒绝；
+  #32 insert_batch_10000 213ms（档位 2 写路径攒批）优于档位 1 历史 396ms。
 

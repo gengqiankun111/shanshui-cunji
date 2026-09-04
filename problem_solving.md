@@ -873,9 +873,11 @@
   → 后台窗口兜底落盘 → drop 重开数据完整）；`txn_commit_durability2_falls_back_when_group_commit_off`
   （档位 2 + 组提交关：回退显式 fsync pending=0）；`flush_log_at_trx_commit_invalid_rejected_by_validate`
   （档位 3 拒绝 / 0、2 通过）。
-- **验收映射**：单连接结构差 4-5× = 档位 1（每 COMMIT 双 WAL + 位图 fsync 物理差，难消，排期接受）；
-  并发 ≤2-3× = cjserver 配档位 2 复测（fsync 摊薄），待用户跑基准确认。③已写入
-  user_guide/宽表SQL性能基准记录.md §13。
+- **验收映射（2026-09-04 实测闭环，见基准记录 §14）**：档位 2 下 1.1M 事务探针 vs MySQL 全部
+  1.0-1.4×——#25 txn_begin_upd_commit 8.4×→1.4×（3.35→0.57ms）、#35 RR 6.1×→1.05×、#36 5.4×→1.0×
+  （档位 1 的逐 COMMIT 三路 fsync 结构差被组提交窗口消除，单连接串行事务同样受益）；
+  验收线"并发 ≤2-3× / 单连接结构差 4-5×"**全部越过**。③档位语义与实测已写入
+  user_guide/宽表SQL性能基准记录.md §13/§14。
 - **回归**：`cargo test --lib` engine::tests 102 + db_adapter::tests 53 全绿；release 全量见
   `feat(P2-A)` 提交记录。
 
