@@ -19,6 +19,7 @@
 
 use crate::engine::{Engine, QueryRow};
 use crate::error::{Error, Result};
+use crate::sstable::ZonePredicate;
 // 64 位 docid 域（多表 docid = table_id<<48|row，查询层位图必须 u64）
 use roaring::treemap::RoaringTreemap as RoaringBitmap;
 use serde_json::Value;
@@ -52,6 +53,9 @@ pub enum WhereExpr {
     Cond(Cond),
     /// `field BETWEEN low AND high`（闭区间，数值/字典序）。
     Between { field: String, low: String, high: String },
+    /// `field LIKE pattern`（SQL 通配，仅支持 `%` = 任意长度串，含空串）。
+    /// 解析期分类：无 `%` → 折叠为 `Cond(Eq)`；含 `%` → 保留本变体（倒排不可表达 → 扫描）。
+    Like { field: String, pattern: String },
     Not(Box<WhereExpr>),
     And(Box<WhereExpr>, Box<WhereExpr>),
     Or(Box<WhereExpr>, Box<WhereExpr>),
@@ -608,6 +612,20 @@ impl Parser {
             }
             return Ok(acc);
         }
+        // LIKE：`field LIKE 'pattern'`（SQL 通配 `%`）。无 `%` → 折叠为等值（走倒排/索引）；
+        // 含 `%` → WhereExpr::Like（倒排不可表达 → 扫描后过滤/全扫，见 eval/scan_leaf）。
+        if matches!(self.peek()?, Tok::Ident(k) if k.eq_ignore_ascii_case("like")) {
+            self.next()?; // like
+            let pat = self.value()?;
+            if !pat.contains('%') {
+                return Ok(WhereExpr::Cond(Cond {
+                    field,
+                    op: CmpOp::Eq,
+                    value: pat,
+                }));
+            }
+            return Ok(WhereExpr::Like { field, pattern: pat });
+        }
         // BETWEEN：`field BETWEEN low AND high`（闭区间）
         if matches!(self.peek()?, Tok::Kw(k) if k == "BETWEEN") {
             self.next()?;
@@ -974,6 +992,7 @@ fn light_leaf_result<'a>(doc: &'a [u8], leaf: &Leaf<'a>) -> Option<bool> {
     let field = match leaf {
         Leaf::Cmp(c) => c.field.as_str(),
         Leaf::Between { field, .. } => field,
+        Leaf::Like { field, .. } => field,
     };
     if field.contains('.') {
         return None;
@@ -982,6 +1001,7 @@ fn light_leaf_result<'a>(doc: &'a [u8], leaf: &Leaf<'a>) -> Option<bool> {
     match (leaf, lv) {
         (Leaf::Cmp(c), lv) => Some(light_cmp_value(lv, &c.op, &c.value)?),
         (Leaf::Between { low, high, .. }, lv) => Some(light_between_value(lv, low, high)?),
+        (Leaf::Like { pattern, .. }, lv) => Some(light_like_value(lv, pattern)?),
     }
 }
 
@@ -996,6 +1016,16 @@ fn light_between_value<'a>(lv: LightVal<'a>, low: &str, high: &str) -> Option<bo
         }
         LightVal::Str(bytes) => Some(bytes >= low.as_bytes() && bytes <= high.as_bytes()),
         LightVal::Bool(_) => Some(false),
+    }
+}
+
+/// LIKE 轻量判定（字节级）：仅 Str 参与（`%` 通配）；Str 字节为无转义 UTF-8 → 转 str 复用
+/// `like_match`；非字符串值恒 false（对齐 serde 路径）。
+fn light_like_value<'a>(lv: LightVal<'a>, pattern: &str) -> Option<bool> {
+    match lv {
+        LightVal::Absent | LightVal::Complex | LightVal::Null | LightVal::Bool(_) => Some(false),
+        LightVal::Str(bytes) => Some(like_match(std::str::from_utf8(bytes).ok()?, pattern)),
+        LightVal::Num(_) => Some(false),
     }
 }
 
@@ -1112,6 +1142,48 @@ fn between_value(doc_val: &Value, low: &str, high: &str) -> bool {
     }
 }
 
+/// LIKE 行级判定（serde 路径）：仅字符串字段参与；`%` 通配任意长度串（含空串）。
+fn like_value(doc_val: &Value, pattern: &str) -> bool {
+    match doc_val {
+        Value::String(s) => like_match(s, pattern),
+        _ => false,
+    }
+}
+
+/// SQL `%` 通配匹配（不支持 `_` 单字符通配，也不做 `ESCAPE` 转义——`%` 恒为通配符）。
+/// 经典双指针贪心：`*`（%）= 任意长度串（含空）。`star` 记录最近 `%` 位置，
+/// 失配时回退让 `%` 多吞一个字符重试。
+fn like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (n, m) = (t.len(), p.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut star: Option<usize> = None; // 最近 % 在 pattern 的下标
+    let mut mark = 0usize; // star 对应时目标串位置
+    while i < n {
+        if j < m && p[j] == t[i] {
+            i += 1;
+            j += 1;
+        } else if j < m && p[j] == '%' {
+            star = Some(j);
+            mark = i;
+            j += 1;
+        } else if let Some(s) = star {
+            // 回退：让最近 % 多吞 t[i]，从其下一位置继续
+            j = s + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
+        }
+    }
+    // 文本耗尽后，pattern 剩余须全为 %
+    while j < m && p[j] == '%' {
+        j += 1;
+    }
+    j == m
+}
+
 impl WhereExpr {
     /// 行级判定（7.95 聚合全量过滤用）：文档 JSON 值是否满足表达式（递归 AND/OR/NOT），
     /// 与 eval 位图语义一致（字段点路径；数值/字典序比较）。
@@ -1123,6 +1195,9 @@ impl WhereExpr {
             WhereExpr::Between { field, low, high } => field_of(doc, field)
                 .map(|v| between_value(v, low, high))
                 .unwrap_or(false),
+            WhereExpr::Like { field, pattern } => field_of(doc, field)
+                .map(|v| like_value(v, pattern))
+                .unwrap_or(false),
             WhereExpr::Not(x) => !x.matches_doc(doc),
             WhereExpr::And(a, b) => a.matches_doc(doc) && b.matches_doc(doc),
             WhereExpr::Or(a, b) => a.matches_doc(doc) || b.matches_doc(doc),
@@ -1130,10 +1205,11 @@ impl WhereExpr {
     }
 }
 
-/// 扫描叶子（比较/BETWEEN——倒排无法表达，作后过滤/全量扫描）。
+/// 扫描叶子（比较/BETWEEN/LIKE——倒排无法表达，作后过滤/全量扫描）。
 enum Leaf<'a> {
     Cmp(&'a Cond),
     Between { field: &'a str, low: &'a str, high: &'a str },
+    Like { field: &'a str, pattern: &'a str },
 }
 
 /// 若表达式是裸扫描叶子则返回（用于 AND 后过滤快路径）。
@@ -1141,6 +1217,7 @@ fn scan_leaf<'a>(e: &'a WhereExpr) -> Option<Leaf<'a>> {
     match e {
         WhereExpr::Cond(c) if !matches!(c.op, CmpOp::Eq | CmpOp::Ne) => Some(Leaf::Cmp(c)),
         WhereExpr::Between { field, low, high } => Some(Leaf::Between { field, low, high }),
+        WhereExpr::Like { field, pattern } => Some(Leaf::Like { field, pattern }),
         _ => None,
     }
 }
@@ -1169,6 +1246,9 @@ fn leaf_passes(engine: &Engine, docid: u64, leaf: &Leaf) -> Result<bool> {
         Leaf::Between { field, low, high } => Ok(field_of(&val, field)
             .map(|v| between_value(v, low, high))
             .unwrap_or(false)),
+        Leaf::Like { field, pattern } => Ok(field_of(&val, field)
+            .map(|v| like_value(v, pattern))
+            .unwrap_or(false)),
     }
 }
 
@@ -1189,6 +1269,9 @@ fn scan_row_matches(doc: &[u8], leaf: &Leaf) -> bool {
         Leaf::Between { field, low, high } => field_of(&val, field)
             .map(|v| between_value(v, low, high))
             .unwrap_or(false),
+        Leaf::Like { field, pattern } => field_of(&val, field)
+            .map(|v| like_value(v, pattern))
+            .unwrap_or(false),
     }
 }
 
@@ -1200,6 +1283,9 @@ fn light_where_matches(doc: &[u8], e: &WhereExpr) -> Option<bool> {
         WhereExpr::Cond(c) => light_leaf_result(doc, &Leaf::Cmp(c)),
         WhereExpr::Between { field, low, high } => {
             light_leaf_result(doc, &Leaf::Between { field, low, high })
+        }
+        WhereExpr::Like { field, pattern } => {
+            light_leaf_result(doc, &Leaf::Like { field, pattern })
         }
         WhereExpr::Not(x) => light_where_matches(doc, x).map(|b| !b),
         WhereExpr::And(a, b) => {
@@ -1284,6 +1370,48 @@ fn scan_all(
     post_filter(engine, full, leaf, limit, guard)
 }
 
+/// P1-E：将扫描叶子条件转换为 Zone Map 谓词（用于 SST 块级字段范围剪枝）。
+/// 返回 `None` 表示该叶子不适合 Zone Map 剪枝（如等值/不等值，由倒排处理）。
+fn leaf_to_zone_pred(leaf: &Leaf) -> Option<ZonePredicate> {
+    match leaf {
+        Leaf::Cmp(c) if !matches!(c.op, CmpOp::Eq | CmpOp::Ne) => {
+            let (min, max) = match c.op {
+                CmpOp::Gt => (Some(json_val_bytes(&c.value)), None),
+                CmpOp::Ge => (Some(json_val_bytes(&c.value)), None),
+                CmpOp::Lt => (None, Some(json_val_bytes(&c.value))),
+                CmpOp::Le => (None, Some(json_val_bytes(&c.value))),
+                _ => return None,
+            };
+            Some(ZonePredicate { field: c.field.clone(), min, max })
+        }
+        Leaf::Between { field, low, high } => {
+            Some(ZonePredicate {
+                field: field.to_string(),
+                min: Some(json_val_bytes(low)),
+                max: Some(json_val_bytes(high)),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// P1-E：将 SQL 值字符串转为 JSON 序列化字节（匹配 FieldZone 存储格式）。
+/// 数值原样保留（如 `"100"` → `b"100"`）；字符串加双引号（如 `"active"` → `b"\"active\""`）。
+fn json_val_bytes(s: &str) -> Vec<u8> {
+    // 尝试解析为数值
+    if s.parse::<f64>().is_ok() {
+        // JSON 数值序列化 = 原样
+        s.as_bytes().to_vec()
+    } else {
+        // JSON 字符串需要双引号
+        let mut b = Vec::with_capacity(s.len() + 2);
+        b.push(b'"');
+        b.extend_from_slice(s.as_bytes());
+        b.push(b'"');
+        b
+    }
+}
+
 /// 谓词下推（7.93）：WHERE 为**裸比较/BETWEEN**（无倒排等值可收敛）时，单遍流式扫描 +
 /// LIMIT/OFFSET 早停直接产出命中行（含 doc 值）——替代旧路径「scan 全量收集 docid →
 /// 逐 docid 二次回表 get」，消除两遍 IO 与全量枚举（千万级库 `amount>90000 LIMIT 10`
@@ -1300,7 +1428,8 @@ fn scan_pushdown(
     let mut out: Vec<QueryRow> = Vec::new();
     let mut skipped = 0u64;
     let mut scanned = 0u64;
-    engine.scan_stream(None, None, |docid, doc| {
+    let zp = leaf_to_zone_pred(leaf);
+    engine.scan_stream_with_zonepred(None, None, zp, |docid, doc| {
         scanned += 1;
         if scanned % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(format!(
@@ -1384,17 +1513,18 @@ fn execute_join(engine: &Engine, sel: &Select, cap: u64) -> Result<Vec<QueryRow>
     let limit = sel.limit.unwrap_or(cap).min(cap);
     let guard = engine.query_guard();
 
-    // 阶段 1：主表 WHERE 产出候选 docid 集
-    let left_bitmap = match &sel.where_expr {
-        Some(e) => eval(engine, e, limit, &guard)?,
-        None => full_docids(engine, &guard)?,
-    };
-    if left_bitmap.is_empty() {
+    // 阶段 1：主表 WHERE → 统一 DocIdSet（get_docid_set = eval 形态包装）。
+    //   - 有 WHERE → Bitmap/Empty（倒排/AND 快路径/LIKE 收敛）；
+    //   - 无 WHERE → All（全表——JOIN 须全量左表候选，不做 LIMIT 截断）。
+    let left_set = get_docid_set(engine, sel.where_expr.as_ref(), None, &guard)?;
+    if left_set.is_empty() {
         return Ok(Vec::new());
     }
-
-    // 阶段 2：主表 batch_get → 提取关联 key → 从表批量查 → Hash 合并
-    let left_docids: Vec<u64> = left_bitmap.iter().map(|d| d as u64).collect();
+    // DocIdSet → 有序 docid 列表（All 走 full_docids 全库语义，同原路径）
+    let left_docids: Vec<u64> = match &left_set {
+        crate::docset::DocIdSet::All => full_docids(engine, &guard)?.iter().collect(),
+        other => other.to_vec(),
+    };
     let left_docs = engine.batch_get(&left_docids)?;
     // review 修复（2026-09-04）：right_cache 值改为 Vec——从表 1:N（同一关联 key 多行）
     // 时逐右行展开产出多结果行；修复前只取 posting 首行 → INNER 缺行 / LEFT 只拼首行。
@@ -1602,6 +1732,11 @@ fn eval(
         WhereExpr::Between { field, low, high } => {
             scan_all(engine, &Leaf::Between { field, low, high }, limit, guard)
         }
+        WhereExpr::Like { field, pattern } => {
+            // LIKE 含 % → 倒排无法表达，全扫收集（AND 快路径在 eval_cond 上层已把 Like 当
+            // 扫描叶后过滤，此处是裸 LIKE / OR / NOT 内组合的兜底）
+            scan_all(engine, &Leaf::Like { field, pattern }, limit, guard)
+        }
         WhereExpr::Not(x) => {
             let full = full_docids(engine, guard)?;
             let hit = eval(engine, x, limit, guard)?;
@@ -1641,6 +1776,46 @@ fn eval(
             Ok(la | lb)
         }
     }
+}
+
+/// A4（DocIdSet 读路径重构）：WHERE 条件 → 统一 docid 集合（optimizer_proces 阶段 1 阶梯）。
+///
+/// 阶梯选择（对齐 optimizer_integration_design.md §2.4）：
+///   - 无 WHERE → `All`（全集，不物化）
+///   - 有 WHERE → `eval()` 位图求值（继承 AND 快路径 / LIKE / OR / NOT 既有语义）→ `Bitmap`
+///     （空位图收敛为 `Empty`）
+///
+/// `limit`：传给 eval 的候选早停上界（`post_filter`/`scan_all` 找到 limit 个即停）。
+/// 读路径传实际 LIMIT/cap 语义（防大候选全量遍历）；写路径定位传 `None`（须全量收敛，
+/// D1 不截断）；JOIN 收敛传 `None`。
+///
+/// 组合索引前缀路由（P0-A）由 execute/execute_join 层先行尝试（cidx 需回表取 doc 复筛，
+/// 属"行产出"而非纯 docid 集；此处专注 WHERE→集合统一抽象，供读/写/JOIN 共用消费端）。
+/// 与 `eval` 等价性保证：本函数是既有 eval 路径的形态包装，不重写求值逻辑——665 测试
+/// 全量护航无回归；写路径（delete/update 定位）与 JOIN 复用同一 DocIdSet 消费接口。
+pub fn get_docid_set(
+    engine: &Engine,
+    where_expr: Option<&WhereExpr>,
+    limit: Option<u64>,
+    guard: &crate::watchdog::QueryGuard,
+) -> Result<crate::docset::DocIdSet> {
+    use crate::docset::DocIdSet;
+    let Some(e) = where_expr else {
+        return Ok(DocIdSet::All);
+    };
+    let cap = limit.unwrap_or(u64::MAX);
+    let bm = eval(engine, e, cap, guard)?;
+    if bm.is_empty() {
+        Ok(DocIdSet::Empty)
+    } else {
+        Ok(DocIdSet::Bitmap(bm))
+    }
+}
+
+/// A4 辅助：DocIdSet → 有序 docid Vec（Bitmap 升序；All/Empty 已由调用方处理语义）。
+/// 供 JOIN/批量定位等需物化消费的场景使用；超大集安全阀由调用方（SORT_MAX_ROWS 等）承担。
+pub fn docset_to_sorted(set: &crate::docset::DocIdSet) -> Vec<u64> {
+    set.to_vec()
 }
 
 /// ORDER BY 候选集上限（防全库排序撑爆内存；超限报错提示 WHERE 收敛）。
@@ -1713,52 +1888,54 @@ fn topk_sort(
         std::cmp::Ordering::Equal
     };
     // 简化：直接用 Vec + 手动管理 top-K（避免 Ord trait 复杂性）
+    // P2-D：batch_get 批量取行替代逐行 get（利用 LSM 有序性 + BlockCache 局部性）
+    let docids: Vec<u64> = bitmap.iter().map(|d| d as u64).collect();
+    let batch = engine.batch_get(&docids)?;
     let mut heap: Vec<SortRow> = Vec::with_capacity(k + 1);
     let mut n = 0u64;
-    for docid in bitmap {
+    for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
         n += 1;
         if n % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(format!(
                 "Top-K 排序超时（已扫 {n} 条，熔断中止）"
             )));
         }
-        if let Some(v) = engine.get(docid as u64)? {
-            let keys: Vec<SortKey> = order_by.iter().map(|(f, _)| sort_key(&v, f)).collect();
-            let row = SortRow { docid: docid as u64, doc: v, keys };
-            if heap.len() < k {
-                heap.push(row);
-                // 上浮
-                let mut i = heap.len() - 1;
-                while i > 0 {
-                    let parent = (i - 1) / 2;
-                    if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
-                        heap.swap(i, parent);
-                        i = parent;
-                    } else {
-                        break;
-                    }
+        let Some(v) = v_opt else { continue };
+        let keys: Vec<SortKey> = order_by.iter().map(|(f, _)| sort_key(&v, f)).collect();
+        let row = SortRow { docid, doc: v, keys };
+        if heap.len() < k {
+            heap.push(row);
+            // 上浮
+            let mut i = heap.len() - 1;
+            while i > 0 {
+                let parent = (i - 1) / 2;
+                if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
+                    heap.swap(i, parent);
+                    i = parent;
+                } else {
+                    break;
                 }
-            } else {
-                // 堆满：比堆顶（最差）更好 → 替换
-                if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
-                    heap[0] = row;
-                    // 下沉
-                    let mut i = 0;
-                    let n = heap.len();
-                    loop {
-                        let mut smallest = i;
-                        let l = 2 * i + 1;
-                        let r = 2 * i + 2;
-                        if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater {
-                            smallest = l;
-                        }
-                        if r < n && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater {
-                            smallest = r;
-                        }
-                        if smallest == i { break; }
-                        heap.swap(i, smallest);
-                        i = smallest;
+            }
+        } else {
+            // 堆满：比堆顶（最差）更好 → 替换
+            if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
+                heap[0] = row;
+                // 下沉
+                let mut i = 0;
+                let n = heap.len();
+                loop {
+                    let mut smallest = i;
+                    let l = 2 * i + 1;
+                    let r = 2 * i + 2;
+                    if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater {
+                        smallest = l;
                     }
+                    if r < n && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater {
+                        smallest = r;
+                    }
+                    if smallest == i { break; }
+                    heap.swap(i, smallest);
+                    i = smallest;
                 }
             }
         }
@@ -1816,6 +1993,43 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     let guard = engine.query_guard();
     let limit = sel.limit.unwrap_or(cap).min(cap);
     let sort = !sel.order_by.is_empty();
+
+    // P4-C：基于代价的优化器——多条件 AND 时评估倒排 vs 全扫 + Zone Map 剪枝，
+    // 选择最优路径。当倒排选择性低（doc_count 占比大）时优先走全扫。
+    if !sort && engine.cost_based_enabled {
+        if let Some(we) = sel.where_expr.as_ref() {
+            if let Some(leaf) = scan_leaf(we) {
+                // 范围/BETWEEN 条件：评估全扫代价是否低于倒排
+                let eq_conds = extract_eq_conds(we);
+                let mut eq_terms: Vec<(String, Option<u64>)> = Vec::new();
+                for (f, v) in &eq_conds {
+                    let term = format!("{f}={v}");
+                    // engine 是 &Engine（不可变），用 cost_route 提供的 doc_count_fast 查询
+                    let count = engine.inverted.doc_count_fast(&term)
+                        .ok()
+                        .flatten();
+                    eq_terms.push((term, count));
+                }
+                let range_fields: Vec<String> = match &leaf {
+                    Leaf::Cmp(c) => vec![c.field.clone()],
+                    Leaf::Between { field, .. } => vec![field.to_string()],
+                    _ => vec![],
+                };
+                let zone_fields: Vec<String> = Vec::new();
+                let total_rows = engine.estimated_total_rows();
+                let best = crate::optimizer::choose_best_plan(
+                    &eq_terms, &range_fields, &engine.cost_params,
+                    total_rows, &zone_fields,
+                );
+                if best.path == crate::optimizer::AccessPath::FullScan {
+                    // 全扫更优 → 走 scan_pushdown（流式扫描 + Zone Map 剪枝）
+                    return scan_pushdown(engine, &leaf, limit, sel.offset, &guard);
+                }
+                // 倒排更优 → 继续走原路径
+            }
+        }
+    }
+
     // 7.94 等值回退：裸 `field=value` 倒排 term 未命中（数字等值/未索引字段）→
     // 单遍流式扫描 + LIMIT/OFFSET 早停（组合 AND/OR/NOT 内回退走 eval_cond 全量集）。
     // 含 ORDER BY 时不走早停快速路径（需完整候选集排序）。
@@ -1834,22 +2048,47 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
             return scan_pushdown(engine, &leaf, limit, sel.offset, &guard);
         }
     }
-    let bitmap = match &sel.where_expr {
-        Some(e) => {
-            let cap_bits = if sort {
-                SORT_MAX_ROWS as u64 + sel.offset + limit
-            } else {
-                limit
-            };
-            eval(engine, e, cap_bits, &guard)?
-        }
-        None => full_docids(engine, &guard)?,
+    // A5：WHERE → 统一 DocIdSet（get_docid_set = eval 形态包装，AND 快路径/LIKE 等语义继承）。
+    // limit 语义对齐原路径：sort 分支 eval cap = SORT_MAX_ROWS+offset+limit（防全量物化巨大
+    // 候选）；非 sort 分支 eval cap = limit（post_filter/scan_all 找到 limit 即停）。
+    // - 有 WHERE → Bitmap/Empty；
+    // - 无 WHERE → All（全库：消费端物化为全量 docid，语义同 full_docids）。
+    let cap = if sort {
+        SORT_MAX_ROWS as u64 + sel.offset + limit
+    } else {
+        limit
     };
+    let set = get_docid_set(engine, sel.where_expr.as_ref(), Some(cap), &guard)?;
     if sort {
+        // sort 分支：DocIdSet → 位图物化（All 需全库 docid；Bitmap/Empty 直接）
+        let bitmap = match &set {
+            crate::docset::DocIdSet::Bitmap(bm) => bm.clone(),
+            crate::docset::DocIdSet::Empty => RoaringBitmap::new(),
+            crate::docset::DocIdSet::All => full_docids(engine, &guard)?,
+            crate::docset::DocIdSet::SortedList(v) => {
+                let mut b = RoaringBitmap::new();
+                for &d in v {
+                    b.insert(d);
+                }
+                b
+            }
+        };
         // P0-B：Top-K 有界堆——有 LIMIT 时用 BinaryHeap 保持 top-K（LIMIT+OFFSET），
         // 内存 O(K) 替代 O(N) 全排序；无 LIMIT 时回退原全排序（有 SORT_MAX_ROWS 守卫）。
         let k = sel.offset + limit;
         if sel.limit.is_some() && k > 0 {
+            // A7：Top-K 堆内存守卫——k = offset+limit 超 SORT_MAX_ROWS 时堆膨胀无界
+            // （对齐设计 6.2：深分页 keyset pagination 建议，拒绝防 OOM）。
+            if k as usize > SORT_MAX_ROWS {
+                return Err(Error::QueryTooExpensive(format!(
+                    "ORDER BY OFFSET {} + LIMIT {} = {} 超过 Top-K 上限 {}，\
+                     建议用 keyset 分页（WHERE id > last_id ORDER BY id LIMIT N）",
+                    sel.offset,
+                    limit,
+                    k,
+                    SORT_MAX_ROWS
+                )));
+            }
             return topk_sort(engine, &bitmap, &sel.order_by, k as usize, sel.offset, limit, &guard);
         }
         // 无 LIMIT：回退原全排序路径（守卫不变）
@@ -1860,16 +2099,18 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
                 SORT_MAX_ROWS
             )));
         }
-        let mut srows: Vec<SortRow> = Vec::with_capacity(bitmap.len() as usize);
-        for docid in bitmap {
-            if let Some(v) = engine.get(docid as u64)? {
-                let keys = sel
-                    .order_by
-                    .iter()
-                    .map(|(f, _)| sort_key(&v, f))
-                    .collect();
-                srows.push(SortRow { docid: docid as u64, doc: v, keys });
-            }
+        // P2-D：batch_get 批量取行替代逐行 get
+        let docids: Vec<u64> = bitmap.iter().map(|d| d as u64).collect();
+        let batch = engine.batch_get(&docids)?;
+        let mut srows: Vec<SortRow> = Vec::with_capacity(docids.len());
+        for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
+            let Some(v) = v_opt else { continue };
+            let keys = sel
+                .order_by
+                .iter()
+                .map(|(f, _)| sort_key(&v, f))
+                .collect();
+            srows.push(SortRow { docid, doc: v, keys });
         }
         srows.sort_by(|a, b| {
             for (((f, desc), k1), k2) in sel.order_by.iter().zip(&a.keys).zip(&b.keys) {
@@ -1892,18 +2133,26 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
         }
         return Ok(out);
     }
+    // 非 sort 分支：DocIdSet 统一迭代消费（Bitmap 升序 / Empty 空 / All 全库 docid 位图）。
+    // P2-D：batch_get 批量取行替代逐行 get
     let mut rows = Vec::new();
-    let mut skipped = 0u64;
-    for docid in bitmap {
-        if rows.len() as u64 >= limit {
-            break;
-        }
-        if skipped < sel.offset {
-            skipped += 1;
-            continue;
-        }
-        if let Some(v) = engine.get(docid as u64)? {
-            rows.push((docid as u64, v));
+    if !set.is_empty() {
+        let docids: Vec<u64> = match &set {
+            crate::docset::DocIdSet::All => full_docids(engine, &guard)?.iter().collect(),
+            other => other.to_vec(),
+        };
+        let batch = engine.batch_get(&docids)?;
+        let mut skipped = 0u64;
+        for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
+            if rows.len() as u64 >= limit {
+                break;
+            }
+            if skipped < sel.offset {
+                skipped += 1;
+                continue;
+            }
+            let Some(v) = v_opt else { continue };
+            rows.push((docid, v));
         }
     }
     Ok(rows)
@@ -2788,6 +3037,126 @@ mod tests {
         let mut e = engine_with_docs();
         let rows = execute(&mut e, "SELECT * FROM t WHERE status='active' AND city='beijing' LIMIT 100", 1000).unwrap();
         assert_eq!(rows.len(), 34, "active 且 beijing 交集（i%3==0）");
+    }
+
+    #[test]
+    fn like_match_wildcard_semantics() {
+        // 纯函数：% 通配任意长度（含空）；无通配 = 全等；_ 不支持
+        assert!(like_match("note-15", "note-1%"));
+        assert!(like_match("note-1", "note-1%"));
+        assert!(!like_match("note-2", "note-1%"));
+        assert!(like_match("abc", "%"));
+        assert!(like_match("", "%"));
+        assert!(like_match("hello", "h%o"));
+        assert!(!like_match("hello", "h%x"));
+        assert!(like_match("note-7", "%7"));
+        assert!(like_match("abc7def", "%7%"));
+        assert!(like_match("xabc", "%abc"));
+        assert!(!like_match("abx", "%abc"));
+        assert!(like_match("exact", "exact"));
+        assert!(!like_match("exacT", "exact"));
+        assert!(like_match("a%%b", "a%%b")); // 无通配语义（无 % 分支不会构造 Like；此处验证字面）
+        assert!(like_match("ab", "a%b"));
+        assert!(!like_match("ac", "a%b"));
+        assert!(like_match("", ""));
+    }
+
+    #[test]
+    fn sql_like_prefix_middle_and_eq_fold() {
+        // LIKE 端到端：
+        // ① 后缀通配 'note-1%' → note-1（% 空）与 note-10..note-19（11 行）
+        // ② 前后通配 '%7'（尾部锚定）→ 7,17,...,97（10 行）
+        // ③ 无通配 'note-0' → 折叠 Eq → 仅 note-0（1 行）
+        // ④ 与倒排等值 AND：status='active'（i%3==0）AND note LIKE 'note-3%' → 3,30,33,36,39（5 行）
+        let mut e = engine_with_docs();
+        let rows = execute(&mut e, "SELECT * FROM t WHERE note LIKE 'note-1%' LIMIT 100", 1000).unwrap();
+        let mut ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        ids.sort_unstable();
+        let mut expect: Vec<u64> = vec![1];
+        expect.extend(10..20);
+        assert_eq!(ids, expect, "note LIKE 'note-1%' → note-1 与 note-10..19");
+        let rows2 = execute(&mut e, "SELECT * FROM t WHERE note LIKE '%7' LIMIT 100", 1000).unwrap();
+        let mut ids2: Vec<u64> = rows2.iter().map(|r| r.0).collect();
+        ids2.sort_unstable();
+        assert_eq!(ids2.len(), 10, "'%7' 尾部锚定");
+        assert_eq!(ids2[0], 7);
+        assert_eq!(ids2[9], 97);
+        let rows3 = execute(&mut e, "SELECT * FROM t WHERE note LIKE 'note-0'", 1000).unwrap();
+        assert_eq!(rows3.len(), 1, "无通配 LIKE 折叠为 Eq");
+        assert_eq!(rows3[0].0, 0);
+        // ④ AND 倒排等值 + LIKE 后过滤（AND 快路径：active 位图 ∩ note LIKE）
+        let rows4 = execute(
+            &mut e,
+            "SELECT * FROM t WHERE status='active' AND note LIKE 'note-3%' LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        let mut ids4: Vec<u64> = rows4.iter().map(|r| r.0).collect();
+        ids4.sort_unstable();
+        assert_eq!(ids4, vec![3, 30, 33, 36, 39], "active 且 note-3x（i%3==0，含 note-3）");
+        // ⑤ OR 组合兜底：note LIKE 'note-0' OR note LIKE 'note-99' → 0,99
+        let rows5 = execute(
+            &mut e,
+            "SELECT * FROM t WHERE note LIKE 'note-0' OR note LIKE 'note-99' LIMIT 100",
+            1000,
+        )
+        .unwrap();
+        let mut ids5: Vec<u64> = rows5.iter().map(|r| r.0).collect();
+        ids5.sort_unstable();
+        assert_eq!(ids5, vec![0, 99]);
+    }
+
+    #[test]
+    fn get_docid_set_shapes_and_equivalence() {
+        // A4：get_docid_set 形态收敛（Bitmap/Empty/All）+ 与 eval 位图等价
+        use crate::docset::DocIdSet;
+        let e = engine_with_docs();
+        let guard = e.query_guard();
+        // 无 WHERE → All
+        assert!(matches!(get_docid_set(&e, None, None, &guard).unwrap(), DocIdSet::All));
+        // 等值命中 → Bitmap，与 eval 一致（active 34 行）
+        let sql = "SELECT * FROM t WHERE status='active'";
+        let we = parse_select(sql).unwrap().where_expr;
+        let set = get_docid_set(&e, we.as_ref(), None, &guard).unwrap();
+        assert!(matches!(&set, DocIdSet::Bitmap(_)));
+        let bm = eval(&e, we.as_ref().unwrap(), u64::MAX, &guard).unwrap();
+        assert_eq!(set.len_estimate(), bm.len());
+        assert_eq!(set.to_vec(), bm.iter().collect::<Vec<u64>>());
+        // 空条件冲突 → Empty
+        let sql2 = "SELECT * FROM t WHERE status='active' AND status='inactive'";
+        let we2 = parse_select(sql2).unwrap().where_expr;
+        let set2 = get_docid_set(&e, we2.as_ref(), None, &guard).unwrap();
+        assert!(matches!(set2, DocIdSet::Empty));
+        // LIKE 命中（含 %）→ Bitmap 与 execute 结果一致（'%7' 10 行）
+        let sql3 = "SELECT * FROM t WHERE note LIKE '%7'";
+        let we3 = parse_select(sql3).unwrap().where_expr;
+        let set3 = get_docid_set(&e, we3.as_ref(), None, &guard).unwrap();
+        assert_eq!(set3.len_estimate(), 10);
+    }
+
+    #[test]
+    fn deep_offset_order_by_rejected_by_topk_guard() {
+        // A7：ORDER BY + 巨大 OFFSET → Top-K 堆守卫拒绝（防 OOM；建议 keyset 分页）
+        let mut e = engine_with_docs();
+        // offset=200k + limit 1 → k=200001 > SORT_MAX_ROWS → 拒绝
+        let r = execute(
+            &mut e,
+            "SELECT * FROM t WHERE status='active' ORDER BY amount LIMIT 1 OFFSET 200000",
+            1000,
+        );
+        assert!(matches!(r, Err(Error::QueryTooExpensive(_))), "深分页应被守卫拒绝: {r:?}");
+        // 正常深分页在守卫内：k = offset+limit ≤ 上限 → 仍可执行（结果正确切片）
+        let rows = execute(
+            &mut e,
+            "SELECT * FROM t WHERE status='active' ORDER BY amount LIMIT 1 OFFSET 33",
+            1000,
+        )
+        .unwrap();
+        // active 行 amount 升序第 34 个（i=99 不 active；active: 0,3,...,99? 99%3==0 active）
+        // 按 amount=i*10 排序：active 0..99 步进 3 → 34 个。offset 33 → 第 34 个（index 33）
+        let active_asc: Vec<u64> = (0..100u64).filter(|i| i % 3 == 0).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, active_asc[33], "offset=33 取第 34 个 active 行");
     }
 
     #[test]
@@ -3714,7 +4083,13 @@ mod tests {
     fn topk_order_by_large_candidate() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
-        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // 300K 行全扫需较长超时，用 30s 避免熔断
+        let mut e = Engine::open_with_timeout(
+            dir.path(),
+            &cfg,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
         // 写入 30 万行（超过 SORT_MAX_ROWS=20 万）
         for i in 0..300_000u64 {
             let doc = serde_json::json!({"k": format!("key{i}"), "amount": i});
@@ -3736,6 +4111,53 @@ mod tests {
         assert_eq!(rows2.len(), 5, "Top-K DESC 返回 5 行");
         let v: serde_json::Value = serde_json::from_slice(&rows2[0].1).unwrap();
         assert_eq!(v["amount"].as_u64().unwrap(), 299999, "DESC 首行 amount=299999");
+    }
+
+    /// P0-A：SQL 层组合索引声明式路由端到端——WHERE 等值命中 composite_indexes 最左前缀时，
+    /// execute 走 cidx 前缀扫描（而非全扫/倒排），结果正确且含 LIMIT/OFFSET。
+    #[test]
+    fn composite_index_sql_routing_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.composite_indexes = vec![
+            vec!["status".into(), "region".into()],
+            vec!["status".into()],
+        ];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        // 写入 6 个文档（不需要倒排，让组合索引路由处理）
+        e.put(1, br#"{"status":"active","region":"east","amount":100}"#.to_vec(), &[]).unwrap();
+        e.put(2, br#"{"status":"active","region":"west","amount":200}"#.to_vec(), &[]).unwrap();
+        e.put(3, br#"{"status":"inactive","region":"east","amount":300}"#.to_vec(), &[]).unwrap();
+        e.put(4, br#"{"status":"active","region":"east","amount":400}"#.to_vec(), &[]).unwrap();
+        e.put(5, br#"{"status":"active","region":"north","amount":500}"#.to_vec(), &[]).unwrap();
+        e.put(6, br#"{"status":"inactive","region":"west","amount":600}"#.to_vec(), &[]).unwrap();
+        e.flush_wal().unwrap();
+
+        // 等值单字段：status='active' → 匹配 [status] 索引 → 4 行
+        let rows = execute(&e, "SELECT * FROM t WHERE status='active'", 1000).unwrap();
+        assert_eq!(rows.len(), 4, "status=active 应返回 4 行");
+        let mut ids: Vec<u64> = rows.iter().map(|(d, _)| *d).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 4, 5]);
+
+        // 等值双字段：status='active' AND region='east' → 匹配 [status,region] 最长前缀 → 2 行
+        let rows2 = execute(&e, "SELECT * FROM t WHERE status='active' AND region='east'", 1000).unwrap();
+        assert_eq!(rows2.len(), 2, "active+east 应返回 2 行");
+        let mut ids2: Vec<u64> = rows2.iter().map(|(d, _)| *d).collect();
+        ids2.sort();
+        assert_eq!(ids2, vec![1, 4]);
+
+        // LIMIT 1：组合索引 + LIMIT 下推正确
+        let rows3 = execute(&e, "SELECT * FROM t WHERE status='active' LIMIT 1", 1000).unwrap();
+        assert_eq!(rows3.len(), 1, "LIMIT 1 只返回 1 行");
+
+        // OFFSET 1 LIMIT 1
+        let rows4 = execute(&e, "SELECT * FROM t WHERE status='active' LIMIT 1 OFFSET 1", 1000).unwrap();
+        assert_eq!(rows4.len(), 1, "OFFSET 1 LIMIT 1 返回 1 行");
+
+        // 不匹配的等值条件：status='unknown' → 组合索引返回空，回退到原路径
+        let rows5 = execute(&e, "SELECT * FROM t WHERE status='unknown'", 1000).unwrap();
+        assert!(rows5.is_empty(), "unknown 应返回空结果");
     }
 }
 

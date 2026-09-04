@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
@@ -68,6 +68,10 @@ pub struct SstSnapshot {
     /// R 项：每层段下标（按层号索引；组内保持快照顺序 = 新→旧，层序 L0→L1→L2 与
     /// "新→旧"一致——flush 只进 L0、compact 下沉，层间版本语义安全）。
     pub layer_indices: Vec<Vec<usize>>,
+    /// P3-A：L0 层**按表分组**范围——key 范围 [min, max] 按 table_id 聚合。
+    /// 由于 flush 按表切分，每个 L0 SST 只含单表数据，所以可按表分组聚合范围。
+    /// 点查时只检查目标表分组内的 L0 SST，跳过其他表全部 L0 SST，减少逐 SST 布隆校验。
+    pub l0_table_ranges: Option<std::collections::HashMap<u16, (Vec<u8>, Vec<u8>)>>,
     /// 与 `ssts` 平行的文件字节数（open/flush/compact 构建时缓存；写路径 needs_compact
     /// 的大小条件读此缓存，零 fs::metadata syscall——修复每 put N 次 stat 拖垮写吞吐）。
     pub sizes: Vec<u64>,
@@ -116,7 +120,8 @@ pub struct ColumnFamily {
     l0_max_size_bytes: u64,
     /// Ex-8.11：L1 段数触发阈值（0 = 现行为：L0 空时 L1>1 即下沉 L2）。>0 = 延迟大合并，
     /// L1 攒够该段数（或 L0 活跃纳入 L0+L1 合并的"已满"界限）才收敛。
-    l1_trigger_files: usize,
+    /// P4-A：AtomicUsize——写入爆发时自适应降为 2（`record_flush_new_l0` 动态调整）。
+    l1_trigger_files: AtomicUsize,
     /// Ex-8.11：L2 段数触发阈值（0 = 现行为：L2>1 即收敛为单段）。
     l2_trigger_files: usize,
     /// Ex-8.6：文件级**最小 put seq** 惰性记忆（path → min seq of put rows）。
@@ -136,8 +141,20 @@ pub struct ColumnFamily {
     /// L 项：冷却中的段（新段 path → 到期轮次）；到期后正常参与合并。纯内存调度态。
     /// O 项第③步：内部 `Mutex`（compact `&self` 读写）。
     cooldown: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+    /// P4-A：滑动窗口写入速率监控（最近 N 次 flush 的 L0 新增段数）。
+    /// 窗口大小 = 配置 `compaction_write_rate_window`，窗口满后计算速率。
+    write_rate_window: std::sync::Mutex<Vec<usize>>,
+    /// P4-A：窗口大小（滑动窗口长度，flush 次数）。
+    write_rate_window_size: usize,
+    /// P4-A：L0 段数增速阈值（窗口内新增超过此值 → 爆发模式）。
+    write_rate_burst_threshold: usize,
+    /// P4-A：基准 `l1_trigger_files`（未爆发时）。
+    base_l1_trigger: usize,
     /// X 项：累计刷盘次数（switch_and_flush 成功 +1；/metrics 指标）。
     flush_counter: AtomicU64,
+    /// P4-A：最近一次 flush 创建的 SST 段数（由 flush_by_table / flush_buckets 在
+    /// snapshot_insert 中累计，供 `switch_and_flush` 记录写入速率窗口）。
+    flush_sst_count: AtomicUsize,
     /// R4（review 2026-09-04）：MVCC 保活水位（seq floor）。compact_merge 去重时，
     /// 最新 seq > floor 的 key 保留多版本（活跃旧快照可回读到删除/覆盖前旧值）；
     /// 位图物理回收（drop_key）亦仅当无活跃快照（floor=0）或最新 seq ≤ floor 时执行。
@@ -377,19 +394,25 @@ impl ColumnFamily {
             l0_max_size_bytes: cfg.storage.l0_max_size_mb * 1024 * 1024,
             compact_input_max_bytes: cfg.storage.compact_input_max_mb * 1024 * 1024,
             // Ex-8.11：L1/L2 段数触发阈值（0 = 现行为）
-            l1_trigger_files: cfg.storage.l1_trigger_files,
+            l1_trigger_files: AtomicUsize::new(cfg.storage.l1_trigger_files),
             l2_trigger_files: cfg.storage.l2_trigger_files,
             seq_min: RwLock::new(std::collections::HashMap::new()),
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),
             cooldown: Mutex::new(std::collections::HashMap::new()),
+            // P4-A：写入速率滑动窗口（默认 8 次 flush 窗口，阈值 4 → 窗口内 >4 次 flush 算爆发）
+            write_rate_window: Mutex::new(Vec::with_capacity(8)),
+            write_rate_window_size: cfg.storage.compaction_write_rate_window.max(2),
+            write_rate_burst_threshold: cfg.storage.compaction_write_rate_burst.max(1),
+            base_l1_trigger: cfg.storage.l1_trigger_files,
             flush_counter: AtomicU64::new(0),
+            flush_sst_count: AtomicUsize::new(0),
             sst_written: AtomicU64::new(0),
             mvcc_keep_floor: AtomicU64::new(0),
             memtable: MemTableBuffer::new(),
             ssts: {
                 let loaded: Vec<Arc<SstReader>> = ssts.into_iter().map(Arc::new).collect();
-                let (layer_ranges, layer_indices) =
+                let (layer_ranges, layer_indices, l0_table_ranges) =
                     Self::build_layer_meta(&loaded, &sst_levels_loaded);
                 let sizes: Vec<u64> = loaded.iter().map(|r| r.file_len()).collect();
                 ArcSwap::new(Arc::new(SstSnapshot {
@@ -397,6 +420,7 @@ impl ColumnFamily {
                     levels: sst_levels_loaded,
                     layer_ranges,
                     layer_indices,
+                    l0_table_ranges,
                     sizes,
                 }))
             },
@@ -590,13 +614,53 @@ impl ColumnFamily {
 
     /// 查询（主键点查，便捷封装）。返回 (value, seq)，已过滤 Tombstone。
     /// `&self`：读写分离读路径（Ex-7.1 PerCpuCounter / BlockCache 已内部同步）。
+    /// P3-A：从 docid 提取 table_id（高 16 位），利用 L0 按表分组范围跳过非目标表 SST。
     pub fn get(&self, docid: u64) -> Result<Option<(Vec<u8>, u64)>> {
-        self.get_bytes(&encode_docid(docid))
+        let key = encode_docid(docid);
+        if let Some(e) = self.memtable.get(&key) {
+            return Ok(e.value.map(|v| (v, e.seq)));
+        }
+        let cache = Arc::clone(&self.block_cache);
+        let snap = self.ssts.load();
+        // P3-A：从 docid 提取 table_id（精确，非 docid 编码的 key 不适用）
+        let tid = (docid >> 48) as u16;
+        let key_bytes = key.as_slice();
+        for (lv, idxs) in snap.layer_indices.iter().enumerate() {
+            // 层级 Zone Map 粗筛（精确：层范围 = 层内各段范围并集）
+            if let Some((lmin, lmax)) = &snap.layer_ranges[lv] {
+                if key_bytes < lmin.as_slice() || key_bytes > lmax.as_slice() {
+                    continue; // 整层跳过
+                }
+            }
+            // P3-A：L0 按表分组范围——目标表在 L0 无数据则整层跳过
+            if lv == 0 {
+                if let Some(ref table_ranges) = snap.l0_table_ranges {
+                    match table_ranges.get(&tid) {
+                        Some((tmin, tmax)) => {
+                            if key_bytes < tmin.as_slice() || key_bytes > tmax.as_slice() {
+                                continue; // 该表在 L0 无此范围数据 → 整层跳过
+                            }
+                        }
+                        None => continue, // 该 table_id 完全无 L0 SST → 整层跳过
+                    }
+                }
+            }
+            for &i in idxs {
+                let sst = &snap.ssts[i];
+                match get_from_sst(sst, &cache, key_bytes)? {
+                    // 命中：最新版本。value=None 为 Tombstone → 视为不存在
+                    Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
+                    None => continue, // 未命中该 SST，继续查更旧的
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// 查询原始字节键。返回 (value, seq)，已过滤 Tombstone。
     /// R 项：按层遍历（L0→L1→L2，层序与"新→旧"一致）——每层先层级 Zone Map 粗筛
     /// （key 越出层范围 → 整层 O(1) 跳过，省逐段二分 + 布隆反序列化），层内逐段。
+    /// 注意：非 docid 编码的 key 不适用 P3-A 的 L0 按表分组（因无法提取 table_id）。
     pub fn get_bytes(&self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
         if let Some(e) = self.memtable.get(key) {
             return Ok(e.value.map(|v| (v, e.seq)));
@@ -660,6 +724,24 @@ impl ColumnFamily {
                     .all(|&i| keys[i].as_slice() < lmin.as_slice() || keys[i].as_slice() > lmax.as_slice())
                 {
                     continue;
+                }
+            }
+            // P3-A：L0 按表分组范围——检查所有剩余 key 是否都越出各表范围 → 整层跳过
+            if lv == 0 {
+                if let Some(ref table_ranges) = snap.l0_table_ranges {
+                    let all_out = remain.iter().all(|&i| {
+                        let key = keys[i].as_slice();
+                        match Self::table_id_from_key(key) {
+                            Some(tid) => match table_ranges.get(&tid) {
+                                Some((tmin, tmax)) => key < tmin.as_slice() || key > tmax.as_slice(),
+                                None => true, // 该表无 L0 数据 → 这个 key out
+                            },
+                            None => false, // 无法提取 table_id → 保守不跳
+                        }
+                    });
+                    if all_out {
+                        continue; // 所有剩余 key 都 out → 整层跳过
+                    }
                 }
             }
             for &i in idxs {
@@ -784,7 +866,7 @@ impl ColumnFamily {
         let start_key = start.map(|s| encode_docid(s).to_vec());
         let end_key = end.map(|e| encode_docid(e).to_vec());
         let mut out = Vec::new();
-        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), |key, val| {
+        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), None, |key, val| {
             let docid = decode_docid(key)
                 .map_err(|_| Error::Corrupted("scan_at key 非 docid 编码".into()))?;
             out.push((docid, val.to_vec()));
@@ -839,7 +921,20 @@ impl ColumnFamily {
         f: F,
     ) -> Result<()> {
         // 最新视图 = 快照 seq 无上限（取最大版本）
-        self.scan_stream_at(u64::MAX, start, end, f)
+        self.scan_stream_at(u64::MAX, start, end, None, f)
+    }
+
+    /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
+    /// 额外在 SST 块级检查 `zone_pred` 范围，不相交块跳过（免 IO/解压）。
+    pub fn scan_stream_with_zonepred<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        zone_pred: Option<crate::sstable::ZonePredicate>,
+        f: F,
+    ) -> Result<()> {
+        // 最新视图 = 快照 seq 无上限（取最大版本）
+        self.scan_stream_at(u64::MAX, start, end, zone_pred, f)
     }
 
     /// 快照范围流式扫描（M 项，事务类查询优化 P0）：同 key 多版本取
@@ -850,6 +945,7 @@ impl ColumnFamily {
         snapshot_seq: u64,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
+        zone_pred: Option<crate::sstable::ZonePredicate>,
         mut f: F,
     ) -> Result<()> {
         // 源：memtable（immutable + mutable）+ SST。P72：memtable 迭代器借用内部 RwLock 读锁
@@ -867,12 +963,16 @@ impl ColumnFamily {
                 if snapshot_seq != u64::MAX && self.sst_min_seq(sst)? > snapshot_seq {
                     continue;
                 }
-                sst_iters.push(crate::sstable::SstRangeIter::new_cached(
+                let mut it = crate::sstable::SstRangeIter::new_cached(
                     sst,
                     start,
                     end,
                     std::sync::Arc::clone(&self.block_cache),
-                )?);
+                )?;
+                if let Some(ref zp) = zone_pred {
+                    it.set_zone_pred(zp.clone());
+                }
+                sst_iters.push(it);
             }
             let mem_count = mem_iters.len();
             let total = mem_count + sst_iters.len();
@@ -1267,16 +1367,23 @@ impl ColumnFamily {
         self.flush_counter.fetch_add(1, Ordering::Relaxed);
         // 环形 WAL 覆盖安全：Flush 完成后上报 imm 内最大 seq（<= 该 seq 的记录已刷盘可覆盖）
         let flushed_max = imm_scan_max_seq(&imm);
-        if self.ttl_days.is_none() {
+        let new_segments = if self.ttl_days.is_none() {
             // M3：主数据列族（多表）按表切分输出；其余单文件（行为不变）
             if self.split_by_table {
                 self.flush_by_table(&imm)?;
+                // 记录 flush_by_table 创建的 SST 数（snapshot_insert 中计数）
+                self.flush_sst_count.load(Ordering::Relaxed)
             } else {
                 self.flush_single(&imm)?;
+                1
             }
         } else {
             self.flush_buckets(&imm)?;
-        }
+            // 记录 flush_buckets 创建的 SST 数
+            self.flush_sst_count.load(Ordering::Relaxed)
+        };
+        // P4-A：记录本次 flush 新增 L0 段数 → 写入速率自适应
+        self.record_flush_new_l0(new_segments);
         self.wal.lock().unwrap().set_flushed_seq(flushed_max);
         // WAL 截断（M8-P5）：append 模式 flush 后全部记录已刷盘，清空 WAL 保持小文件
         // （避免无限增长 + 大文件 fsync 拖慢写入）；ring 模式自带覆盖回收（no-op）
@@ -1308,6 +1415,57 @@ impl ColumnFamily {
         c
     }
 
+    /// 从 docid 编码 key 中提取 table_id（高 16 位）。
+    /// key 为 encode_docid 的 8 字节大端编码，前 2 字节 = table_id。
+    fn table_id_from_key(key: &[u8]) -> Option<u16> {
+        if key.len() >= 2 {
+            Some(u16::from_be_bytes([key[0], key[1]]))
+        } else {
+            None
+        }
+    }
+
+    /// P3-A：构建 L0 层按表分组的范围——遍历 L0 SST，按 table_id 聚合 key 范围。
+    /// 每个 SST 只含单表数据（M3 flush/compact 按表切分），所以从 key_range 的 min key
+    /// 提取 table_id 即可确定所属表。
+    fn build_l0_table_ranges(
+        ssts: &[Arc<SstReader>],
+        l0_indices: &[usize],
+    ) -> Option<std::collections::HashMap<u16, (Vec<u8>, Vec<u8>)>> {
+        if l0_indices.is_empty() {
+            return None;
+        }
+        let mut table_ranges: std::collections::HashMap<u16, (Vec<u8>, Vec<u8>)> =
+            std::collections::HashMap::new();
+        for &i in l0_indices {
+            let s = &ssts[i];
+            let (min, max) = match s.key_range() {
+                Some((mn, mx)) => (mn, mx),
+                None => return None, // 无范围段 → 无法构建，回退 None
+            };
+            // 从 min key 提取 table_id（M3 保证每文件单表）
+            let tid = match Self::table_id_from_key(min) {
+                Some(t) => t,
+                None => return None,
+            };
+            match table_ranges.entry(tid) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (lo, hi) = e.get_mut();
+                    if min < lo.as_slice() {
+                        *lo = min.to_vec();
+                    }
+                    if max > hi.as_slice() {
+                        *hi = max.to_vec();
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((min.to_vec(), max.to_vec()));
+                }
+            }
+        }
+        Some(table_ranges)
+    }
+
     /// R 项：快照构建时计算层聚合元数据（O(段数)）——每层 key 范围 + 每层段下标。
     /// 层范围 = 层内各段范围并集；层内存在"无范围段"（无约束）→ 该层 None（不可跳过，
     /// 防假阴性——布隆/范围粗筛只允许假阳性，不允许假阴性）。
@@ -1317,6 +1475,7 @@ impl ColumnFamily {
     ) -> (
         Vec<Option<(Vec<u8>, Vec<u8>)>>,
         Vec<Vec<usize>>,
+        Option<std::collections::HashMap<u16, (Vec<u8>, Vec<u8>)>>,
     ) {
         let mut ranges: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None, None, None];
         let mut indices: Vec<Vec<usize>> = vec![Vec::new(), Vec::new(), Vec::new()];
@@ -1339,7 +1498,9 @@ impl ColumnFamily {
                 None => ranges[lv] = None,
             }
         }
-        (ranges, indices)
+        // P3-A：L0 按表分组范围
+        let l0_table_ranges = Self::build_l0_table_ranges(ssts, &indices[0]);
+        (ranges, indices, l0_table_ranges)
     }
 
     /// O 项第③步：原子插入新 SST（快照 `store()`）——新文件插最前（读路径优先命中），层号 L0。
@@ -1352,13 +1513,14 @@ impl ColumnFamily {
         ssts.insert(0, Arc::new(reader));
         let mut levels = cur.levels.clone();
         levels.insert(0, 0);
-        let (layer_ranges, layer_indices) = Self::build_layer_meta(&ssts, &levels);
+        let (layer_ranges, layer_indices, l0_table_ranges) = Self::build_layer_meta(&ssts, &levels);
         let sizes: Vec<u64> = ssts.iter().map(|r| r.file_len()).collect();
         self.ssts.store(Arc::new(SstSnapshot {
             ssts,
             levels,
             layer_ranges,
             layer_indices,
+            l0_table_ranges,
             sizes,
         }));
     }
@@ -1434,6 +1596,7 @@ impl ColumnFamily {
         if let Some(mut w) = writer.take() {
             w.finish().expect("SST finish 失败");
         }
+        self.flush_sst_count.store(outputs.len(), Ordering::Relaxed);
         for p in &outputs {
             self.io_acquire(p)?;
             let reader = SstReader::open_with_granularity(p, self.index_granularity)?;
@@ -1472,6 +1635,7 @@ impl ColumnFamily {
         });
         let bucket_count = buckets.len();
         let _g = self.sst_mutate.lock().unwrap();
+        let mut created = 0;
         for (days, rows) in buckets {
             let sst_id = self.next_sst_id.fetch_add(1, Ordering::Relaxed);
             let fname = match days {
@@ -1483,7 +1647,9 @@ impl ColumnFamily {
             self.io_acquire(&path)?;
             let reader = SstReader::open_with_granularity(&path, self.index_granularity)?;
             self.snapshot_insert(reader);
+            created += 1;
         }
+        self.flush_sst_count.store(created, Ordering::Relaxed);
         self.persist_manifest()?;
         drop(_g);
         info!(
@@ -1553,6 +1719,36 @@ impl ColumnFamily {
             .clamp(self.l0_stall_min, self.l0_stall_max)
     }
 
+    /// P4-A：Compaction 写入速率自适应——记录本次 flush 新增 L0 段数，
+    /// 更新滑动窗口，检测写入爆发并动态调整 `l1_trigger_files`。
+    /// 爆发（窗口内新增 > 阈值）→ `l1_trigger` 降为 2 → 提前下沉 L1→L2，防 L0 爆胀；
+    /// 正常 → 恢复基准 `base_l1_trigger`。
+    pub fn record_flush_new_l0(&self, new_segments: usize) {
+        let mut window = self.write_rate_window.lock().unwrap();
+        // 滑动窗口：窗口满 → 弹出最旧，加入最新
+        if window.len() >= self.write_rate_window_size {
+            window.remove(0);
+        }
+        window.push(new_segments);
+        // 计算窗口内总新增段数，判断是否爆发
+        let total: usize = window.iter().sum();
+        drop(window);
+
+        // 原子安全地调整 l1_trigger_files（AtomicUsize 无需 &mut）
+        if total > self.write_rate_burst_threshold {
+            // 写入爆发 → 降阈值，提前合并
+            self.l1_trigger_files.store(2.max(self.base_l1_trigger / 2), Ordering::Relaxed);
+        } else {
+            // 正常写入 → 恢复基准，攒批降写放大
+            self.l1_trigger_files.store(self.base_l1_trigger, Ordering::Relaxed);
+        }
+    }
+
+    /// P4-A：获取当前有效 `l1_trigger_files`（基准/爆发自适应）。
+    pub fn effective_l1_trigger(&self) -> usize {
+        self.l1_trigger_files.load(Ordering::Relaxed)
+    }
+
     /// L 项：当前处于冷却期的段下标集合（按 path 匹配到期轮次 > 当前合并轮次）。
     fn cooling_indices(&self) -> std::collections::HashSet<usize> {
         let mut out = std::collections::HashSet::new();
@@ -1587,15 +1783,16 @@ impl ColumnFamily {
         let snap = self.ssts.load();
         let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
         // Ex-8.11：L1 段数上限（L0 活跃时纳入 L0+L1 合并的"已满"界限）——>0 时用 l1_trigger_files
-        let cap = if self.l1_trigger_files > 0 {
-            self.l1_trigger_files
+        let l1_tf = self.l1_trigger_files.load(Ordering::Relaxed);
+        let cap = if l1_tf > 0 {
+            l1_tf
         } else {
             self.effective_l0_threshold()
         };
         let (sel, out_level) = select_compaction_inputs_ex(
             &snap.levels,
             cap,
-            self.l1_trigger_files,
+            l1_tf,
             self.l2_trigger_files,
             &heat,
             &self.cooling_indices(),
@@ -1645,15 +1842,16 @@ impl ColumnFamily {
         let snap = self.ssts.load();
         let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
         // Ex-8.11：同 compact()，L1 段数上限 = l1_trigger_files（>0 时）
-        let cap = if self.l1_trigger_files > 0 {
-            self.l1_trigger_files
+        let l1_tf = self.l1_trigger_files.load(Ordering::Relaxed);
+        let cap = if l1_tf > 0 {
+            l1_tf
         } else {
             self.effective_l0_threshold()
         };
         let (sel, out_level) = select_compaction_inputs_ex(
             &snap.levels,
             cap,
-            self.l1_trigger_files,
+            l1_tf,
             self.l2_trigger_files,
             &heat,
             &self.cooling_indices(),
@@ -1692,15 +1890,16 @@ impl ColumnFamily {
         };
         let snap = self.ssts.load();
         let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
-        let cap = if self.l1_trigger_files > 0 {
-            self.l1_trigger_files
+        let l1_tf = self.l1_trigger_files.load(Ordering::Relaxed);
+        let cap = if l1_tf > 0 {
+            l1_tf
         } else {
             self.effective_l0_threshold()
         };
         let (sel, out_level) = select_compaction_inputs_ex(
             &snap.levels,
             cap,
-            self.l1_trigger_files,
+            l1_tf,
             self.l2_trigger_files,
             &heat,
             &self.cooling_indices(),
@@ -1775,111 +1974,342 @@ impl ColumnFamily {
         drop_key: &dyn Fn(&[u8]) -> bool,
     ) -> Result<CompactReport> {
         let old_count = sel.len();
-        // ① 读取选中条目（快照 Arc 持有文件句柄，与并发读共享）
+        // ① P80 修复：流式 k 路归并（代替全量 Vec 物化）
+        // 为每个输入段读出所有 entries 排序 → 推入迭代器，用最小堆输出
+        // 内存占用 O(k + 输出缓冲区)，不随输入规模线性增长，解决 GB 级合并卡死
         let snap = self.ssts.load();
-        let mut rows: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::new();
-        for idx in sel {
-            snap.ssts[*idx].iterate(|k, v, seq| {
-                rows.push((k.to_vec(), seq, v.map(|x| x.to_vec())));
+
+        // 堆元素：Reverse((key, seq, value, 迭代器索引)) — BinaryHeap 是最大堆，Reverse 转最小堆
+        use std::cmp::Reverse;
+        // 堆排序：key 升序，同 key seq 降序（最新版本优先弹出）
+        // 内层 Reverse<u64> 使同 key 时最大 seq 优先出堆
+        let mut heap: std::collections::BinaryHeap<Reverse<(Vec<u8>, Reverse<u64>, Option<Vec<u8>>, usize)>> =
+            std::collections::BinaryHeap::new();
+
+        // 为每个输入段创建排序好的迭代器
+        let mut iterators: Vec<std::boxed::Box<dyn Iterator<Item = (Vec<u8>, u64, Option<Vec<u8>>)>>> =
+            Vec::with_capacity(sel.len());
+        let mut total_input_entries = 0usize;
+        for &sst_idx in sel {
+            let mut entries = Vec::new();
+            snap.ssts[sst_idx].iterate(|k, v, seq| {
+                entries.push((k.to_vec(), seq, v.map(|x| x.to_vec())));
             })?;
+            // 同一段内先排序（key 升序，同 key seq 降序 → 弹出时保证最大 seq 优先）
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            total_input_entries += entries.len();
+            let mut iter = entries.into_iter();
+            if let Some(first) = iter.next() {
+                heap.push(Reverse((first.0, Reverse(first.1), first.2, iterators.len())));
+            }
+            iterators.push(Box::new(iter));
         }
-        // ② 排序 + 分组保活去重：key 升序、seq 降序。
-        // R4（review 2026-09-04）：默认同 key 保留最高 seq（后写覆盖先写）；当存在活跃
-        // 快照（mvcc_keep_floor > 0）且 key 最新 seq > floor 时保留多版本——全部 seq>floor
-        // 版本 + seq≤floor 的最新一条，使删除/覆盖前旧快照可回读旧值。
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        let kept_keys = rows.len();
+
+        // ② 流式处理：弹出最小 key → 分组同 key → 按 MVCC 保活规则过滤 → 直接输出
+        // 不缓存全量到内存，内存占用恒定（仅当前分组 + 堆）
         let floor = self.mvcc_keep_floor.load(Ordering::Acquire);
-        let mut kept: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(rows.len());
-        let mut dropped_keys = 0usize;
-        let mut i = 0usize;
-        while i < rows.len() {
-            let key = rows[i].0.clone();
-            let mut j = i + 1;
-            while j < rows.len() && rows[j].0 == key {
-                j += 1;
+        let mut total_kept_keys = 0u64;
+        let mut dropped_keys = 0u64;
+        let mut current_tbl: Option<u16> = None;
+        let mut current_writer: Option<SstWriter> = None;
+        let mut out_paths: Vec<std::path::PathBuf> = Vec::new();
+
+        // 开始新表输出段（split_by_table 时表边界切分文件）
+        let start_new_table = |this: &Self, out_level: u32| -> Result<(SstWriter, PathBuf)> {
+            let sst_id = this.next_sst_id.fetch_add(1, Ordering::Relaxed);
+            let path = this.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
+            let w = SstWriter::new_with_pax(
+                &path,
+                this.compression,
+                this.compression_level_for(out_level),
+                this.block_size,
+                0, // 流式不知道总行数，0 走动态分配
+                &this.pax_hot_fields,
+                this.bloom_fpr,
+            )?;
+            Ok((w, path))
+        };
+
+        // 流式弹出 + 分组处理：同 key 全部 entries 缓冲后一次处理输出
+        let mut buffer: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::new();
+        // P80 修复：初始必须创建一个 writer（即使 split_by_table 关闭，也需要输出）
+        if self.split_by_table {
+            // 按表切分：初始 writer 为 None，第一个 key 输出时创建；
+            // 如果 heap 为空（没有输出）则保持 None 不创建。
+        } else {
+            // 不按表切分：整个合并输出到单个文件，提前创建 writer
+            let (w, path) = start_new_table(self, out_level)?;
+            current_tbl = None;
+            current_writer = Some(w);
+            out_paths.push(path);
+        }
+        while !heap.is_empty() {
+            // 弹出当前全局最小 key
+            let Reverse((current_key, Reverse(current_seq), current_val, iter_idx)) = heap.pop().unwrap();
+
+            // 缓冲当前 entry 到分组
+            if buffer.is_empty() || buffer.last().unwrap().0 == current_key {
+                buffer.push((current_key, current_seq, current_val));
+            } else {
+                // 完成上一个 key 分组：按 MVCC 规则处理并输出
+                let group_key = buffer[0].0.clone();
+                let deleted = drop_key(&group_key);
+                let latest_seq = buffer[0].1; // 已按 seq 降序，第一个 = 最大
+
+                if !(deleted && !(floor > 0 && latest_seq > floor)) {
+                    // 需要输出至少一个版本
+                    let mut pushed_floor = false;
+                    for (k, seq, v) in &buffer {
+                        if floor > 0 && latest_seq > floor {
+                            if *seq > floor {
+                                // 活跃快照保活：seq > floor → 输出
+                                if let Some(tbl_id) = key_table_id(k) {
+                                    if self.split_by_table && current_tbl != Some(tbl_id) {
+                                        // 表边界：结束当前段，开新段
+                                        if let Some(mut w) = current_writer.take() {
+                                            w.finish()?;
+                                            if !out_paths.is_empty() {
+                                                self.io_acquire(out_paths.last().unwrap())?;
+                                            }
+                                        }
+                                        let (w, path) = start_new_table(self, out_level)?;
+                                        current_tbl = Some(tbl_id);
+                                        current_writer = Some(w);
+                                        out_paths.push(path);
+                                    }
+                                }
+                                let w = current_writer.as_mut().ok_or_else(|| {
+                                    Error::Config("没有当前 writer 输出复合键".into())
+                                })?;
+                                match v {
+                                    Some(val) => w.add(k, val, *seq)?,
+                                    None => w.add_tombstone(k, *seq)?,
+                                }
+                                total_kept_keys += 1;
+                            } else if !pushed_floor {
+                                // seq ≤ floor → 只输出一个最新
+                                // M3：表边界切分（split_by_table 时检测表切换）
+                                if let Some(tbl_id) = key_table_id(k) {
+                                    if self.split_by_table && current_tbl != Some(tbl_id) {
+                                        if let Some(mut w) = current_writer.take() {
+                                            w.finish()?;
+                                            if !out_paths.is_empty() {
+                                                self.io_acquire(out_paths.last().unwrap())?;
+                                            }
+                                        }
+                                        let (w, path) = start_new_table(self, out_level)?;
+                                        current_tbl = Some(tbl_id);
+                                        current_writer = Some(w);
+                                        out_paths.push(path);
+                                    }
+                                }
+                                // P80 修复：首次输出时 writer 为 None → 创建
+                                if current_writer.is_none() {
+                                    let (w, path) = start_new_table(self, out_level)?;
+                                    current_tbl = key_table_id(k);
+                                    current_writer = Some(w);
+                                    out_paths.push(path);
+                                }
+                                let w = current_writer.as_mut().ok_or_else(|| {
+                                    Error::Config("没有当前 writer 输出复合键".into())
+                                })?;
+                                match v {
+                                    Some(val) => w.add(k, val, *seq)?,
+                                    None => w.add_tombstone(k, *seq)?,
+                                }
+                                pushed_floor = true;
+                                total_kept_keys += 1;
+                            }
+                        } else {
+                            // 无保活需求 → 只输出最新版本
+                            // M3：表边界切分（split_by_table 时检测表切换）
+                            if let Some(tbl_id) = key_table_id(k) {
+                                if self.split_by_table && current_tbl != Some(tbl_id) {
+                                    if let Some(mut w) = current_writer.take() {
+                                        w.finish()?;
+                                        if !out_paths.is_empty() {
+                                            self.io_acquire(out_paths.last().unwrap())?;
+                                        }
+                                    }
+                                    let (w, path) = start_new_table(self, out_level)?;
+                                    current_tbl = Some(tbl_id);
+                                    current_writer = Some(w);
+                                    out_paths.push(path);
+                                }
+                            }
+                            // P80 修复：首次输出时 writer 为 None → 创建
+                            if current_writer.is_none() {
+                                let (w, path) = start_new_table(self, out_level)?;
+                                current_tbl = key_table_id(k);
+                                current_writer = Some(w);
+                                out_paths.push(path);
+                            }
+                            let w = current_writer.as_mut().ok_or_else(|| {
+                                Error::Config("没有当前 writer 输出复合键".into())
+                            })?;
+                            match v {
+                                Some(val) => w.add(k, val, *seq)?,
+                                None => w.add_tombstone(k, *seq)?,
+                            }
+                            total_kept_keys += 1;
+                            break; // 只输出最新
+                        }
+                    }
+                } else {
+                    dropped_keys += 1;
+                }
+
+                // 开始新分组
+                buffer.clear();
+                buffer.push((current_key, current_seq, current_val));
             }
-            let latest_seq = rows[i].1; // 组内首个 = 最高 seq
-            // ②.5 Ex-5.6：位图已删 key 物理丢弃——R4 约束：仅当无活跃快照（floor=0）或
-            // 最新 seq ≤ floor（活跃快照全在删除之后，无旧快照引用）才整 key 丢弃；
-            // 否则保活（该删除可能被更早活跃快照读取 → 快照读需要删除前的旧版本）。
-            let deleted = drop_key(&key);
-            if deleted && !(floor > 0 && latest_seq > floor) {
-                dropped_keys += 1; // 整 key 物理丢弃（含全部版本）
-                i = j;
-                continue;
+
+            // 从原迭代器取下一个元素，推回堆
+            if let Some(next) = iterators[iter_idx].next() {
+                heap.push(Reverse((next.0, Reverse(next.1), next.2, iter_idx)));
             }
-            if floor > 0 && latest_seq > floor {
-                // 保活：seq > floor 的全部版本 + seq ≤ floor 的最新一条
-                let mut pushed_floor = false;
-                for r in &rows[i..j] {
-                    if r.1 > floor {
-                        kept.push(r.clone());
-                    } else if !pushed_floor {
-                        kept.push(r.clone());
-                        pushed_floor = true;
+        }
+
+        // 处理最后一个 key 分组
+        if !buffer.is_empty() {
+            let group_key = buffer[0].0.clone();
+            let deleted = drop_key(&group_key);
+            let latest_seq = buffer[0].1;
+
+            if !(deleted && !(floor > 0 && latest_seq > floor)) {
+                    let mut pushed_floor = false;
+                    for (k, seq, v) in &buffer {
+                        if floor > 0 && latest_seq > floor {
+                            if *seq > floor {
+                                if let Some(tbl_id) = key_table_id(k) {
+                                    // P80 修复：split_by_table 场景，第一个 key 输出时 writer 还没创建
+                                    if current_writer.is_none() {
+                                        let (w, path) = start_new_table(self, out_level)?;
+                                        current_tbl = Some(tbl_id);
+                                        current_writer = Some(w);
+                                        out_paths.push(path);
+                                    }
+                                    if self.split_by_table && current_tbl != Some(tbl_id) {
+                                        if let Some(mut w) = current_writer.take() {
+                                            w.finish()?;
+                                            if !out_paths.is_empty() {
+                                                self.io_acquire(out_paths.last().unwrap())?;
+                                            }
+                                        }
+                                        let (w, path) = start_new_table(self, out_level)?;
+                                        current_tbl = Some(tbl_id);
+                                        current_writer = Some(w);
+                                        out_paths.push(path);
+                                    }
+                                }
+                                // P80 修复：非 docid 键首次输出时 writer 仍为 None → 创建
+                                if current_writer.is_none() {
+                                    let (w, path) = start_new_table(self, out_level)?;
+                                    current_writer = Some(w);
+                                    out_paths.push(path);
+                                }
+                                let w = current_writer.as_mut().ok_or_else(|| {
+                                    Error::Config("没有当前 writer 输出复合键".into())
+                                })?;
+                            match v {
+                                Some(val) => w.add(k, val, *seq)?,
+                                None => w.add_tombstone(k, *seq)?,
+                            }
+                            total_kept_keys += 1;
+                        } else if !pushed_floor {
+                            // M3：表边界切分（split_by_table 时检测表切换）
+                            if let Some(tbl_id) = key_table_id(k) {
+                                if self.split_by_table && current_tbl != Some(tbl_id) {
+                                    if let Some(mut w) = current_writer.take() {
+                                        w.finish()?;
+                                        if !out_paths.is_empty() {
+                                            self.io_acquire(out_paths.last().unwrap())?;
+                                        }
+                                    }
+                                    let (w, path) = start_new_table(self, out_level)?;
+                                    current_tbl = Some(tbl_id);
+                                    current_writer = Some(w);
+                                    out_paths.push(path);
+                                }
+                            }
+                            // P80 修复：首次输出时 writer 为 None → 创建
+                            if current_writer.is_none() {
+                                let (w, path) = start_new_table(self, out_level)?;
+                                current_tbl = key_table_id(k);
+                                current_writer = Some(w);
+                                out_paths.push(path);
+                            }
+                            let w = current_writer.as_mut().ok_or_else(|| {
+                                Error::Config("没有当前 writer 输出复合键".into())
+                            })?;
+                            match v {
+                                Some(val) => w.add(k, val, *seq)?,
+                                None => w.add_tombstone(k, *seq)?,
+                            }
+                            pushed_floor = true;
+                            total_kept_keys += 1;
+                        }
+                    } else {
+                            // P80 修复：首次输出时 writer 为 None → 创建
+                            if current_writer.is_none() {
+                                let (w, path) = start_new_table(self, out_level)?;
+                                current_writer = Some(w);
+                                out_paths.push(path);
+                            }
+                            // 表切分边界检查（同 non-floor 分支）
+                            if let Some(tbl_id) = key_table_id(k) {
+                                if self.split_by_table && current_tbl != Some(tbl_id) {
+                                    if let Some(mut w) = current_writer.take() {
+                                        w.finish()?;
+                                        if !out_paths.is_empty() {
+                                            self.io_acquire(out_paths.last().unwrap())?;
+                                        }
+                                    }
+                                    let (w, path) = start_new_table(self, out_level)?;
+                                    current_tbl = Some(tbl_id);
+                                    current_writer = Some(w);
+                                    out_paths.push(path);
+                                }
+                            }
+                            let w = current_writer.as_mut().ok_or_else(|| {
+                                Error::Config("没有当前 writer 输出复合键".into())
+                            })?;
+                        match v {
+                            Some(val) => w.add(k, val, *seq)?,
+                            None => w.add_tombstone(k, *seq)?,
+                        }
+                        total_kept_keys += 1;
                     }
                 }
             } else {
-                kept.push(rows[i].clone()); // 常规：只留最新版本
+                dropped_keys += 1;
             }
-            i = j;
         }
-        rows = kept;
 
-        // ③ 写输出段（读路径新文件插最前）。
-        // M3（§26 多表，实施清单②）：归并后 key 升序、同表键天然连续 → 按 `docid >> 48`
-        // 检测表边界切分输出，每表一个文件（输出段互不重叠，符合 L1/L2 层内不重叠语义；
-        // 单表 / 表切分关闭 → 单文件输出，与旧行为一致）。
-        let mut out_paths: Vec<std::path::PathBuf> = Vec::new();
-        let write_one = |self_: &Self, rows: &[(Vec<u8>, u64, Option<Vec<u8>>)]| -> Result<PathBuf> {
-            let sst_id = self_.next_sst_id.fetch_add(1, Ordering::Relaxed);
-            let path = self_.dir.join(format!("{SST_PREFIX}{sst_id:08}.sst"));
-            {
-                let mut w = SstWriter::new_with_pax(
-                    &path,
-                    self_.compression,
-                    self_.compression_level_for(out_level),
-                    self_.block_size,
-                    rows.len(),
-                    &self_.pax_hot_fields,
-                    self_.bloom_fpr,
-                )?;
-                for (key, _seq, value) in rows {
-                    match value {
-                        Some(v) => w.add(key, v, *_seq)?,
-                        None => w.add_tombstone(key, *_seq)?,
-                    }
-                }
-                w.finish()?;
+        // 结束最后一个 writer
+        if let Some(mut w) = current_writer.take() {
+            w.finish()?;
+            if !out_paths.is_empty() {
+                self.io_acquire(out_paths.last().unwrap())?;
             }
-            self_.io_acquire(&path)?;
-            Ok(path)
-        };
-        if self.split_by_table && rows.len() > 1 {
-            let mut start = 0usize;
-            while start < rows.len() {
-                let tbl = key_table_id(&rows[start].0).unwrap_or(0);
-                let mut end = start + 1;
-                while end < rows.len() && key_table_id(&rows[end].0).unwrap_or(0) == tbl {
-                    end += 1;
-                }
-                out_paths.push(write_one(self, &rows[start..end])?);
-                start = end;
-            }
-        } else {
-            // 全量单输出（含全部键被位图物理丢弃后 rows 为空 → 写空段，保持旧语义）
-            out_paths.push(write_one(self, &rows)?);
+        } else if out_paths.is_empty() {
+            // 所有键都被丢弃 → 仍写一个空段保持层结构不变
+            let (w, path) = start_new_table(self, out_level)?;
+            w.finish()?;
+            self.io_acquire(&path)?;
+            out_paths.push(path);
         }
+
+        let kept_before_grouping = total_input_entries as u64;
 
         self.finalize_compact(
             sel,
             &out_paths,
             out_level,
             old_count,
-            rows.len(),
-            kept_keys.saturating_sub(rows.len()),
-            dropped_keys,
+            total_kept_keys as usize,
+            kept_before_grouping.saturating_sub(total_kept_keys) as usize,
+            dropped_keys as usize,
         )
     }
 
@@ -2033,13 +2463,14 @@ impl ColumnFamily {
             kept_ssts.insert(0, Arc::new(reader));
             kept_levels.insert(0, out_level);
         }
-        let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
+        let (layer_ranges, layer_indices, l0_table_ranges) = Self::build_layer_meta(&kept_ssts, &kept_levels);
         let sizes: Vec<u64> = kept_ssts.iter().map(|r| r.file_len()).collect();
         self.ssts.store(Arc::new(SstSnapshot {
             ssts: kept_ssts,
             levels: kept_levels,
             layer_ranges,
             layer_indices,
+            l0_table_ranges,
             sizes,
         }));
         self.persist_manifest()?;
@@ -2146,16 +2577,19 @@ impl ColumnFamily {
                 None => return true, // 底部混表老段：需合并切分
             }
         }
-        let l1_gate = if self.l1_trigger_files > 0 {
-            l1n >= self.l1_trigger_files // Ex-8.11：L1 攒批一次下沉（防频繁底层重写）
+        let l1_tf = self.l1_trigger_files.load(Ordering::Relaxed);
+        let has_l1_table_with_multi = l1.values().any(|&c| c >= 2);
+        let l1_gate = if l1_tf > 0 {
+            l1n >= l1_tf || has_l1_table_with_multi
         } else {
-            l1.values().any(|&c| c >= 2)
+            has_l1_table_with_multi
         };
+        
         if l1_gate {
             return true;
         }
-        if self.l1_trigger_files > 0 && l1n > 0 {
-            return false; // 延迟模式：L1 未达阈值，等批次到齐（不提前收敛 L2）
+        if l1_tf > 0 && l1n > 0 {
+            return false; // 延迟模式：L1 未达阈值，所有表单段，等批次到齐（不提前收敛 L2）
         }
         let l2_gate = if self.l2_trigger_files > 0 {
             l2n >= self.l2_trigger_files
@@ -2191,15 +2625,16 @@ impl ColumnFamily {
         if self.split_by_table {
             return self.split_bottom_merge_work();
         }
-        let l1_gate = if self.l1_trigger_files > 0 {
-            l1 >= self.l1_trigger_files
+        let l1_tf = self.l1_trigger_files.load(Ordering::Relaxed);
+        let l1_gate = if l1_tf > 0 {
+            l1 >= l1_tf
         } else {
             l1 > 1
         };
         if l1_gate {
             return true;
         }
-        if self.l1_trigger_files > 0 && l1 > 0 {
+        if l1_tf > 0 && l1 > 0 {
             return false; // 延迟模式：L1 未达阈值，等批次到齐
         }
         let l2_gate = if self.l2_trigger_files > 0 {
@@ -2345,6 +2780,7 @@ impl ColumnFamily {
             levels: Vec::new(),
             layer_ranges: Vec::new(),
             layer_indices: Vec::new(),
+            l0_table_ranges: None,
             sizes: Vec::new(),
         }));
         self.seq_min.write().unwrap().clear();
@@ -2396,13 +2832,14 @@ impl ColumnFamily {
             return Ok(0);
         }
         // 原子发布（store → persist → remove，同 finalize_compact / purge_data）
-        let (layer_ranges, layer_indices) = Self::build_layer_meta(&kept_ssts, &kept_levels);
+        let (layer_ranges, layer_indices, l0_table_ranges) = Self::build_layer_meta(&kept_ssts, &kept_levels);
         let sizes: Vec<u64> = kept_ssts.iter().map(|r| r.file_len()).collect();
         self.ssts.store(Arc::new(SstSnapshot {
             ssts: kept_ssts,
             levels: kept_levels,
             layer_ranges,
             layer_indices,
+            l0_table_ranges,
             sizes,
         }));
         self.persist_manifest()?;
@@ -2595,10 +3032,8 @@ fn get_from_sst(
     }
     // Ex-5.9：布隆放行（真正读块）→ 读热度 +1（冷热感知 Compaction 数据源）
     sst.touch();
-    let ck = BlockCacheKey {
-        file: sst.path().to_path_buf(),
-        offset: entry.offset,
-    };
+    let tid = sst.table_id().unwrap_or(0);
+    let ck = BlockCacheKey::new(sst.path().to_path_buf(), entry.offset, tid);
     let block = if let Some(b) = cache.get(&ck) {
         b
     } else {
@@ -2641,10 +3076,8 @@ fn get_from_sst_at(
         }
     }
     sst.touch();
-    let ck = BlockCacheKey {
-        file: sst.path().to_path_buf(),
-        offset: entry.offset,
-    };
+    let tid = sst.table_id().unwrap_or(0);
+    let ck = BlockCacheKey::new(sst.path().to_path_buf(), entry.offset, tid);
     let block = if let Some(b) = cache.get(&ck) {
         b
     } else {
@@ -2729,10 +3162,8 @@ fn get_many_from_sst(
             // 布隆放行 → 读热度 +1（冷热感知 Compaction 数据源，与 get_from_sst 一致）
             sst.touch();
             let entry = located[pos].2.clone();
-            let ck = BlockCacheKey {
-                file: sst.path().to_path_buf(),
-                offset: entry.offset,
-            };
+            let tid = sst.table_id().unwrap_or(0);
+            let ck = BlockCacheKey::new(sst.path().to_path_buf(), entry.offset, tid);
             let block = if let Some(b) = cache.get(&ck) {
                 b
             } else {
@@ -4474,6 +4905,14 @@ mod tests {
             assert!(guard < 8, "压缩应快速收敛（当前 {} 轮）", guard);
         }
         // 收敛：跨表每表 1 段（表1 去重为 1 段、表2 1 段），不再需要压缩
+        eprintln!("DEBUG: sst_count={}, needs_compact={}, levels={:?}, l1_tf={}, effective_l0={}, l0_max_size={}",
+            cf.sst_count(),
+            cf.needs_compact(),
+            { let snap = cf.ssts.load(); snap.levels.clone() },
+            cf.l1_trigger_files.load(std::sync::atomic::Ordering::Relaxed),
+            cf.effective_l0_threshold(),
+            cf.l0_max_size_bytes,
+        );
         assert!(!cf.needs_compact(), "按表收敛后不应再触发压缩");
         let mut ts: Vec<u16> = sst_tables(&cf).into_iter().map(|t| t.unwrap()).collect();
         ts.sort();

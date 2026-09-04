@@ -497,7 +497,10 @@ impl DbServer {
                     // 读锁内 clone 目标（Arc clone 廉价）→ drop 锁 → 无锁合并
                     let targets = engine.read().map(|g| g.compaction_targets()).unwrap_or(None);
                     if let Some(t) = targets {
-                        let _ = t.run();
+                        // P80：合并失败记日志，不 panic（下一轮信号/兜底再试）
+                        if let Err(e) = t.run() {
+                            tracing::warn!("后台合并 worker 失败: {e}，下一轮再试");
+                        }
                     }
                     if backstop {
                         last_backstop = std::time::Instant::now();
@@ -3229,6 +3232,13 @@ fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
         Ok(where_part) => {
             // §26 M1：SQL row_id / 字段候选 → 本表 docid
             let tid = table_id_for(&table_name_of(sql));
+            // B2（delete_range50 修复）：主键闭区间 `id BETWEEN a AND b` / `docid BETWEEN a AND b`
+            // → **区间 keys-only 扫描**产出 docid → `delete_batch` 批量删（单次提交）。
+            // 替代旧路径：resolve_where_ids 落 sqlish `SELECT docid` 全扫物化 Vec（cap 200_000）
+            // + 逐行 engine.delete（每行独立 fsync/watchdog/delta 清理 → 50 行区间慢 6729×）。
+            if let Some((lo, hi)) = parse_pk_between(&where_part) {
+                return delete_pk_range(engine, tid, lo, hi);
+            }
             let ids = match resolve_where_ids(engine, &where_part)
                 .map(|v| route_where_ids(tid, &where_part, v))
             {
@@ -3238,16 +3248,58 @@ fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
             if ids.is_empty() {
                 return QueryResponse::Ok(0, 0);
             }
-            let mut n = 0u64;
-            for id in ids {
-                match engine.delete(id) {
-                    Ok(_) => n += 1,
-                    Err(e) => return QueryResponse::Err(1064, format!("delete error: {e}")),
-                }
+            // 批量删（B2：替代逐行 engine.delete——字段条件命中集也统一走 delete_batch 攒批提交）
+            match engine.delete_batch(ids.into_iter()) {
+                Ok(n) => QueryResponse::Ok(n, 0),
+                Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
             }
-            QueryResponse::Ok(n, 0)
         }
         Err(e) => QueryResponse::Err(1064, format!("delete syntax: {e}")),
+    }
+}
+
+/// B2：解析主键闭区间 WHERE——`id BETWEEN a AND b` / `docid BETWEEN a AND b`
+/// （SQL row_id 区间，闭区间含 a/b；对齐 MySQL DELETE 主键区间语义）。
+/// 其余形态返回 None（交回 resolve_where_ids）。
+fn parse_pk_between(where_part: &str) -> Option<(u64, u64)> {
+    let w = where_part.trim().trim_end_matches(';').trim();
+    let lower = w.to_lowercase();
+    let rest = lower
+        .strip_prefix("id between ")
+        .or_else(|| lower.strip_prefix("docid between "))?;
+    let (lo_s, hi_s) = rest.split_once(" and ")?;
+    let lo = lo_s.trim().parse::<u64>().ok()?;
+    let hi = hi_s.trim().trim_end_matches(';').trim().parse::<u64>().ok()?;
+    if lo > hi {
+        return None; // 空区间：交回通用路径（也返回 0 行）
+    }
+    Some((lo, hi))
+}
+
+/// B2：主键闭区间批量删——docid ∈ [docid_for(tid,lo), docid_for(tid,hi)] 区间内
+/// **keys-only 扫描现存 docid** → `engine.delete_batch`（单次提交，无逐行 fsync）。
+/// 只删**现存**行（区间内缺失/已删的 docid 不计数，对齐 MySQL affected_rows）。
+fn delete_pk_range(engine: &mut Engine, tid: u16, lo: u64, hi: u64) -> QueryResponse {
+    let start = docid_for(tid, lo);
+    let end = docid_for(tid, hi);
+    let mut ids: Vec<u64> = Vec::new();
+    match engine.scan_stream_ids(Some(start), Some(end), |d| {
+        // keys-only：不解文档值；回调 false 可提前终止（此处全量收集）
+        if d < start || d > end {
+            return Ok(true); // 防御：区间外不收集
+        }
+        ids.push(d);
+        Ok(true)
+    }) {
+        Ok(()) => {}
+        Err(e) => return QueryResponse::Err(1064, format!("delete range: {e}")),
+    }
+    if ids.is_empty() {
+        return QueryResponse::Ok(0, 0);
+    }
+    match engine.delete_batch(ids.into_iter()) {
+        Ok(n) => QueryResponse::Ok(n, 0),
+        Err(e) => QueryResponse::Err(1064, format!("delete range: {e}")),
     }
 }
 
@@ -4623,6 +4675,98 @@ mod tests {
             super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
         }
         assert!(e.get(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_pk_between_range_batch() {
+        // B2（delete_range50 修复）：`DELETE … WHERE id BETWEEN a AND b` → 主键区间
+        // keys-only 扫描 + delete_batch（单次提交）。验证：
+        // ① 影响行数 = 区间内现存行；② 删除后区间外行保留；③ 缺行不计数（对齐 MySQL）；
+        // ④ 多表场景只删目标表区间（他表同 row_id 不受影响）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let put = |e: &mut crate::engine::Engine, id: u64| {
+            let doc = format!("{{\"v\":{id}}}");
+            e.put(id, doc.as_bytes().to_vec(), &[]).unwrap();
+        };
+        // documents（tid=0）：1..=10 与 21..=30，中间 11..=20 缺行
+        for i in (1..=10u64).chain(21..=30u64) {
+            put(&mut e, i);
+        }
+        // ① 区间 [5,15]：现存 5..=10（6 行）→ 影响 6
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE id BETWEEN 5 AND 15") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 6, "区间内现存行数"),
+            super::QueryResponse::Err(c, m) => panic!("delete BETWEEN 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 5..=10u64 {
+            assert!(e.get(i).unwrap().is_none(), "docid={i} 应被区间删");
+        }
+        for i in (1..5u64).chain(21..=30u64) {
+            assert!(e.get(i).unwrap().is_some(), "docid={i} 应保留");
+        }
+        // ② 空区间 [50,60] → 0 行
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE id BETWEEN 50 AND 60") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 0, "空区间应删 0 行"),
+            super::QueryResponse::Err(c, m) => panic!("delete 空区间失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        // ③ 大写/空白容错：`ID BETWEEN  1 AND 4`
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE ID BETWEEN  1 AND 4") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 4),
+            super::QueryResponse::Err(c, m) => panic!("delete 大写 BETWEEN 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        assert!(e.get(1).unwrap().is_none() && e.get(4).unwrap().is_none());
+        // ④ docid BETWEEN（引擎 docid 直解区间）
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE docid BETWEEN 21 AND 25") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 5),
+            super::QueryResponse::Err(c, m) => panic!("delete docid BETWEEN 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        // ⑤ 多表：t_a 同 row_id 区间（tid≠0），documents 已删的不受影响
+        let tid_a = super::table_id_for("t_a");
+        assert_ne!(tid_a, 0);
+        for r in 1..=30u64 {
+            let doc = format!("{{\"v\":{r}}}");
+            e.put(super::docid_for(tid_a, r), doc.as_bytes().to_vec(), &[]).unwrap();
+        }
+        // t_a 区间 [8,12] → t_a 行 8..=12 删（5 行）；documents 的 8..=10 已删、11..=20 本就缺 —— 不干扰
+        match super::delete_response(&mut e, "DELETE FROM t_a WHERE id BETWEEN 8 AND 12") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 5, "仅删 t_a 区间现存行"),
+            super::QueryResponse::Err(c, m) => panic!("delete t_a BETWEEN 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for r in 8..=12u64 {
+            assert!(e.get(super::docid_for(tid_a, r)).unwrap().is_none(), "t_a row={r} 应删");
+        }
+        // documents 21..=30 仍可见（BETWEEN 表区间隔离）
+        for i in 26..=30u64 {
+            assert!(e.get(i).unwrap().is_some(), "documents docid={i} 应保留");
+        }
+        // ⑥ 反向/单值 BETWEEN（lo==hi 等价点删）
+        match super::delete_response(&mut e, "DELETE FROM documents WHERE id BETWEEN 26 AND 26") {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 1),
+            super::QueryResponse::Err(c, m) => panic!("delete 单点 BETWEEN 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+    }
+
+    #[test]
+    fn parse_pk_between_forms() {
+        // B2 解析器：主键闭区间形态识别；其余形态（字段 BETWEEN / 复合条件 / 非 id 前缀）返回 None
+        assert_eq!(super::parse_pk_between("id BETWEEN 100 AND 200"), Some((100, 200)));
+        assert_eq!(super::parse_pk_between("docid BETWEEN 1 AND 9"), Some((1, 9)));
+        assert_eq!(super::parse_pk_between("  ID BETWEEN  5 AND  9 "), Some((5, 9)));
+        assert_eq!(super::parse_pk_between("id between 5 and 9;"), Some((5, 9)));
+        assert_eq!(super::parse_pk_between("id = 42"), None);
+        assert_eq!(super::parse_pk_between("id IN (1,2,3)"), None);
+        assert_eq!(super::parse_pk_between("amount BETWEEN 1 AND 5"), None); // 非主键字段
+        assert_eq!(
+            super::parse_pk_between("id BETWEEN 5 AND 9 AND status='x'"),
+            None, // 复合条件交回通用路径
+        );
     }
 
     #[test]

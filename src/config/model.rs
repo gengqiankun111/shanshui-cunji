@@ -39,6 +39,7 @@ pub struct Config {
     pub read_write_separation: ReadWriteSeparationConfig,
     pub broadcast_query: BroadcastQueryConfig,
     pub compaction: CompactionConfig,
+    pub optimizer: OptimizerConfig,
     pub sidecar: SidecarConfig,
     pub cache_external: CacheExternalConfig,
     pub watchdog: WatchdogConfig,
@@ -672,6 +673,12 @@ pub struct StorageConfig {
     /// `query_by_composite_prefix`（引擎已具备，缺口在写路径 + SQL 层接线）。
     /// 例：`[["status","ts"], ["region","k"]]` → `WHERE status='active' AND ts=?` 走组合索引。
     pub composite_indexes: Vec<Vec<String>>,
+    /// P4-A：Compaction 写入速率自适应——滑动窗口大小（flush 次数），窗口内统计新增 L0 段数。
+    /// 默认 8 → 看最近 8 次 flush 平均增速。
+    pub compaction_write_rate_window: usize,
+    /// P4-A：写入爆发阈值（滑动窗口内新增 L0 段数），超过此值视为写入爆发，
+    /// L1 触发阈值从 `l1_trigger_files` 降为 2 → 提前下沉 L1→L2，防 L0 爆胀。
+    pub compaction_write_rate_burst: usize,
 }
 
 impl Default for StorageConfig {
@@ -721,6 +728,9 @@ impl Default for StorageConfig {
             // （防小批量删除/历史置位误触发整段重写；删除密集负载空间回收依赖此路径）。
             delete_density_min_ratio: 0.10,
             delete_density_min_docs: 1000,
+            // P4-A：写入速率自适应窗口 8 次 flush，爆发阈值 4（窗口内 >4 次 flush 新增 L0 = 爆发）
+            compaction_write_rate_window: 8,
+            compaction_write_rate_burst: 4,
             composite_indexes: Vec::new(),
         }
     }
@@ -770,6 +780,9 @@ pub struct InvertedConfig {
     /// `GROUP BY status` 聚合免全扫（配合 v5 段载荷；第①步仅内存段累积）。
     /// 空 = 关闭（默认，零额外写开销）；多数字字段全开失控——对齐 Ex-4 成本控制准则。
     pub stats_fields: Vec<String>,
+    /// P4-B：delta FST 大小上限（MB）——最后一段 FST 超过此大小自动触发合并进 base
+    /// （0 = 默认 16MB，每次合并后新 delta 从零开始）。
+    pub delta_fst_max_mb: u64,
 }
 
 impl Default for InvertedConfig {
@@ -788,6 +801,48 @@ impl Default for InvertedConfig {
             fulltext_fields: Vec::new(),
             cjk_segmenter: "bigram".into(),
             stats_fields: Vec::new(),
+            // P4-B：delta FST 上限默认 16MB，超过后自动 roll into base
+            delta_fst_max_mb: 16,
+        }
+    }
+}
+
+/// P4-C：优化器配置（代价模型参数）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OptimizerConfig {
+    /// 启用基于代价的动态路由（true = P4-C 动态路由；false = 保留静态路由兼容）。
+    pub cost_based_enabled: bool,
+    /// 一次主键点查的代价（微秒）。
+    pub point_lookup_cost: f64,
+    /// 每行全表扫描的代价（微秒/行）。
+    pub full_scan_row_cost: f64,
+    /// 倒排每行回表的代价（微秒/行）。
+    pub inverted_fetch_cost: f64,
+    /// 倒排 bitmap 合并的固定开销（微秒）。
+    pub inverted_merge_fixed: f64,
+    /// 组合索引每行回表的代价（微秒/行）。
+    pub composite_fetch_cost: f64,
+    /// Zone Map 剪枝效率系数（0~1）：1 = 完全剪枝，0 = 无剪枝。
+    pub zone_map_effectiveness: f64,
+    /// 倒排查询阈值：doc_count 超过此值时考虑全扫替代（0 = 使用代价估算）。
+    pub inverted_fallback_threshold: u64,
+    /// 支持 Zone Map 剪枝的字段列表（空 = 所有字段均支持）。
+    pub zone_map_fields: Vec<String>,
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            cost_based_enabled: true,
+            point_lookup_cost: 1.0,
+            full_scan_row_cost: 0.1,
+            inverted_fetch_cost: 2.0,
+            inverted_merge_fixed: 50.0,
+            composite_fetch_cost: 1.5,
+            zone_map_effectiveness: 0.85,
+            inverted_fallback_threshold: 100_000,
+            zone_map_fields: Vec::new(),
         }
     }
 }

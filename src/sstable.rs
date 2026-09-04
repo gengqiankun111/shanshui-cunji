@@ -52,7 +52,8 @@ use crate::per_cpu::PerCpuCounter;
 pub const SST_MAGIC: &[u8; 8] = b"NVSSTL01";
 /// v4：数据块引入 PAX 列式布局（块首 kind 字节）；仍可读取 v3（行式）。
 /// 当前格式版本：v5 = 分区布隆（Partitioned Bloom，design 4.4.2）。
-pub const SST_VERSION: u16 = 5;
+/// v6 = P3-B：FieldZone 新增 `sum` 字段（数值列块内累加和，供 SUM/AVG 聚合下推）。
+pub const SST_VERSION: u16 = 6;
 /// v3：行式数据块（无 kind 字节）——Reader 向后兼容的最低版本。
 pub const SST_VERSION_ROW: u16 = 3;
 
@@ -136,6 +137,8 @@ struct PendingRow {
 }
 
 /// 字段级 Zone Map（阶段 1.5，design 4.4.1 强化）：块内单字段采样统计，供范围条件剪枝。
+/// P3-B：v6 新增 `sum` 字段——数值列块内累加和（字节为 JSON 数值序列化），
+/// 非数值列固定为 `0.0`；`sum` 聚合并可用时（present_count == null_count == 0 表示未计算）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FieldZone {
     pub field: String,
@@ -146,6 +149,9 @@ pub struct FieldZone {
     pub present_count: u32,
     /// null 计数（缺失字段不计）。
     pub null_count: u32,
+    /// P3-B：v6 数值列块内累加和（JSON 数值直接求和），非数值列或 v5 旧段为 0.0。
+    /// 用于 SUM(amount)/AVG(amount) 等聚合下推：跨块累加 sum 即可，无需读数据块。
+    pub sum: f64,
 }
 
 /// SSTable Writer：按 key 升序写入，自动切块、压缩、维护稀疏索引与分区布隆（v5）。
@@ -450,6 +456,8 @@ impl SstWriter {
                 encode_varlen(&mut ib, &z.max);
                 ib.extend_from_slice(&z.present_count.to_le_bytes());
                 ib.extend_from_slice(&z.null_count.to_le_bytes());
+                // P3-B：v6 新增 sum 字段（f64 8 字节）
+                ib.extend_from_slice(&z.sum.to_le_bytes());
             }
         }
         self.write_all(&ib)?;
@@ -598,6 +606,9 @@ fn encode_pax_block(
         let mut max: Option<Vec<u8>> = None;
         let mut present_count: u32 = 0;
         let mut null_count: u32 = 0;
+        // P3-B：数值列累加和
+        let mut is_numeric = true;
+        let mut sum: f64 = 0.0;
         for (_, obj, _) in &parsed {
             match obj.get(f) {
                 None => out.push(0), // present=0（缺失）
@@ -615,6 +626,14 @@ fn encode_pax_block(
                     encode_varint(&mut out, s.len() as u64);
                     out.extend_from_slice(&s);
                     present_count += 1;
+                    // P3-B：数值列累加和
+                    if is_numeric {
+                        if let Some(n) = v.as_f64() {
+                            sum += n;
+                        } else {
+                            is_numeric = false;
+                        }
+                    }
                     if min.as_ref().is_none_or(|m| s.as_slice() < m.as_slice()) {
                         min = Some(s.clone());
                     }
@@ -635,6 +654,8 @@ fn encode_pax_block(
             max: max.unwrap_or_default(),
             present_count,
             null_count,
+            // P3-B：非数值列 sum=0.0（由查询方通过 present_count==0 识别未计算的列）
+            sum: if is_numeric { sum } else { 0.0 },
         });
     }
     // Seqs
@@ -692,6 +713,9 @@ pub struct SstReader {
     /// 空段（无块）为全空 Vec，`key_range()` 返回 None = 无约束。
     min_key: Vec<u8>,
     max_key: Vec<u8>,
+    /// P3-C：该 SST 所属表 ID（从 min_key 提取，因 M3 保证每个 SST 仅含单表）。
+    /// 非 docid 编码的混合索引 SST → None，使用全局默认分区 0。
+    table_id: Option<u16>,
     /// 文件字节数（open 时一次 metadata；快照 sizes 缓存用——写路径 needs_compact
     /// 不再逐次 fs::metadata，避免每 put 3 次 stat 拖垮写吞吐）。
     file_len: u64,
@@ -867,6 +891,15 @@ impl SstReader {
         let compression = Compression::from_code(hb[10])?;
         let _block_size = u32::from_le_bytes(hb[11..15].try_into().unwrap()) as usize;
 
+        let min_key = index.first().map(|e| e.first_key.clone()).unwrap_or_default();
+        let max_key = index.last().map(|e| e.max_key.clone()).unwrap_or_default();
+        // P3-C：从 min_key 提取 table_id（docid 高 2 字节；非 docid 键 → None）
+        let table_id = if min_key.len() >= 2 {
+            Some(u16::from_be_bytes([min_key[0], min_key[1]]))
+        } else {
+            None
+        };
+
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -884,9 +917,9 @@ impl SstReader {
             full_index: Mutex::new(None),
             partition_blooms,
             bloom,
-            // R 项：段 [min, max] 从解码索引首尾取（索引按 key 升序；空段无约束）
-            min_key: index.first().map(|e| e.first_key.clone()).unwrap_or_default(),
-            max_key: index.last().map(|e| e.max_key.clone()).unwrap_or_default(),
+            min_key,
+            max_key,
+            table_id,
             file_len: fsize,
             compression,
             format: version,
@@ -943,6 +976,11 @@ impl SstReader {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// P3-C：获取该 SST 所属表 ID（None = 未知/混合索引）。
+    pub fn table_id(&self) -> Option<u16> {
+        self.table_id
     }
 
     /// 精确块数（无需触发 Level 2 加载，open 时即得）。
@@ -1283,6 +1321,18 @@ impl SstReader {
     }
 }
 
+/// P1-E：字段级 Zone Map 谓词——块级 min/max 与查询范围比较，不相交块跳过。
+/// 字段的 min/max 是 `serde_json` 序列化后的字节序，比较时直接按字节序（数值/字符串均有序）。
+/// `min`/`max` 为 `None` 表示该侧无界（如 `amount > 100` 的 max 为 None）。
+#[derive(Debug, Clone)]
+pub struct ZonePredicate {
+    pub field: String,
+    /// 查询范围下界（JSON 序列化字节，闭区间）；None = 无下界。
+    pub min: Option<Vec<u8>>,
+    /// 查询范围上界（JSON 序列化字节，闭区间）；None = 无上界。
+    pub max: Option<Vec<u8>>,
+}
+
 /// SST 范围扫描**流式迭代器**（M8-P10 scan 流式化）：块级惰性读取 + Zone Map 剪枝，
 /// 逐条 yield `(key, value, seq)`（value=None = Tombstone）。与 `scan_range` 语义一致，
 /// 但可暂停/推进（k-way merge 多源归并用），内存 O(块) 而非 O(全量)。
@@ -1304,6 +1354,8 @@ pub struct SstRangeIter<'a> {
     /// 读块**写穿**缓存：全组命中免磁盘 IO + 解压，重复窗口（分页/热范围/重测）直达；
     /// None = 不缓存（低层/测试直用，行为与改造前一致）。
     cache: Option<std::sync::Arc<crate::blockcache::BlockCache>>,
+    /// P1-E：字段级 Zone Map 谓词——块级 min/max 检查，不相交块跳过。
+    zone_pred: Option<ZonePredicate>,
 }
 
 impl<'a> SstRangeIter<'a> {
@@ -1367,7 +1419,13 @@ impl<'a> SstRangeIter<'a> {
             prefetch: std::collections::VecDeque::new(),
             keys_only,
             cache,
+            zone_pred: None,
         })
+    }
+
+    /// P1-E：设置字段级 Zone Map 谓词（扫描路径用，默认 None 无剪枝）。
+    pub fn set_zone_pred(&mut self, zp: ZonePredicate) {
+        self.zone_pred = Some(zp);
     }
 
     /// 推进到下一个候选块（Zone Map 剪枝），加载并解码；无更多块返回 false。
@@ -1383,7 +1441,7 @@ impl<'a> SstRangeIter<'a> {
         let mut picks: Vec<(usize, IndexEntry)> = Vec::new();
         let mut bidx = self.block_idx;
         while bidx < self.reader.index_len() && picks.len() < SCAN_GROUP {
-            let e = self.reader.block_entry(bidx)?;
+            let mut e = self.reader.block_entry(bidx)?;
             if let Some(s) = &self.start {
                 if e.max_key.as_slice() < s.as_slice() {
                     bidx += 1;
@@ -1393,6 +1451,25 @@ impl<'a> SstRangeIter<'a> {
             if let Some(en) = &self.end {
                 if e.first_key.as_slice() > en.as_slice() {
                     break; // 索引按 key 有序，后续块更大
+                }
+            }
+            // P1-E：字段级 Zone Map 剪枝——块级 min/max 与谓词比较，不相交则跳过整块
+            if let Some(ref zp) = self.zone_pred {
+                if let Some(zone) = e.zones.iter().find(|z| z.field == zp.field) {
+                    // 若查询下界 > 块上界 → 整块不命中（跳过）
+                    if let Some(ref min) = zp.min {
+                        if min.as_slice() > zone.max.as_slice() {
+                            bidx += 1;
+                            continue;
+                        }
+                    }
+                    // 若查询上界 < 块下界 → 整块不命中（跳过）
+                    if let Some(ref max) = zp.max {
+                        if max.as_slice() < zone.min.as_slice() {
+                            bidx += 1;
+                            continue;
+                        }
+                    }
                 }
             }
             picks.push((bidx, e));
@@ -1407,12 +1484,10 @@ impl<'a> SstRangeIter<'a> {
         // 未全命中则整组读并**写穿**缓存（热窗口二次扫描起命中）。
         let blocks = if let Some(cache) = &self.cache {
             let file = self.reader.path().to_path_buf();
+            let tid = self.reader.table_id().unwrap_or(0);
             let cks: Vec<crate::blockcache::BlockCacheKey> = picks
                 .iter()
-                .map(|(_, e)| crate::blockcache::BlockCacheKey {
-                    file: file.clone(),
-                    offset: e.offset,
-                })
+                .map(|(_, e)| crate::blockcache::BlockCacheKey::new(file.clone(), e.offset, tid))
                 .collect();
             let hits: Vec<Option<Vec<u8>>> = cks.iter().map(|ck| cache.get(ck)).collect();
             if hits.iter().all(Option::is_some) {
@@ -1508,12 +1583,24 @@ fn decode_index(ib: &[u8], version: u16) -> Result<Vec<IndexEntry>> {
                 let present_count = u32::from_le_bytes(ib[cur..cur + 4].try_into().unwrap());
                 let null_count = u32::from_le_bytes(ib[cur + 4..cur + 8].try_into().unwrap());
                 cur += 8;
+                // P3-B：v6 读取 sum 字段（f64 8 字节）；v5 旧段无此字段 → sum=0.0
+                let sum = if version >= 6 {
+                    if cur + 8 > ib.len() {
+                        return Err(Error::Corrupted("索引 Zone sum 越界".into()));
+                    }
+                    let s = f64::from_le_bytes(ib[cur..cur + 8].try_into().unwrap());
+                    cur += 8;
+                    s
+                } else {
+                    0.0
+                };
                 zones.push(FieldZone {
                     field,
                     min,
                     max,
                     present_count,
                     null_count,
+                    sum,
                 });
             }
         }
@@ -1700,6 +1787,99 @@ fn decode_pax_block(data: &[u8]) -> Result<Vec<DecodedRow>> {
                 .unwrap(),
         );
         rows.push((keys[i].clone(), Some(value), seq));
+    }
+    Ok(rows)
+}
+
+/// P3-B：从 PAX 块中读取指定列的值，不重构完整行——只反序列化目标列的数据，
+/// 跳过其他列（减少 JSON 解析和内存分配开销，适用于聚合查询）。
+///
+/// 返回 `(key, column_value, seq)` 列表，其中 `column_value` 是目标列的 JSON 值字节。
+/// 如果目标列不存在或全为 null，则 `column_value` 为 None。
+pub fn decode_pax_block_column(data: &[u8], column: &str) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>, u64)>> {
+    let mut cur = 1usize; // 跳过 kind
+    if cur + 4 > data.len() {
+        return Err(Error::Corrupted("PAX 块行数越界".into()));
+    }
+    let row_count = u32::from_le_bytes(data[cur..cur + 4].try_into().unwrap()) as usize;
+    cur += 4;
+
+    // Keys
+    let mut keys = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        keys.push(decode_varlen(data, &mut cur)?.to_vec());
+    }
+    // 列偏移量表
+    if cur + 2 > data.len() {
+        return Err(Error::Corrupted("PAX 列计数越界".into()));
+    }
+    let col_count = u16::from_le_bytes(data[cur..cur + 2].try_into().unwrap()) as usize;
+    cur += 2;
+    for _ci in 0..col_count {
+        let field = String::from_utf8(decode_varlen(data, &mut cur)?.to_vec())
+            .map_err(|_| Error::Corrupted("PAX 列名非法 UTF-8".into()))?;
+        let _is_hot = data[cur];
+        cur += 1;
+        if cur + 8 > data.len() {
+            return Err(Error::Corrupted("PAX 列表越界".into()));
+        }
+        let offset = u32::from_le_bytes(data[cur..cur + 4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(data[cur + 4..cur + 8].try_into().unwrap()) as usize;
+        cur += 8;
+        if field == column {
+            // 读取目标列数据
+            let col_data = &data[offset..offset + len];
+            let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_count);
+            let mut ccur = 0usize;
+            for _ in 0..row_count {
+                if ccur >= col_data.len() {
+                    return Err(Error::Corrupted("PAX 列数据越界".into()));
+                }
+                let present = col_data[ccur];
+                ccur += 1;
+                if present == 1 {
+                    let vlen = decode_varint(col_data, &mut ccur)? as usize;
+                    if ccur + vlen > col_data.len() {
+                        return Err(Error::Corrupted("PAX 列值越界".into()));
+                    }
+                    let vbytes = &col_data[ccur..ccur + vlen];
+                    ccur += vlen;
+                    if vbytes == b"n" {
+                        vals.push(Some(b"null".to_vec())); // null
+                    } else {
+                        vals.push(Some(vbytes.to_vec()));
+                    }
+                } else {
+                    vals.push(None); // 缺失
+                }
+            }
+            // Seqs（块尾：row_count × u64）
+            if data.len() < row_count * 8 {
+                return Err(Error::Corrupted("PAX seq 区越界".into()));
+            }
+            let seqs_start = data.len() - row_count * 8;
+            let mut rows = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                let seq = u64::from_le_bytes(
+                    data[seqs_start + i * 8..seqs_start + (i + 1) * 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                rows.push((keys[i].clone(), vals[i].clone(), seq));
+            }
+            return Ok(rows);
+        }
+    }
+    // 目标列不存在：返回空值列表
+    let seqs_start = data.len() - row_count * 8;
+    let mut rows = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let seq = u64::from_le_bytes(
+            data[seqs_start + i * 8..seqs_start + (i + 1) * 8]
+                .try_into()
+                .unwrap(),
+        );
+        rows.push((keys[i].clone(), None, seq));
     }
     Ok(rows)
 }

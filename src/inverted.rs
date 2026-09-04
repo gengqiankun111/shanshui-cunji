@@ -133,6 +133,9 @@ pub struct InvertedIndex {
     flush_threshold: u64,
     /// 段文件 GC 阈值（字节）：磁盘段总量超此值触发 `gc()` 合并（design 5.2.2；0 = 禁用）。
     gc_threshold_bytes: u64,
+    /// P4-B：delta FST 大小上限（字节）——最后一段 FST 超过此大小自动触发合并进 base
+    /// （0 = 默认 16MB，每次合并后新 delta 从零开始）。
+    delta_fst_max_bytes: u64,
     /// Ex-8.13：后台 IO 预算（Token Bucket，与列族压缩共享同一"写压力收窄后"预算语义）。
     /// GC/后台段写（`account_written_budgeted`）acquire 节流；前台紧急刷段
     /// （`flush_segment`）仅记账不等待——保留写入语义（预算不足时不停前台）。
@@ -302,6 +305,7 @@ impl InvertedIndex {
             mutate: std::sync::Mutex::new(()),
             flush_threshold,
             gc_threshold_bytes,
+            delta_fst_max_bytes: 0,
             bitmap_fields: std::collections::HashSet::new(),
             bitmaps: (0..BITMAP_SHARDS)
                 .map(|_| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -693,6 +697,15 @@ impl InvertedIndex {
         self.stats_mem.clear(); // 统计已随段落盘（v5 载荷），避免下次 flush 重复累积
         self.mem_docids.reset();
         info!("倒排刷盘完成: {fname}");
+
+        // P4-B：刷盘后检查最新 delta 段 FST 是否超限，超限触发后台 GC 合并进 base
+        if self.should_delta_gc() {
+            info!("delta FST 达到上限 {} MB，触发自动合并进 base", self.delta_fst_max_bytes / (1024 * 1024));
+            // 后台合并已经持有 mutate 锁（当前我们已经持有），直接 gc
+            let report = self.gc()?;
+            info!("delta FST 自动合并完成: 合并 {} 段，释放 {} 字节", report.merged, report.freed_bytes);
+        }
+
         Ok(())
     }
 
@@ -1160,15 +1173,48 @@ impl InvertedIndex {
             && self.segment_bytes() >= self.gc_threshold_bytes
     }
 
+    /// P4-B：是否需要 delta FST GC——最后一段（最新 delta）FST 超过上限。
+    /// 检查最新段 FST 文件大小，超过 `delta_fst_max_bytes` 即触发合并。
+    pub fn should_delta_gc(&self) -> bool {
+        if self.delta_fst_max_bytes == 0 {
+            return false;
+        }
+        let segs = self.segments.load();
+        if segs.len() <= 1 {
+            return false;
+        }
+        // 新段列表首位（新→旧顺序，首位 = 最新 delta）
+        let delta = &segs[0];
+        // 最新段可能有单独的 .fst 文件或 .seg 文件
+        let fst_name = delta.replace(".seg", ".fst");
+        let fst_path = self.dir.join(&fst_name);
+        if fst_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&fst_path) {
+                return meta.len() >= self.delta_fst_max_bytes;
+            }
+        }
+        // 无 FST（hash 引擎）→ 检查 seg 文件大小
+        if let Ok(meta) = std::fs::metadata(self.dir.join(delta)) {
+            return meta.len() >= self.delta_fst_max_bytes;
+        }
+        false
+    }
+
+    /// P4-B：设置 delta FST 大小上限（字节），0 = 禁用。
+    pub fn set_delta_fst_max_bytes(&mut self, bytes: u64) {
+        self.delta_fst_max_bytes = bytes;
+    }
+
     /// 倒排文件 GC（design 5.2.2）：将全部段读取所有 Term 的最新 Bitmap，
     /// **重写为单个紧凑段**（临时文件 → fsync → 原子更新 Manifest → 删除旧段 + 旧 FST），
     /// 中途崩溃不丢数据（启动只加载 Manifest 中的段，孤儿段被忽略）。
     /// J 项（7.73）：改 `&self` + mutate 锁——后台 GC 线程与写路径 flush 并发安全
     /// （flush/gc 写 Manifest 与删文件互斥，防丢失更新）。
+    /// P4-B：增强触发条件——also triggers when `should_delta_gc()` returns true.
     pub fn gc(&self) -> Result<GcReport> {
         // J 项：与 flush_segment 互斥（Manifest 写 / 删段文件序列化）
         let _mut = self.mutate.lock().unwrap();
-        if !self.should_gc() {
+        if !self.should_gc() && !self.should_delta_gc() {
             return Ok(GcReport {
                 merged: 0,
                 freed_bytes: 0,

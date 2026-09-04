@@ -258,17 +258,27 @@ tools/   shanshui-cunji-migrate · shanshui-cunji-export · shanshui-cunji-impor
 
 ## 十八、开发排期队列完成状态（A~AF，全部 ✅）
 
-**P0 级**：A 本机 2 千万/5 千万基准 ✅、B 1 亿 sysbench ✅、M 事务类查询优化 ✅、N 倒排回表批量读 ✅、P 事件驱动自动 Compaction ✅、AD 10 亿库阶段 A~D ✅、AE LSM 读路径范围优化（id BETWEEN p50 86ms→2.48ms，vs MySQL 3.6×）✅、AF SQL 能力补全（#1~#5 完成，#6 倒排加速 GROUP BY 待排期）🚧。
+**P0 级**：A 本机 2 千万/5 千万基准 ✅、B 1 亿 sysbench ✅、M 事务类查询优化 ✅、N 倒排回表批量读 ✅、P 事件驱动自动 Compaction ✅、AD 10 亿库阶段 A~D ✅、AE LSM 读路径范围优化（id BETWEEN p50 86ms→2.48ms，vs MySQL 3.6×）✅、AF SQL 能力补全（#1~#5 完成 ✅、**#6 倒排加速 GROUP BY 50m 验收 2026-09-04 完成（细节见下）；默认化阻塞于 count_all_docs 改为 O(1)，另立项**）✅。
 **P1 级**：C 分布式吞吐优化 ✅、H MySQL 协议适配 ✅、L Compaction 智能调度 ✅、O 读路径无锁化 ✅、R L0/层 Zone Map 粗筛 ✅。
 **P2/P3 级**：D/E/F LSM 事务三阶段（WriteBatch/快照隔离/完整 ACID）✅、G 倒排 posting 优化 ✅、I 高并发查询 ✅、J 倒排段 GC 后台化 ✅、K fulltext posting 分块 ✅、S/T/U/V/W/X ✅。
 **延伸**：Y 分布式+写路径收尾 ✅、Z 无锁合并 ✅、AA/AB/AC 导出增强 ✅。
 **多表大项（2026-09-03 立项，非 A~AF 字母序列）**：§26 真多表 M1~M3 ✅（详见「二十、真多表（§26）实现归档」）。
 
-**Ex 系列归档（全部 ✅）**：L0 单分片本地事务+组提交（已有）、Ex-1 outbox、Ex-2 SAGA、Ex-3 Calvin（评估不引入）、Ex-4 倒排字段策略（50M 库 inverted 2231.8→144.3MB，-93.5%）、Ex-5 SSD 原生、Ex-6 并发读（Seqlock/ArcSwap）、Ex-7 多核；Ex-8/Ex-9 系列（AE 与聚合加速）完成标记归档。
+**Ex 系列归档**：L0 单分片本地事务+组提交（已有）、Ex-1 outbox、Ex-2 SAGA、Ex-3 Calvin（评估不引入）、Ex-4 倒排字段策略（50M 库 inverted 2231.8→144.3MB，-93.5%）、Ex-5 SSD 原生、Ex-6 并发读（Seqlock/ArcSwap）、Ex-7 多核。
+**Ex-8/Ex-9 50m 复测/验收（2026-09-04 一次性完成，细节见 development_remain.md 近邻排期表 + problem_solving P80）**：
+- **Ex-8.11 50m（A/B 采纳 l1_trigger=8 写放大复测）**：WA=0.31（写盘 13.09GB / 原始 41.61GB）、最终 6656MB、层=(9,7,0)、点查 p50=135.5µs 范围 p50=54.9ms（vs 5M 基线 (0,2,0) p50=0.2/0.2µs，L0 重叠段作为主退化源 ≈700×/27000× 被实测证实）—— ✅ 采纳已获 50m 背书。
+- **Ex-8.12 50m（L2 冷档 zstd19 A/B 重评）**：采样 200k JSON 载荷独立 zstd，shrink=0.5823（**省 41.8% 磁盘，越过 -10% 验收线**；12.8 万 demo 原"差 4.7%"系低重复 JSON 工况偏差，不代表真实数据）；解压 p50 zstd19=25.6µs vs zstd3=30.9µs（**读退化不存在，0.83× 反快 17%**）；外推 50m 基线 6.66GB → L2 ≈4.06GB（省 39%）。但 **P80 L1→L2 底部合并卡死**（compact_merge 全量 Vec 物化 + watchdog 500ms 空转双因，5M/50m 双规模复现）阻塞默认化落地——默认保持 level_l2=0，P80 修完再切。
+- **Ex-8.13 独立 IO 预算 A/B**：按 2026-09-04 用户选择跳过收尾。切片 1 记账+IO 预算接线 + 切片 2A worker 调度并入 Ex-8.9 已具备，无需改动（配置 io_rate_limit_mb>0 即生效）。
+- **Ex-9.3 ⑤ 倒排加速 GROUP BY 50m 验收 + 全量回归**：
+  - count_all_docs = 50,000,000（文档总数一致 ✓）。
+  - 正确性全过：status/city/region inverted_group_stats doc_count 跨段求和 =50,000,000（缺字段 0）✓；端到端 execute_group_by status/COUNT(*) 组计数总和=50M 一致=true ✓。
+  - 纯倒排词典枚举中位：status 3 组 7023µs / city 332 组 5764µs / region 6 组 5452µs（~5.5–7ms，**随段数线性 / 随组数亚线性**，与 N=50M 无关）。
+  - 端到端 A/B：A 快路径 120.6s vs B 全扫 122.5s → 加速比 1.02×（收益被 GROUP BY 内嵌 count_all_docs 全键扫 112.8s 几乎完全抵消）。默认化前置：**Engine.count_all_docs 必须 O(1)**（put/delete/flush/事务增量记账 + manifest 启动重建基线，跨模块大工程另行立项）。
+  - **全量回归：cargo test 628 passed / 0 failed / 3 ignored（190s）—— 0 回归 ✅**。
 
 ---
 
-## 十九、关键取舍（评估后不引入 / 暂缓）
+## 十九、关键取舍（评估后不引入 / 暂缓 / 待前置修复后重评）
 
 | 项 | 结论 |
 |---|---|
@@ -278,6 +288,9 @@ tools/   shanshui-cunji-migrate · shanshui-cunji-export · shanshui-cunji-impor
 | Calvin 确定性事务 | 不引入（远期触发）——单 docid 天然不分片，outbox+SAGA 已覆盖 |
 | Calvin 硬件卸载 | 无必要——gseq 2 亿/s 远超目标 2+ 数量级 |
 | io_uring | 默认关闭——2 核小机器负收益，多核 NVMe 生产按指引开启 |
+| **Ex-8.12 L2 冷档压缩默认化（compression_level_l2=19）** | **待前置修复 P80 后重评**——原判（12.8 万 demo 差 4.7% 不采纳）已被 2026-09-04 50m 采样法推翻：实际载荷 shrink=0.5823（省 41.8% 磁盘、解压 0.83× 反快 17%），外推 50m 6.66GB → 4.06GB（省 ~39%），-10% 验收线大幅越过。但 P80「L1→L2 底部合并卡死」（compact_merge 全量 Vec 物化 + watchdog 500ms 空转双因）在 5M/50m 双规模复现，**必须先修 P80（流式 k 路归并 + compact 推进语义）才能落地默认**。当前默认保持 level_l2=0。 |
+| **AF #6（Ex-9.3 ⑤）GROUP BY 倒排快路径默认化** | **待前置修复：count_all_docs 改为 O(1)**——2026-09-04 50m 验收：正确性全过（count_all_docs=50M、status/city/region 组计数总和=50M、端到端 SQL 一致=true）；纯倒排词典枚举 ~5.5–7ms（随段数线性 / 随组数亚线性，N=50M 无关）；但端到端 A/B 加速比 1.02×（收益被 GROUP BY 内嵌 count_all_docs 全键扫 112.8s 几乎完全抵消）。默认化前置为 Engine.count_all_docs O(1) 增量记账（put/delete/flush/事务 + manifest 启动重建），跨模块大工程另行立项。当前快路径保持 on-demand（execute_group_by 会走，只是端到端比不显快）。 |
+| **Ex-8.13 独立 IO 预算 A/B（io_rate_limit_mb>0 并发对比）** | 暂不做（2026-09-04 用户选择收尾）。核心（切片 1 倒排写记账 + IO 预算接线 + 切片 2A worker 三档调度并入 Ex-8.9）已落地并有单测覆盖；启用 io_rate_limit_mb>0 即生效，有交变负载验收需求时单独立项。 |
 | 倒排 posting 新编码 | 维持 Roaring——密集/簇状已达 1bit/docid 理论下限，稀疏绝对量小且牺牲 20× 交集性能 |
 | 并行解压 | 回退——spawn 开销 ≫ zstd 解压省时 |
 

@@ -881,6 +881,77 @@
 - **回归**：`cargo test --lib` engine::tests 102 + db_adapter::tests 53 全绿；release 全量见
   `feat(P2-A)` 提交记录。
 
+### P83. delete_range50 严重性能问题（6729×）：DELETE 范围逐行点删 → delete_batch 批量删（646.7× 实测）
+- **现象**：宽表基准（user_guide/宽表SQL性能基准记录.md §24 / 交接说明）`delete_range50`
+  （`DELETE FROM t WHERE id BETWEEN a AND b`，50 行）cjserver 7537ms vs MySQL 1.12ms = **6729×**，
+  全库最严重性能问题。
+- **根因**（双层）：
+  1. **定位层**：`db_adapter::resolve_where_ids` 对 `id BETWEEN` 不识别为主键区间 → 落
+     `sqlish::execute("SELECT docid …")` 全扫物化候选 Vec（cap 200_000），无索引收敛；
+  2. **删除层**：`delete_response` 拿到候选后 `for id { engine.delete(id) }` **逐行点删**。
+     rr-conformance 多表须关 `deletion_bitmap`（多表高位 docid 稀疏位图约束，见真多表收尾）
+     → `Engine::delete` None 分支走 `ColumnFamily::delete` → `delete_bytes` → **逐行 `sync_wal`
+     fsync**；50 行 = 50 次独立 fsync + 50 次 watchdog/HotCache 失效/delta 前缀清理 → 慢 6729×。
+- **修复**（分两层落地）：
+  1. **引擎批量删原语** `Engine::delete_batch(iter)`（engine.rs）：逐 docid 语义与 `delete` 完全
+     一致（HotCache 失效 + 删除位图置位（新置位计垃圾密度）+ 版本化 memtable Tombstone +
+     WAL 删除记录 + Delta 前缀清理；幂等），但墓碑统一走 `delete_record_mem`（WAL 攒批不逐行
+     fsync），watchdog 批头一次 + 每 4096 巡检。**持久性镜像 `delete` 语义**：
+     - 位图路径（Some）：`delete` 本就不主动 flush（内存即时隐藏，落盘由组提交/后续 flush）→ 批尾不提交；
+     - Tombstone 路径（None）：`delete` 逐行 sync_wal（强安全）→ 批尾**单次** `primary/delta
+       sync_wal`（50 行从 50 次 fsync → 1 次）。
+     ⚠️ 坑：初版批尾调 `maybe_group_commit`→`flush_wal` 会触发 `deletion_bitmap.flush()` 写
+     `deletion.bitmap` 文件——但位图路径 `Engine::delete` 从不主动 flush 该文件（server 场景
+     首次落盘即 os error 3）→ 回归测试 `handshake_auth_and_query_roundtrip` /
+     `txn_for_update_current_read_c3` 失败。修复 = 批尾仅 None 路径 sync_wal（不碰 bm.flush）。
+  2. **SQL 层主键区间快路径**（db_adapter.rs `delete_response`）：
+     - `parse_pk_between` 识别 `id BETWEEN a AND b` / `docid BETWEEN a AND b`（大写/空白/分号容错；
+       复合条件/非主键字段 → None 交回通用路径）；
+     - `delete_pk_range`：docid 区间 [docid_for(tid,lo), docid_for(tid,hi)] **keys-only 扫描现存
+       docid** → `delete_batch`（单次提交）；只删现存行（区间缺行/已删不计数，对齐 MySQL
+       affected_rows）；多表天然隔离（docid 高位 = table_id）。
+     - 通用字段条件 DELETE 的逐行删循环也改走 `delete_batch`。
+- **A/B 实测**（src/demo/delete-range-ab，release，5 万行，deletion_bitmap 关闭）：
+  **A 逐行 48319ms vs B 批量 74.7ms = 646.7×**（与 6729× 同根因逐行 fsync）；
+  位图开启对照：逐行/批量均 ~85ms（本就无逐行 fsync），批量无回归。
+- **测试**（5 新增，全绿）：`delete_batch_range_removes_all_and_idempotent`（位图开/关双路径：
+  可见集 + 幂等 + 与逐行删一致）、`delete_batch_revive_put_clears_bitmap`（批量删后 put 复活）、
+  `delete_pk_between_range_batch`（区间删计数/区间外保留/空区间/大写/多表隔离/单点 BETWEEN）、
+  `parse_pk_between_forms`（解析器形态识别）。
+- **回归**：`cargo test --lib` 665 全绿（含此前失败的 2 个 server 测试）。
+- **设计**：research/optimizer_integration_design.md §9（写路径整合 + delete_batch/delete_pk_range）。
+
+### P84. DocIdSet 读路径重构（阶段 A：统一 docid 集合抽象 + LIKE 支持 + Top-K OFFSET 守卫）
+- **背景**：optimizer_integration_design.md 阶段 A——把读路径 WHERE 收敛统一到 DocIdSet
+  （optimizer_proces 阶段 1），供读/写/JOIN 共用消费端；顺带补 LIKE（like_offset_design）与
+  Top-K 深分页守卫。
+- **实施**（A1~A8 增量落地，每步编译+单测）：
+  1. **A1/A2** 新模块 src/docset.rs：`LimitSpec`（limit+offset 统一规格，total_to_fetch/
+     can_early_stop）+ `DocIdSet`（Bitmap/SortedList/Empty/All + intersect 归并/位图交集 +
+     to_vec/iter/len_estimate）。**工程取舍**：引擎 scan 是回调式 push，惰性 Stream(Box<dyn
+     Iterator>) 与 &mut 消费有借用硬冲突 → 收敛为物化集合；范围/全扫继续走既有回调路径。
+  2. **A3** `WhereExpr::Like` + 解析（无 `%` 折叠为 Cond(Eq) 走倒排；含 `%` 保留）+ `like_match`
+     双指针通配 + 接入 matches_doc/light_where_matches/scan_leaf/Leaf/eval——AND 快路径
+     （倒排位图 ∩ LIKE 后过滤）天然生效。
+  3. **A4** `get_docid_set(engine, where, limit, guard)`：无 WHERE → All；有 WHERE → eval 位图
+     → Bitmap/Empty。**设计决策**：是 eval 的形态包装而非重写（eval 已含 AND 快路径/LIKE/OR/NOT，
+     665 测试护航），读写 JOIN 共用消费接口。
+  4. **A5** execute() 末尾 bitmap 生产/消费改走 get_docid_set（sort 分支 DocIdSet→位图物化保
+     Top-K/全排序；非 sort 分支 DocIdSet 统一迭代）；All（无 WHERE）消费端物化语义对齐原
+     full_docids（u32 过滤保留）。
+  5. **A6** execute_join() 阶段 1 主表候选改走 get_docid_set（Bitmap/Empty/All），从表收敛仍走
+     ON 关联 key（right_field=docid 主键点查 / 倒排 1:N 展开）。**修正**：主表候选不再用 limit
+     截断（原 eval(limit) 在低匹配密度下会漏 JOIN 行），改 None 全量 + 合并段 limit 早停。
+  6. **A7** Top-K 守卫：k=offset+limit 超 SORT_MAX_ROWS 拒绝（深分页 keyset 提示，防堆膨胀）。
+- **测试**（11 新增，全绿）：docset 7（intersect 各组合/LimitSpec/to_vec）、
+  like_match_wildcard_semantics、sql_like_prefix_middle_and_eq_fold（前缀/尾锚/无通配折叠/
+  AND+LIKE 快路径/OR 兜底）、get_docid_set_shapes_and_equivalence、deep_offset_order_by_rejected
+  （深分页守卫 + 守卫内 offset 切片正确）。
+- **回归**：`cargo test --lib` 676 全绿（基线 665 + 11 新增）。
+- **设计**：research/optimizer_integration_design.md §一~八（A1~A8 步骤）。
+- **遗留**：JOIN 8 阶段全流程（主键 JOIN 直达/索引-索引 DocIdSet.intersect/广播哈希）需 SQL
+  语法支持从表独立 WHERE 后才可完整接线（当前单表 JOIN + ON 关联形态已接入统一 DocIdSet）。
+
 
 ## 环境备忘（不入库）
 

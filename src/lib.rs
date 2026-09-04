@@ -26,6 +26,7 @@ pub mod config;
 pub mod db_adapter;
 pub mod demo;
 pub mod docid_alloc;
+pub mod docset;
 pub mod engine;
 pub mod error;
 pub mod explain;

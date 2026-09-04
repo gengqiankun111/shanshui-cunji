@@ -99,6 +99,10 @@ pub struct Engine {
     /// Compaction 并行度（Ex-5.4）：并行压实 primary/cidx/delta 三列族；
     /// 0 = 自动（min(4, 核数/2)），1 = 串行，>1 = 指定并行数。
     compaction_parallel: usize,
+    /// P4-C：基于代价的优化器是否启用。
+    pub cost_based_enabled: bool,
+    /// P4-C：代价模型参数。
+    pub cost_params: crate::optimizer::CostParams,
     /// P 项：事件驱动自动 Compaction（`storage.auto_compact`）——写入路径自触发：
     /// 写前 L0 达硬顶（l0_stall_max）先合并（背压），写后 L0 超阈值（段数/大小）合并收敛。
     auto_compact: bool,
@@ -453,6 +457,10 @@ impl Engine {
             &cfg.inverted.engine,
             cfg.inverted.segment_max_size_mb * 1024 * 1024,
         )?;
+        // P4-B：delta FST 上限配置（MB → 字节）
+        if cfg.inverted.delta_fst_max_mb > 0 {
+            inverted.set_delta_fst_max_bytes(cfg.inverted.delta_fst_max_mb * 1024 * 1024);
+        }
         // 位图索引（design 5.2.4，M7-2）：白名单非空时全量重建内存位图
         inverted.with_bitmap_fields(&cfg.inverted.bitmap_fields)?;
         // Ex-8.13：倒排 GC/后台段写共享后台 IO 预算（与列族压缩同受 Ex-7.4 写压力收窄；
@@ -574,6 +582,17 @@ impl Engine {
             composite_indexes: cfg.storage.composite_indexes.clone(),
             pending_inverted: Mutex::new(Vec::new()),
             compaction_parallel: cfg.storage.compaction_parallel,
+            cost_based_enabled: cfg.optimizer.cost_based_enabled,
+            cost_params: crate::optimizer::CostParams {
+                point_lookup_cost: cfg.optimizer.point_lookup_cost,
+                full_scan_row_cost: cfg.optimizer.full_scan_row_cost,
+                inverted_fetch_cost: cfg.optimizer.inverted_fetch_cost,
+                inverted_merge_fixed: cfg.optimizer.inverted_merge_fixed,
+                composite_fetch_cost: cfg.optimizer.composite_fetch_cost,
+                zone_map_effectiveness: cfg.optimizer.zone_map_effectiveness,
+                scan_row_factor: 1.5,
+                inverted_fallback_threshold: cfg.optimizer.inverted_fallback_threshold,
+            },
             auto_compact: cfg.storage.auto_compact,
             compact_pending: Arc::new(AtomicBool::new(false)),
             compact_worker: Arc::new(AtomicBool::new(false)),
@@ -1177,6 +1196,54 @@ impl Engine {
         Ok(())
     }
 
+    /// delete_range50 修复（性能项①）：**批量删除原语**——流式消费 docid 迭代器，逐 docid
+    /// 执行与 [`delete`](Self::delete) 完全一致的语义（HotCache 失效 + 删除位图置位 +
+    /// 版本化 memtable Tombstone + WAL 删除记录 + Delta 前缀清理；幂等），但**不逐行 fsync**：
+    /// 墓碑统一走 `delete_record_mem`（WAL 攒批，批尾一次 `maybe_group_commit` 提交——
+    /// 组提交关闭时回退单次 `flush_wal`），watchdog 批头检查一次 + 每 4096 行巡检。
+    /// 收益：范围删 50 行从「50 次独立 fsync + 50 次 watchdog/热缓存/Delta 开销」降到
+    /// 「1 次提交 + 摊销巡检」；语义与逐行 `delete` 完全一致（含删除密度计数、复活清位、快照版本判定）。
+    pub fn delete_batch<I: Iterator<Item = u64>>(&mut self, docids: I) -> Result<u64> {
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
+        let mut n = 0u64;
+        for docid in docids {
+            self.hotcache.invalidate(docid);
+            match &self.deletion_bitmap {
+                Some(bm) => {
+                    // Ex-8.7：新置位才计入删除密度净置位数（重复删除幂等）
+                    if bm.mark_deleted(docid) {
+                        self.garbage_marked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.primary
+                        .delete_record_mem(encode_docid(docid).to_vec())?;
+                    self.delta.delete_prefix(&encode_docid(docid))?;
+                }
+                None => {
+                    // 位图关闭（传统 Tombstone 路径）：墓碑进版本链（快照语义同 delete），
+                    // 但批尾统一 sync 替代逐行 sync_wal（delete_range50 提速关键）
+                    self.primary
+                        .delete_record_mem(encode_docid(docid).to_vec())?;
+                    self.delta.delete_prefix(&encode_docid(docid))?;
+                }
+            }
+            n += 1;
+            // 摊销看门狗：每 4096 行巡检（防超长批量撞硬水位/磁盘熔断）
+            if n % 4096 == 0 {
+                self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
+            }
+        }
+        // 持久性对齐逐行 delete：
+        // - 位图路径（Some）：Engine::delete 本身不主动 flush（删除位图内存即时隐藏，
+        //   落盘由组提交/后续 flush 负责）→ 镜像语义，批尾不提交（避免触发 bm.flush 落盘）。
+        // - Tombstone 路径（None）：Engine::delete 走 delete_bytes 逐行 sync_wal（强安全），
+        //   此处批尾**单次** sync 主/delta WAL（墓碑 + 删除记录已入 WAL），50 行从 50 次 fsync → 1 次。
+        if self.deletion_bitmap.is_none() {
+            self.primary.sync_wal()?;
+            self.delta.sync_wal()?;
+        }
+        Ok(n)
+    }
+
     /// M3（§26 多表，实施清单④）：DROP TABLE 磁盘文件级回收——物理删除主列族内
     /// **完全落在指定表 docid 区间**的 SST（表切分后每文件单表，可整文件删）。
     /// 须在 `multitable::drop_table_range`（逐 docid 逻辑删除：墓碑已覆盖全部该表键）之后调用，
@@ -1586,6 +1653,31 @@ impl Engine {
         })
     }
 
+    /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
+    /// 但额外在 SST 块级检查 `zone_pred` 的 min/max，不相交块跳过（免 IO/解压）。
+    /// 适用于 SQL 范围查询（`ts BETWEEN`、`amount > N`）的扫描下推路径。
+    pub fn scan_stream_with_zonepred<F: FnMut(u64, &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        zone_pred: Option<crate::sstable::ZonePredicate>,
+        mut f: F,
+    ) -> Result<()> {
+        let sk = start.map(|s| encode_docid(s).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        self.primary.scan_stream_with_zonepred(sk.as_deref(), ek.as_deref(), zone_pred, |key, val| {
+            let docid = decode_docid(key).map_err(|_| {
+                crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
+            })?;
+            if let Some(bm) = &self.deletion_bitmap {
+                if bm.is_deleted(docid) {
+                    return Ok(true);
+                }
+            }
+            f(docid, val)
+        })
+    }
+
     /// Ex-8.3 Part B：keys-only 流式 id 扫描（最新视图，免整文档值解码）——纯 `SELECT id` /
     /// COUNT 类只关心 docid 存在性的路径；merge 版本折叠 + Tombstone 跳过 + 删除位图过滤，
     /// 回调返回 false 提前终止。语义与 `scan_stream` 输出 docid 集一致。
@@ -1740,8 +1832,14 @@ impl Engine {
         let end = crate::keys::encode_composite_key(fields, u64::MAX);
         let hits = cidx.scan_raw_range(Some(&start), Some(&end))?;
         let mut out = Vec::new();
+        // P0-A：多个 composite_indexes 可能共享前缀（如 [status] 和 [status,region]），
+        // 前缀扫描会命中多个索引的条目（同一 docid 多次出现），须去重。
+        let mut seen = std::collections::HashSet::new();
         for (key, _) in hits {
             let (_fields, docid) = crate::keys::decode_composite_key(&key)?;
+            if !seen.insert(docid) {
+                continue;
+            }
             if let Some(v) = self.get(docid)? {
                 out.push((docid, v));
             }
@@ -1915,6 +2013,33 @@ impl Engine {
             return Ok(n);
         }
         self.inverted.doc_count(term)
+    }
+
+    /// P4-C：基于代价的动态路由。返回最优访问路径与代价估算。
+    /// 使用配置中的代价模型参数，结合倒排 doc_count 统计。
+    pub fn cost_route(&self, spec: &crate::optimizer::QuerySpec) -> crate::optimizer::CostEstimate {
+        let total_rows = self.estimated_total_rows();
+        let zone_fields: Vec<String> = Vec::new(); // 后续可扩展从 SST 元数据获取
+        crate::optimizer::cost_route(
+            spec,
+            &self.cost_params,
+            &|term| self.inverted.doc_count_fast(term).ok().flatten(),
+            total_rows,
+            &zone_fields,
+        )
+    }
+
+    /// P4-C：估算表总行数（基于 max_docid 或 inverted 段总数）。
+    /// 精确值由 `count_all_docs` 提供（当前是 O(N) 扫描，暂不用于热路径）。
+    pub fn estimated_total_rows(&self) -> u64 {
+        // 使用 max_docid 作为上界（最接近实际行数）
+        let max_docid = self.max_docid.load(Ordering::Relaxed);
+        if max_docid > 0 {
+            max_docid
+        } else {
+            // 回退：从 inverted 段总量估算
+            self.inverted.mem_docids() + 1000
+        }
     }
 
     /// 按字段前缀分组（GROUP BY 聚合）：返回 `field=value` 各分组的文档数。
@@ -2202,6 +2327,8 @@ impl Engine {
     /// - **无 worker**（demo/rpc/测试）：保持同步执行（单写者模型：合并期间阻塞读写，
     ///   写入自然退避 = 背压，L0 有界）。
     /// guard 上限 8：一次写入最多收敛 8 轮（正常 1~2 轮即收敛，防异常空转死循环）。
+    /// P80 修复：合并无进展（merged_ssts=0 或错误）时退避 100ms 再重试，防 watchdog 超时截断
+    /// 导致永不推进的 0 CPU 死循环。
     fn auto_compact(&mut self) -> Result<()> {
         if !self.auto_compact {
             return Ok(());
@@ -2214,7 +2341,19 @@ impl Engine {
         }
         let mut guard = 0;
         while self.needs_compact() && guard < 8 {
-            self.compact()?;
+            match self.compact() {
+                Ok(rep) => {
+                    if rep.merged_ssts == 0 {
+                        // 无进展：退避防空转，重试直到下一轮 L0 有新段/超 guard 上限
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+                Err(e) => {
+                    // P80：合并超时/失败 → 记录警告，退避 200ms 再试（异常路径不 panic）
+                    tracing::warn!("auto_compact 失败: {e}，退避 200ms 后重试");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
             guard += 1;
         }
         Ok(())
@@ -4108,6 +4247,80 @@ mod tests {
         e.put(7, b"x".to_vec(), &["k"]).unwrap();
         e.delete(7).unwrap();
         assert!(e.get(7).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_batch_range_removes_all_and_idempotent() {
+        // delete_range50 修复：批量删语义与逐行 delete 一致（位图路径 + Tombstone 路径双验证）：
+        // ① 命中行全部不可见；② 重复批量删幂等（不报错、计数不膨胀）；
+        // ③ 与 scan_stream_ids 可见集一致（无残留、无复活）。
+        for bitmap_on in [true, false] {
+            let mut c = cfg();
+            c.storage.deletion_bitmap_enabled = bitmap_on;
+            let mut e = Engine::open(&tmp(), &c).unwrap();
+            let items: Vec<(u64, Vec<u8>, Vec<String>)> = (0..50u64)
+                .map(|i| {
+                    (
+                        i,
+                        format!("doc-{i}").into_bytes(),
+                        vec![format!("status={}", if i % 2 == 0 { "active" } else { "inactive" })],
+                    )
+                })
+                .collect();
+            e.put_batch(&items).unwrap();
+            // 统计可见行数（keys-only 计数）
+            let mut visible = 0u64;
+            e.scan_stream_ids(None, None, |_| {
+                visible += 1;
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(visible, 50, "批量删前可见 50 行");
+            // ① 范围批量删 [10, 30) → 20 行
+            let n = e.delete_batch((10..30u64).into_iter()).unwrap();
+            assert_eq!(n, 20);
+            for i in 0..50u64 {
+                let expect_none = (10..30).contains(&i);
+                assert_eq!(e.get(i).unwrap().is_none(), expect_none, "docid={i} 可见性");
+            }
+            // 与逐行 delete 对比可见集：删 [30,50) 逐行 → 与 delete_batch 删除不可区分
+            for i in 30..50u64 {
+                e.delete(i).unwrap();
+            }
+            let mut left = 0u64;
+            e.scan_stream_ids(None, None, |_| {
+                left += 1;
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(left, 10, "批量删+逐行删后仅剩 [0,10)");
+            // ② 重复批量删幂等
+            let n2 = e.delete_batch((0..50u64).into_iter()).unwrap();
+            assert_eq!(n2, 50, "重复删仍消费全部迭代项（幂等，不报错）");
+            let mut left2 = 0u64;
+            e.scan_stream_ids(None, None, |_| {
+                left2 += 1;
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(left2, 0, "重复删后可见集为空");
+        }
+    }
+
+    #[test]
+    fn delete_batch_revive_put_clears_bitmap() {
+        // 批量删后 put 复活（Ex-5.6 语义）：删除位图清位 + 墓碑版本链被覆盖 → get 恢复可见。
+        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        e.put(1, b"v1".to_vec(), &[]).unwrap();
+        e.put(2, b"v2".to_vec(), &[]).unwrap();
+        e.delete_batch(vec![1u64, 2].into_iter()).unwrap();
+        assert!(e.get(1).unwrap().is_none());
+        assert!(e.get(2).unwrap().is_none());
+        // 复活
+        e.put(1, b"v1-new".to_vec(), &[]).unwrap();
+        e.put(2, b"v2-new".to_vec(), &[]).unwrap();
+        assert_eq!(e.get(1).unwrap().unwrap(), b"v1-new");
+        assert_eq!(e.get(2).unwrap().unwrap(), b"v2-new");
     }
 
     #[test]
