@@ -6,7 +6,9 @@
 //! session.rs     Session 会话状态 + new_session
 //! client.rs      MysqlWireClient（JDBC 直连客户端）+ escape_sql
 //! sqlparse.rs    SQL 解析辅助 + 表/docid 映射 + WHERE 写定位
-//! http.rs        HTTP-JSON 网关（原 src/server.rs 整体迁入，公开面经下方 re-export）
+//! http/          HTTP-JSON 网关包（原 src/server.rs 整体迁入后按主题拆分：mod.rs 入口/
+//!                路由 + saga_api.rs + doc_api.rs + admin_api.rs + json.rs + tokenize.rs +
+//!                tests.rs；公开面经下方 re-export）
 //! protocol/      packet.rs 包编解码与协议常量；handshake.rs 握手认证；
 //!                response.rs QueryResponse 与结果集构造
 //! command/       query.rs 命令入口/SQL 分发/SHOW；select.rs SELECT 执行族；
