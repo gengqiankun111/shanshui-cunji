@@ -493,6 +493,11 @@ Task-030：MySQL 语法面补齐——COUNT(DISTINCT col) 与 GROUP BY … ORDER
 > 扫描口径，未达 ≤10ms——倒排/bitmap 去重快路径尚未接线，与 P115 注一致，作残余项记录）；高基数
 > count_distinct_highcard **87.61ms** ≈ MySQL 72.70ms（1.2×，≤全扫量级 ✅）；COUNT(DISTINCT) 与
 > GROUP BY…ORDER BY 聚合两探针正确性两侧行集一致（rows 等值）。
+> **残余闭环（2026-09-05，P118）：** 低基数 COUNT(DISTINCT) **位图词典快路径已接线**——inverted
+> `bitmap_field_snapshot` + engine `count_distinct_fast`（窗口∩活跃集判活，整值全删/复活精确）+ aggregate
+> distinct 分支先行尝试，不可用回退权威扫描；+1 单测 task030b（= 带 WHERE 逼扫描等值：基础/整值全删/
+> 复活/非白名单兜底）。全量 lib 回归 742 绿。10w #61 65.49ms → 目标 <1ms 量级（status 5 组枚举），
+> 110 万同口径复测数值随基准轮回填（边界与明细见 problem_solving P118）。
 
 Task-031：结果集行输出批量化（~25µs/行输出常数，10w 轮 ②⑤④ 行输出类探针共同瓶颈）
 > 实测（scc-sqlrun-100k 副本）：引擎侧同窗 COUNT(20k 行) 94ms ≈ **5µs/行**；SELECT id keys-only 20k 行
@@ -755,6 +760,26 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 | AF #6（对应 Ex-9.3 ⑤） | 倒排加速 GROUP BY 的验收与默认化（见上 Ex-9.3 ⑤） | 随 Ex-9.3 |
 | Ex-9.4（事务 #25/35/36，2026-09-04 新基准报告追加） | **事务公平档位复测闭环 + 残余优化触发项** | **根因（已由 P2-A 定位，2026-09-04）：** cjserver 默认 `storage.flush_log_at_trx_commit=1`（逐 COMMIT 三路 fsync 强安全）→ 本轮 110 万 #25 3.5×/#35 3.1×/#36 2.8×、10 万 #25 2.1×/#35 3.2×/#36 2.5× 系**档位不对称**（MySQL 该实例 `innodb_flush_log_at_trx_commit=2`）；P2-A 档位 0/2（组提交窗口）代码已落地且 1.1M 探针实测 #25 8.4×→1.4×、#35 ~6×→1.05×、#36 ~6×→1.0×（基准记录 §14，对比报告 §四.3 已注明可复测）。**本轮行动：** ①公平复测闭环——`tmp/sqlrun/tmp-cfg-wide-2g.toml` 增 `storage.flush_log_at_trx_commit=2`，重启 3317 复跑 10 万/110 万 37 探针，#25/35/36 预期落 1.0-1.4×，实测值回填对比报告 §四.3（档位语义见基准记录 §13）；②**残余差分解**（档位 2 下 #25 若仍 ~1.4×≈0.57ms vs MySQL 0.40ms，~0.17ms 为单连接逐 COMMIT 固定开销，无法并发摊薄）：txn_locks Mutex 获取 ×2（commit 加锁 + release）+ RR 写冲突检测逐目标 `last_write_seq`（LSM 点读）+ active_snapshot 注册/注销 RwLock 写锁 + watchdog.check_all；**③触发式微优化候选**（公平档位复测后仍 >2× 才立项，预期单事务 ~0.1ms 级）：a. active_snapshots 改原子低水位替代 RwLock<BTreeSet> 全量写；b. 写冲突检测与 ops 应用合并同一次主数据访问（逐 docid 一次 get_many）；c. txn_locks 无并发持有者时 try_lock 快速路径跳过 Mutex 排队 | **复测闭环 ✅（2026-09-04，随 P85–P90 复测轮执行）：`tmp/sqlrun/tmp-cfg-wide-2g.toml` 已置 `flush_log_at_trx_commit=2` 并重启 3317 复跑 10 万/110 万 37 探针；实测 #25/35/36（110 万）p50 = 0.50/0.42/0.46ms（对齐档位 2 基线 §14 的 0.4–0.6ms），mean 1.5–2.1×（受写区首次 fsync 尾部 p99 1.9–16ms 抬高）——"并发 ≤2-3×"验收越过；10 万轮 1.1–1.3×。残余微优化 a/b/c 仍为触发式（mean 需压至 ~1.0× 时才立项）** |
 | 事务微优化（触发项，见 Ex-9.4） | 仅当公平档位（flush_log_at_trx_commit=2）复测 #25/35/36 仍 >2× 时立项：①active_snapshots 原子水位；②冲突检测 + ops 应用合并；③txn_locks try_lock 快路径 | 触发式（暂不排期） |
+| **P-GB（2026-09-05 追加）** | **窗口位图分组快路径（GROUP BY 5.7~7.2× 与 #60/#81 收敛）。根因（10w 轮 #14/#27/#59 = 210/262/252ms vs MySQL 29/46/39ms；#60 290ms；#81 308ms）**：server 聚合/分组一律传本表整窗（select.rs L107）→ `execute_group_by_window` scoped=true **禁用 `group_by_fast_inverted`**（仅 !scoped 启用）→ 全扫。**方案（复用 P118 基建）**：engine `group_by_bitmap_window(fields, cand_term, start, end)`——≤2 白名单字段值位图 AND ∩「窗口∩活跃∩(WHERE 单等值候选 posting)」逐组计数，返回 (组, 匹配数)，Σcounts 守卫（>匹配数 / 两字段 <匹配数 → 回退扫描保精确）；group_by.rs `group_by_fast_bitmap_window`（COUNT(*)/HAVING/组字段或聚合头排序/LIMIT；其余回退扫描）；基准 cfg `bitmap_fields` 补 `"channel"`（#60 region,channel 全白名单）。**10w 干净轮实测回填（P119）**：#14 210→**1.6ms**、#59 253→**1.3~1.7ms**、#27 262→**7.6~9.6ms**、#60 290→**10.8ms**、#81 308→**2.6~3.8ms**（MySQL 对照 29/39/46/112/27ms，全部反超）；单测扩展 ①~⑧ = 权威扫描等值（删除/复活/缺字段回退/HAVING/LIMIT/WHERE 候选+聚合排序）。边界同 P118（值变更陈旧、非白名单字段回退扫描） | ✅ 已完成（2026-09-05，P119，数值回填） |
+| **UPDATE 10×+ 决策（2026-09-05 追加）** | **宽表 UPDATE 系（#17-19/73/75 = 8.7~15.3×）规避决策 + 触发式候选。实测与旁证**：INSERT 单行 0.5×、DELETE 0.1~0.5×、**txn 内 UPDATE #25/#35/#36 0.6~1.4×** → 引擎写能力非瓶颈；单语句 autocommit UPDATE ≈2ms/条（#17 1.99ms）——结构 = 读-改-写整文档 put_batch（P89：批尾单次落盘；单连接串行组提交窗口等满 ~2ms）+ 全量解码/倒排重索引。**决策（用户 2026-09-05）：宽表对比/使用场景规避 UPDATE，改用 INSERT 新 docid / DELETE+重建语义**；探针保留如实记录。触发式候选（UPDATE 成主流场景再立项）：①单字段 `SET f=v` 走 delta patch（免整行重写/重索引，与下方接线项 6 同源）；②单语句落盘等待对齐 INSERT 路径（组提交/异步 ack）。验收：update_id ≤2×（触发项）；不触发不排期 | 决策 ✅（2026-09-05，记录于本行） |
+
+### 接线盘点（2026-09-05 全量盘点：能力 53 / 已接线 40（其中 4 仅 bin 工具）/ 未接线 13）
+> 口径：对 src/engine、storage、inverted、txn、join、mv、bitmap、scale_out、redis、backup 的 pub 能力逐一在
+> src/sql、src/server、src/cli、src/bin 定向 Grep 统计非测试调用（明细见 P118 会话记录）。13 项未接线中：
+> **任务级 8 项（下表，逐项立项）**；**重复/内部 4 项不立项**（scan_stream_with_zonepred 与 scan_stream_parallel(zone_pred)
+> 功能等价、fulltext_search 非分页与 paged 重复、cost_route 由 engine.execute() 内部自用、auto_watermark 引擎内部水位）；
+> WriteBatch 类型上层直用 put_batch 亦可（不立项）；timing_wheel（Task-007）基建就绪**待挂载对象**（状态不变，不重开）。
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| **M-1 物化视图接线（src/mv.rs）** | MaterializedView/MvScheduler 已实现但**全仓零生产引用**（仅 lib.rs 模块声明）——确认是否保留（接线到 SQL `CREATE MATERIALIZED VIEW`/HTTP 管理端点）或废弃归档，二者择一，避免死代码 | 待评估（接线 or 废弃） |
+| **M-2 outbox 投递接线（Ex-1）** | engine enqueue/dispatch/pending/drained 仅测试覆盖，无上层投递入口（CDC/消息消费/扩容切换前置）——接 HTTP/gateway 事件面或归档 | 待评估 |
+| **M-3 增量备份接线（M6-5）** | backup_incremental/restore_incremental 仅引擎测试；全量备份已接 CLI backup/restore——补齐 CLI 增量子命令 + 验收 | 待排 |
+| **M-4 扩容 scale_out/reshard 管理入口** | ScaleOutCoordinator 仅自测引用；reshard 仅 gateway migration 中间层消费——补 admin/CLI 触发与状态面（生产 RPC+编排联动见 §三） | 待排（联动 10 亿验收） |
+| **M-5 external_cache/sdk_cache/Redis 链路启用接线** | RedisClient(TTL SETEX)/SDK 缓存/外部缓存整链零生产引用——接到 server 配置启用（缓存降级/共享热层）或归档 | 待评估 |
+| **M-6 SQL fulltext 检索接线** | fulltext_search_paged 仅 HTTP `/fulltext`；SQL parser 无 MATCH…AGAINST/全文谓词，LIKE 是子串扫、f=v 是整词倒排——补 SQL 全文检索形态 | 待评估（语法面扩展） |
+| **M-7 SQL 类型化多字段 UPDATE（接线 engine.patch）** | engine.patch 支持多字段/JSON 类型化/null 删字段/Delta 合并，仅 HTTP/CLI patch 入口；SQL UPDATE 单字段且值一律字符串化——接线类型化 UPDATE = UPDATE 决策行候选① | 待评估（随 UPDATE 候选①） |
+| **M-8 聚合/写定位快路径缺失调用点接线** | inverted_bitmap_and_count 无生产调用——挂优化器多条件计数候选（P4-C choose_best_plan 后选）/SQL 多条件 COUNT；Engine::execute(QuerySpec) 已有 HTTP/explain 但 MySQL 协议层无 spec 执行端点（低优先，HTTP 面已覆盖） | 待排（小项） |
 
 ## 三、远期（触发条件满足后落地；蓝图/触发/验收基准见 design_remain 对应节，此处只做执行跟踪）
 

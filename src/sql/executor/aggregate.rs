@@ -81,6 +81,18 @@ pub fn execute_aggregate_window(
             Error::Config("COUNT(DISTINCT) 需字段参数".into())
         })?;
         let header = format!("COUNT(DISTINCT {f})");
+        // Task-030 残余（10w 轮 #61 count_distinct_enum 344.7×）：无 WHERE 顶层字段 →
+        // 位图白名单词典快路径（引擎内"窗口∩活跃集"判活，精确同扫描）；不可用（非白名单/
+        // 高基数/含 WHERE）回退下方权威窗口扫描。
+        if sel.where_expr.is_none() && !f.contains('.') {
+            if let Some(n) = engine.count_distinct_fast(&f, start, end)? {
+                return Ok(Some(AggScalar {
+                    header,
+                    is_null: false,
+                    text: n.to_string(),
+                }));
+            }
+        }
         let guard = engine.query_guard();
         let needed = aggregate_needed_fields(sel.where_expr.as_ref(), Some(&f));
         let mut seen: HashSet<(u8, String)> = HashSet::with_capacity(1024);

@@ -446,6 +446,139 @@ fn group_by_fast_inverted(
     }))
 }
 
+/// P-GB（2026-09-05）：窗口白名单位图分组快路径（server 整表窗口下 #14/#27/#59/#81 收敛）。
+/// 语义 = 权威扫描：组计数经「窗口∩活跃集（∩WHERE 单等值候选 posting）」精确（删除/复活；
+/// 候选=WHERE 命中集内分组，等价行级过滤）；单字段可补 NULL 组（Σ<live）；两字段要求
+/// Σ==live（无缺字段/NULL 组）否则回退扫描；Σ>live（陈旧值变更交叉放大）亦回退扫描保精确。
+/// 支持单列 `COUNT(*)` 聚合（含 HAVING/组字段或该聚合列头排序/LIMIT）；WHERE 为非单等值、
+/// SUM/AVG 等 stats 聚合、多聚合 → None（回退主路径）。
+fn group_by_fast_bitmap_window(
+    engine: &Engine,
+    sel: &Select,
+    fields: &[String],
+    cap: u64,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> Result<Option<GroupResult>> {
+    let specs = &sel.group_aggs;
+    if specs.len() != 1 || !(specs[0].0 == "count" && specs[0].1.is_none()) {
+        return Ok(None);
+    }
+    // WHERE：无 或 单等值 `f=value`（含数值文本；AND/OR/比较/BETWEEN/LIKE → 行级 → 扫描）
+    let cand_term: Option<String> = match sel.where_expr.as_ref() {
+        None => None,
+        Some(WhereExpr::Cond(c)) if c.op == CmpOp::Eq && !c.field.eq_ignore_ascii_case("docid") => {
+            Some(format!("{}={}", c.field, c.value))
+        }
+        Some(_) => return Ok(None),
+    };
+    let (combos, live_total) = match engine.group_by_bitmap_window(fields, cand_term.as_deref(), start, end)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = Vec::with_capacity(combos.len() + 1);
+    let mut sum = 0u64;
+    for (vals, cnt) in &combos {
+        sum += *cnt;
+        let mut st = AggState::new();
+        st.count = *cnt;
+        list.push((vals.iter().map(|v| GroupKey::Str(v.clone())).collect(), vec![st]));
+    }
+    if sum > live_total {
+        return Ok(None); // 陈旧值变更交叉放大 → 回退权威扫描
+    }
+    if fields.len() == 1 {
+        if sum < live_total {
+            let mut st = AggState::new();
+            st.count = live_total - sum;
+            list.push((vec![GroupKey::Null], vec![st]));
+        }
+    } else if sum < live_total {
+        return Ok(None); // 两字段含缺字段行 → NULL 组分布词典无法精确 → 回退扫描
+    }
+    if list.len() as u64 > cap {
+        return Err(Error::QueryTooExpensive(format!(
+            "GROUP BY 分组数超过上限（{} 组，上限 {cap}），请加 WHERE 收敛",
+            list.len()
+        )));
+    }
+    // HAVING（组字段 + COUNT(*) 聚合左项）
+    if let Some(h) = &sel.having {
+        list.retain(|(k, sts)| having_matches(h, fields, k, specs, sts));
+    }
+    // 排序：ORDER BY 序列（组字段级 'f' / 唯一聚合列头 'a'=COUNT(*)，DESC 反转）+ 其余组 level 升序补尾
+    let mut order_seq: Vec<(char, usize, bool)> = Vec::new();
+    for (f, desc) in &sel.order_by {
+        let rf = if let Some(idx) = fields.iter().position(|x| x == f) {
+            ('f', idx)
+        } else if specs.iter().any(|(n, fl)| spec_header(n, fl) == *f) {
+            ('a', 0) // specs 已限单列 COUNT(*)
+        } else {
+            return Ok(None); // 越界 → 交主路径（正确报错/行为）
+        };
+        if !order_seq.iter().any(|(k, i, _)| k == &rf.0 && i == &rf.1) {
+            order_seq.push((rf.0, rf.1, *desc));
+        }
+    }
+    for (i, _) in fields.iter().enumerate() {
+        if !order_seq.iter().any(|(k, j, _)| *k == 'f' && *j == i) {
+            order_seq.push(('f', i, false));
+        }
+    }
+    list.sort_by(|a, b| {
+        for (k, idx, desc) in &order_seq {
+            let mut ord = if *k == 'f' {
+                cmp_group_key(&a.0[*idx], &b.0[*idx])
+            } else {
+                let av = agg_cell(&specs[*idx].0, &a.1[*idx]);
+                let bv = agg_cell(&specs[*idx].0, &b.1[*idx]);
+                cmp_agg_text(av.as_deref(), bv.as_deref())
+            };
+            if *desc {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let offset = sel.offset as usize;
+    let limit = sel.limit.unwrap_or(cap).min(cap) as usize;
+    let rows: Vec<GroupRow> = list
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(k, sts)| {
+            let keys = k.iter().map(|gk| gk.text()).collect();
+            let key_is_num = k.iter().map(|gk| gk.is_num()).collect();
+            let cells = specs
+                .iter()
+                .zip(sts.iter())
+                .map(|((name, _), st)| agg_cell(name, st))
+                .collect();
+            GroupRow { keys, key_is_num, cells }
+        })
+        .collect();
+    let funcs: Vec<&str> = specs.iter().map(|(n, _)| n.as_str()).collect();
+    let group_cols: Vec<String> = sel
+        .columns
+        .iter()
+        .filter(|c| !funcs.contains(&c.to_lowercase().as_str()))
+        .cloned()
+        .collect();
+    let headers: Vec<String> = specs
+        .iter()
+        .map(|(n, f)| spec_header(n, f))
+        .collect();
+    Ok(Some(GroupResult {
+        group_fields: fields.to_vec(),
+        group_cols,
+        headers,
+        rows,
+    }))
+}
+
 /// GROUP BY 执行（AF#2~#4）：`SELECT <cols>, COUNT/SUM/AVG/MIN/MAX ... GROUP BY f1, f2...` →
 /// 全量单遍扫描分组（与无索引聚合同语义，不依赖倒排完整性；WHERE 行级过滤），组键升序
 /// 输出（Null < Num < Str；`ORDER BY` 决定键序——仅限分组字段），LIMIT/OFFSET 对**组行**
@@ -475,6 +608,15 @@ pub fn execute_group_by_window(
     // P1-3：表区间窗口禁用（倒排为引擎全库口径，跨表会串表）。
     if !scoped && sel.where_expr.is_none() && fields.len() == 1 {
         if let Some(res) = group_by_fast_inverted(engine, &sel, &fields[0], &specs, cap)? {
+            return Ok(Some(res));
+        }
+    }
+    // P-GB（2026-09-05）：**窗口**白名单位图分组快路径——server 恒传本表整窗（select.rs L107）
+    // → scoped=true，上面词典路径不可用 → #14/#27/#59/#81 恒全扫。窗口位图路径在引擎侧按
+    // 「窗口∩活跃集（∩WHERE 单等值候选）」精确计数（跨表高位 docid 排外，无串表），语义 =
+    // 权威扫描；WHERE 非单等值 / SUM/AVG / 两字段含缺字段行时 helper 自动回退下方全量扫描。
+    if scoped && (1..=2).contains(&fields.len()) {
+        if let Some(res) = group_by_fast_bitmap_window(engine, &sel, &fields, cap, start, end)? {
             return Ok(Some(res));
         }
     }

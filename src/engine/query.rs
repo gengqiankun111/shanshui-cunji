@@ -400,6 +400,148 @@ impl Engine {
         Ok(())
     }
 
+    /// Task-030 残余项（10w 轮 #61：`COUNT(DISTINCT status)` 65.49ms = 344.7× MySQL 0.19ms）：
+    /// 低基数字段 COUNT(DISTINCT) 词典快路径。字段命中**内存位图白名单**（`bitmap_fields`）时
+    /// 值 → docid 位图常驻内存：逐值判定「窗口 [start,end] ∩ 活跃 docid 集（`live_docids`，
+    /// 删除位图/墓碑口径与权威窗口扫描一致）非空」即计 1 个 distinct 值 → O(组数)，枚举级
+    /// 低基数字段亚毫秒；组数超上限（高基数，如 user_id）或字段非白名单 → None（调用方回退
+    /// 权威窗口扫描）。已知边界（与引擎倒排既有语义一致）：白名单位图仅追加不摘除（同 docid
+    /// 覆盖换值/复活换值留陈旧 docid）→ 存在值变更时可能多计陈旧值，与 `COUNT(*) WHERE f='v'`
+    /// 倒排计数同类口径偏差；宽表负载（同值追加 + 更新非分组字段）不触发，扫描路径恒为精确兜底。
+    pub fn count_distinct_fast(
+        &self,
+        field: &str,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Option<u64>> {
+        const MAX_DISTINCT_GROUPS: usize = 512;
+        if !self.inverted.is_bitmap_field(field) {
+            return Ok(None);
+        }
+        self.flush_inverted_pending(); // 与 inverted_posting 同口径：刷入攒批保证可见最新
+        let groups = match self.inverted.bitmap_field_snapshot(field, MAX_DISTINCT_GROUPS) {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+        if groups.is_empty() {
+            return Ok(Some(0));
+        }
+        self.live_ensure()?;
+        // 活跃集快照后释放锁（位图已克隆，判活迭代在锁外，避免与写路径嵌套锁序）
+        let live = self.live_docids.lock().unwrap().clone().unwrap_or_default();
+        let hits = |d: u64| {
+            live.contains(d)
+                && start.map_or(true, |s| d >= s)
+                && end.map_or(true, |e| d <= e)
+        };
+        let mut n = 0u64;
+        for (_value, posting) in &groups {
+            if posting.iter().any(|d| hits(d)) {
+                n += 1;
+            }
+        }
+        Ok(Some(n))
+    }
+
+    /// P-GB（2026-09-05）：窗口位图**分组计数**——`GROUP BY <白名单字段[,…]>` 的词典快路径。
+    /// 组计数 = 各分组字段值位图 AND（多字段组合）∩「窗口 [start,end] ∩ 活跃 docid 集 ∩（可选）
+    /// 候选词条 posting」的长度；活跃集（`live_docids`）口径 = 权威扫描（删除位图/墓碑隐藏已删、
+    /// 复活重计），跨表 docid 由窗口排外；`cand_term`（如 `status=active`，WHERE 单等值）非 None 时
+    /// 额外以该 posting 收敛（命中集内分组，行级过滤语义=仅含命中行）。
+    /// 字段数 1..=2（防笛卡尔爆炸）、全部 ∈ `bitmap_fields`、任一组值数超上限 → None（调用方回退扫描）。
+    /// 位图快照克隆后锁外计数（读路径不持倒排锁）。
+    /// 返回 `Some((组, 窗口活跃匹配数))`——组 = (字段值序列, 计数)（计数 >0，未排序）；匹配数 =
+    /// 「窗口 ∩ 活跃 ∩（候选）」的行数（无候选 = 窗口活跃行数；Σ组 ≤ 匹配数，调用方以此判 NULL 组/
+    /// 陈旧放大回退）。已知边界（同 `count_distinct_fast`/P118）：白名单位图仅追加不摘除（同 docid
+    /// 换值留陈旧）→ 值变更场景组计数可能偏高——调用方以 Σcounts 与匹配数核对，不等即回退扫描保精确。
+    pub fn group_by_bitmap_window(
+        &self,
+        fields: &[String],
+        cand_term: Option<&str>,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Option<(Vec<(Vec<String>, u64)>, u64)>> {
+        const MAX_VALUES: usize = 512; // 单字段值数上限（枚举级；user_id 类高基数回退扫描）
+        const MAX_COMBOS: usize = 4096; // 两字段组合数上限（防笛卡尔爆炸）
+        if fields.is_empty() || fields.len() > 2 {
+            return Ok(None);
+        }
+        if fields.iter().any(|f| !self.inverted.is_bitmap_field(f)) {
+            return Ok(None);
+        }
+        self.flush_inverted_pending(); // 与 inverted_posting 同口径：刷入攒批保证可见最新
+        let cand: Option<roaring::treemap::RoaringTreemap> = match cand_term {
+            Some(t) => Some(self.inverted.search(t)?),
+            None => None,
+        };
+        let mut maps = Vec::with_capacity(fields.len());
+        for f in fields {
+            match self.inverted.bitmap_field_snapshot(f, MAX_VALUES) {
+                Some(m) => maps.push(m),
+                None => return Ok(None), // 非白名单 / 组数超上限
+            }
+        }
+        self.live_ensure()?;
+        // 活跃集快照后释放锁（位图已克隆，计数迭代在锁外，避免与写路径嵌套锁序）
+        let live = self.live_docids.lock().unwrap().clone().unwrap_or_default();
+        let hits = |d: u64| {
+            live.contains(d)
+                && start.map_or(true, |s| d >= s)
+                && end.map_or(true, |e| d <= e)
+                && cand.as_ref().map_or(true, |c| c.contains(d))
+        };
+        let count_live =
+            |posting: &roaring::treemap::RoaringTreemap| -> u64 {
+                let mut n = 0u64;
+                for d in posting.iter() {
+                    if hits(d) {
+                        n += 1;
+                    }
+                }
+                n
+            };
+        // 窗口活跃匹配数（无候选 = 全活跃窗口行数）
+        let live_match: u64 = match &cand {
+            Some(c) => count_live(c),
+            None => {
+                let s = start.unwrap_or(0);
+                let e = end.unwrap_or(u64::MAX);
+                let before = if s == 0 { 0 } else { live.rank(s - 1) };
+                live.rank(e) - before
+            }
+        };
+        if fields.len() == 1 {
+            let mut out = Vec::with_capacity(maps[0].len());
+            for (v, p) in &maps[0] {
+                let c = count_live(p);
+                if c > 0 {
+                    out.push((vec![v.clone()], c));
+                }
+            }
+            return Ok(Some((out, live_match)));
+        }
+        // 两字段组合：迭代较小 posting 判对方/活跃/窗口/候选成员（免笛卡尔 AND 物化）
+        let mut out = Vec::new();
+        for (v1, p1) in &maps[0] {
+            for (v2, p2) in &maps[1] {
+                if out.len() >= MAX_COMBOS {
+                    return Ok(None);
+                }
+                let (iter_p, other_p) = if p1.len() <= p2.len() { (p1, p2) } else { (p2, p1) };
+                let mut c = 0u64;
+                for d in iter_p.iter() {
+                    if other_p.contains(d) && hits(d) {
+                        c += 1;
+                    }
+                }
+                if c > 0 {
+                    out.push((vec![v1.clone(), v2.clone()], c));
+                }
+            }
+        }
+        Ok(Some((out, live_match)))
+    }
+
 }
 
 /// 组合索引声明签名：字段组按 `.` 连接、组间按 `|` 连接（配置变更 → 签名变 → 触发重建）。

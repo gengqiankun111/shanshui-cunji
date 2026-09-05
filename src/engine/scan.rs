@@ -306,7 +306,7 @@ impl Engine {
     /// P1-C：懒建活跃 docid 基线（首次 `count_all_docs` 全键扫一次；此后写路径增量
     /// 维护，读取 O(1)）。keys-only 扫最新视图（Tombstone / 删除位图已隐藏），口径与
     /// 既有 count_all_docs 完全一致。
-    fn live_ensure(&self) -> Result<()> {
+    pub(crate) fn live_ensure(&self) -> Result<()> {
         let mut g = self.live_docids.lock().unwrap();
         if g.is_some() {
             return Ok(());

@@ -77,6 +77,24 @@ impl InvertedIndex {
         Some(out)
     }
 
+    /// 快照白名单字段的（值 → docid 位图）全集合——COUNT(DISTINCT) 词典快路径用
+    /// （Engine 侧再做"窗口 ∩ 活跃集"判活）。组数超 `cap`（高基数，克隆放大失控）或
+    /// 字段非白名单 → None（调用方回退权威扫描）。位图克隆后立即释放分片锁，迭代在
+    /// 锁外进行（避免读路径长时间持倒排锁与写路径互等）。
+    pub fn bitmap_field_snapshot(&self, field: &str, cap: usize) -> Option<Vec<(String, Posting)>> {
+        let bm = self.bitmaps[bitmap_shard(field)].lock().unwrap();
+        let values = bm.get(field)?;
+        if values.len() > cap {
+            return None;
+        }
+        let mut out: Vec<(String, Posting)> = values
+            .iter()
+            .map(|(v, b)| (v.clone(), b.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(out)
+    }
+
     /// 查询 term：合并内存 posting 与各段 posting，返回 64 位 docid 位图（Posting）。
     /// G 项优化（design_extension 9.6）：① 白名单字段 term 直接返回全量内存位图（O(1)）；
     /// ② 非白名单 term 查 LRU 缓存（重复查询免段遍历 + posting 反序列化）。

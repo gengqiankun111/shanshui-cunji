@@ -525,6 +525,157 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         assert!(parse_select("SELECT status, COUNT(DISTINCT city) FROM t GROUP BY status").is_err());
     }
 
+    /// Task-030 残余（10w 轮 #61 count_distinct_enum 344.7×）：低基数 COUNT(DISTINCT)
+    /// 位图白名单词典快路径 = 权威窗口扫描口径（含整值全删后的陈旧位图不计、复活复计）。
+    #[test]
+    fn task030b_count_distinct_bitmap_fast_path_matches_scan_and_deletes() {
+        let mask = (1u64 << 48) - 1;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.inverted.bitmap_fields = vec!["status".into(), "city".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, status: &str, city: &str, amount: i64| {
+            let val = serde_json::json!({"docid": docid, "status": status, "city": city, "amount": amount});
+            let bytes = serde_json::to_vec(&val).unwrap();
+            let terms = crate::server::extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(docid, bytes, &t).unwrap();
+        };
+        for i in 1..=100u64 {
+            put_doc(
+                &mut e,
+                i,
+                if i % 3 == 0 { "active" } else { "inactive" },
+                ["beijing", "shanghai", "shenzhen"][(i % 3) as usize],
+                (i * 10) as i64,
+            );
+        }
+        // 全表窗口（MySQL 协议层形态 [0, 2^48)）count distinct status → 快路径（白名单）
+        // （闭包带 engine 参数，不捕获 → 后续 delete_batch/put 可变借用不冲突）
+        let q = |e: &Engine, sql: &str| -> String {
+            execute_aggregate_window(e, sql, Some(0), Some(mask))
+                .unwrap()
+                .unwrap()
+                .text
+        };
+        // ① 基础：active(33)/inactive(67) → 2；parity：amount>=0 逼权威扫描 = 2
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT status) FROM t"), "2");
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT status) FROM t WHERE amount>=0"), "2");
+        // ② 整值全删：67 个 inactive 全删 → distinct=1（陈旧位图 docid 不计）
+        let inact: Vec<u64> = (1..=100u64).filter(|i| i % 3 != 0).collect();
+        e.delete_batch(inact.iter().copied()).unwrap();
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT status) FROM t"), "1");
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT status) FROM t WHERE amount>=0"), "1");
+        // inactive 全删 → shanghai/shenzhen 仅存于已删行 → distinct city 亦剩 1（beijing）
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT city) FROM t"), "1");
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT city) FROM t WHERE amount>=0"), "1");
+        // ③ 复活（同值 inactive）：docid2 复活 → 复计 2；两路径一致
+        put_doc(&mut e, 2, "inactive", "shanghai", 20);
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT status) FROM t"), "2");
+        assert_eq!(q(&e, "SELECT COUNT(DISTINCT status) FROM t WHERE amount>=0"), "2");
+        // ④ 非白名单字段（amount）→ 快路径 None → 权威扫描兜底
+        //   （现存：active 33 行 amount 30..990 步 30 = 33 值 + docid2 复活 20 → 34 唯一值）
+        let r3 = execute_aggregate(&e, "SELECT COUNT(DISTINCT amount) FROM t")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r3.text, "34");
+    }
+
+    /// P-GB（2026-09-05）：窗口（server 整表窗形态）白名单位图 GROUP BY 快路径
+    /// = 权威窗口扫描（删除/复活精确、缺字段回退扫描、LIMIT/HAVING/ORDER BY 组字段一致）。
+    #[test]
+    fn pg_windowed_bitmap_group_by_matches_scan() {
+        let mask = (1u64 << 48) - 1;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.inverted.bitmap_fields = vec!["status".into(), "region".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, status: &str, region: Option<&str>, amount: i64| {
+            let val = match region {
+                Some(r) => serde_json::json!({"docid": docid, "status": status, "region": r, "amount": amount}),
+                None => serde_json::json!({"docid": docid, "status": status, "amount": amount}),
+            };
+            let bytes = serde_json::to_vec(&val).unwrap();
+            let terms = crate::server::extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(docid, bytes, &t).unwrap();
+        };
+        for i in 1..=90u64 {
+            put_doc(
+                &mut e,
+                i,
+                if i % 2 == 0 { "active" } else { "inactive" },
+                Some(if i % 3 == 0 { "beijing" } else { "shanghai" }),
+                (i * 10) as i64,
+            );
+        }
+        // （闭包带 engine 参数，不捕获 → 后续 delete_batch/put 可变借用不冲突）
+        let gb = |e: &Engine, sql: &str| -> Vec<(Vec<Option<String>>, Vec<Option<String>>)> {
+            let gr = execute_group_by_window(e, sql, 100_000, Some(0), Some(mask))
+                .unwrap()
+                .unwrap();
+            gr.rows.iter().map(|r| (r.keys.clone(), r.cells.clone())).collect()
+        };
+        let scan_ref = |sql: &str| sql.replace("GROUP BY", "WHERE amount>=0 GROUP BY");
+        // ① 单字段（位图快路径）vs 权威扫描（WHERE amount>=0 逼扫描路径）
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*) FROM t GROUP BY status"))
+        );
+        // ② 两字段组合（status×region，均白名单 → 笛卡尔 AND 计数）
+        assert_eq!(
+            gb(&e, "SELECT status, region, COUNT(*) FROM t GROUP BY status, region"),
+            gb(&e, &scan_ref("SELECT status, region, COUNT(*) FROM t GROUP BY status, region"))
+        );
+        // ③ #59 形态 LIMIT 切片一致
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*) FROM t GROUP BY status LIMIT 1"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*) FROM t GROUP BY status LIMIT 1"))
+        );
+        // ④ ORDER BY 组字段 DESC 一致
+        assert_eq!(
+            gb(&e, "SELECT region, COUNT(*) FROM t GROUP BY region ORDER BY region DESC"),
+            gb(&e, &scan_ref("SELECT region, COUNT(*) FROM t GROUP BY region ORDER BY region DESC"))
+        );
+        // ⑤ 删除 shanghai（i%3!=0，60 行）→ 位图含陈旧 docid，须仅计活跃（beijing 30）
+        let sh: Vec<u64> = (1..=90u64).filter(|i| i % 3 != 0).collect();
+        e.delete_batch(sh.iter().copied()).unwrap();
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*) FROM t GROUP BY status"))
+        );
+        assert_eq!(
+            gb(&e, "SELECT region, COUNT(*) FROM t GROUP BY region"),
+            gb(&e, &scan_ref("SELECT region, COUNT(*) FROM t GROUP BY region"))
+        );
+        assert_eq!(gb(&e, "SELECT region, COUNT(*) FROM t GROUP BY region").len(), 1);
+        // ⑥ 缺 region 行（91..=100）→ 两字段 Σ<live → 快路径回退扫描，结果仍一致
+        for i in 91..=100u64 {
+            put_doc(&mut e, i, if i % 2 == 0 { "active" } else { "inactive" }, None, (i * 10) as i64);
+        }
+        assert_eq!(
+            gb(&e, "SELECT status, region, COUNT(*) FROM t GROUP BY status, region"),
+            gb(&e, &scan_ref("SELECT status, region, COUNT(*) FROM t GROUP BY status, region"))
+        );
+        // ⑦ HAVING（快路径支持 COUNT(*) 左项）与扫描一致
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*) FROM t GROUP BY status HAVING COUNT(*) > 10"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*) FROM t GROUP BY status HAVING COUNT(*) > 10"))
+        );
+        // ⑧ #81 形态：WHERE 单等值候选 + ORDER BY COUNT(*) DESC LIMIT（biz_agg_filter）
+        //    快路径；对照 = 同 WHERE 加 amount>=0 构成 AND → 逼权威扫描
+        let fast81 = gb(
+            &e,
+            "SELECT region, COUNT(*) FROM t WHERE status='active' GROUP BY region ORDER BY COUNT(*) DESC LIMIT 2",
+        );
+        let scan81 = gb(
+            &e,
+            "SELECT region, COUNT(*) FROM t WHERE status='active' AND amount>=0 GROUP BY region ORDER BY COUNT(*) DESC LIMIT 2",
+        );
+        assert_eq!(fast81, scan81);
+        assert_eq!(fast81.len(), 2);
+    }
+
     #[test]
     fn sql_comparison_pushdown_single_pass_early_stop() {
         // 7.93：裸比较/BETWEEN 下推——单遍流式扫描 + LIMIT 早停，结果与旧 eval 路径一致

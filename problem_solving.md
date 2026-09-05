@@ -1399,6 +1399,51 @@ MySQL 3316 = **waiter-1205锁等待超时（waiter-t=3013ms）**；SCC 3317 = **
 结论：1205 收敛需行锁持有 + 等待/超时（锁生命周期重构），风险超本任务预期 → 走 Task-033「或明示
 差异」路径收口：SCC 无引擎改动；差异入已知边界；探针 outcome 两侧如实记录，回归全绿。
 
+**P118（Task-030 残余 #61）COUNT(DISTINCT) 低基数 344.7× → 位图词典快路径**
+复现/根因：10w 干净双端轮（results-sqlrun-compare-100k #61）SCC `COUNT(DISTINCT status)` 65.49ms
+（MySQL 0.19ms，344.7×）。P115 去重计数走**权威窗口扫描**（execute_aggregate_window distinct 分支
+scan_stream_fields 逐行收 HashSet 去重键）；server 路径（src/server/command/select.rs L107）聚合一律
+传本表整窗 [table_base, table_base+2^48)，scoped 窗口扫描逐行解码——低基数枚举字段没有任何词典捷径。
+修复（kernel 3 处）：
+① src/inverted/query.rs `bitmap_field_snapshot(field, cap)`——白名单字段（bitmap_fields）值→docid 位图
+   克隆快照（组数超 cap=512 → None，防 user_id 类高基数克隆放大；锁内克隆后释放，读路径不持倒排锁）；
+② src/engine/query.rs `count_distinct_fast(field, start, end)`——白名单字段 + flush pending + live_ensure
+   活跃集（RoaringTreemap）快照，逐值判定「窗口 [start,end] ∩ 活跃 docid 非空」即 1 个 distinct——
+   删除位图/墓碑口径与权威窗口扫描一致（整值全删陈旧位图不复计、同值复活复计；跨表高位 docid 被窗口
+   排外）；非白名单/高基数 → None（回退扫描）；
+③ src/sql/executor/aggregate.rs distinct 分支先行尝试快路径（无 WHERE + 顶层简单字段），不可用回退
+   权威窗口扫描（WHERE/嵌套路径/非索引字段路径不变）。
++1 单测 task030b（快路径 = 带 WHERE amount>=0 逼权威扫描等值：基础 2 值 / 67 行整值全删后 1 /
+city 同步 / 同值复活 2 / 非白名单 amount 扫描兜底 34）。全量 lib 回归 **742 passed / 0 failed**。
+验收锚点：10w #61 65.49ms → <1ms 量级（status 5 组枚举）；110 万同口径复测数值随基准轮回填。
+已知边界（与引擎倒排既有语义一致）：白名单位图仅追加不摘除（同 docid 覆盖/复活**换值**留陈旧 docid）
+→ 值变更场景快路径可能多计陈旧值（与 `COUNT(*) WHERE f='v'` 倒排计数同类口径偏差）；扫描路径恒为精确兜底。
+
+**P119（P-GB）窗口位图分组快路径 + WHERE 单等值候选（#14/#27/#59/#60/#81 收敛）**
+根因：server 聚合/分组一律传本表整窗（select.rs L107）→ `execute_group_by_window` scoped=true 禁用
+`group_by_fast_inverted`（仅 !scoped 启用）→ 10w 轮 #14/#27/#59 = 210/262/252ms vs MySQL 29/46/39ms；
+#81 biz_agg_filter（WHERE+ORDER BY COUNT(*) DESC LIMIT）308ms（11.4×）；#60（WHERE status='active'
+GROUP BY region,channel）290ms。修复（kernel 4 处）：
+① engine/query.rs `group_by_bitmap_window(fields, cand_term, start, end)`——窗口位图分组计数：各组
+   字段值位图 AND（≤2 字段）∩「窗口 ∩ 活跃集 ∩（WHERE 单等值候选 posting）」逐组计数；返回
+   (组, 窗口活跃匹配数)（无候选 = 窗口活跃 rank 差），调用方以 Σcounts 与匹配数核对判 NULL 组/
+   陈旧放大回退（Σ>live 或两字段 Σ<live → 回退扫描保精确）；
+② inverted 复用 P118 `bitmap_field_snapshot`（值→位图克隆，锁外计数）；
+③ group_by.rs `group_by_fast_bitmap_window`——windowed 路由（scoped + 1..=2 白名单字段 + 单列
+   COUNT(*)/HAVING/组字段或该聚合列头排序/LIMIT；WHERE 单等值转候选词条；其余 → None 回退扫描）；
+④ 基准配置 tmp-cfg-wide-2g.toml `bitmap_fields` 补 `"channel"`（枚举字段白名单，#60 分组字段
+   region,channel 全白名单才可达位图路径）。
++1 单测扩展（pg_windowed_bitmap_group_by_matches_scan ⑧：#81 形态 WHERE 候选 + ORDER BY COUNT(*) DESC
+LIMIT = 权威扫描等值；既有 ①~⑦ 覆盖单/双字段/删除/复活/缺字段回退/HAVING/LIMIT/组字段排序）。
+10w 干净轮实测回填（scratch 库 + 当前 release，对比 results-sqlrun-compare-100k 记录）：
+#14 210.9→**1.6ms**（MySQL 29.3）、#59 252.7→**1.3~1.7ms**（38.8）、#27 262.1→**7.6~9.6ms**（45.9）、
+#60 290.1→**10.8ms**（112.1，channel 白名单后）、#81 308.2→**2.6~3.8ms**（27.0）；
+#61 count_distinct_enum（P118）65.5→**0.18ms**（0.19 = 1.0×）、highcard 87.6→98.2ms（≈1.35×，扫描兜底）。
+全量 lib 回归 742+1 绿（一次 seqlock 概率型重试率用例偶发失败，单跑复通过，与本项无关）。
+已知边界（同 P118）：白名单位图仅追加不摘除——同 docid 换值留陈旧 → 计数可能偏高，一律以
+Σcounts≤匹配数 守卫回退扫描保精确；字段不在 bitmap_fields 时快路径不可用（回退扫描，见 #60 配置注）。
+残余（记录不开发）：#15/#28 SUM/AVG+HAVING ~1.5-1.7×（数值聚合需行级/载荷窗口化，触发候选）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
