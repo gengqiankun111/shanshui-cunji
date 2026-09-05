@@ -147,6 +147,23 @@ Task-025：范围查询提速——Partition Pruning 与 Parallel Scan（2026-09
 > 列须在 hot_fields（PAX）才产 zone 行 → #11 用 hot_fields 含 amount 的 PAX 库复测回填；
 > 并行扫描（Task-025b）保持规划（阶段 3）。
 
+Task-027：HotCache TinyLFU 读回填准入（2026-09-05 用户定：**优先开发**，先于 Task-025b/PAX 复测与 Task-026）
+> 设计：research/cache_TinyLFU.md §二/§三（Count-Min + Doorkeeper + 衰减；衰减采样阈值 N 默认
+> 4×width≈104 万次 Record，可配覆盖，非“查询次数”）。
+属性	内容
+优先级	P0（优先开发，置于 Task-026 之前）
+工作量	sketch+doorkeeper 1 天、reset 0.5 天、接线（engine 读回填准入）1 天、单测验收 0.5 天
+依赖	现有 hotcache（seqlock 读写锁/LFU 采样淘汰/软水位）——只加准入端，不改淘汰端
+具体工作：
+□ src/hotcache/tinylfu.rs：CMS（4 哈希 ×512×512、4-bit 饱和）+ Record/Estimate(4 取最小)/reset(全量>>1)
+□ doorkeeper：首访 Bloom，准入 = doorkeeper 命中 || Estimate ≥ 3（默认门槛，配置可调）
+□ 衰减：累计 Record 样本 ≥ N 触发 >>1（N=4×width 默认 ≈1,048,576；配置 reset_samples 覆盖，0=默认）
+□ 读回填接线：engine 读路径 LSM 命中后 Estimate 过门槛才 put/promote（防全表扫/扫描型回填污染）；
+  写 put 保持直写；invalidate 清 doorkeeper 位、计数靠衰减淡出（CMS 无法单 key 精确删）
+□ 单测：zipf 频率误差 <5%；顺序全扫不污染（准入率低）；reset 后热点仍高/冷归零；删后重写可再准入
+□ 验收：ycsb c（全随机读）命中率/吞吐不降、内存受控；离线条带导出后点查 p50 劣化 ≤1.5×
+> 衰减问答（2026-09-05）：不配“查询次数”；按累计 Record 样本数触发，N/(读QPS)≈实际衰减秒数。
+
 Task-026：Per-CPU WAL（可选项默认开启；**排期最靠后**，2026-09-05 定稿）
 > 定位：#17-19 单行更新 ~1.2ms（WAL fsync + LSM 写放大 + 全局锁）；Per-CPU WAL 主要解高并发写锁竞争
 > （16 核 64 线程 22 万 → 30-35 万 TPS，+36~59%；单笔 #17 0.8-1.0ms，-15~32%），单笔延迟改善有限。
