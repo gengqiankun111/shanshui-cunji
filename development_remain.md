@@ -249,6 +249,12 @@ Task-026：Per-CPU WAL（可选项默认开启；**排期最靠后**，2026-09-0
 > 健康度；WAL 格式兼容（旧 `wal-{seq}.log` + 新 `wal-{queue}-{gseq_start}.log` 共存识别，gseq 全局
 > 归并回放）。完整设计与排期（8.5 天：接口 0.5/核心 3/恢复 1.5/配置 0.5/监控 0.5/测试 1/压测 1.5）见
 > research/range-scan-percpu-wal-design.md §二。**所有 Task-021~025 之后最后实施**。
+> ⏳ 进度（2026-09-05）：**阶段1 ✅（接口/配置/路由骨架，commit 2843832）**——config.storage
+> per_cpu_{enabled,queues,depth,batch_window_us} + engine/percpu_wal.rs（队列解析/CPU 路由/轮询
+> 回退/满队列背压/深度-消费监控，默认关闭单队列零开销回退）+ Engine 持有 + 3 单测，全量 712 绿。
+> **阶段2/3 设计细化已定稿**（research/percpu-wal-stage2-design.md：方案 A engine 级外置队列 WAL、
+> WalEntry(cf,op,key,value)+gseq 原子组、wal-{q}-{gseq_start}.log 命名与 checkpoint 裁剪、旧文件
+> 迁移共存、gseq 归并恢复与洞跳过、2a-3b 分步实现顺序）→ 核心/恢复按该文档在专门会话推进。
 
 > 2026-09-04 收敛说明：原 20 项插队任务经与 development.md / 本文件其余内容逐项对照，**Task-001/003/004/006/008~020 已移除**——原因：与既有实现同主题重复（FST 字典 7.34+P4-B、倒排回表批量 P2-D/P85~P87、TTL 按天分桶整目录 O(1) 删除、WAL 延迟删除异步 unlink、组提交/环形 WAL、Bloom 分区布隆、基准/验收体系等，均已实现 ✅）或属随父项销项（Task-004/017→Task-002、Task-011/015/018→Task-007/Task-014、Task-012→Task-006~011）。**仅保留以下 3 项独立任务**（真实缺口，与插队族解耦，各自单独排期执行）：
 
