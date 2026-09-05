@@ -47,8 +47,8 @@ pub(crate) mod merge;
 
 // 对外公开项 re-export（等价于拆分前 mod.rs 内直接 pub 定义，路径不变）。
 pub use block::{
-    decode_data_block, decode_data_block_keys, decode_pax_block_column, decode_pax_block_fields,
-    decode_projected_block, extract_fields_from_json_row, DecodedRow,
+    assemble_subset_json, decode_data_block, decode_data_block_keys, decode_pax_block_column,
+    decode_pax_block_fields, decode_projected_block, extract_fields_from_json_row, DecodedRow,
 };
 pub use iter::{SstRangeIter, ZonePredicate};
 pub use reader::{SstFooter, SstReader, SummaryEntry};

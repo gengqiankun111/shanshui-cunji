@@ -1488,6 +1488,81 @@ use crate::optimizer::QuerySpec;
         }
     }
 
+    // ---------- 缺口①：主键 IN 投影批量取行（get_many_pk_in_fields） ----------
+
+    #[test]
+    fn gap1_pk_in_fields_subset_matches_full_row_both_layouts() {
+        // 缺口①（P105-①）：get_many_pk_in_fields（投影批量取行）子集 JSON 的字段值/命中集
+        // 须与 get_many_pk_in 整行路径一致——行式与 PAX(hot_fields) 两布局 × memtable/flush/重开，
+        // 覆盖缺字段 / JSON null / 转义字符串 / 浮点 / 删除位图隐藏 / 重复与缺失 id。
+        for pax in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = cfg();
+            if pax {
+                c.storage.hot_fields = vec!["a".into(), "b".into()];
+            }
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            let fields: Vec<String> = vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "n".into(),
+                "t".into(),
+                "f".into(),
+            ];
+            for i in 0..3000u64 {
+                let mut m = serde_json::Map::new();
+                m.insert("a".into(), json!(format!("a{i}")));
+                m.insert("b".into(), json!(i as i64));
+                if i % 3 != 1 {
+                    m.insert("c".into(), json!(i % 7)); // 部分行缺 c
+                }
+                if i == 42 {
+                    m.insert("n".into(), serde_json::Value::Null); // JSON null
+                }
+                if i == 43 {
+                    m.insert("t".into(), json!("s\"q\\w")); // 转义字符串
+                }
+                if i == 44 {
+                    m.insert("f".into(), json!(1.5)); // 浮点
+                }
+                let doc = serde_json::Value::Object(m);
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &["t"]).unwrap();
+            }
+            e.delete(9).unwrap(); // 删除位图隐藏
+            let dense: Vec<u64> = (10..=60).step_by(3).collect();
+            let sparse: Vec<u64> = vec![1, 2999, 5002, 2, 43, 42, 44, 9000, 9, 7, 1];
+            let check = |e: &Engine, ids: &[u64]| {
+                let full = e.get_many_pk_in(ids).unwrap();
+                let sub = e.get_many_pk_in_fields(ids, &fields).unwrap();
+                assert_eq!(sub.len(), full.len(), "pax={pax} 命中集须一致 ids={ids:?}");
+                for (d, row) in &full {
+                    let sub_doc: serde_json::Value = serde_json::from_slice(
+                        sub.get(d).unwrap_or_else(|| {
+                            panic!("pax={pax} 整行命中 docid {d} 须在投影命中集")
+                        }),
+                    )
+                    .unwrap();
+                    let full_doc: serde_json::Value = serde_json::from_slice(row).unwrap();
+                    for f in &fields {
+                        assert_eq!(
+                            sub_doc.get(f),
+                            full_doc.get(f),
+                            "pax={pax} docid={d} 字段 {f} 值须与整行路径一致"
+                        );
+                    }
+                }
+            };
+            check(&e, &dense); // memtable 期（稠密区间扫）
+            check(&e, &sparse);
+            e.flush_primary().unwrap();
+            drop(e);
+            let e2 = Engine::open(dir.path(), &c).unwrap();
+            check(&e2, &dense); // SST 期（PAX 列解码 / 行式块）
+            check(&e2, &sparse);
+        }
+    }
+
     // ---------- Task-025b 阶段③：条带并行全扫（导出构建块） ----------
 
     #[test]

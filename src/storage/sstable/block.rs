@@ -387,12 +387,14 @@ pub fn decode_projected_block(
     decode_data_block(data, format)
 }
 
-/// P91：请求列字节 → 子集 JSON 对象字节（`{"f1":<v1>,"f2":null}`）。
+/// P91/缺口①：请求列字节 → 子集 JSON 对象字节（`{"f1":<v1>,"f2":null}`）。
 /// - `None` = 原文档缺失该键 → 子集省略（与整行文档缺键语义一致）；
 /// - `Some(b"null")` = JSON null（PAX null 哨兵解码结果）；
 /// - 其余 = 值已为 JSON 片段（字符串带引号/数字原样/布尔）→ 直接嵌入。
 /// 字段名 JSON 转义由 `serde_json::to_string` 处理（含引号/反斜杠/控制符）。
-fn assemble_subset_json(fields: &[String], vals: &[Option<Vec<u8>>]) -> Vec<u8> {
+/// pub：engine/read.rs（get_many_pk_in_fields 稀疏回填）与 select.rs 点查复用
+/// （经 sstable/mod.rs `pub use` 汇总，crate 级 `crate::sstable::assemble_subset_json`）。
+pub fn assemble_subset_json(fields: &[String], vals: &[Option<Vec<u8>>]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(64);
     out.push(b'{');
     let mut first = true;

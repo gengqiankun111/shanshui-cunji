@@ -418,6 +418,116 @@ use crate::multitable::drop_table_range;
         assert_eq!(got, vec![b"1", b"2"]);
     }
 
+    #[test]
+    fn gap1_point_and_in_projection_pushdown_matches_whole_row_path() {
+        // 缺口①（P105-①）：点查/IN 投影下推（batch_get_fields / get_many_pk_in_fields）
+        // 输出结果集须与整行路径（engine.get / get_many_pk_in → build_result_set）逐行一致——
+        // PAX(hot_fields) 布局 + flush 落盘（SST PAX 列解码路径；非 hot 冷列 / 缺字段 /
+        // JSON null / 转义字符串 / 删除位图隐藏 / 不存在的 id）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = crate::config::Config::default();
+        c.storage.hot_fields = vec!["status".into(), "city".into(), "amount".into()];
+        let mut engine = Engine::open(dir.path(), &c).unwrap();
+        for i in 1..=60u64 {
+            let doc = serde_json::json!({
+                "status": format!("s{}", i % 5),
+                "city": format!("c{}", i),
+                "amount": (i as i64) * 10,
+                "k": i, // 非 hot 冷列（SST 冷列解码路径）
+                "pad": format!("pad-{i}"),
+            });
+            engine
+                .put(i, serde_json::to_vec(&doc).unwrap(), &["status"])
+                .unwrap();
+        }
+        // 转义字符串 + 缺若干投影列 + JSON null（62 缺 city/amount）
+        engine
+            .put(61, br#"{"status":"active","note":"x\"y\\z","extra":null}"#.to_vec(), &[])
+            .unwrap();
+        engine.delete(7).unwrap();
+        engine.flush_primary().unwrap();
+
+        let proj = |sql: &str| -> Option<Vec<ProjCol>> { parse_projection(sql) };
+        // 参考路径 = 旧实现同构：整行取回 → build_result_set 常规裁剪
+        let ref_rows = |engine: &Engine, sql: &str, raw: Vec<(u64, Vec<u8>)>| {
+            build_result_set(
+                proj(sql).as_deref(),
+                raw,
+                sql.to_uppercase().contains("ORDER BY"),
+                extract_limit(sql),
+            )
+        };
+        let assert_same_set = |a: QueryResponse, b: QueryResponse, tag: &str| {
+            let (c1, r1) = match a {
+                QueryResponse::Set { columns, rows } => (columns, rows),
+                _ => panic!("{tag}: a 应为 ResultSet"),
+            };
+            let (c2, r2) = match b {
+                QueryResponse::Set { columns, rows } => (columns, rows),
+                _ => panic!("{tag}: b 应为 ResultSet"),
+            };
+            assert_eq!(c1, c2, "{tag}: 列定义须一致");
+            assert_eq!(r1, r2, "{tag}: 行内容须一致");
+        };
+
+        // 点查（单行）
+        for id in [1u64, 42, 7, 61, 62, 9000] {
+            let sql = format!(
+                "SELECT id, status, city, amount, k FROM documents WHERE id={id}"
+            );
+            let push = select_response(&engine, &sql);
+            let raw = match engine.get(id) {
+                Ok(Some(v)) => vec![(id, v)],
+                _ => Vec::new(),
+            };
+            let whole = ref_rows(&engine, &sql, raw);
+            assert_same_set(push, whole, &format!("点查投影 id={id}"));
+        }
+        // IN（多行；含缺失 id 9000 / 已删 7 / 转义 61 / 缺列 62 / 无 extra 投影列）
+        let sql =
+            "SELECT id, status, city, amount, k FROM documents WHERE id IN (42,7,61,62,9000,42)";
+        let push = select_response(&engine, sql);
+        let raw = {
+            let docids: Vec<u64> = extract_target_ids(sql)
+                .unwrap()
+                .into_iter()
+                .map(|i| i) // 默认表 docid = row id
+                .collect();
+            let mut raw: Vec<(u64, Vec<u8>)> = Vec::new();
+            if let Ok(found) = engine.get_many_pk_in(&docids) {
+                for d in docids {
+                    if let Some(v) = found.get(&d) {
+                        raw.push((d, v.clone()));
+                    }
+                }
+            }
+            raw
+        };
+        let whole = ref_rows(&engine, sql, raw);
+        assert_same_set(push, whole, "IN 投影");
+        // 回退护栏：整 doc 列 / 嵌套路径保持整行路径（语义不变）
+        let sql2 = "SELECT id, doc FROM documents WHERE id=42";
+        let a = select_response(&engine, sql2);
+        let b = {
+            let raw = match engine.get(42) {
+                Ok(Some(v)) => vec![(42, v)],
+                _ => Vec::new(),
+            };
+            ref_rows(&engine, sql2, raw)
+        };
+        assert_same_set(a, b, "SELECT id,doc 整行直通");
+        let sql3 = "SELECT note, extra FROM documents WHERE id=61";
+        let a3 = select_response(&engine, sql3);
+        let b3 = {
+            let raw = match engine.get(61) {
+                Ok(Some(v)) => vec![(61, v)],
+                _ => Vec::new(),
+            };
+            ref_rows(&engine, sql3, raw)
+        };
+        assert_same_set(a3, b3, "JSON null / 转义投影");
+    }
+
     // ---------- 单元：SQL 解析 ----------
 
     #[test]

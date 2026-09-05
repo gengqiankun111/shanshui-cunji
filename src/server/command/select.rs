@@ -125,6 +125,22 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
                 rows: vec![vec![sum.to_string().into_bytes()]],
             };
         }
+        // 缺口①（P105-①）：点查投影下推——投影为纯顶层简单字段（无 doc/嵌套路径）时，
+        // 改走 engine.get_many_pk_in_fields 按需取数：HotCache 命中行直通整行（零二次
+        // parse），PAX 冷读只解投影列（免整行 25 列重构），子集/整行组装后复用
+        // build_result_set 常规裁剪；cell/列类型与整行路径逐行等值。
+        if let Some(fields) = projection_pushdown_fields(proj.as_deref()) {
+            let d = docid_for(tid, id);
+            let raw = match engine.get_many_pk_in_fields(&[d], &fields) {
+                Ok(found) => match found.get(&d) {
+                    Some(v) => vec![(d, v.clone())],
+                    None => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+            return build_result_set(proj.as_deref(), raw, false, limit);
+        }
+        // 投影含整 doc / 嵌套路径 / 无字段列（SELECT id、*）→ 保持整行路径
         let raw = match engine.get(docid_for(tid, id)) {
             Ok(Some(v)) => vec![(docid_for(tid, id), v)],
             _ => Vec::new(),
@@ -216,6 +232,21 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
         // Task-023：id IN → 稠密/稀疏自适应批量取行（engine.get_many_pk_in：稠密区间
         // 顺序读 + 集合过滤 / 稀疏 batch_get），替代逐 id 随机 LSM 点查；行序保持 IN 列表序
         // （与旧逐条 get 一致），可见性语义同 get（删除位图隐藏跳过）。
+        // 缺口①：投影为纯顶层简单字段时改走 get_many_pk_in_fields（字段级变体，稠密/稀疏
+        // 判定同 Task-023；PAX 按列解码只解投影列，免整行 25 列回传）→ 子集 JSON。
+        if let Some(fields) = projection_pushdown_fields(proj.as_deref()) {
+            let docids: Vec<u64> = ids.iter().map(|id| docid_for(tid, *id)).collect();
+            let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
+            if let Ok(found) = engine.get_many_pk_in_fields(&docids, &fields) {
+                for id in ids {
+                    let d = docid_for(tid, id);
+                    if let Some(v) = found.get(&d) {
+                        raw.push((d, v.clone()));
+                    }
+                }
+            }
+            return build_result_set(proj.as_deref(), raw, upper2.contains("ORDER BY"), limit);
+        }
         let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
         let docids: Vec<u64> = ids.iter().map(|id| docid_for(tid, *id)).collect();
         if let Ok(found) = engine.get_many_pk_in(&docids) {
@@ -376,5 +407,35 @@ pub(crate) fn extract_point_id(sql: &str) -> Option<u64> {
         None
     } else {
         num.parse().ok()
+    }
+}
+
+/// 缺口①（P105-①）：点查/IN **投影下推判定**——投影含 ≥1 个**纯顶层简单**字段列、
+/// 且不含整 doc 列（`doc` 列需整行字节直通，下推会丢非投影键）→ 返回去重的顶层
+/// 字段名清单（engine 按需列取数；PAX 列解码只解这些列）；含嵌套路径（点/下标）或
+/// doc/无字段列（`SELECT id`、`SELECT *`）→ None（保持整行路径，语义不变）。
+fn projection_pushdown_fields(proj: Option<&[ProjCol]>) -> Option<Vec<String>> {
+    let cols = proj?;
+    let mut fields: Vec<String> = Vec::new();
+    let mut has_doc = false;
+    for c in cols {
+        match c {
+            ProjCol::Id => {}
+            ProjCol::Doc => has_doc = true,
+            ProjCol::Field(f) => {
+                // batch_get_fields/PAX 列解码仅支持顶层简单名；嵌套路径需整行深查 → 回退
+                if f.contains('.') || f.contains('[') {
+                    return None;
+                }
+                if !fields.iter().any(|x| x == f) {
+                    fields.push(f.clone());
+                }
+            }
+        }
+    }
+    if has_doc || fields.is_empty() {
+        None
+    } else {
+        Some(fields)
     }
 }

@@ -220,6 +220,74 @@ impl Engine {
         Ok(out)
     }
 
+    /// 缺口①（P105-①）：主键 IN 列表批量**投影**取行——`get_many_pk_in` 的字段级变体。
+    /// 命中行按 `fields`（顶层字段白名单）只回**子集 JSON**：PAX 冷读走列解码只解所需列
+    /// （免整行 25 列重构/解码）；**HotCache 命中行直通整行字节**（避免"整行提取→重序列化→
+    /// 再组装子集→消费端二次 parse"的退化——整行消费端本只需一次轻提取，见 P106 复测注）。
+    /// 可见性/分层语义与 `get_many_pk_in` 同构：删除位图 O(1) 过滤；稠密（跨度 ≤ 4×计数）
+    /// 冷行 → `scan_stream_fields` 区间顺序读 + 集合过滤；稀疏冷行 → `batch_get_fields`
+    /// （P87② 投影批量点查，Delta 字段级合并）→ 子集组装。
+    /// 返回 docid → 文档字节映射（去重；热行 = 整行、冷行 = 子集，消费端均只取投影列，
+    /// 结果语义一致）；`fields` 为空 → 空映射。
+    pub fn get_many_pk_in_fields(
+        &self,
+        ids: &[u64],
+        fields: &[String],
+    ) -> Result<std::collections::HashMap<u64, Vec<u8>>> {
+        let mut sorted: Vec<u64> = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut out = std::collections::HashMap::with_capacity(sorted.len());
+        if sorted.is_empty() || fields.is_empty() {
+            return Ok(out);
+        }
+        // ① HotCache 直通（整行字节）→ 仅冷行进入 primary 投影取数
+        let mut cold: Vec<u64> = Vec::with_capacity(sorted.len());
+        for &d in &sorted {
+            if let Some(bm) = &self.deletion_bitmap {
+                if bm.is_deleted(d) {
+                    continue;
+                }
+            }
+            if let Some(row) = self.hotcache.get(d) {
+                out.insert(d, row);
+            } else {
+                cold.push(d);
+            }
+        }
+        if cold.is_empty() {
+            return Ok(out);
+        }
+        let first = cold[0];
+        let last = *cold.last().unwrap();
+        // ② 稠密冷行：投影流式区间顺序读（跨度 ≤ 4×计数，对齐 get_many_pk_in / P92 判定）
+        if let Some(span) = last.checked_sub(first).and_then(|d| d.checked_add(1)) {
+            if span <= (4 * cold.len()) as u64 {
+                let want: std::collections::HashSet<u64> = cold.iter().copied().collect();
+                self.scan_stream_fields(
+                    Some(first),
+                    Some(last),
+                    fields.to_vec(),
+                    |d, val| {
+                        if want.contains(&d) {
+                            out.insert(d, val.to_vec());
+                        }
+                        Ok(true)
+                    },
+                )?;
+                return Ok(out);
+            }
+        }
+        // ③ 稀疏冷行：P87② 投影批量点查 → 命中行组装子集 JSON（缺列/缺失语义同整行提取）
+        let vals = self.batch_get_fields(&cold, fields)?;
+        for (d, v) in cold.into_iter().zip(vals) {
+            if let Some(vals) = v {
+                out.insert(d, crate::sstable::assemble_subset_json(fields, &vals));
+            }
+        }
+        Ok(out)
+    }
+
     /// P87②：投影字段批量回表——每个 docid 只返回请求的顶层字段值（倒排候选
     /// Top-K 排序键解码下推：PAX 块列解码 / 行式块按需字段提取，免整行 25 列解码）。
     /// 语义与 `batch_get` 一致（删除位图 O(1) 过滤 / HotCache 命中 / Delta 字段级覆盖 /
