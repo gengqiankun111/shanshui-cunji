@@ -157,6 +157,10 @@ pub(crate) fn dispatch_query(engine: &mut Engine, sql: &str, session: &mut Sessi
         }
         return QueryResponse::Ok(0, 0);
     }
+    if upper.starts_with("SHOW MEMORY") {
+        // 2026-09-05：组件内存计量（引擎 memory_report）——观测用诊断语句
+        return show_memory_response(engine);
+    }
     if upper.starts_with("SHOW") {
         return show_response(&upper);
     }
@@ -282,6 +286,24 @@ pub(crate) fn dispatch_query_read(engine: &Engine, sql: &str, session: &mut Sess
     QueryResponse::Err(1064, format!("syntax error: unsupported statement: {sql}"))
 }
 // ============ SQL 分发实现 ============
+
+/// 2026-09-05：SHOW MEMORY —— 组件内存计量（引擎 memory_report）行集。
+pub(crate) fn show_memory_response(engine: &Engine) -> QueryResponse {
+    let columns = vec![
+        column_payload("Variable_name", MYSQL_TYPE_VAR_STRING, 45),
+        column_payload("Value", MYSQL_TYPE_VAR_STRING, 45),
+    ];
+    let rows: Vec<Vec<Vec<u8>>> = engine
+        .memory_report()
+        .iter()
+        .map(|(name, _help, v)| vec![name.as_bytes().to_vec(), v.to_string().into_bytes()])
+        .collect();
+    // 观测辅助：组件值同步打到服务端 stderr（诊断命令本身低频）
+    for (name, _help, v) in engine.memory_report() {
+        eprintln!("MEM {name}={v}");
+    }
+    QueryResponse::Set { columns, rows }
+}
 
 /// SHOW DATABASES / TABLES / VARIABLES 等系统查询。
 pub(crate) fn show_response(upper: &str) -> QueryResponse {

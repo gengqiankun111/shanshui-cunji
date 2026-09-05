@@ -21,7 +21,7 @@ pub(crate) fn handle_metrics(engine: &mut Engine) -> (u16, String) {
     let flush = engine.total_flush_count();
     let mut out = engine
         .metrics
-        .render(s.sst_file_count as u64, l0, s.mem_ratio, s.disk_ratio, flush);
+        .render(s.sst_file_count as u64, l0, s.mem_ratio, s.disk_ratio, flush, &engine.memory_report());
     // 10 亿库阶段 D：分片级指标（docid 水位 + 读写计数 + 预警）
     out.push_str(&engine.shard_metrics_render());
     if !engine.shard_watermark_alerts().is_empty() {

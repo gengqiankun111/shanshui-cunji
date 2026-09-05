@@ -45,6 +45,11 @@ impl ColumnFamily {
         self.memtable.mutable_bytes() + self.memtable.immutable_bytes()
     }
 
+    /// 2026-09-05：块缓存当前占用（字节，含元数据粗算，见 blockcache used_bytes）。
+    pub fn blockcache_bytes(&self) -> usize {
+        self.block_cache.used_bytes()
+    }
+
     /// P90：列族是否完全无数据（内存双缓冲 + 磁盘段均空）——delta 列族"无 patch"判定。
     pub fn data_empty(&self) -> bool {
         if self.memtable_bytes() > 0 {

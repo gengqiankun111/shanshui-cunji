@@ -293,6 +293,18 @@ impl Engine {
         (used / max).clamp(0.0, 1.0)
     }
 
+    /// 2026-09-05（内存口径观测）：组件内存计量（字节/计数）——`/metrics` 实时 gauge。
+    /// 覆盖：主 memtable、hotcache、blockcache、倒排内存 docid；用于 RSS 构成拆解
+    /// （cache payload ≠ 进程 RSS；元数据/临时对象/mmap 页另计，容量规划乘 1.4~1.8×）。
+    pub fn memory_report(&self) -> Vec<(&'static str, &'static str, u64)> {
+        vec![
+            ("shanshui_mem_memtable_bytes", "主列族 memtable 内存（字节）", self.primary.memtable_bytes() as u64),
+            ("shanshui_mem_hotcache_bytes", "文档热缓存占用（字节）", self.hotcache.used_bytes() as u64),
+            ("shanshui_mem_blockcache_bytes", "块缓存占用（字节，SST 块 payload）", self.primary.blockcache_bytes() as u64),
+            ("shanshui_mem_inverted_mem_docids", "倒排内存累积 docid posting 数", self.inverted_mem_docids()),
+        ]
+    }
+
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
         // P52：磁盘剩余空间占比（syscall 带缓存，1s 间隔）

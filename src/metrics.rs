@@ -58,6 +58,8 @@ impl Metrics {
         mem_ratio: f64,
         disk_ratio: f64,
         flush_count: u64,
+        // 2026-09-05：组件内存计量 gauge（name, help, value）——/metrics 实时读取
+        mem_gauges: &[(&str, &str, u64)],
     ) -> String {
         let mut out = String::new();
         let mut counter = |name: &str, help: &str, value: u64| {
@@ -148,6 +150,10 @@ impl Metrics {
             "MySQL 当前活跃连接数",
             self.active_conns.load(Ordering::Relaxed).to_string(),
         );
+        // 2026-09-05：组件内存计量（引擎 memory_report）
+        for (name, help, value) in mem_gauges {
+            gauge(name, help, value.to_string());
+        }
         out
     }
 }
