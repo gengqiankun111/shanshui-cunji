@@ -1641,6 +1641,46 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         assert_eq!(pax_ids, expect, "PAX 数值 zone 剪枝不得误剪 9.x/10 边界块（方案 A）");
     }
 
+    #[test]
+    fn task025b_parallel_window_agg_matches_sequential() {
+        // Task-025b（阶段①）：无 WHERE + 有限窗口 → [lo..hi] 等分子窗并发 scan_stream_fields，
+        // 各 worker 独立 count/sum/min/max 后交换律合并。结果必须与串行（None 端）逐值一致。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        for i in 1..=5000u64 {
+            let doc = if i % 7 == 0 {
+                // 缺 amount / null 行（COUNT(f) 不计、SUM 跳过）
+                serde_json::json!({ "status": "a", "amount": null })
+            } else {
+                serde_json::json!({ "status": "a", "amount": (i * 3) as u64 })
+            };
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        for sql in [
+            "SELECT COUNT(*) FROM t",
+            "SELECT COUNT(amount) FROM t",
+            "SELECT SUM(amount) FROM t",
+            "SELECT MIN(amount) FROM t",
+            "SELECT MAX(amount) FROM t",
+            "SELECT AVG(amount) FROM t",
+        ] {
+            // 并行：有限窗口（两端 Some）；串行：无界端 None
+            let pa = execute_aggregate_window(&e, sql, Some(1), Some(5000))
+                .unwrap()
+                .unwrap();
+            let se = execute_aggregate_window(&e, sql, Some(1), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (pa.header, pa.is_null, pa.text),
+                (se.header, se.is_null, se.text),
+                "并行窗口聚合须与串行一致: {sql}"
+            );
+        }
+    }
+
     // ---------- Task-021：COUNT 全包窗口直通 O(1) ----------
 
     #[test]

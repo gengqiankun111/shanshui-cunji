@@ -340,17 +340,165 @@ pub fn execute_aggregate_window(
             }
         }
         None => {
-            // P91：全扫聚合投影解码——只解 WHERE/聚合所需列（PAX 块列解码），
-            // 行式/内存直通原 JSON（消费端 acc 本就只读所需列，语义不变）
-            engine.scan_stream_fields(start, end, needed, |_docid, doc| {
-                scanned += 1;
-                if scanned % 4096 == 0 && guard.is_expired() {
-                    return Err(Error::QueryTooExpensive(
-                        "类 SQL 聚合全量扫描超时（熔断中止）".into(),
-                    ));
+            // Task-025b（阶段①）：无 WHERE + 有限窗口时把 [lo..hi] 等分 W 个子窗**并发**
+            // `scan_stream_fields`（每 worker 独立 count/n_num/sum/min/max，逐值与串行 acc 的
+            // no-WHERE 顶层字段分支一致；COUNT/SUM/MIN/MAX/AVG 交换律 → 合并即全窗结果）。
+            // 其余路径（无界窗口/带 WHERE/排序/LIMIT/GROUP 依赖行序或需合并分组）保持串行。
+            let mut did_parallel = false;
+            if sel.where_expr.is_none()
+                && sel.order_by.is_empty()
+                && sel.limit.is_none()
+            {
+                if let Some((lo, hi)) = start.zip(end) {
+                    if lo < hi {
+                        if let Ok(ncpu) = std::thread::available_parallelism() {
+                            let workers = ncpu.get().clamp(2, 8);
+                            let span = hi - lo + 1;
+                            let guard_ref = &guard;
+                            let mut joined: Vec<Result<(u64, u64, f64, f64, f64)>> =
+                                Vec::with_capacity(workers);
+                            let (mut pc, mut pn, mut ps, mut pmin, mut pmax) =
+                                (0u64, 0u64, 0f64, f64::INFINITY, f64::NEG_INFINITY);
+                            std::thread::scope(|sc| {
+                                let mut handles = Vec::with_capacity(workers);
+                                for w in 0..workers {
+                                    let engine_ref = engine;
+                                    let needed = needed.clone();
+                                    let fld = field.clone();
+                                    let (cs, ce) = {
+                                        let step = span / workers as u64;
+                                        let s = lo + step * w as u64;
+                                        let e = if w + 1 == workers {
+                                            hi
+                                        } else {
+                                            lo + step * (w as u64 + 1) - 1
+                                        };
+                                        (s, e)
+                                    };
+                                    handles.push(sc.spawn(move || -> Result<(u64, u64, f64, f64, f64)> {
+                                        let mut c = 0u64;
+                                        let mut nn = 0u64;
+                                        let mut su = 0f64;
+                                        let mut mn = f64::INFINITY;
+                                        let mut mx = f64::NEG_INFINITY;
+                                        let mut scanned_local = 0u64;
+                                        engine_ref.scan_stream_fields(Some(cs), Some(ce), needed, |_d, doc| {
+                                            scanned_local += 1;
+                                            if scanned_local % 4096 == 0 && guard_ref.is_expired() {
+                                                return Err(Error::QueryTooExpensive(
+                                                    "类 SQL 聚合并行全扫超时（熔断中止）".into(),
+                                                ));
+                                            }
+                                            // 与串行 acc 的 no-WHERE 分支逐值一致
+                                            if let Some(f) = fld.as_deref() {
+                                                let mut need_serde = true;
+                                                if !f.contains('.') {
+                                                    match light_top_field(doc, f) {
+                                                        Some(LightVal::Absent | LightVal::Null) => {
+                                                            return Ok(true)
+                                                        }
+                                                        Some(LightVal::Num(bytes)) => {
+                                                            c += 1;
+                                                            if let Some(x) = std::str::from_utf8(bytes)
+                                                                .ok()
+                                                                .and_then(|s| s.parse::<f64>().ok())
+                                                            {
+                                                                nn += 1;
+                                                                su += x;
+                                                                if x < mn {
+                                                                    mn = x;
+                                                                }
+                                                                if x > mx {
+                                                                    mx = x;
+                                                                }
+                                                            }
+                                                            return Ok(true);
+                                                        }
+                                                        Some(LightVal::Str(_)) | Some(LightVal::Bool(_)) | Some(LightVal::Complex) => {
+                                                            c += 1;
+                                                            return Ok(true);
+                                                        }
+                                                        Some(_) => {}
+                                                        None => {}
+                                                    }
+                                                }
+                                                if need_serde {
+                                                    let val = match serde_json::from_slice::<Value>(doc) {
+                                                        Ok(v) => v,
+                                                        Err(_) => return Ok(true),
+                                                    };
+                                                    let Some(fv) = field_of(&val, f) else {
+                                                        return Ok(true);
+                                                    };
+                                                    if matches!(fv, Value::Null) {
+                                                        return Ok(true);
+                                                    }
+                                                    c += 1;
+                                                    if let Value::Number(n) = fv {
+                                                        nn += 1;
+                                                        let x = n.as_f64().unwrap_or(0.0);
+                                                        su += x;
+                                                        if x < mn {
+                                                            mn = x;
+                                                        }
+                                                        if x > mx {
+                                                            mx = x;
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                c += 1; // COUNT(*)
+                                            }
+                                            Ok(true)
+                                        })?;
+                                        Ok((c, nn, su, mn, mx))
+                                    }));
+                                }
+                                for h in handles {
+                                    joined.push(h.join().unwrap());
+                                }
+                            });
+                            for acc in joined {
+                                let (c, nn, su, mn, mx) = acc?;
+                                pc += c;
+                                pn += nn;
+                                ps += su;
+                                if mn < pmin {
+                                    pmin = mn;
+                                }
+                                if mx > pmax {
+                                    pmax = mx;
+                                }
+                            }
+                            // 与收尾格式完全一致（等价早退，避免触碰外层 acc 持有变量）
+                            let arg = field.as_deref().unwrap_or("*");
+                            let header = format!("{}({arg})", name.to_uppercase());
+                            let (is_null, text) = match name.as_str() {
+                                "count" => (false, pc.to_string()),
+                                "sum" if pn > 0 => (false, fmt_num(ps)),
+                                "avg" if pn > 0 => (false, fmt_num(ps / pn as f64)),
+                                "min" if pn > 0 => (false, fmt_num(pmin)),
+                                "max" if pn > 0 => (false, fmt_num(pmax)),
+                                _ => (true, String::new()),
+                            };
+                            return Ok(Some(AggScalar { header, is_null, text }));
+                        }
+                    }
                 }
-                acc(doc)
-            })?;
+            }
+            if !did_parallel {
+                // P91：全扫聚合投影解码——只解 WHERE/聚合所需列（PAX 块列解码），
+                // 行式/内存直通原 JSON（消费端 acc 本就只读所需列，语义不变）
+                engine.scan_stream_fields(start, end, needed, |_docid, doc| {
+                    scanned += 1;
+                    if scanned % 4096 == 0 && guard.is_expired() {
+                        return Err(Error::QueryTooExpensive(
+                            "类 SQL 聚合全量扫描超时（熔断中止）".into(),
+                        ));
+                    }
+                    acc(doc)
+                })?;
+            }
         }
     }
     let arg = field.as_deref().unwrap_or("*");
