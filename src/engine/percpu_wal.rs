@@ -12,8 +12,18 @@
 //! 与现有架构的衔接（不冲突）：全局 `gseq`（Arc<AtomicU64>）语义沿用；跨队列最终写盘可交错，
 //! 恢复按文件名解析队列与 gseq 范围后**gseq 全局归并回放**；Manifest `checkpoint_gseq` 判定
 //! 失败写跳过编号（洞）不回放；关闭/队列 0 时回退全局模式（等价现状）。
+//!
+//! **阶段2a（本文件底部，2026-09-05）**：WalEntry 编解码 + 队列文件读写（独立于列族，
+//! 纯新增模块）；阶段2c（后台消费线程/engine 接线）与 3a（恢复归并）按
+//! research/percpu-wal-stage2-design.md 推进。
 
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::error::{Error, Result};
+use crate::keys::{decode_varlen, encode_varlen};
+use crate::wal::{crc32, OP_DELETE, OP_PUT};
 
 /// Per-CPU WAL 运行配置（Engine 持有；阶段1 仅解析 + 路由，写路径接线见阶段2）。
 pub(crate) struct PerCpuWal {
@@ -100,6 +110,210 @@ impl PerCpuWal {
     }
 }
 
+// ===========================================================================
+// 阶段2a：WalEntry 编解码 + 队列文件读写（research/percpu-wal-stage2-design.md §2.3）
+// 队列文件内条目沿用 `Len(u32)+CRC32(u32)+Payload`（部分写入安全：CRC 坏/截断即止）。
+// Payload := gseq(u64 LE) | cf(u8) | op(u8) | key(VarLen) | value(VarLen)
+// ===========================================================================
+
+/// 列族编号（WalEntry.cf；与 Engine 打开的列族对应）。
+pub(crate) const CF_PRIMARY: u8 = 0;
+pub(crate) const CF_DELTA: u8 = 1;
+pub(crate) const CF_CIDX: u8 = 2;
+pub(crate) const CF_OUTBOX: u8 = 3;
+
+/// Per-CPU 队列 WAL 条目（engine 级，跨列族统一持久化）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WalEntry {
+    /// 全局单调 seq（组 gseq：一次 SQL/API 写内全部 CF 条目共用同一 gseq →
+    /// 崩溃回放按组原子：同组要么全回放要么整组跳过（checkpoint 以组为单位）。
+    pub gseq: u64,
+    /// 目标列族（CF_PRIMARY / CF_DELTA / CF_CIDX / CF_OUTBOX）。
+    pub cf: u8,
+    /// 操作（OP_PUT = 0 / OP_DELETE = 1）。
+    pub op: u8,
+    pub key: Vec<u8>,
+    /// Put 的值；Delete 为 None。
+    pub value: Option<Vec<u8>>,
+}
+
+impl WalEntry {
+    pub fn put(cf: u8, gseq: u64, key: Vec<u8>, value: Vec<u8>) -> Self {
+        WalEntry { gseq, cf, op: OP_PUT, key, value: Some(value) }
+    }
+    pub fn delete(cf: u8, gseq: u64, key: Vec<u8>) -> Self {
+        WalEntry { gseq, cf, op: OP_DELETE, key, value: None }
+    }
+}
+
+/// 编码单条目 Payload（不含 Len/CRC 帧）。
+fn encode_payload(e: &WalEntry, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&e.gseq.to_le_bytes());
+    buf.push(e.cf);
+    buf.push(e.op);
+    encode_varlen(buf, &e.key);
+    match &e.value {
+        Some(v) => encode_varlen(buf, v),
+        None => encode_varlen(buf, &[]), // Delete 时值部分为空 VarLen（同既有 WAL 格式）
+    }
+}
+
+/// 解码单条目 Payload（格式非法 → Corrupted）。
+pub(crate) fn decode_payload(payload: &[u8]) -> Result<WalEntry> {
+    if payload.len() < 10 {
+        return Err(Error::Corrupted("WalEntry payload 过短".into()));
+    }
+    let gseq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let cf = payload[8];
+    let op = payload[9];
+    let mut pos = 10usize;
+    let key = decode_varlen(payload, &mut pos)?.to_vec();
+    let raw = decode_varlen(payload, &mut pos)?;
+    let value = if raw.is_empty() && op == OP_DELETE {
+        None
+    } else {
+        Some(raw.to_vec())
+    };
+    Ok(WalEntry { gseq, cf, op, key, value })
+}
+
+/// 队列文件命名：`wal-{queue}-{gseq_start:020}.log`（queue ∈ [0, queues)）。
+/// 解析失败（非队列文件 / 旧 `wal.log` 无 `-queue-` 段）→ None（旧格式识别依据）。
+pub(crate) fn parse_queue_file_name(fname: &str) -> Option<(usize, u64)> {
+    let rest = fname.strip_prefix("wal-")?;
+    let (q, tail) = rest.split_once('-')?;
+    let start = tail.strip_suffix(".log")?;
+    let q: usize = q.parse().ok()?;
+    let start: u64 = start.parse().ok()?;
+    Some((q, start))
+}
+
+/// 队列文件写入器（每队列独立文件；写侧切段/后台裁剪见阶段2c）。
+pub(crate) struct QueueFileWriter {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    buf: Vec<u8>,
+    /// 已落盘字节（切段阈值用）。
+    bytes_written: u64,
+    /// 文件内已写入最大 gseq（裁剪判定）。
+    max_gseq: u64,
+    min_gseq: u64,
+}
+
+impl QueueFileWriter {
+    /// 新建（截断已存在文件）；`first_gseq` = 文件首条记录 gseq（命名 + 裁剪参考）。
+    pub fn create(dir: &Path, queue: usize, first_gseq: u64) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("wal-{queue}-{first_gseq:020}.log"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self {
+            file: Some(file),
+            path,
+            buf: Vec::new(),
+            bytes_written: 0,
+            max_gseq: first_gseq,
+            min_gseq: first_gseq,
+        })
+    }
+
+    /// 追加一批（不落盘；由窗口/显式 flush 统一 fsync）。返回本批最大 gseq。
+    pub fn write_batch(&mut self, entries: &[WalEntry]) -> Result<u64> {
+        let mut max = 0u64;
+        for e in entries {
+            let mut payload = Vec::with_capacity(16 + e.key.len() + e.value.as_ref().map_or(0, |v| v.len()));
+            encode_payload(e, &mut payload);
+            let crc = crc32(&payload);
+            self.buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            self.buf.extend_from_slice(&crc.to_le_bytes());
+            self.buf.extend_from_slice(&payload);
+            self.bytes_written += (8 + payload.len()) as u64;
+            max = max.max(e.gseq);
+        }
+        if max > 0 {
+            self.max_gseq = self.max_gseq.max(max);
+        }
+        Ok(max)
+    }
+
+    /// 写盘并 fsync（组提交窗口边界 / 显式 flush）。
+    pub fn flush(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let file = self.file.as_mut().unwrap();
+        file.seek(std::io::SeekFrom::End(0))?;
+        file.write_all(&self.buf)?;
+        self.buf.clear();
+        file.sync_all().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// 已写盘 + 待刷字节合计（切段阈值用）。
+    pub fn bytes(&self) -> u64 {
+        self.bytes_written
+    }
+
+    /// 文件内最大 gseq（裁剪判定：`<= checkpoint` 的段可删）。
+    pub fn max_gseq(&self) -> u64 {
+        self.max_gseq
+    }
+
+    pub fn min_gseq(&self) -> u64 {
+        self.min_gseq
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 关闭并落盘。
+    pub fn close(mut self) -> Result<()> {
+        self.flush()?;
+        self.file.take();
+        Ok(())
+    }
+}
+
+impl Drop for QueueFileWriter {
+    fn drop(&mut self) {
+        // 崩溃模拟路径：drop 不保证 flush（测试通过不调用 flush 直接 drop 模拟断电）
+        let _ = self.file.take();
+    }
+}
+
+/// 回放队列文件：返回文件内全部有效条目（CRC 坏/截断处停止，同现有 WalReader 语义）。
+pub(crate) fn read_queue_file(path: &Path) -> Result<Vec<WalEntry>> {
+    let buf = std::fs::read(path)?;
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= buf.len() {
+        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
+        pos += 8;
+        if pos + len > buf.len() {
+            break; // 截断：尾部不完整记录丢弃（断电场景）
+        }
+        let payload = &buf[pos..pos + len];
+        pos += len;
+        if crc32(payload) != crc {
+            break; // 损坏：停止回放（此记录之后的不可信）
+        }
+        match decode_payload(payload) {
+            Ok(rec) => records.push(rec),
+            Err(_) => break,
+        }
+    }
+    Ok(records)
+}
+
+/// 队列文件切段字节阈值（写满即切新段，配合 checkpoint 裁剪控制单文件大小）。
+pub(crate) const QUEUE_FILE_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +367,126 @@ mod tests {
         let s = w.status();
         assert!(s.contains("queues=2"));
         assert!(s.contains("q0:depth=4 consumed=0"), "{s}");
+    }
+
+    // ---------------- 阶段2a：WalEntry 编解码 + 队列文件读写 ----------------
+
+    fn tmp_dir() -> std::path::PathBuf {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!("pw-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+            .path()
+            .join(name)
+    }
+
+    #[test]
+    fn entry_codec_roundtrip() {
+        // Put（各 cf）+ Delete 编解码往返
+        let cases = vec![
+            WalEntry::put(CF_PRIMARY, 7, vec![0, 0, 0, 0, 0, 0, 0, 42], b"{\"a\":1}".to_vec()),
+            WalEntry::put(CF_DELTA, 8, vec![9, 9], b"v".to_vec()),
+            WalEntry::put(CF_CIDX, 9, b"composite-key".to_vec(), Vec::new()),
+            WalEntry::delete(CF_PRIMARY, 10, vec![1, 2, 3]),
+        ];
+        for e in &cases {
+            let mut buf = Vec::new();
+            encode_payload(e, &mut buf);
+            let got = decode_payload(&buf).unwrap();
+            assert_eq!(got, *e);
+        }
+    }
+
+    #[test]
+    fn entry_codec_rejects_short_or_trailing() {
+        assert!(decode_payload(&[0u8; 9]).is_err(), "短负载拒绝");
+        // 截断 varlen（len 声明超余下字节）→ Corrupted
+        let e = WalEntry::put(CF_DELTA, 5, vec![0xAB; 300], vec![0xCD; 300]);
+        let mut buf = Vec::new();
+        encode_payload(&e, &mut buf);
+        let got = decode_payload(&buf[..buf.len() / 2]).unwrap_err();
+        assert!(matches!(got, Error::Corrupted(_)), "{got:?}");
+    }
+
+    #[test]
+    fn queue_file_name_parse() {
+        assert_eq!(parse_queue_file_name("wal-0-00000000000000000042.log"), Some((0, 42)));
+        assert_eq!(parse_queue_file_name("wal-3-00000000000000000100.log"), Some((3, 100)));
+        assert_eq!(parse_queue_file_name("wal.log"), None, "旧格式无 -queue- 段");
+        assert_eq!(parse_queue_file_name("wal-1.log"), None);
+        assert_eq!(parse_queue_file_name("sst-00000001.sst"), None);
+    }
+
+    #[test]
+    fn queue_file_write_batch_flush_read_roundtrip() {
+        let dir = tmp_dir();
+        let mut w = QueueFileWriter::create(&dir, 0, 1).unwrap();
+        let batch = vec![
+            WalEntry::put(CF_PRIMARY, 1, vec![1], b"a".to_vec()),
+            WalEntry::put(CF_PRIMARY, 2, vec![2], b"b".to_vec()),
+            WalEntry::delete(CF_DELTA, 3, vec![3]),
+        ];
+        let max = w.write_batch(&batch).unwrap();
+        assert_eq!(max, 3);
+        // 未 flush 前文件为空（断电丢失模拟：drop 不落盘）
+        assert!(read_queue_file(&w.path()).unwrap().is_empty());
+        w.flush().unwrap();
+        let recs = read_queue_file(&w.path()).unwrap();
+        assert_eq!(recs, batch);
+        // 追加第二批（切段后同文件继续）
+        let b2 = vec![WalEntry::put(CF_CIDX, 9, b"k9".to_vec(), Vec::new())];
+        w.write_batch(&b2).unwrap();
+        w.flush().unwrap();
+        let recs2 = read_queue_file(&w.path()).unwrap();
+        assert_eq!(recs2.len(), 4);
+        assert_eq!(recs2[3], b2[0]);
+        assert_eq!(w.max_gseq(), 9);
+    }
+
+    #[test]
+    fn queue_file_crash_tail_and_corrupt_stop() {
+        let dir = tmp_dir();
+        let mut w = QueueFileWriter::create(&dir, 1, 10).unwrap();
+        for g in 10..=19u64 {
+            w.write_batch(&[WalEntry::put(CF_PRIMARY, g, vec![g as u8], vec![0x42])]).unwrap();
+        }
+        w.flush().unwrap();
+        let p = w.path().to_path_buf();
+        drop(w);
+        let mut data = std::fs::read(&p).unwrap();
+        // 截断尾部一半 → 回放只保留完整记录
+        data.truncate(data.len() / 2);
+        std::fs::write(&p, &data).unwrap();
+        let recs = read_queue_file(&p).unwrap();
+        assert!(!recs.is_empty() && recs.len() <= 10);
+        assert!(recs.iter().all(|r| r.gseq >= 10));
+        // 损坏中间字节 → 损坏点前恢复、之后停止（不 panic）
+        let mut w2 = QueueFileWriter::create(&dir, 1, 20).unwrap();
+        for g in 20..=29u64 {
+            w2.write_batch(&[WalEntry::put(CF_PRIMARY, g, vec![g as u8], vec![0x42])]).unwrap();
+        }
+        w2.flush().unwrap();
+        let p2 = w2.path().to_path_buf();
+        drop(w2);
+        let mut data2 = std::fs::read(&p2).unwrap();
+        let mid = data2.len() / 2;
+        data2[mid] ^= 0xFF;
+        std::fs::write(&p2, &data2).unwrap();
+        let recs2 = read_queue_file(&p2).unwrap();
+        assert!(recs2.len() < 10, "损坏点之后停止: {}", recs2.len());
+    }
+
+    #[test]
+    fn queue_file_empty_and_append_reopen() {
+        let dir = tmp_dir();
+        // 空文件（新建未写）可安全回放为空
+        let mut w = QueueFileWriter::create(&dir, 0, 1).unwrap();
+        assert!(read_queue_file(&w.path()).unwrap().is_empty());
+        w.write_batch(&[WalEntry::put(CF_DELTA, 100, vec![5], b"v".to_vec())]).unwrap();
+        w.flush().unwrap();
+        drop(w);
+        // 重开（create 截断）→ 旧内容清空；新写从新命名文件开始
+        let w2 = QueueFileWriter::create(&dir, 0, 101).unwrap();
+        assert!(read_queue_file(&w2.path()).unwrap().is_empty());
     }
 }
