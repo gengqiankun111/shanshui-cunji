@@ -469,72 +469,198 @@ pub fn execute_group_by_window(
     // 复合组键 = 各分组 level 键向量；每组持每聚合列一个累积器（与 specs 对齐）。
     let mut groups: std::collections::HashMap<Vec<GroupKey>, Vec<AggState>> =
         std::collections::HashMap::new();
-    let mut scanned = 0u64;
-    engine.scan_stream_fields(start, end, needed.clone(), |_docid, doc| {
-        scanned += 1;
-        if scanned % 4096 == 0 && guard.is_expired() {
-            return Err(Error::QueryTooExpensive(
-                "GROUP BY 全量扫描超时（熔断中止）".into(),
-            ));
-        }
-        // 整行原文 → 子集字节（缺省：非对象/解析失败保持原文，行为与整行路径一致）
-        let mut owned_sub;
-        let work: &[u8] = if simple_needed {
-            match subset_doc_bytes(doc, &needed) {
-                Some(b) => {
-                    owned_sub = b;
-                    &owned_sub
+    // Task-025b 阶段②：GROUP BY 分片合并——窗口两端有限时按核等分子窗并发构建局部分组，
+    // 再按组键/累加器逐项合并（count/n_num/sum 相加、min/max 取极值；聚合交换律保证一致）。
+    let mut did_parallel = false;
+    if let Some((lo, hi)) = start.zip(end) {
+        if lo < hi {
+            if let Ok(ncpu) = std::thread::available_parallelism() {
+                let workers = ncpu.get().clamp(2, 8);
+                let span = hi - lo + 1;
+                let guard_ref = &guard;
+                let sel_where = sel.where_expr.as_ref();
+                let mut partials: Vec<Result<std::collections::HashMap<Vec<GroupKey>, Vec<AggState>>>> =
+                    Vec::with_capacity(workers);
+                std::thread::scope(|sc| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for w in 0..workers {
+                        let (cs, ce) = {
+                            let step = span / workers as u64;
+                            let s = lo + step * w as u64;
+                            let e = if w + 1 == workers { hi } else { lo + step * (w as u64 + 1) - 1 };
+                            (s, e)
+                        };
+                        // 以引用捕获（move 闭包只复制引用，不搬走 owned 值）
+                        let needed_r = &needed;
+                        let fields_r = &fields;
+                        let specs_r = &specs;
+                        handles.push(sc.spawn(move || -> Result<std::collections::HashMap<Vec<GroupKey>, Vec<AggState>>> {
+                            let mut g: std::collections::HashMap<Vec<GroupKey>, Vec<AggState>> =
+                                std::collections::HashMap::new();
+                            let mut scanned_local = 0u64;
+                            engine.scan_stream_fields(Some(cs), Some(ce), needed_r.clone(), |_docid, doc| {
+                                scanned_local += 1;
+                                if scanned_local % 4096 == 0 && guard_ref.is_expired() {
+                                    return Err(Error::QueryTooExpensive(
+                                        "GROUP BY 并行全扫超时（熔断中止）".into(),
+                                    ));
+                                }
+                                // 与串行分支一致的子集化 + WHERE + 分组/聚合提取
+                                let mut owned_sub;
+                                let work: &[u8] = if simple_needed {
+                                    match subset_doc_bytes(doc, needed_r) {
+                                        Some(b) => {
+                                            owned_sub = b;
+                                            &owned_sub
+                                        }
+                                        None => doc,
+                                    }
+                                } else {
+                                    doc
+                                };
+                                if let Some(wh) = sel_where {
+                                    let hit = match light_where_matches(work, wh) {
+                                        Some(r) => r,
+                                        None => serde_json::from_slice::<Value>(work)
+                                            .map(|v| wh.matches_doc(&v))
+                                            .unwrap_or(false),
+                                    };
+                                    if !hit {
+                                        return Ok(true);
+                                    }
+                                }
+                                let key: Vec<GroupKey> = fields_r.iter().map(|f| group_key_of(work, f)).collect();
+                                let states = g.entry(key).or_insert_with(|| {
+                                    (0..specs_r.len()).map(|_| AggState::new()).collect()
+                                });
+                                for (idx, (name, fld)) in specs_r.iter().enumerate() {
+                                    let st = &mut states[idx];
+                                    match name.as_str() {
+                                        "count" => {
+                                            if fld.is_none() || field_non_null(work, fld.as_ref().unwrap()) {
+                                                st.count += 1;
+                                            }
+                                        }
+                                        _ => {
+                                            if let Some(x) = numeric_field(work, fld.as_ref().unwrap()) {
+                                                st.n_num += 1;
+                                                st.sum += x;
+                                                if x < st.min {
+                                                    st.min = x;
+                                                }
+                                                if x > st.max {
+                                                    st.max = x;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if g.len() as u64 > cap {
+                                    return Err(Error::QueryTooExpensive(format!(
+                                        "GROUP BY 分组数超过上限（{} 组，上限 {cap}），请加 WHERE 收敛",
+                                        g.len()
+                                    )));
+                                }
+                                Ok(true)
+                            })?;
+                            Ok(g)
+                        }));
+                    }
+                    for h in handles {
+                        partials.push(h.join().unwrap());
+                    }
+                });
+                for p in partials {
+                    for (k, sv) in p? {
+                        let dst = groups.entry(k).or_insert_with(|| {
+                            (0..specs.len()).map(|_| AggState::new()).collect()
+                        });
+                        for (i, s) in sv.into_iter().enumerate() {
+                            let d = &mut dst[i];
+                            d.count += s.count;
+                            d.n_num += s.n_num;
+                            d.sum += s.sum;
+                            if s.min < d.min {
+                                d.min = s.min;
+                            }
+                            if s.max > d.max {
+                                d.max = s.max;
+                            }
+                        }
+                    }
                 }
-                None => doc,
+                did_parallel = true;
             }
-        } else {
-            doc
-        };
-        if let Some(wh) = &sel.where_expr {
-            let hit = match light_where_matches(work, wh) {
-                Some(r) => r,
-                None => serde_json::from_slice::<Value>(work)
-                    .map(|v| wh.matches_doc(&v))
-                    .unwrap_or(false),
+        }
+    }
+    if !did_parallel {
+        let mut scanned = 0u64;
+        engine.scan_stream_fields(start, end, needed.clone(), |_docid, doc| {
+            scanned += 1;
+            if scanned % 4096 == 0 && guard.is_expired() {
+                return Err(Error::QueryTooExpensive(
+                    "GROUP BY 全量扫描超时（熔断中止）".into(),
+                ));
+            }
+            // 整行原文 → 子集字节（缺省：非对象/解析失败保持原文，行为与整行路径一致）
+            let mut owned_sub;
+            let work: &[u8] = if simple_needed {
+                match subset_doc_bytes(doc, &needed) {
+                    Some(b) => {
+                        owned_sub = b;
+                        &owned_sub
+                    }
+                    None => doc,
+                }
+            } else {
+                doc
             };
-            if !hit {
-                return Ok(true);
-            }
-        }
-        let key: Vec<GroupKey> = fields.iter().map(|f| group_key_of(work, f)).collect();
-        let states = groups.entry(key).or_insert_with(|| {
-            (0..specs.len()).map(|_| AggState::new()).collect()
-        });
-        for (idx, (name, fld)) in specs.iter().enumerate() {
-            let st = &mut states[idx];
-            match name.as_str() {
-                "count" => {
-                    if fld.is_none() || field_non_null(work, fld.as_ref().unwrap()) {
-                        st.count += 1;
-                    }
-                }
-                _ => {
-                    if let Some(x) = numeric_field(work, fld.as_ref().unwrap()) {
-                        st.n_num += 1;
-                        st.sum += x;
-                        if x < st.min {
-                            st.min = x;
-                        }
-                        if x > st.max {
-                            st.max = x;
-                        }
-                    }
+            if let Some(wh) = &sel.where_expr {
+                let hit = match light_where_matches(work, wh) {
+                    Some(r) => r,
+                    None => serde_json::from_slice::<Value>(work)
+                        .map(|v| wh.matches_doc(&v))
+                        .unwrap_or(false),
+                };
+                if !hit {
+                    return Ok(true);
                 }
             }
-        }
-        if groups.len() as u64 > cap {
-            return Err(Error::QueryTooExpensive(format!(
-                "GROUP BY 分组数超过上限（{} 组，上限 {cap}），请加 WHERE 收敛",
-                groups.len()
-            )));
-        }
-        Ok(true)
-    })?;
+            let key: Vec<GroupKey> = fields.iter().map(|f| group_key_of(work, f)).collect();
+            let states = groups.entry(key).or_insert_with(|| {
+                (0..specs.len()).map(|_| AggState::new()).collect()
+            });
+            for (idx, (name, fld)) in specs.iter().enumerate() {
+                let st = &mut states[idx];
+                match name.as_str() {
+                    "count" => {
+                        if fld.is_none() || field_non_null(work, fld.as_ref().unwrap()) {
+                            st.count += 1;
+                        }
+                    }
+                    _ => {
+                        if let Some(x) = numeric_field(work, fld.as_ref().unwrap()) {
+                            st.n_num += 1;
+                            st.sum += x;
+                            if x < st.min {
+                                st.min = x;
+                            }
+                            if x > st.max {
+                                st.max = x;
+                            }
+                        }
+                    }
+                }
+            }
+            if groups.len() as u64 > cap {
+                return Err(Error::QueryTooExpensive(format!(
+                    "GROUP BY 分组数超过上限（{} 组，上限 {cap}），请加 WHERE 收敛",
+                    groups.len()
+                )));
+            }
+            Ok(true)
+        })?;
+    }
     let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = groups.into_iter().collect();
     // HAVING（AF#5）：分组完成后、排序/切片前过滤组行。
     if let Some(h) = &sel.having {

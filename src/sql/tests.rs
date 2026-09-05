@@ -1653,7 +1653,8 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
                 // 缺 amount / null 行（COUNT(f) 不计、SUM 跳过）
                 serde_json::json!({ "status": "a", "amount": null })
             } else {
-                serde_json::json!({ "status": "a", "amount": (i * 3) as u64 })
+                let st = if i % 2 == 0 { "a" } else { "b" };
+                serde_json::json!({ "status": st, "amount": (i * 3) as u64 })
             };
             e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
         }
@@ -1674,10 +1675,47 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
                 .unwrap()
                 .unwrap();
             assert_eq!(
+                 (pa.header, pa.is_null, pa.text),
+                 (se.header, se.is_null, se.text),
+                 "并行窗口聚合须与串行一致: {sql}"
+             );
+        }
+        // 阶段②：带 WHERE 的有限窗口并行 = 无界串行（通用 WHERE 并行）
+        for sql in [
+            "SELECT COUNT(*) FROM t WHERE status='a'",
+            "SELECT SUM(amount) FROM t WHERE status='a' AND amount>=100",
+            "SELECT AVG(amount) FROM t WHERE status='a'",
+        ] {
+            let pa = execute_aggregate_window(&e, sql, Some(1), Some(5000))
+                .unwrap()
+                .unwrap();
+            let se = execute_aggregate_window(&e, sql, Some(1), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
                 (pa.header, pa.is_null, pa.text),
                 (se.header, se.is_null, se.text),
-                "并行窗口聚合须与串行一致: {sql}"
+                "WHERE 并行窗口聚合须与串行一致: {sql}"
             );
+        }
+        // 阶段②：GROUP BY 分片合并（有限窗口并行） = 无界串行（组行/聚合值逐项一致）
+        let mut gsnap = |sql: &str, lo: Option<u64>, hi: Option<u64>| -> Vec<(Vec<Option<String>>, Vec<Option<String>>)> {
+            execute_group_by_window(&e, sql, 100_000, lo, hi)
+                .unwrap()
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|g| (g.keys, g.cells))
+                .collect()
+        };
+        for sql in [
+            "SELECT status, COUNT(*) FROM t GROUP BY status",
+            "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status",
+            "SELECT status, MIN(amount), MAX(amount) FROM t GROUP BY status",
+        ] {
+            let pa = gsnap(sql, Some(1), Some(5000));
+            let se = gsnap(sql, Some(1), None);
+            assert_eq!(pa, se, "GROUP BY 分片合并须与串行一致: {sql}");
         }
     }
 

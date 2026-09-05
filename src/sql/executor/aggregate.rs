@@ -345,16 +345,16 @@ pub fn execute_aggregate_window(
             // no-WHERE 顶层字段分支一致；COUNT/SUM/MIN/MAX/AVG 交换律 → 合并即全窗结果）。
             // 其余路径（无界窗口/带 WHERE/排序/LIMIT/GROUP 依赖行序或需合并分组）保持串行。
             let mut did_parallel = false;
-            if sel.where_expr.is_none()
-                && sel.order_by.is_empty()
-                && sel.limit.is_none()
-            {
+            if sel.order_by.is_empty() && sel.limit.is_none() {
                 if let Some((lo, hi)) = start.zip(end) {
                     if lo < hi {
                         if let Ok(ncpu) = std::thread::available_parallelism() {
                             let workers = ncpu.get().clamp(2, 8);
                             let span = hi - lo + 1;
                             let guard_ref = &guard;
+                            // Task-025b 阶段②：通用 WHERE 并行——WHERE 为逐行纯函数，与分片/聚合
+                            // 交换律兼容（判定逻辑与串行 acc 一致：light 优先、serde 回退）
+                            let sel_where = sel.where_expr.as_ref();
                             let mut joined: Vec<Result<(u64, u64, f64, f64, f64)>> =
                                 Vec::with_capacity(workers);
                             let (mut pc, mut pn, mut ps, mut pmin, mut pmax) =
@@ -388,6 +388,19 @@ pub fn execute_aggregate_window(
                                                 return Err(Error::QueryTooExpensive(
                                                     "类 SQL 聚合并行全扫超时（熔断中止）".into(),
                                                 ));
+                                            }
+                                            // 阶段②：WHERE 逐行判定（与串行 acc 分支一致：light 优先、
+                                            // 点路径/转义 serde 回退；投影子集含 WHERE 引用列，语义等价）
+                                            if let Some(wh) = sel_where {
+                                                let hit = match light_where_matches(doc, wh) {
+                                                    Some(r) => r,
+                                                    None => serde_json::from_slice::<Value>(doc)
+                                                        .map(|v| wh.matches_doc(&v))
+                                                        .unwrap_or(false),
+                                                };
+                                                if !hit {
+                                                    return Ok(true);
+                                                }
                                             }
                                             // 与串行 acc 的 no-WHERE 分支逐值一致
                                             if let Some(f) = fld.as_deref() {
