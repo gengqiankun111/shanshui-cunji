@@ -193,9 +193,25 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     // （SstRangeIter 二分定位起始块 + Zone Map 只读相交块 + k-way merge；删除位图已过滤），
     // 语义与收集路径等价（demo range-window 验证）。
     if let Some((a, b)) = extract_between_range(sql) {
+        let upper0 = sql.to_uppercase();
+        // P127 小改（2026-09-05）：纯主键区间 + LIMIT + 无聚合/ORDER BY → 复用
+        // execute_with_tid 的 pk_range_select（rest=None）：docid 区间 keys-only
+        // **LIMIT/OFFSET 早停** + batch_get 回表——替代旧 scan_stream/keys-only **全窗口
+        // 收集**（110 万 2 万行窗口：一般列值解码 ~360ms / 纯 id keys-only ~760ms →
+        // 早停命中行级 ms~十ms）。聚合/ORDER BY/无 LIMIT（全窗口语义）保留下方收集路径。
+        let has_limit = extract_limit(sql).is_some();
+        if has_limit
+            && !upper0.contains("SUM(")
+            && !upper0.contains("COUNT(")
+            && !upper0.contains("ORDER BY")
+        {
+            return match crate::sqlish::execute_with_tid(engine, sql, 10_000, tid) {
+                Ok(rows) => build_result_set(proj.as_deref(), rows, false, limit),
+                Err(e) => QueryResponse::Err(1064, format!("query error: {e}")),
+            };
+        }
         // Ex-8.3 Part B：纯 `SELECT id`（无聚合/无 ORDER BY）走 keys-only 流式——
         // 免整文档值解码/拷贝（SST 端 new_keys_cached 值跳过 + 块缓存 + 位图过滤 + LIMIT 早停）
-        let upper0 = sql.to_uppercase();
         let pure_id = !upper0.contains("SUM(")
             && !upper0.contains("COUNT(")
             && !upper0.contains("ORDER BY")

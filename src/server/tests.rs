@@ -1238,6 +1238,57 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn p127_b_select_pk_range_server_path_with_limit() {
+        // P127 小改：server 纯主键区间分支（带 LIMIT、无聚合/ORDER BY）改走 execute_with_tid
+        // pk_range_select 早停——真实形态（doc 无 id 字段）经 select_response 端到端正确：
+        // 行数/升序/首行/OFFSET（旧 scan_stream 全窗口收集 110 万 ~360-760ms → 早停命中行级）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        for i in 1..=300u64 {
+            let doc = serde_json::json!({"status": "ok", "n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["status=ok"]).unwrap();
+        }
+        e.flush_wal().unwrap();
+        // 一般列投影 + LIMIT（此前走 scan_stream 值解码全窗口收集）
+        match super::select_response(
+            &e,
+            "SELECT id,n FROM documents WHERE id BETWEEN 1 AND 300 LIMIT 5",
+        ) {
+            super::QueryResponse::Set { rows, .. } => {
+                assert_eq!(rows.len(), 5, "LIMIT 5 行");
+                let first: Vec<u8> = rows[0][0].clone();
+                assert_eq!(String::from_utf8_lossy(&first).trim(), "1", "升序首行 id=1");
+            }
+            other => panic!("纯区间 SELECT 异常（一般列）"),
+        }
+        // 纯 id + LIMIT（此前 keys-only 全窗口收集 760ms → 早停）
+        match super::select_response(&e, "SELECT id FROM documents WHERE id BETWEEN 100 AND 300 LIMIT 3") {
+            super::QueryResponse::Set { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(String::from_utf8_lossy(&rows[0][0]).trim(), "100");
+            }
+            other => panic!("纯 id 区间异常（keys-only 早停）"),
+        }
+        // OFFSET
+        match super::select_response(
+            &e,
+            "SELECT id FROM documents WHERE id BETWEEN 1 AND 300 LIMIT 3 OFFSET 10",
+        ) {
+            super::QueryResponse::Set { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(String::from_utf8_lossy(&rows[0][0]).trim(), "11");
+            }
+            other => panic!("区间 OFFSET 异常"),
+        }
+        // 无 LIMIT（全窗口语义保留旧收集路径）→ 300 行
+        match super::select_response(&e, "SELECT id FROM documents WHERE id BETWEEN 1 AND 300") {
+            super::QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 300),
+            other => panic!("无 LIMIT 区间异常"),
+        }
+    }
+
+    #[test]
     fn update_same_value_skips_write_affected_zero() {
         // MySQL affected 对齐（P127 残余②，2026-09-05）：UPDATE 赋值同值 → 影响 0 行且
         // **跳过写**（免无条件读-改-写整文档 + 倒排重索引 → 同键多版本堆积 + 多轮基准漂移）。
