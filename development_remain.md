@@ -155,6 +155,8 @@ Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09
 >    10万 PAX 实测（results-gap2-scc-100k）：#12 42.84ms → **0.27ms**（p50 0.28/p99 0.29，5 次全
 >    O(1)），验收 ≤1ms 达成；harness 首个 COUNT 亦 O(1)。全量 709 绿。
 > ③ #29/#5 残余 = 行读+块 IO/跨文件扇出 → Task-025b 阶段④。
+>    ✅ 已随 Task-025b 阶段④ 落地（2026-09-05，P109）：scan_pushdown 接线跨文件扇出并行；
+>    #5/#11 多段/重叠 L0 窗口 IO 并行（行读+块 IO 中的多文件读延迟不再串行相加），数值随压测回填。
 > ④ #11 数值 zone 运行时路由待核：若 BETWEEN 行级走 scan_all 未带 zonepred，zone 只生效于
 >   scan_pushdown 路径（正确性已由 task025 单测保障；运行时收益待接线）。
 >    ✅ 核实完成（2026-09-05，P108）：**无运行时缺口**——裸 BETWEEN/比较谓词 100% 走
@@ -206,6 +208,16 @@ Task-025：范围查询提速——Partition Pruning 与 Parallel Scan（2026-09
 > 已覆盖（①/②）。全量 706 绿。
 > **Task-025b 阶段④（独立、深，未开发）**：跨文件扇出并行——CF scan 层逐文件并发 + k-way
 > 归并（#5/#11 多段/重叠 L0 场景主杠杆），需 CF scan_stream_at 层改造（与 Ex-8.9/IO 预算结合）。
+> ✅ 已完成（2026-09-05，P109）：CF `scan_stream_at_parallel`（column_family/scan.rs）——窗口命中
+> ≥2 SST 且 workers≥2 时每 SST 源一个 scoped 线程批量推进（FAN_BATCH=512，块读/解压/解码并行，
+> sync_channel cap2 背压），主线程沿用堆归并（同 key 折叠/快照/删除/zone/投影/回调早停语义与
+> 串行逐行一致）；spawn 后即 drop 原始 Sender 集（否则 worker 结束 channel 不关闭 → 末批 recv
+> 死锁，已实测修复）。memtable 内联；workers<2/命中<2 SST 自动回退既有串行 scan_stream_at（零
+> 回归）。Engine::scan_stream_parallel（+删除位图过滤）与 scan_pushdown（裸比较/BETWEEN 谓词下推，
+> workers=可用并行度 clamp 2..=8）接线。**+1 单测** task025b4（行式/PAX × 多 L0 + 覆盖写/删除/
+> memtable 尾行 × workers 2/4/8 = 串行逐行一致 + 早停前缀一致 + 投影等值），全量 710 绿。
+> 数值收益面向多 L0 大文件窗口（压测随基准轮回填）；与 Ex-8.9 IO 预算经既有 scan_limiter（输出
+> 行字节节流）协同。
 
 Task-027：HotCache TinyLFU 读回填准入（2026-09-05 用户定：**优先开发**，先于 Task-025b/PAX 复测与 Task-026）
 > 设计：research/cache_TinyLFU.md §二/§三（Count-Min + Doorkeeper + 衰减；衰减采样阈值 N 默认

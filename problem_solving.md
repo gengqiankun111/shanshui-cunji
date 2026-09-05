@@ -1313,6 +1313,26 @@
   下仍选 FullScan，不影响正确性）。
 
 
+### P109. Task-025b 阶段④——跨文件扇出并行（2026-09-05）
+
+- **目标（dev_remain 阶段④ 未开发项）**：#5/#11 单窗口多段/重叠 L0 场景，CF scan_stream_at
+  串行逐源归并——各文件块读/解压/解码延迟相加，无法多核利用。
+- **做法**：CF 新增 `scan_stream_at_parallel`（column_family/scan.rs）：窗口命中 ≥2 SST 且
+  workers≥2 时，**每 SST 源一个 scoped 线程**批量推进 `SstRangeIter::next()`（FAN_BATCH=512，
+  `sync_channel(2)` 背压），memtable 源主线程内联；主线程沿用串行堆归并（同 key 折叠/快照过滤/
+  Tombstone/Zone 谓词/投影/回调 false 早停逐行一致）。Engine::scan_stream_parallel 包装（+删除
+  位图过滤），并接线 scan_pushdown（裸比较/BETWEEN 谓词下推；workers = 可用并行度 clamp 2..=8）。
+- **关键修复（死锁）**：scope 闭包捕获原始 `txs` Sender 集不释放 → worker 结束（其克隆 Sender
+  drop）后 channel 仍因原始 Sender 存活而不关闭 → 主线程末批 `recv` 永久阻塞。**spawn 后立即
+  `drop(txs)`** 解决（调试探针实测定位：4 worker 全部送达完成仍卡在 recv wait）。
+- **回退护栏**：workers<2 或命中 <2 SST → 直接委托既有串行 `scan_stream_at`（零行为/性能回归，
+  公共 API 均保持默认 1 worker）；与 Ex-8.9 IO 预算经既有 scan_limiter（输出行字节节流）协同。
+- **单测（+1）**：`task025b4_scan_stream_parallel_matches_serial_multi_l0`——auto_compact 关 +
+  小 memtable 分 4 段 flush（多 L0 重叠）行式/PAX 两布局 × 覆盖写/删除/删除位图/memtable 尾行
+  × workers 2/4/8：扇出与串行逐行一致、全局升序、早停前缀一致、投影列值等值。全量 **710** 绿。
+- **数值收益**：面向多 L0 大文件窗口（逐文件 IO/解码并行），压测随基准轮回填。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
