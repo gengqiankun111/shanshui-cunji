@@ -146,6 +146,10 @@ Task-025：范围查询提速——Partition Pruning 与 Parallel Scan（2026-09
 > 数值列块级 zone 剪枝安全化（iter.rs f64 比较，防 `"10"<"9.0"` 字节误剪）已落地，**生效条件**：
 > 列须在 hot_fields（PAX）才产 zone 行 → #11 用 hot_fields 含 amount 的 PAX 库复测回填；
 > 并行扫描（Task-025b）保持规划（阶段 3）。
+> ✅ Task-025b 阶段①（2026-09-05，P102）：无 WHERE + 有限窗口的**并行全扫聚合**已落地
+> （aggregate.rs：按核 2..=8 等分 docid 子窗并发 scan_stream_fields，COUNT/SUM/MIN/MAX/AVG
+> 交换律合并，逐行与串行 no-WHERE 分支一致；其余路径串行回退）；5000 行一致性测试绿，
+> 全量 705 绿。阶段②（通用 WHERE 并行、GROUP BY 分片合并、导出/条带与跨文件扇出并行）后续。
 
 Task-027：HotCache TinyLFU 读回填准入（2026-09-05 用户定：**优先开发**，先于 Task-025b/PAX 复测与 Task-026）
 > 设计：research/cache_TinyLFU.md §二/§三（Count-Min + Doorkeeper + 衰减；衰减采样阈值 N 默认

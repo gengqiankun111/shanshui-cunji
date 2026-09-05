@@ -1178,6 +1178,20 @@
   劣化 ≤1.5×（下次基准回填）。
 
 
+### P102. Task-025b 阶段①——并行全扫聚合（2026-09-05）
+
+- **落点**：聚合全扫（engine.scan_stream_fields 串行回调）为整窗单线程；并行路径限定
+  **无 WHERE / 无 ORDER / 无 LIMIT 且窗口两端有限 [lo..hi]**——等分子窗并发扫描，聚合
+  （COUNT/SUM/MIN/MAX/AVG）交换律可合并，逐行提取逻辑与串行 acc 的 no-WHERE 分支一致。
+- **改动**（sql/executor/aggregate.rs）：候选 None 分支内并行分支——`available_parallelism`
+  2..=8 核等分 docid 子窗，`std::thread::scope` 每 worker 独立 acc（含熔断检查），合并后按
+  收尾格式等价早退（不触碰串行 acc 持有变量）；无界/带 WHERE/排序/LIMIT 保持串行。
+- **测试**：5000 行（含 null/缺字段）COUNT(*)/COUNT(f)/SUM/MIN/MAX/AVG 有限窗口并行 =
+  无界串行逐值一致（task025b_*）。全量 **705**（701+seqlock 4）绿。
+- **阶段②（后续）**：通用全扫（WHERE 组合）并行、GROUP BY 分片合并、导出/条带扫描并行
+  与跨文件扇出并行（对应 #5/#11 多段场景）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
