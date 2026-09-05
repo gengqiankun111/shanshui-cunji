@@ -295,6 +295,7 @@ pub(crate) fn show_memory_response(engine: &Engine) -> QueryResponse {
     ];
     let mut rep: Vec<(&str, &str, u64)> = engine.memory_report();
     rep.extend(engine.snapshot_report());
+    rep.extend(engine.bloom_report());
     let rows: Vec<Vec<Vec<u8>>> = rep
         .iter()
         .map(|(name, _help, v)| vec![name.as_bytes().to_vec(), v.to_string().into_bytes()])

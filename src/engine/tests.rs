@@ -3511,3 +3511,52 @@ use crate::optimizer::QuerySpec;
             assert_eq!(e2.search_term("go").unwrap().len(), 1);
         }
     }
+
+    // ---------- P2 Bloom 分层计量 ----------
+
+    #[test]
+    fn bloom_layer_counters_move_on_flushed_miss_queries() {
+        // 只写偶数 docid 并分批 flush → SST（v5 分区布隆）；对段内不存在的奇数 key 点查/
+        // 批量点查 → 布隆 skip 增长；对段外 key 少量查询 → minmax skip 增长。
+        let dir = tmp();
+        let mut e = Engine::open(&dir, &cfg()).unwrap();
+        let n = 4_000u64; // 最大偶数
+        let chunk = 1_000u64;
+        let mut flushed = 0u64;
+        for (c, d) in (1..=n).enumerate() {
+            if d % 2 != 0 {
+                continue;
+            }
+            e.put_nosync(d, format!("v{d}").into_bytes(), &[]).unwrap();
+            flushed += 1;
+            if flushed % chunk == 0 {
+                e.flush_primary().unwrap();
+            }
+        }
+        e.flush_wal().unwrap();
+        assert!(e.primary.sst_count() > 0, "应已有 SST（flush 成功）");
+        let before = e.primary.bloom_counts();
+        // 段内不存在的奇数 key（介于既有偶数之间 → 定位块 + 分区布隆）
+        let mut odd_hits = 0u64;
+        for d in (1..=n).step_by(2) {
+            if e.get(d).unwrap().is_none() {
+                odd_hits += 1;
+            }
+        }
+        assert!(odd_hits > 0);
+        // 批量点查 miss（batch_get 走 get_many_from_sst 分区布隆路径）
+        let miss: Vec<u64> = (1..=n).step_by(2).collect();
+        let out = e.batch_get(&miss).unwrap();
+        assert!(out.iter().all(Option::is_none));
+        // 段外 key（> 最大）→ 段级 min/max 粗筛跳过
+        for d in (n + 1)..=(n + 200) {
+            assert!(e.get(d).unwrap().is_none());
+        }
+        let after = e.primary.bloom_counts();
+        assert!(
+            after.3 > before.3,
+            "分区布隆 skip 应增长（奇数 key 段内 miss）: {before:?} → {after:?}"
+        );
+        assert!(after.0 > before.0, "minmax skip 应增长（段外 key）");
+        assert!(after.2 > before.2, "分区布隆 probe 应增长");
+    }

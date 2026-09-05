@@ -310,6 +310,33 @@ impl Engine {
         ]
     }
 
+    /// 2026-09-05（P2 Bloom 分层计量）：读路径过滤计数 gauge（minmax/legacy/分区 probe·skip·pass/fp）。
+    /// 聚合 primary + delta + cidx 三列族；`/metrics` 与 SHOW MEMORY 采集。
+    pub fn bloom_report(&self) -> Vec<(&'static str, &'static str, u64)> {
+        let (p0, p1, p2, p3, p4, p5) = self.primary.bloom_counts();
+        let (d0, d1, d2, d3, d4, d5) = self.delta.bloom_counts();
+        let (c0, c1, c2, c3, c4, c5) = match &self.cidx {
+            Some(cf) => cf.bloom_counts(),
+            None => (0, 0, 0, 0, 0, 0),
+        };
+        let (s0, s1, s2, s3, s4, s5) = (
+            p0 + d0 + c0,
+            p1 + d1 + c1,
+            p2 + d2 + c2,
+            p3 + d3 + c3,
+            p4 + d4 + c4,
+            p5 + d5 + c5,
+        );
+        vec![
+            ("shanshui_bloom_minmax_skip_total", "段级 min/max 粗筛跳过（精确）", s0),
+            ("shanshui_bloom_legacy_skip_total", "v3/v4 整文件布隆 miss", s1),
+            ("shanshui_bloom_partition_probe_total", "v5 分区布隆校验进入（目标块）", s2),
+            ("shanshui_bloom_partition_skip_total", "v5 分区布隆拒绝", s3),
+            ("shanshui_bloom_partition_pass_total", "v5 分区布隆放行（真正读块）", s4),
+            ("shanshui_bloom_fp_est_total", "误报估计（放行后段未命中）", s5),
+        ]
+    }
+
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
         // P52：磁盘剩余空间占比（syscall 带缓存，1s 间隔）

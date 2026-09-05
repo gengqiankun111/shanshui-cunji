@@ -70,6 +70,23 @@ pub struct SstSnapshot {
     pub sizes: Vec<u64>,
 }
 
+/// 2026-09-05（P2 Bloom 分层计量）：布隆读路径三层过滤计数。
+/// 语义（按候选 SST、每次点查/批量点查 key 计）：
+/// - `minmax_skip`：段级 Zone Map（min/max）粗筛跳过（精确，无假阴性）；
+/// - `legacy_skip`：v3/v4 整文件布隆 miss；
+/// - `part_probe / part_skip / part_pass`：v5 分区布隆（目标块）校验进入/拒绝/放行；
+/// - `fp_est`：误报估计——分区布隆放行并读块后该段未命中（近似，多版本/删除会低估；
+///   真实命中在其他更旧段不减少本段计数）。
+#[derive(Debug, Default)]
+pub(crate) struct BloomCounters {
+    pub(crate) minmax_skip: AtomicU64,
+    pub(crate) legacy_skip: AtomicU64,
+    pub(crate) part_probe: AtomicU64,
+    pub(crate) part_skip: AtomicU64,
+    pub(crate) part_pass: AtomicU64,
+    pub(crate) fp_est: AtomicU64,
+}
+
 /// 列族：主数据 / 组合索引 / Delta 共用骨架。
 pub struct ColumnFamily {
     pub(crate) name: String,
@@ -148,6 +165,8 @@ pub struct ColumnFamily {
     /// P4-A：最近一次 flush 创建的 SST 段数（由 flush_by_table / flush_buckets 在
     /// snapshot_insert 中累计，供 `switch_and_flush` 记录写入速率窗口）。
     flush_sst_count: AtomicUsize,
+    /// 2026-09-05（P2）：布隆读路径三层过滤计数（点查/批量点查埋点）。
+    pub(crate) bloom: BloomCounters,
     /// R4（review 2026-09-04）：MVCC 保活水位（seq floor）。compact_merge 去重时，
     /// 最新 seq > floor 的 key 保留多版本（活跃旧快照可回读到删除/覆盖前旧值）；
     /// 位图物理回收（drop_key）亦仅当无活跃快照（floor=0）或最新 seq ≤ floor 时执行。

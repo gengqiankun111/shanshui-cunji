@@ -14,10 +14,11 @@ pub(crate) fn handle_admin_status(engine: &mut Engine) -> (u16, String) {
     }
 }
 
-/// 2026-09-05：运行时组件 gauge（内存计量 + MVCC 快照生命周期）。
+/// 2026-09-05：运行时组件 gauge（内存计量 + MVCC 快照生命周期 + Bloom 分层过滤计数）。
 fn engine_runtime_gauges(engine: &Engine) -> Vec<(&'static str, &'static str, u64)> {
     let mut g = engine.memory_report();
     g.extend(engine.snapshot_report());
+    g.extend(engine.bloom_report());
     g
 }
 

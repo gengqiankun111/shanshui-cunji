@@ -9,10 +9,24 @@ use crate::bloom::BloomFilter;
 use crate::error::Result;
 use crate::keys::encode_docid;
 use crate::sstable::{IndexEntry, SstReader};
+use std::sync::atomic::Ordering;
 
 use super::*;
 
 impl ColumnFamily {
+    /// 2026-09-05（P2 Bloom 分层计量）：读取布隆读路径计数（minmax/legacy/分区 probe·skip·pass/fp 估计）。
+    pub(crate) fn bloom_counts(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let r = &self.bloom;
+        (
+            r.minmax_skip.load(Ordering::Relaxed),
+            r.legacy_skip.load(Ordering::Relaxed),
+            r.part_probe.load(Ordering::Relaxed),
+            r.part_skip.load(Ordering::Relaxed),
+            r.part_pass.load(Ordering::Relaxed),
+            r.fp_est.load(Ordering::Relaxed),
+        )
+    }
+
     /// 查询（主键点查，便捷封装）。返回 (value, seq)，已过滤 Tombstone。
     /// `&self`：读写分离读路径（Ex-7.1 PerCpuCounter / BlockCache 已内部同步）。
     /// P3-A：从 docid 提取 table_id（高 16 位），利用 L0 按表分组范围跳过非目标表 SST。
@@ -48,7 +62,7 @@ impl ColumnFamily {
             }
             for &i in idxs {
                 let sst = &snap.ssts[i];
-                match get_from_sst(sst, &cache, key_bytes)? {
+                match get_from_sst(sst, &cache, key_bytes, &self.bloom)? {
                     // 命中：最新版本。value=None 为 Tombstone → 视为不存在
                     Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
                     None => continue, // 未命中该 SST，继续查更旧的
@@ -77,7 +91,7 @@ impl ColumnFamily {
             }
             for &i in idxs {
                 let sst = &snap.ssts[i];
-                match get_from_sst(sst, &cache, key)? {
+                match get_from_sst(sst, &cache, key, &self.bloom)? {
                     // 命中：最新版本。value=None 为 Tombstone → 视为不存在
                     Some((value, seq)) => return Ok(value.map(|v| (v, seq))),
                     None => continue, // 未命中该 SST，继续查更旧的
@@ -149,7 +163,7 @@ impl ColumnFamily {
                 if remain.is_empty() {
                     break;
                 }
-                let hits = get_many_from_sst(&snap.ssts[i], &cache, &keys, &remain)?;
+                let hits = get_many_from_sst(&snap.ssts[i], &cache, &keys, &remain, &self.bloom)?;
                 let mut next = Vec::with_capacity(remain.len());
                 for (j, &idx) in remain.iter().enumerate() {
                     match &hits[j] {
@@ -276,7 +290,7 @@ impl ColumnFamily {
                 if snapshot_seq != u64::MAX && self.sst_min_seq(&snap.ssts[i])? > snapshot_seq {
                     continue;
                 }
-                if let Some((value, seq)) = get_from_sst_at(&snap.ssts[i], &cache, key, snapshot_seq)?
+                if let Some((value, seq)) = get_from_sst_at(&snap.ssts[i], &cache, key, snapshot_seq, &self.bloom)?
                 {
                     if best.as_ref().map_or(true, |(s, _)| seq > *s) {
                         best = Some((seq, value));
@@ -339,17 +353,20 @@ fn get_from_sst(
     sst: &SstReader,
     cache: &BlockCache,
     key: &[u8],
+    bloom: &BloomCounters,
 ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
     // R 项：段级 Zone Map 粗筛——key 越出段范围 → O(1) 跳过（不做二分 + 布隆反序列化；
     // 精确判断，无假阴性）。
     if let Some((min, max)) = sst.key_range() {
         if key < min || key > max {
+            bloom.minmax_skip.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
     }
     // v3/v4：整文件布隆粗筛
     if let Some(b) = sst.legacy_bloom() {
         if !b.maybe_contains(&key.to_vec()) {
+            bloom.legacy_skip.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
     }
@@ -358,12 +375,17 @@ fn get_from_sst(
         return Ok(None);
     };
     // v5 分区布隆：只校验目标块（design 4.4.2，查询只加载目标块布隆）
+    let mut part_passed = false;
     if let Some(pb) = sst.partition_blooms() {
         if let Some(bytes) = pb.get(block_idx) {
             if let Some(b) = BloomFilter::from_bytes(bytes) {
+                bloom.part_probe.fetch_add(1, Ordering::Relaxed);
                 if !b.maybe_contains(&key.to_vec()) {
+                    bloom.part_skip.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
+                bloom.part_pass.fetch_add(1, Ordering::Relaxed);
+                part_passed = true;
             }
         }
     }
@@ -378,7 +400,12 @@ fn get_from_sst(
         cache.put(ck, b.clone());
         b
     };
-    sst.scan_block_for_key(&block, key)
+    let r = sst.scan_block_for_key(&block, key)?;
+    // P2：误报估计——分区布隆放行但读块后该段未命中（Tombstone Some(None) 为命中不计）
+    if part_passed && r.is_none() {
+        bloom.fp_est.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(r)
 }
 
 /// 单 SST 快照等值查询（S 项）：同 `get_from_sst`，但返回 **seq ≤ snapshot_seq** 的
@@ -388,27 +415,35 @@ fn get_from_sst_at(
     cache: &BlockCache,
     key: &[u8],
     snapshot_seq: u64,
+    bloom: &BloomCounters,
 ) -> Result<Option<(Option<Vec<u8>>, u64)>> {
     // R 项：段级 Zone Map 粗筛（同 get_from_sst）
     if let Some((min, max)) = sst.key_range() {
         if key < min || key > max {
+            bloom.minmax_skip.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
     }
     if let Some(b) = sst.legacy_bloom() {
         if !b.maybe_contains(&key.to_vec()) {
+            bloom.legacy_skip.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
     }
     let Some((block_idx, entry)) = sst.locate_indexed_block(key)? else {
         return Ok(None);
     };
+    let mut part_passed = false;
     if let Some(pb) = sst.partition_blooms() {
         if let Some(bytes) = pb.get(block_idx) {
             if let Some(b) = BloomFilter::from_bytes(bytes) {
+                bloom.part_probe.fetch_add(1, Ordering::Relaxed);
                 if !b.maybe_contains(&key.to_vec()) {
+                    bloom.part_skip.fetch_add(1, Ordering::Relaxed);
                     return Ok(None);
                 }
+                bloom.part_pass.fetch_add(1, Ordering::Relaxed);
+                part_passed = true;
             }
         }
     }
@@ -422,7 +457,11 @@ fn get_from_sst_at(
         cache.put(ck, b.clone());
         b
     };
-    sst.scan_block_for_key_at(&block, key, snapshot_seq)
+    let r = sst.scan_block_for_key_at(&block, key, snapshot_seq)?;
+    if part_passed && r.is_none() {
+        bloom.fp_est.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(r)
 }
 
 /// 单 SST 批量等值查询（N 项）：整文件布隆粗筛 → 逐 key 二分定位数据块 → 按块分组 →
@@ -434,6 +473,7 @@ fn get_many_from_sst(
     cache: &BlockCache,
     keys: &[Vec<u8>],
     idxs: &[usize],
+    bloom: &BloomCounters,
 ) -> Result<Vec<Option<(Option<Vec<u8>>, u64)>>> {
     let mut out: Vec<Option<(Option<Vec<u8>>, u64)>> = vec![None; idxs.len()];
     if idxs.is_empty() {
@@ -448,11 +488,13 @@ fn get_many_from_sst(
         let k = &keys[i];
         if let Some((min, max)) = seg_range {
             if k.as_slice() < min || k.as_slice() > max {
+                bloom.minmax_skip.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         }
         if let Some(b) = legacy {
             if !b.maybe_contains(k) {
+                bloom.legacy_skip.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         }
@@ -484,8 +526,12 @@ fn get_many_from_sst(
             if let Some(bytes) = pb.get(block_idx) {
                 if let Some(b) = BloomFilter::from_bytes(bytes) {
                     for &(i, _, _) in &located[pos..end] {
+                        bloom.part_probe.fetch_add(1, Ordering::Relaxed);
                         if b.maybe_contains(&keys[i]) {
+                            bloom.part_pass.fetch_add(1, Ordering::Relaxed);
                             targets.push(i);
+                        } else {
+                            bloom.part_skip.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     pruned = true;
@@ -514,6 +560,16 @@ fn get_many_from_sst(
                 if let Some(i) = targets.iter().copied().find(|&i| keys[i] == k) {
                     if let Some(&slot) = slot_of.get(&i) {
                         out[slot] = Some((v, seq));
+                    }
+                }
+            }
+            // P2：误报估计——分区布隆放行的 key 读块后该段未命中（Tombstone 计入 Some 不算）
+            if pruned {
+                for &i in &targets {
+                    if let Some(&slot) = slot_of.get(&i) {
+                        if out[slot].is_none() {
+                            bloom.fp_est.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

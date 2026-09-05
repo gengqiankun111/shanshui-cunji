@@ -215,6 +215,7 @@ impl ColumnFamily {
             base_l1_trigger: cfg.storage.l1_trigger_files,
             flush_counter: AtomicU64::new(0),
             flush_sst_count: AtomicUsize::new(0),
+            bloom: BloomCounters::default(),
             sst_written: AtomicU64::new(0),
             mvcc_keep_floor: AtomicU64::new(0),
             memtable: MemTableBuffer::new(),
