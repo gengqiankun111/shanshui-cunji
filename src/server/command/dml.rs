@@ -327,9 +327,14 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                 };
                 let mut items: Vec<(u64, Vec<u8>, Vec<String>)> = Vec::with_capacity(chunk.len());
                 for (&id, cur_opt) in chunk.iter().zip(cur.into_iter()) {
+                    let old_bytes: Option<&[u8]> = cur_opt.as_deref();
                     // 整体替换（field=doc）
                     if field.eq_ignore_ascii_case("doc") {
                         let raw = unquote(&expr);
+                        // MySQL affected 对齐：新值==旧值 → 跳过写（免同键版本堆积/多轮基准漂移）
+                        if old_bytes == Some(raw.as_bytes()) {
+                            continue;
+                        }
                         let terms = match doc_terms(&raw) {
                             Ok(t) => t,
                             Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
@@ -338,8 +343,8 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                         continue;
                     }
                     // 读当前文档 → 字段级修改 → 覆盖写回（缺失/删除 id 视为空文档：与旧单 id 语义一致）
-                    let mut doc: serde_json::Value = match cur_opt {
-                        Some(v) => serde_json::from_slice(&v)
+                    let mut doc: serde_json::Value = match old_bytes {
+                        Some(v) => serde_json::from_slice(v)
                             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
                         None => serde_json::Value::Object(serde_json::Map::new()),
                     };
@@ -354,6 +359,11 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                         obj.insert(field.clone(), serde_json::Value::String(unquote(&expr)));
                     }
                     let new_doc = serde_json::to_string(&doc).unwrap_or_default();
+                    // MySQL affected 对齐：字段变换后文档未变（赋值同值）→ 跳过写
+                    // （免无条件读-改-写整文档 + 倒排重索引 → 同键多版本堆积 + 多轮基准漂移）
+                    if old_bytes == Some(new_doc.as_bytes()) {
+                        continue;
+                    }
                     let terms = match doc_terms(&new_doc) {
                         Ok(t) => t,
                         Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),

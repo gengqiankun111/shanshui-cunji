@@ -1238,6 +1238,53 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn update_same_value_skips_write_affected_zero() {
+        // MySQL affected 对齐（P127 残余②，2026-09-05）：UPDATE 赋值同值 → 影响 0 行且
+        // **跳过写**（免无条件读-改-写整文档 + 倒排重索引 → 同键多版本堆积 + 多轮基准漂移）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        p127_lib(&mut e); // 4000 行，偶数 active（n = i 数值）
+        // ① 赋值同值（status 本就 active）→ 0 影响
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET status='active' WHERE id BETWEEN 1 AND 1000 AND status='active' LIMIT 50",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 0, "同值赋值影响 0"),
+            super::QueryResponse::Err(c, m) => panic!("update same 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        // ② 值变化 → 50 行（n 数值 → 字符串 "99"）
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET n=99 WHERE id BETWEEN 1 AND 1000 AND status='active' LIMIT 50",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 50, "值变化应影响 50"),
+            super::QueryResponse::Err(c, m) => panic!("update set 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        let mut changed = 0u64;
+        for i in 1..=1000u64 {
+            if i % 2 == 0 && i <= 100 {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&e.get(i).unwrap().unwrap()).unwrap();
+                assert_eq!(v["n"], "99", "docid={i} 应被改为 '99'");
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, 50);
+        // ③ 再赋同值 "99" → 0（第二轮跳过写，不产生新版本）
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET n=99 WHERE id BETWEEN 1 AND 1000 AND status='active' LIMIT 50",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 0, "重复同值更新跳过写影响 0"),
+            super::QueryResponse::Err(c, m) => panic!("update same2 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+    }
+
+    #[test]
     fn p127_b_select_combo_pk_range_no_id_field_in_doc() {
         // P127 分支 B（真实形态）：cjserver INSERT 的 id 列提取为主键、**文档 JSON 无 id 字段**
         // → 组合 `id BETWEEN ∩ status=` 此前 executor 字段语义求值恒 0 行慢查（110 万验收实测
