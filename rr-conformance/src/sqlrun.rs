@@ -51,6 +51,7 @@ pub struct Ctx {
     pub upd_hi: u64,
     pub del_lo: u64,   // 单删区 100 行
     pub delb_lo: u64,  // 批量删区 500 行（delete_range50 用）
+    pub delc_lo: u64,  // 大批量删区 1000 行（delete_range_1000 用）
     pub ins_lo: u64,   // 批量插区起点
 }
 
@@ -115,6 +116,7 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
         upd_hi: n + 200_200,
         del_lo: n + 200_501,
         delb_lo: n + 200_601,
+        delc_lo: n + 246_001, // 大批量删预留（1000 行，base+46001..，与插区分离）
         ins_lo: n + 201_501,
     };
     println!("[sqlrun] url={url} 表={tb} N={n} base={} out={out}", ctx.base);
@@ -138,12 +140,19 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
     }
     let r = exec_stmt(&mut conn, &format!("INSERT INTO {tb} ({COLS_FULL}) VALUES {}", vals.join(",")));
     let delb_ok = r.err.is_none();
-    println!("[sqlrun] 预留行：upd {}-{}、del {}-{}、delb {}-{}（{}{}{}）",
+    vals.clear();
+    for id in ctx.delc_lo..=ctx.delc_lo + 999 {
+        vals.push(ins_vals(id, &format!("r{id}")));
+    }
+    let r = exec_stmt(&mut conn, &format!("INSERT INTO {tb} ({COLS_FULL}) VALUES {}", vals.join(",")));
+    let delc_ok = r.err.is_none();
+    println!("[sqlrun] 预留行：upd {}-{}、del {}-{}、delb {}-{}、delc {}-{}（{}{}{}{}）",
              ctx.upd_lo, ctx.upd_hi, ctx.del_lo, ctx.del_lo + 99,
-             ctx.delb_lo, ctx.delb_lo + 499,
+             ctx.delb_lo, ctx.delb_lo + 499, ctx.delc_lo, ctx.delc_lo + 999,
              if upd_ok { "OK " } else { "UPD-FAIL " },
              if del_ok { "OK " } else { "DEL-FAIL " },
-             if delb_ok { "OK" } else { "DELB-FAIL" });
+             if delb_ok { "OK " } else { "DELB-FAIL " },
+             if delc_ok { "OK" } else { "DELC-FAIL" });
 
     // ---------- 各探针 SQL 生成（两侧方言统一，不使用列别名） ----------
     let sql_pk = |_r: &mut StdRng, c: &Ctx, _i: usize| format!("SELECT * FROM {tb} WHERE id={}", _r.gen_range(1..=c.n), tb = t());
@@ -273,6 +282,144 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
         let id = c.upd_lo + (r.gen_range(0..200) as u64);
         format!("SELECT k,amount FROM {tb} WHERE id={id} FOR UPDATE", tb = t())
     };
+    // ---------- 第三批（2026-09-05，A~J 44 项性能分档探针） ----------
+    // 档位语义 = 每查询目标结果行数（LIMIT/窗口宽度）；执行次数按类别控制（点查/倒排/写偏多、
+    // 聚合/排序偏少）。MySQL 端同 SQL（同宽表列），数据量不强制与 SCC 一致（瓶颈快扫用）。
+    let sql_in200 = |r: &mut StdRng, c: &Ctx, _i: usize| in_sql(r, c, 200);
+    let sql_in1000 = |r: &mut StdRng, c: &Ctx, _i: usize| in_sql(r, c, 1000);
+    let sql_in5000 = |r: &mut StdRng, c: &Ctx, _i: usize| in_sql(r, c, 5000);
+    let sql_win500 = |r: &mut StdRng, c: &Ctx, _i: usize| {
+        let a = r.gen_range(1..c.n.saturating_sub(509));
+        format!("SELECT id,k,status FROM {tb} WHERE id BETWEEN {a} AND {}", a + 499, tb = t())
+    };
+    let sql_win3000 = |r: &mut StdRng, c: &Ctx, _i: usize| {
+        let a = r.gen_range(1..c.n.saturating_sub(3009));
+        format!("SELECT id,k,status FROM {tb} WHERE id BETWEEN {a} AND {}", a + 2999, tb = t())
+    };
+    let sql_win10000 = |r: &mut StdRng, c: &Ctx, _i: usize| {
+        let a = r.gen_range(1..c.n.saturating_sub(10009));
+        format!("SELECT id,k,status FROM {tb} WHERE id BETWEEN {a} AND {}", a + 9999, tb = t())
+    };
+    let sql_enum500 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let s = ["active", "closed", "pending", "failed", "archived"][r.gen_range(0..5)];
+        format!("SELECT id,status FROM {tb} WHERE status='{s}' LIMIT 500", tb = t())
+    };
+    let sql_enum3000 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let s = ["active", "closed", "pending", "failed", "archived"][r.gen_range(0..5)];
+        format!("SELECT id,status FROM {tb} WHERE status='{s}' LIMIT 3000", tb = t())
+    };
+    let sql_enum10000 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let s = ["active", "closed", "pending", "failed", "archived"][r.gen_range(0..5)];
+        format!("SELECT id,status FROM {tb} WHERE status='{s}' LIMIT 10000", tb = t())
+    };
+    let sql_combo500 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let s = ["active", "closed"][r.gen_range(0..2)];
+        let g = ["beijing", "shanghai", "shenzhen", "hangzhou"][r.gen_range(0..4)];
+        format!("SELECT id FROM {tb} WHERE status='{s}' AND region='{g}' LIMIT 500", tb = t())
+    };
+    let sql_combo3000 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let s = ["active", "closed"][r.gen_range(0..2)];
+        let g = ["beijing", "shanghai", "shenzhen", "hangzhou"][r.gen_range(0..4)];
+        format!("SELECT id FROM {tb} WHERE status='{s}' AND region='{g}' LIMIT 3000", tb = t())
+    };
+    let sql_fieldin500 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id FROM {tb} WHERE status IN ('active','closed','pending') LIMIT 500", tb = t())
+    };
+    let sql_fieldin3000 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id FROM {tb} WHERE status IN ('active','closed','pending') LIMIT 3000", tb = t())
+    };
+    let sql_three = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id FROM {tb} WHERE status='active' AND region='beijing' AND channel='web' LIMIT 100", tb = t())
+    };
+    let sql_uid = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id,user_id FROM {tb} WHERE user_id={} LIMIT 100", r.gen_range(1..=5_000_000u32), tb = t())
+    };
+    let sql_gt500 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id,amount FROM {tb} WHERE amount > 900000 LIMIT 500", tb = t())
+    };
+    let sql_gt3000 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id,amount FROM {tb} WHERE amount > 900000 LIMIT 3000", tb = t())
+    };
+    let sql_between_wide = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let a = 200_000 + _r.gen_range(0..200);
+        format!("SELECT id,amount FROM {tb} WHERE amount BETWEEN {a} AND {}", a + 1000, tb = t())
+    };
+    let sql_like = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id,title FROM {tb} WHERE title LIKE 'a%' LIMIT 100", tb = t())
+    };
+    let sql_cntenum = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let s = ["active", "closed", "pending", "failed", "archived"][_r.gen_range(0..5)];
+        format!("SELECT COUNT(*) FROM {tb} WHERE status='{s}'", tb = t())
+    };
+    let sql_gbs = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT status, COUNT(*) FROM {tb} GROUP BY status LIMIT 20", tb = t())
+    };
+    let sql_gb2 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT region, channel, COUNT(*) FROM {tb} WHERE status='active' GROUP BY region, channel", tb = t())
+    };
+    let sql_dst_e = |_r: &mut StdRng, _c: &Ctx, _i: usize| format!("SELECT COUNT(DISTINCT status) FROM {tb}", tb = t());
+    let sql_dst_h = |_r: &mut StdRng, _c: &Ctx, _i: usize| format!("SELECT COUNT(DISTINCT user_id) FROM {tb}", tb = t());
+    let sql_om500 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id, k, amount FROM {tb} ORDER BY k, amount DESC LIMIT 500", tb = t())
+    };
+    let sql_om3000 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id, k, amount FROM {tb} ORDER BY k, amount DESC LIMIT 3000", tb = t())
+    };
+    let sql_os10k = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id, score FROM {tb} ORDER BY score DESC LIMIT 10000", tb = t())
+    };
+    let sql_owoff = |_r: &mut StdRng, c: &Ctx, _i: usize| {
+        let a = _r.gen_range(1..c.n.saturating_sub(30_000));
+        format!("SELECT id,amount FROM {tb} WHERE id BETWEEN {a} AND {} ORDER BY amount DESC LIMIT 100 OFFSET 1000", a + 20_000, tb = t())
+    };
+    // ts 范围窗：30s/行（wide_load ts 均匀 3000 万秒/100 万行）→ 宽 15000s ≈ 500 行、30000s ≈ 1000 行
+    let sql_crng500 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let v = 1_700_000_000u64 + r.gen_range(0..(30_000_000u64 - 15_000));
+        format!("SELECT id,ts FROM {tb} WHERE ts BETWEEN {v} AND {}", v + 15_000, tb = t())
+    };
+    let sql_crng1000 = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let v = 1_700_000_000u64 + r.gen_range(0..(30_000_000u64 - 30_000));
+        format!("SELECT id,ts FROM {tb} WHERE ts BETWEEN {v} AND {}", v + 30_000, tb = t())
+    };
+    let sql_cidx_eq = |r: &mut StdRng, _c: &Ctx, _i: usize| {
+        let v = 1_700_000_000u64 + r.gen_range(0..=30_000_000u64);
+        format!("SELECT id,status,ts FROM {tb} WHERE status='active' AND ts={v} LIMIT 100", tb = t())
+    };
+    // H 档插入窗：base+33001 起按档位长递增（cleanup 统一删 base+1501..46001）
+    let sql_ins500 = |_r: &mut StdRng, c: &Ctx, i: usize| ins_multi(c.base + 33_001 + (i as u64) * 500, 500, "h1");
+    let sql_ins2000 = |_r: &mut StdRng, c: &Ctx, i: usize| ins_multi(c.base + 33_001 + 3_000 + (i as u64) * 2000, 2000, "h2");
+    let sql_ups500 = |_r: &mut StdRng, c: &Ctx, i: usize| {
+        let s = c.delc_lo + ((i as u64 % 2) * 500);
+        let mut vals = Vec::with_capacity(500);
+        for id in s..s + 500 {
+            vals.push(ins_vals(id, &format!("u{id}")));
+        }
+        format!("INSERT INTO {tb} ({COLS_FULL}) VALUES {}{UPS_SUF}", vals.join(","), tb = t())
+    };
+    let sql_hotupd = |_r: &mut StdRng, c: &Ctx, _i: usize| {
+        format!("UPDATE {tb} SET note='x9' WHERE id={}", c.upd_lo, tb = t()) // 热点同一主键反复 update
+    };
+    let sql_delc = |_r: &mut StdRng, c: &Ctx, _i: usize| {
+        let lo = c.delc_lo;
+        format!("DELETE FROM {tb} WHERE id BETWEEN {lo} AND {}", lo + 999, tb = t())
+    };
+    let sql_upd_range = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("UPDATE {tb} SET note='x9' WHERE id BETWEEN 1 AND 20000 AND status='active' LIMIT 200", tb = t())
+    };
+    let sql_longread = |_r: &mut StdRng, c: &Ctx, _i: usize| {
+        let a = _r.gen_range(1..c.n.saturating_sub(100_000));
+        format!("SELECT id,k,amount FROM {tb} WHERE id BETWEEN {a} AND {}", a + 100_000, tb = t())
+    };
+    let sql_biz500 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id,k,amount,ts FROM {tb} WHERE status='active' ORDER BY ts DESC LIMIT 500 OFFSET 0", tb = t())
+    };
+    let sql_bizpage = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT id,k,amount,ts FROM {tb} WHERE status='active' ORDER BY ts DESC LIMIT 100 OFFSET 2000", tb = t())
+    };
+    let sql_bizagg = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
+        format!("SELECT region, COUNT(*) FROM {tb} WHERE status='active' GROUP BY region ORDER BY COUNT(*) DESC LIMIT 20", tb = t())
+    };
+    let sql_multi = |_r: &mut StdRng, _c: &Ctx, _i: usize| "--multi".to_string();
 
     let list: Vec<Probe> = vec![
         Probe { cat: "点查", name: "pk_point_star", kind: Kind::Rows, n: 300, sql: sql_pk, note: "SELECT *" },
@@ -312,6 +459,51 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
         Probe { cat: "事务", name: "txn_rr_readwrite", kind: Kind::Block, n: 50, sql: txn_upd, note: "RR 读写事务" },
         Probe { cat: "事务", name: "txn_serializable", kind: Kind::Block, n: 50, sql: txn_upd, note: "SERIALIZABLE 读写事务" },
         Probe { cat: "事务", name: "txn_lock_wait", kind: Kind::Block, n: 5, sql: sql_lock, note: "并发 FOR UPDATE 锁等待" },
+        // ---- 第三批（2026-09-05，A~J 44 项性能分档；档位 = 结果行数） ----
+        Probe { cat: "点查", name: "pk_in_200", kind: Kind::Rows, n: 60, sql: sql_in200, note: "id IN 200 点" },
+        Probe { cat: "点查", name: "pk_in_1000", kind: Kind::Rows, n: 40, sql: sql_in1000, note: "id IN 1000 点" },
+        Probe { cat: "点查", name: "pk_in_5000", kind: Kind::Rows, n: 15, sql: sql_in5000, note: "id IN 5000 点" },
+        Probe { cat: "范围", name: "pk_between_500", kind: Kind::Rows, n: 60, sql: sql_win500, note: "500 行窗口" },
+        Probe { cat: "范围", name: "pk_between_3000", kind: Kind::Rows, n: 30, sql: sql_win3000, note: "3000 行窗口" },
+        Probe { cat: "范围", name: "pk_between_10000", kind: Kind::Rows, n: 15, sql: sql_win10000, note: "10000 行窗口" },
+        Probe { cat: "倒排", name: "enum_sel_limit500", kind: Kind::Rows, n: 40, sql: sql_enum500, note: "枚举等值 bitmap limit 500" },
+        Probe { cat: "倒排", name: "enum_sel_limit3000", kind: Kind::Rows, n: 30, sql: sql_enum3000, note: "枚举等值 bitmap limit 3000" },
+        Probe { cat: "倒排", name: "enum_sel_limit10000", kind: Kind::Rows, n: 15, sql: sql_enum10000, note: "枚举等值 bitmap limit 10000" },
+        Probe { cat: "倒排", name: "combo_and_limit500", kind: Kind::Rows, n: 40, sql: sql_combo500, note: "枚举×枚举 AND limit 500" },
+        Probe { cat: "倒排", name: "combo_and_limit3000", kind: Kind::Rows, n: 30, sql: sql_combo3000, note: "枚举×枚举 AND limit 3000" },
+        Probe { cat: "倒排", name: "field_in_limit500", kind: Kind::Rows, n: 40, sql: sql_fieldin500, note: "字段 IN 列表 limit 500" },
+        Probe { cat: "倒排", name: "field_in_limit3000", kind: Kind::Rows, n: 30, sql: sql_fieldin3000, note: "字段 IN 列表 limit 3000" },
+        Probe { cat: "倒排", name: "combo_three_and", kind: Kind::Rows, n: 40, sql: sql_three, note: "三枚举 AND limit 100" },
+        Probe { cat: "倒排", name: "enum_card_high_sel100", kind: Kind::Rows, n: 40, sql: sql_uid, note: "高基数字段过滤 limit 100" },
+        Probe { cat: "扫描", name: "cmp_gt_limit500", kind: Kind::Rows, n: 20, sql: sql_gt500, note: "数值> limit 500 早停" },
+        Probe { cat: "扫描", name: "cmp_gt_limit3000", kind: Kind::Rows, n: 10, sql: sql_gt3000, note: "数值> limit 3000 早停" },
+        Probe { cat: "扫描", name: "cmp_between_nolimit", kind: Kind::Rows, n: 20, sql: sql_between_wide, note: "数值 between 无 limit（宽窗返回~千行）" },
+        Probe { cat: "扫描", name: "cmp_like_prefix", kind: Kind::Rows, n: 20, sql: sql_like, note: "前缀 like 无索引 limit 100" },
+        Probe { cat: "聚合", name: "count_where_enum", kind: Kind::Rows, n: 10, sql: sql_cntenum, note: "COUNT WHERE 枚举（倒排命中）" },
+        Probe { cat: "聚合", name: "sum_where_idx", kind: Kind::Rows, n: 10, sql: sql_sumwhere, note: "SUM WHERE 倒排过滤后聚合" },
+        Probe { cat: "聚合", name: "group_by_status_limit", kind: Kind::Rows, n: 5, sql: sql_gbs, note: "group by status limit 20" },
+        Probe { cat: "聚合", name: "group_by_two_where", kind: Kind::Rows, n: 5, sql: sql_gb2, note: "双字段 group by + where 过滤" },
+        Probe { cat: "聚合", name: "count_distinct_enum", kind: Kind::Rows, n: 5, sql: sql_dst_e, note: "COUNT(DISTINCT 枚举)" },
+        Probe { cat: "聚合", name: "count_distinct_highcard", kind: Kind::Rows, n: 5, sql: sql_dst_h, note: "COUNT(DISTINCT 高基数 user_id)" },
+        Probe { cat: "排序", name: "orderby_multi_limit500", kind: Kind::Rows, n: 8, sql: sql_om500, note: "多字段 ORDER BY limit 500" },
+        Probe { cat: "排序", name: "orderby_multi_limit3000", kind: Kind::Rows, n: 5, sql: sql_om3000, note: "多字段 ORDER BY limit 3000" },
+        Probe { cat: "排序", name: "orderby_single_desc_10000", kind: Kind::Rows, n: 5, sql: sql_os10k, note: "单字段排序 limit 10000" },
+        Probe { cat: "排序", name: "orderby_win_offset_1000", kind: Kind::Rows, n: 10, sql: sql_owoff, note: "窗口深分页 offset 1000 limit 100" },
+        Probe { cat: "索引", name: "composite_idx_range_limit500", kind: Kind::Rows, n: 20, sql: sql_crng500, note: "联合索引非前置列范围（~500 行）" },
+        Probe { cat: "索引", name: "composite_idx_multi_eq", kind: Kind::Rows, n: 60, sql: sql_cidx_eq, note: "联合索引多列全等值 limit 100" },
+        Probe { cat: "索引", name: "idx_range_scan_1000", kind: Kind::Rows, n: 20, sql: sql_crng1000, note: "二级索引范围扫描读 ~1000 行" },
+        Probe { cat: "批量写", name: "insert_batch_500", kind: Kind::Exec, n: 6, sql: sql_ins500, note: "单语句插入 500 行" },
+        Probe { cat: "批量写", name: "insert_batch_2000", kind: Kind::Exec, n: 4, sql: sql_ins2000, note: "单语句插入 2000 行" },
+        Probe { cat: "批量写", name: "upsert_batch_500", kind: Kind::Exec, n: 10, sql: sql_ups500, note: "ON DUPLICATE KEY 500 行/语句（delc 区交替窗）" },
+        Probe { cat: "写", name: "update_hotrow_single", kind: Kind::Exec, n: 200, sql: sql_hotupd, note: "热点同一主键反复 update" },
+        Probe { cat: "写", name: "delete_range_1000", kind: Kind::Exec, n: 1, sql: sql_delc, note: "范围删除 1000 行" },
+        Probe { cat: "写", name: "update_range_idx", kind: Kind::Exec, n: 20, sql: sql_upd_range, note: "索引条件批量 update 200 行" },
+        Probe { cat: "事务", name: "txn_lock_mid_contend", kind: Kind::Block, n: 5, sql: sql_lock, note: "中等并发 for update 部分锁冲突（双连接）" },
+        Probe { cat: "事务", name: "txn_long_read", kind: Kind::Block, n: 5, sql: sql_longread, note: "长只读快照事务（读 10 万行窗）" },
+        Probe { cat: "事务", name: "txn_multi_stat", kind: Kind::Block, n: 20, sql: sql_multi, note: "事务内多条 DML 混合" },
+        Probe { cat: "混合", name: "biz_list_query", kind: Kind::Rows, n: 10, sql: sql_biz500, note: "倒排过滤+时间排序 limit 500" },
+        Probe { cat: "混合", name: "biz_page_offset", kind: Kind::Rows, n: 10, sql: sql_bizpage, note: "where+order by offset 2000 limit 100" },
+        Probe { cat: "混合", name: "biz_agg_filter", kind: Kind::Rows, n: 5, sql: sql_bizagg, note: "where+group by+order by 聚合 limit 20" },
     ];
 
     let env_note = if url.contains("3316") {
@@ -339,7 +531,7 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
             let r = match p.kind {
                 Kind::Rows => exec_stmt(&mut conn, &sql).let_rows(),
                 Kind::Exec => exec_stmt(&mut conn, &sql).let_exec(),
-                Kind::Block => run_block(&mut conn, &url, &sql, p.name),
+                Kind::Block => run_block(&mut conn, &url, &sql, p.name, ctx.upd_lo),
             };
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             match r {
@@ -371,8 +563,9 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
         md.push_str(&note);
         md.push('\n');
     }
-    // 清理写区（upd 区保留；ins/del/delb + 大插区 base+1501..33000 整区删除，恢复初始行数）
-    let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.base + 1501, ctx.base + 33000, tb = t()));
+    // 清理写区（upd 区保留；ins/del/delb/delc + 大插区 base+1501..46001 整区删除，恢复初始行数）
+    let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.base + 1501, ctx.base + 46001, tb = t()));
+    let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.delc_lo, ctx.delc_lo + 999, tb = t()));
     let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.delb_lo, ctx.delb_lo + 499, tb = t()));
     let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.del_lo, ctx.del_lo + 99, tb = t()));
     std::fs::write(format!("{out}/summary.md"), md).expect("写 summary");
@@ -384,9 +577,12 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
 /// - name "txn_lock_wait"：双连接锁等待（主连接持锁 sleep 后提交，副连接等锁超时 3s）
 /// - name "txn_rr_readwrite"/"txn_serializable"：先 SET SESSION 对应隔离级
 /// - name "txn_for_update_read"：按结果行数计；其余写按 affected 计
-fn run_block(conn: &mut mysql::Conn, url: &str, body: &str, name: &'static str) -> Result<(usize, String), String> {
-    if name == "txn_lock_wait" {
+fn run_block(conn: &mut mysql::Conn, url: &str, body: &str, name: &'static str, upd_lo: u64) -> Result<(usize, String), String> {
+    if name == "txn_lock_wait" || name == "txn_lock_mid_contend" {
         return run_lock_wait(conn, url, body);
+    }
+    if name == "txn_multi_stat" {
+        return run_multi_stat(conn, upd_lo);
     }
     if name == "txn_rr_readwrite" {
         let _ = exec_stmt(conn, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ");
@@ -398,7 +594,11 @@ fn run_block(conn: &mut mysql::Conn, url: &str, body: &str, name: &'static str) 
         return Err(format!("BEGIN: {}", r0.err.unwrap()));
     }
     let r = exec_stmt(conn, body);
-    let rn = if name == "txn_for_update_read" { r.rows.len() } else { r.affected as usize };
+    let rn = if name == "txn_for_update_read" || name == "txn_long_read" {
+        r.rows.len()
+    } else {
+        r.affected as usize
+    };
     if r.err.is_some() {
         let _ = exec_stmt(conn, "ROLLBACK");
         return Err(format!("body: {}", r.err.unwrap()));
@@ -408,6 +608,36 @@ fn run_block(conn: &mut mysql::Conn, url: &str, body: &str, name: &'static str) 
         return Err(format!("COMMIT: {}", rc.err.unwrap()));
     }
     Ok((rn, format!("block")))
+}
+
+/// 事务内多条 DML 混合（txn_multi_stat）：BEGIN → 单点 UPDATE → 批量 UPDATE IN 10 →
+/// 快照聚合读 → COMMIT（整块计时）。写作用于 upd 预留区，保证每次可重跑。
+fn run_multi_stat(conn: &mut mysql::Conn, upd_lo: u64) -> Result<(usize, String), String> {
+    let tb = t();
+    let r0 = exec_stmt(conn, "BEGIN");
+    if r0.err.is_some() {
+        return Err(format!("BEGIN: {}", r0.err.unwrap()));
+    }
+    let mut affected = 0usize;
+    let lo = upd_lo;
+    for stmt in [
+        format!("UPDATE {tb} SET score=0.5 WHERE id={lo}", tb = t()),
+        format!("UPDATE {tb} SET note='x9' WHERE id IN ({lo},{})", lo + 1, tb = t()),
+    ] {
+        let r = exec_stmt(conn, &stmt);
+        if r.err.is_some() {
+            let _ = exec_stmt(conn, "ROLLBACK");
+            return Err(format!("body: {}", r.err.unwrap()));
+        }
+        affected += r.affected as usize;
+    }
+    // 快照聚合读（不参与 affected）
+    let _ = exec_stmt(conn, &format!("SELECT COUNT(*) FROM {tb}", tb = t()));
+    let rc = exec_stmt(conn, "COMMIT");
+    if rc.err.is_some() {
+        return Err(format!("COMMIT: {}", rc.err.unwrap()));
+    }
+    Ok((affected, "multi-dml".to_string()))
 }
 
 /// 锁等待探针：主连接 BEGIN + SELECT..FOR UPDATE 持锁 → 副连接对同 id UPDATE 等锁
