@@ -182,6 +182,43 @@ impl Engine {
         Ok(out)
     }
 
+    /// Task-023：主键 IN 列表批量取行（稠密/稀疏自适应）——排序去重后：
+    /// - **稠密**（跨度 ≤ 4×计数，对齐 P92 稠密判定）→ `scan_range` 区间顺序读 + 集合过滤
+    ///   （SST 块顺序读 + BlockCache 局部性，替代逐 id 随机定位；#4 pk_in_50 目标 ≤0.5ms）；
+    /// - **稀疏** → 复用 `batch_get`（P2-D 按 SST 块分组批量点查，不回退逐条 get）。
+    /// 可见性语义与 `get` 一致（删除位图/墓碑隐藏跳过、HotCache/Delta 正常）。
+    /// 返回 docid→value 映射（去重）。
+    pub fn get_many_pk_in(&self, ids: &[u64]) -> Result<std::collections::HashMap<u64, Vec<u8>>> {
+        let mut sorted: Vec<u64> = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut out = std::collections::HashMap::with_capacity(sorted.len());
+        if sorted.is_empty() {
+            return Ok(out);
+        }
+        let first = sorted[0];
+        let last = *sorted.last().unwrap();
+        // 跨度 = last-first+1（防溢出回退稀疏）
+        if let Some(span) = last.checked_sub(first).and_then(|d| d.checked_add(1)) {
+            if span <= (4 * sorted.len()) as u64 {
+                let want: std::collections::HashSet<u64> = sorted.iter().copied().collect();
+                for (d, v) in self.scan_range(Some(first), Some(last))? {
+                    if want.contains(&d) {
+                        out.insert(d, v);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+        let vals = self.batch_get(&sorted)?;
+        for (d, v) in sorted.into_iter().zip(vals) {
+            if let Some(v) = v {
+                out.insert(d, v);
+            }
+        }
+        Ok(out)
+    }
+
     /// P87②：投影字段批量回表——每个 docid 只返回请求的顶层字段值（倒排候选
     /// Top-K 排序键解码下推：PAX 块列解码 / 行式块按需字段提取，免整行 25 列解码）。
     /// 语义与 `batch_get` 一致（删除位图 O(1) 过滤 / HotCache 命中 / Delta 字段级覆盖 /

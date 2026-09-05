@@ -213,10 +213,17 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
                 rows: vec![vec![sum.to_string().into_bytes()]],
             };
         }
+        // Task-023：id IN → 稠密/稀疏自适应批量取行（engine.get_many_pk_in：稠密区间
+        // 顺序读 + 集合过滤 / 稀疏 batch_get），替代逐 id 随机 LSM 点查；行序保持 IN 列表序
+        // （与旧逐条 get 一致），可见性语义同 get（删除位图隐藏跳过）。
         let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Ok(Some(v)) = engine.get(docid_for(tid, id)) {
-                raw.push((docid_for(tid, id), v));
+        let docids: Vec<u64> = ids.iter().map(|id| docid_for(tid, *id)).collect();
+        if let Ok(found) = engine.get_many_pk_in(&docids) {
+            for id in ids {
+                let d = docid_for(tid, id);
+                if let Some(v) = found.get(&d) {
+                    raw.push((d, v.clone()));
+                }
             }
         }
         return build_result_set(proj.as_deref(), raw, upper2.contains("ORDER BY"), limit);

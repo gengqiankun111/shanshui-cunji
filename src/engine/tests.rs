@@ -1448,6 +1448,46 @@ use crate::optimizer::QuerySpec;
         assert_eq!(e2.get(49).unwrap().unwrap(), b"doc-49");
     }
 
+    // ---------- Task-023：主键 IN 稠密/稀疏批量取行 ----------
+
+    #[test]
+    fn task023_pk_in_dense_sparse_matches_individual_get() {
+        // 稠密（区间顺序读+集合过滤）与稀疏（batch_get）均须与逐条 get 一致：
+        // 删除位图隐藏行跳过、不存在 id 跳过、重复 id 去重。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=200u64 {
+            e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        for i in 0..5u64 {
+            e.put(5000 + i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.delete(7).unwrap(); // 删除位图隐藏
+        e.flush_primary().unwrap();
+
+        // 稠密：10..=60 每隔 3 取一个（17 个 id，跨度 51 ≤ 4×17=68 → 区间顺序读）
+        let dense: Vec<u64> = (10..=60).step_by(3).collect();
+        // 稀疏：跨大跨度（含高位 5002 / 不存在 9000 / 重复 7）
+        let sparse: Vec<u64> = vec![1, 5002, 9000, 2, 7, 7, 55, 1];
+        let expect = |ids: &[u64]| -> std::collections::HashMap<u64, Vec<u8>> {
+            let mut m = std::collections::HashMap::new();
+            for id in ids {
+                if let Ok(Some(v)) = e.get(*id) {
+                    m.entry(*id).or_insert(v);
+                }
+            }
+            m
+        };
+        for ids in [dense.clone(), sparse.clone()] {
+            let got = e.get_many_pk_in(&ids).unwrap();
+            let want = expect(&ids);
+            assert_eq!(got.len(), want.len(), "命中数一致 ids={ids:?}");
+            for (d, v) in &want {
+                assert_eq!(got.get(d), Some(v), "docid={d} 值一致（Task-023）");
+            }
+        }
+    }
+
     // ---------- 批量导入模式（P40） ----------
 
     #[test]
