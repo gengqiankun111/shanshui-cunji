@@ -1122,6 +1122,23 @@
 - 排期剩余：Task-024（#29+#14/#27/#11 合并）、Task-025（范围提速）、Task-026（Per-CPU WAL，最后）。
 
 
+### P99. Task-024 阶段①——全扫分组子集一次构建（#14/#27，2026-09-05）
+
+- **背景**：GROUP BY 无 WHERE 全扫（110 万 #14 855ms / #27 1057ms）在默认行式布局下：
+  `scan_stream_fields` 返回整行原文，回调对**每行每个分组键/聚合字段各做一次整行
+  `serde_json::from_slice<Value>`**（25 列 × (组键+聚合) 次/行）——解码开销随整行列数重复放大。
+- **改动**：
+  - sql/executor/eval.rs：新增 `subset_doc_bytes(doc, keep)`——单遍 MapAccess 只收 needed 顶层字段
+    （非目标 IgnoredAny 跳过）→ 子集 JSON 字节（缺失省略，语义同整行）；含 `.`/`[` 由调用方回退；
+  - sql/executor/group_by.rs 全扫回调：行式原文先一次子集化（simple_needed 守卫），WHERE 判定/
+    分组键/聚合提取全部在短子集上进行（group_key_of/field_non_null/numeric_field 原函数复用，
+    子集 parse 廉价）；非对象/解析失败保持原文（行为与整行路径一致）。
+- **测试**：既有 GROUP BY 行式=PAX 等值、HAVING/排序/地面真值全量通过；全量 698
+  （lib 694 + seqlock 4 单独绿）绿。
+- **验收口径**：#14/#27 目标 ≤ 现值 0.5×（下次 rr 复测回填）；#29/#11 属默认行式 IO 地板，
+  阶段②需 PAX(hot_fields) 数据布局复测（Task-024 阶段②）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
