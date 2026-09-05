@@ -1488,6 +1488,34 @@ use crate::optimizer::QuerySpec;
         }
     }
 
+    // ---------- Task-025b 阶段③：条带并行全扫（导出构建块） ----------
+
+    #[test]
+    fn task025b_parallel_scan_range_matches_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=20_000u64 {
+            e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        for d in [3u64, 700, 19_999] {
+            e.delete(d).unwrap();
+        }
+        // flush 后追加（memtable 未刷盘行混入条带）
+        for i in 20_001..=20_010u64 {
+            e.put(i, format!("tail-{i}").into_bytes(), &["t"]).unwrap();
+        }
+        let serial = e.scan_range(Some(1), Some(20_010)).unwrap();
+        let parallel = e.scan_range_parallel(1, 20_010, 8).unwrap();
+        assert_eq!(serial.len(), parallel.len(), "并行条带行数须与串行一致");
+        assert!(serial.iter().all(|(d, v)| *d != 3 && *d != 700 && *d != 19_999), "删除位图隐藏");
+        assert_eq!(serial, parallel, "并行 K 路归并须与串行逐行一致（含删除/尾批）");
+        assert!(
+            parallel.windows(2).all(|w| w[0].0 < w[1].0),
+            "并行结果须全局升序"
+        );
+    }
+
     // ---------- 批量导入模式（P40） ----------
 
     #[test]

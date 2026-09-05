@@ -13,6 +13,73 @@ use crate::keys::{decode_docid, encode_docid};
 
 
 impl Engine {
+    /// Task-025b 阶段③：条带并行全扫（导出/条带消费端构建块）——把 [lo..hi] 按核等分子窗，
+    /// 并发 `scan_range`（每窗内部按 docid 升序），再 **K 路归并** 输出全局升序。
+    /// 与 `scan_range` 同契约（同可见性/删除位图/Delta），仅把扫描 IO 摊到多核；
+    /// `workers <= 1` 直接退化为单线程。空窗（无数据子窗）开销≈一次起始 seek。
+    pub fn scan_range_parallel(
+        &self,
+        lo: u64,
+        hi: u64,
+        workers: usize,
+    ) -> Result<Vec<QueryRow>> {
+        if lo > hi {
+            return Ok(Vec::new());
+        }
+        let workers = workers.clamp(1, 16);
+        if workers <= 1 {
+            return self.scan_range(Some(lo), Some(hi));
+        }
+        let span = hi - lo + 1;
+        let mut chunks: Vec<Result<Vec<QueryRow>>> = Vec::with_capacity(workers);
+        std::thread::scope(|sc| {
+            let mut handles = Vec::with_capacity(workers);
+            for w in 0..workers {
+                let (cs, ce) = {
+                    let step = span / workers as u64;
+                    let s = lo + step * w as u64;
+                    let e = if w + 1 == workers {
+                        hi
+                    } else {
+                        lo + step * (w as u64 + 1) - 1
+                    };
+                    (s, e)
+                };
+                handles.push(sc.spawn(move || self.scan_range(Some(cs), Some(ce))));
+            }
+            for h in handles {
+                chunks.push(h.join().unwrap());
+            }
+        });
+        // K 路归并：各窗已升序，逐窗推进取最小 docid
+        let mut parts: Vec<Vec<QueryRow>> = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            parts.push(c?);
+        }
+        let mut out: Vec<QueryRow> = Vec::new();
+        let mut idx: Vec<usize> = vec![0; parts.len()];
+        let mut cur: Vec<Option<(u64, Vec<u8>)>> = parts
+            .iter()
+            .zip(idx.iter_mut())
+            .map(|(p, i)| p.get(*i).cloned())
+            .collect();
+        loop {
+            let mut best: Option<(usize, u64)> = None;
+            for (pi, item) in cur.iter().enumerate() {
+                if let Some((d, _)) = item {
+                    if best.map(|(_, bd)| *d < bd).unwrap_or(true) {
+                        best = Some((pi, *d));
+                    }
+                }
+            }
+            let Some((pi, _)) = best else { break };
+            out.push(cur[pi].take().unwrap());
+            idx[pi] += 1;
+            cur[pi] = parts[pi].get(idx[pi]).cloned();
+        }
+        Ok(out)
+    }
+
     /// 主键范围扫描分页（M8-P8 + M8-P10 流式化）：k-way merge 流式扫描——内存 O(page)
     /// 不随扫描总量膨胀（旧实现先全量收集 O(total) 再截断）；`total` = 范围行数
     /// （全扫计数，limit 取满页后仅计数不回表，语义与全量一致）。
