@@ -132,6 +132,12 @@ Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09
 > 验收：110 万 #29 ≤1.5s（MySQL ~0.53s 3× 内）；写侧守护：wide-load ≤1.3×、YCSB a/b/c/f 容忍带内、
 > INSERT/点查无回归；全列/点查/全扫回归全绿（746 基线）；EXPLAIN 标注路由；回退开关一键行式生效。
 > 设计文档：research/dual_track_colstore.md（待评审）；流程：demo 先行 → kernel 整合 → 基准回填。
+> ✅ M2 demo（2026-09-05，src/demo/p94-colstore/，gitignore 不提交，4 测全绿）：
+> 列组块编解码原语验证（docid 数组 + 每列独立区域 + footer 偏移；缺列/JSON null → None 保行序对齐；
+> 删除行不入 colstore 与最新视图一致；top-K 与整行解析结果一致）。60k 宽行证据：只解 k/amount 体积
+> = 1.13MB vs 整行 19.9MB（体积比 0.057，列 IO -94%）；解码+topK = 55.9ms vs 整行 JSON 2452ms（44×，
+> debug 宽样本）。**M3（kernel 整合）待开发**：flush 派生 .cs 文件族（复用 flush 内 PAX 热列提取点）+
+> engine.scan_colstore_cols 原语 + topk 稠密路由 + EXPLAIN/回退开关 + 10/30/110 万 Task-005 三档回填。
 
 > ✅ 阶段①（2026-09-05，P99）：GROUP BY 全扫 #14/#27 子集一次构建（sql/executor/eval.rs
 > `subset_doc_bytes` 单遍只收 needed + group_by.rs 全扫回调接线，免逐字段整行 parse×N）；回归 698
