@@ -385,6 +385,74 @@ struct SortLite {
 /// P87②排序键解码下推：batch_get_fields 内部 PAX 块列解码 / 行式块按需字段提取；
 /// P87③输出瘦身：top-K 确定后仅对胜出 docid 整行回表（SELECT * 语义），候选扫期间
 /// 不物化整行（原实现全量 batch_get 110 万行 ≈1GB+ 峰值物化消除）。
+/// P93：SortLite 排序键比较（order_by 字段序含 DESC 翻转；keys 与 order_by 逐位对齐）。
+fn sortlite_cmp(a: &SortLite, b: &SortLite, order_by: &[(String, bool)]) -> std::cmp::Ordering {
+    for (((_, desc), k1), k2) in order_by.iter().zip(&a.keys).zip(&b.keys) {
+        let mut ord = cmp_sort_key(k1, k2);
+        if *desc {
+            ord = ord.reverse();
+        }
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// P93：手动 top-K 堆（数组上浮/下沉，语义与 P92 原内联一致）——模块级纯函数，
+/// 供并行分片 worker 与串行/稀疏路径共用（免闭包捕获线程约束）。
+fn topk_heap_push(
+    heap: &mut Vec<SortLite>,
+    row: SortLite,
+    k: usize,
+    order_by: &[(String, bool)],
+) {
+    if heap.len() < k {
+        heap.push(row);
+        // 上浮
+        let mut i = heap.len() - 1;
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            if sortlite_cmp(&heap[i], &heap[parent], order_by) == std::cmp::Ordering::Greater {
+                heap.swap(i, parent);
+                i = parent;
+            } else {
+                break;
+            }
+        }
+    } else {
+        // 堆满：比堆顶（最差）更好 → 替换
+        if sortlite_cmp(&row, &heap[0], order_by) == std::cmp::Ordering::Less {
+            heap[0] = row;
+            // 下沉
+            let mut i = 0;
+            let n = heap.len();
+            loop {
+                let mut smallest = i;
+                let l = 2 * i + 1;
+                let r = 2 * i + 2;
+                if l < n
+                    && sortlite_cmp(&heap[l], &heap[smallest], order_by)
+                        == std::cmp::Ordering::Greater
+                {
+                    smallest = l;
+                }
+                if r < n
+                    && sortlite_cmp(&heap[r], &heap[smallest], order_by)
+                        == std::cmp::Ordering::Greater
+                {
+                    smallest = r;
+                }
+                if smallest == i {
+                    break;
+                }
+                heap.swap(i, smallest);
+                i = smallest;
+            }
+        }
+    }
+}
+
 pub(crate) fn topk_sort(
     engine: &Engine,
     bitmap: &RoaringBitmap,
@@ -394,63 +462,10 @@ pub(crate) fn topk_sort(
     limit: u64,
     guard: &crate::watchdog::QueryGuard,
 ) -> Result<Vec<QueryRow>> {
-    // 比较函数：按 order_by 排序键比较（含 DESC）
-    let cmp_rows = |a: &SortLite, b: &SortLite| -> std::cmp::Ordering {
-        for (((_, desc), k1), k2) in order_by.iter().zip(&a.keys).zip(&b.keys) {
-            let mut ord = cmp_sort_key(k1, k2);
-            if *desc {
-                ord = ord.reverse();
-            }
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    };
-    // 简化：直接用 Vec + 手动管理 top-K（避免 Ord trait 复杂性）
+    // 简化：直接用 Vec + 手动管理 top-K（比较/堆逻辑见模块级 sortlite_cmp / topk_heap_push）
     let fields: Vec<String> = order_by.iter().map(|(f, _)| f.clone()).collect();
     let mut heap: Vec<SortLite> = Vec::with_capacity(k + 1);
     let mut scanned = 0u64;
-    let mut insert = |heap: &mut Vec<SortLite>, row: SortLite| {
-        if heap.len() < k {
-            heap.push(row);
-            // 上浮
-            let mut i = heap.len() - 1;
-            while i > 0 {
-                let parent = (i - 1) / 2;
-                if cmp_rows(&heap[i], &heap[parent]) == std::cmp::Ordering::Greater {
-                    heap.swap(i, parent);
-                    i = parent;
-                } else {
-                    break;
-                }
-            }
-        } else {
-            // 堆满：比堆顶（最差）更好 → 替换
-            if cmp_rows(&row, &heap[0]) == std::cmp::Ordering::Less {
-                heap[0] = row;
-                // 下沉
-                let mut i = 0;
-                let n = heap.len();
-                loop {
-                    let mut smallest = i;
-                    let l = 2 * i + 1;
-                    let r = 2 * i + 2;
-                    if l < n && cmp_rows(&heap[l], &heap[smallest]) == std::cmp::Ordering::Greater {
-                        smallest = l;
-                    }
-                    if r < n && cmp_rows(&heap[r], &heap[smallest]) == std::cmp::Ordering::Greater {
-                        smallest = r;
-                    }
-                    if smallest == i {
-                        break;
-                    }
-                    heap.swap(i, smallest);
-                    i = smallest;
-                }
-            }
-        }
-    };
     // P92：候选**稠密**（窗口跨度 ≤ 4× 候选数）→ 投影列流式窗口扫描替代逐 docid
     // 点查定位（P87①/② 的点查 batch_get_fields ~11µs/docid 是 #29 13.5s 残余瓶颈：
     // 升序稠密 docid 逐点回表仍按 key 二分定位每行）。流式扫描经 scan_stream_fields
@@ -470,21 +485,83 @@ pub(crate) fn topk_sort(
     if dense {
         let lo = bitmap.min().unwrap() as u64;
         let hi = bitmap.max().unwrap() as u64;
-        engine.scan_stream_fields(Some(lo), Some(hi), fields.clone(), |docid, doc| {
-            if !bitmap.contains(docid) {
-                return Ok(true);
-            }
-            scanned += 1;
-            // 看门狗逐行检查（原子，开销可忽略）：保 P87 熔断语义（首个候选即中止）
-            if guard.is_expired() {
-                return Err(Error::QueryTooExpensive(format!(
-                    "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
-                )));
-            }
-            let keys = row_sort_keys(doc, &fields);
-            insert(&mut heap, SortLite { docid, keys });
-            Ok(true)
-        })?;
+        let span = hi - lo + 1;
+        // P93：大候选稠密 top-K → [lo..hi] 按 docid 等分子窗**并行**投影扫描，每片独立
+        // 维护局部 top-K 堆，全局 top-K = 各片局部堆并集的 top-K（经典正确性：片外淘汰的
+        // 行必不可能进全局 top-K）。针对 #29 全表 ORDER BY LIMIT：110 万行整表整块
+        // 解压 + 逐行 JSON 解码是 CPU/IO 双瓶颈，串行单核受限；并行后解压/解码摊到多核
+        // （块缓存热时近似 CPU-bound → ~核心数倍收益）。阈值 20 万行避免小库线程开销。
+        // 候选/单核：默认**串行**（P93-110万实测：并行分片扫描在块缓存 put 速率超淘汰时内存
+        // 超预算膨胀 + 多核利用率不足，未达验收前默认关闭；P93_PARALLEL=1 显式开启实验）。
+        let nw_avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let big = std::env::var_os("P93_PARALLEL").is_some()
+            && len >= 200_000
+            && nw_avail >= 2
+            && span / (k.max(1) as u64) >= nw_avail as u64;
+        if big {
+            let nw = (nw_avail as u64).min(16);
+            let step = span / nw;
+            std::thread::scope(|s| -> Result<()> {
+                let mut handles: Vec<std::thread::ScopedJoinHandle<Result<Vec<SortLite>>>> =
+                    Vec::with_capacity(nw as usize);
+                for i in 0..nw {
+                    let s0 = lo + i * step;
+                    let e0 = if i + 1 == nw {
+                        hi
+                    } else {
+                        lo + (i + 1) * step - 1
+                    };
+                    if e0 < s0 {
+                        continue;
+                    }
+                    let fields = fields.clone();
+                    handles.push(s.spawn(move || -> Result<Vec<SortLite>> {
+                        let mut local: Vec<SortLite> = Vec::with_capacity(k + 1);
+                        engine.scan_stream_fields(Some(s0), Some(e0), fields.clone(), |docid, doc| {
+                            if !bitmap.contains(docid) {
+                                return Ok(true);
+                            }
+                            if guard.is_expired() {
+                                return Err(Error::QueryTooExpensive(format!(
+                                    "Top-K 排序超时（并行分片熔断中止）"
+                                )));
+                            }
+                            let keys = row_sort_keys(doc, &fields);
+                            topk_heap_push(&mut local, SortLite { docid, keys }, k, order_by);
+                            Ok(true)
+                        })?;
+                        Ok(local)
+                    }));
+                }
+                for h in handles {
+                    let local = h
+                        .join()
+                        .map_err(|_| Error::QueryTooExpensive("Top-K worker panic".into()))??;
+                    for row in local {
+                        topk_heap_push(&mut heap, row, k, order_by);
+                    }
+                }
+                Ok(())
+            })?;
+            scanned = len;
+        } else {
+            // 小候选/单核：原串行稠密投影流式扫描
+            engine.scan_stream_fields(Some(lo), Some(hi), fields.clone(), |docid, doc| {
+                if !bitmap.contains(docid) {
+                    return Ok(true);
+                }
+                scanned += 1;
+                // 看门狗逐行检查（原子，开销可忽略）：保 P87 熔断语义（首个候选即中止）
+                if guard.is_expired() {
+                    return Err(Error::QueryTooExpensive(format!(
+                        "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
+                    )));
+                }
+                let keys = row_sort_keys(doc, &fields);
+                topk_heap_push(&mut heap, SortLite { docid, keys }, k, order_by);
+                Ok(true)
+            })?;
+        }
     } else {
         // P87①：分块流式扫描（Roaring iter 惰性；产出 top-K 即停，块内 watchguard 熔断）
         const CHUNK: usize = 512;
@@ -522,12 +599,12 @@ pub(crate) fn topk_sort(
                         None => SortKey::Null,
                     })
                     .collect();
-                insert(&mut heap, SortLite { docid, keys });
+                topk_heap_push(&mut heap, SortLite { docid, keys }, k, order_by);
             }
         }
     }
     // 排序 top-K → 输出切片 docid（skip offset / take limit）
-    heap.sort_by(|a, b| cmp_rows(a, b));
+    heap.sort_by(|a, b| sortlite_cmp(a, b, order_by));
     let win: Vec<u64> = heap
         .into_iter()
         .skip(offset as usize)

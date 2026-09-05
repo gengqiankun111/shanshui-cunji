@@ -1511,6 +1511,26 @@ results/results-sqlrun-scc-10w-full/summary.md 保留为基线参考。
 业务层补充（防再踩）：大删请按 per_cpu_queue_depth 控制单批（勿 >depth/2）；多线程并发删同一表 + 大批
 仍可能把队列写侧压满，建议串行或限并发；本修复兜底引擎 API 层，应用层分批+sleep+日志的实践仍推荐。
 
+**P93（P0-B #29 达线实验）Top-K 全表排序：PAX 无 IO 收益根因 + 并行分片内存/核利用问题（未达线）**
+现象链路：110 万 PAX(hot_fields=[k,amount,...]) 库 #29 ORDER BY k,amount LIMIT 100 ——串行均值
+18~43s（冷热波动）> 行式 13.1s 基线；10 万 PAX 224ms ≈ 行式 234ms → **PAX 布局未带来 IO 节省**。
+根因分析（P93_TRACE 分段计时，10 万内存驻留态）：scan 解码 147ms/100k≈1.5µs/行 + 回调子集 JSON
+二次 parse≈1µs/行；关键：**v6 PAX 热列虽列存但各列仍封在同一块内压缩**——全表排序必须整块解压，
+体积≈行式，故 IO 无差异；110 万数据 > 块缓存容量 → 每轮整块重解压（磁盘 500MB/s 下 ~GB 级 IO）
+主导耗时，且放大到 110 万时每行成本 ~17µs（缓存未驻留）。
+尝试方案 A：**并行分片 top-K**（src/sql/executor/select.rs，候选 ≥20 万时按 docid 等分子窗
+std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局合并=精确 top-K，比较/堆逻辑
+抽模块级 sortlite_cmp/topk_heap_push）。语义单测 p93_parallel_dense_topk_large_matches_known_answer
+（200,050 行，amount 互异单调，LIMIT/OFFSET 对权威答案）通过；全量 lib 746 绿。
+110 万实测（4G 块缓存配置）：失败——(a) 块缓存 put 速率（并行多路整表读）超过淘汰节流 → 私有
+内存 5.35G→~9.7G 继续膨胀（超预算；空闲稳态 5.35G 收敛 = 缓存填满即停，非泄漏）；
+(b) 多核利用率仅 ~2/12 核（SST 仅 2 文件，分片扫描仍串行在文件内）+ 客户端长连接被掐。结论：
+**并行默认关闭（P93_PARALLEL=1 显式实验）**，保留语义正确的堆重构与单测（默认路径无回归）。
+**#29 达线未达成（P0-B 保持 ⏳）**；下一步候选 P94：① 块缓存写穿/淘汰节流（scan 路径 put 限速，
+防并行读超预算）+ 文件内并行分块扫描；或 ② 列分块 SST（排序键列独立块/独立压缩 → 真·列 IO，
+免整块解压，PAX 才真正减 IO）。内存判定参考：4G 块缓存配置稳态 RSS≈5.2G（hotcache512+bcache4G
++inv256+mem128+开销），爬升到 6G 是缓存填充过程非泄漏。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

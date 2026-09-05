@@ -863,6 +863,50 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
     }
 
     #[test]
+    fn p93_parallel_dense_topk_large_matches_known_answer() {
+        // P93：≥20 万行稠密 top-K 走 [lo..hi] 分片并行投影扫描（各片独立堆→全局合并）。
+        // 语义须与已知权威答案一致（amount=i*3 互异单调 → top5 DESC = 最大 5 个 docid）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        // 200k 行全扫超过默认查询熔断超时 → 放宽（仅测试；并行 top-K 语义验证用）
+        let mut e = Engine::open_with_timeout(
+            dir.path(),
+            &cfg,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        let n = 200_050u64;
+        for i in 1..=n {
+            e.put(
+                i,
+                serde_json::to_vec(&serde_json::json!({ "amount": i * 3 })).unwrap(),
+                &[],
+            )
+            .unwrap();
+        }
+        e.flush_primary().unwrap();
+        let rows = execute(
+            &mut e,
+            "SELECT id FROM t ORDER BY amount DESC LIMIT 5",
+            100_000,
+        )
+        .unwrap();
+        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        let mut expect: Vec<u64> = (n - 4..=n).rev().collect();
+        assert_eq!(ids, expect, "并行稠密 top-K 取最大 5 个 docid: got {ids:?} want {expect:?}");
+        // 分片并行不吞行：OFFSET 切片与权威一致（amount 互异：跳过 rank1-3 → rank4/5）
+        expect = vec![n - 3, n - 4];
+        let rows2 = execute(
+            &mut e,
+            "SELECT id FROM t ORDER BY amount DESC LIMIT 2 OFFSET 3",
+            100_000,
+        )
+        .unwrap();
+        let ids2: Vec<u64> = rows2.iter().map(|r| r.0).collect();
+        assert_eq!(ids2, expect, "并行稠密 top-K OFFSET 切片与权威一致: got {ids2:?} want {expect:?}");
+    }
+
+    #[test]
     fn order_by_numeric_asc_with_where_and_offset() {
         let mut e = engine_with_docs();
         // WHERE 收敛后排序 + OFFSET/LIMIT 切片
