@@ -63,6 +63,31 @@ fn gen(rng: &mut StdRng, i: u64) -> String {
 
 pub fn run(url: &str, rows: u64, procs: usize, table: &str) -> i32 {
     let _ = TAB.set(table.to_string());
+    // 宽表不存在时自动建表（两端同 DDL；MySQL 端库中已存在则跳过）
+    {
+        let mut conn = match mysql::Conn::new(url) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[wide_load] 建表连接失败 {url}: {e}");
+                return 2;
+            }
+        };
+        let tb = t();
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {tb} (id BIGINT PRIMARY KEY, k BIGINT, amount DOUBLE, \
+             score DOUBLE, ts BIGINT, status VARCHAR(20), region VARCHAR(30), channel VARCHAR(20), \
+             user_id INT, age INT, active_days INT, visit_count INT, balance DOUBLE, flag INT, \
+             tag VARCHAR(20), note VARCHAR(64), title VARCHAR(100), url VARCHAR(160), \
+             email VARCHAR(64), phone VARCHAR(40), ip VARCHAR(40), desc_a VARCHAR(255), \
+             desc_b VARCHAR(255), txt_a VARCHAR(255), txt_b VARCHAR(255))"
+        );
+        let r = exec_stmt(&mut conn, &ddl);
+        if r.err.is_some() {
+            eprintln!("[wide_load] 建表失败: {}", r.err.unwrap());
+            return 2;
+        }
+        println!("[wide_load] 表 {tb} 已就绪（无则新建 25 列宽表）");
+    }
     println!("[wide_load] url={url} 表={} rows={rows} procs={procs}", t());
     let start = std::time::Instant::now();
     let handles: Vec<_> = (0..procs)

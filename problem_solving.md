@@ -1386,6 +1386,19 @@ pk_in_5000 174ms）。修复：稠密判定 4×→64×（区间顺序读 ~0.5µs
 > 数值验收随 Task-005 10w 基准回填；Task-033（锁等待超时 1205）需先实测 run_lock_wait 副会话
 > outcome（SCC waiter-ok vs MySQL waiter-1205）再定等待/超时接线，暂不盲改。
 
+**P117（Task-033）锁等待探针修正 + 实测收敛（明示差异，不改引擎）**
+探针缺陷：`run_lock_wait` 把 `SET SESSION innodb_lock_wait_timeout=3` 设在**主**连接，副（等待方）
+连接走 MySQL 默认 50s → 永不 1205，两侧都只是等主提交后拿到（10w 轮「4s 两侧一致」的成因），
+且 outcome 字符串被套件丢弃（只记整块耗时，耗时为探针固定 sleep 4s 主导）→ 锁语义从未被测出。
+修复：超时改在副连接生效；outcome 以 ⚑ 记入 stdout/summary.md（waiter-ok / waiter-1205 /
+waiter-t=xxms；对比脚本视 ⚑ 为记录而非失败）；sqlrun 加 `--only` 探针过滤。
+实测（干净 100k 双端，主 FOR UPDATE 持锁 sleep 4s 后 COMMIT，副同 id UPDATE）：
+MySQL 3316 = **waiter-1205锁等待超时（waiter-t=3013ms）**；SCC 3317 = **waiter-ok（waiter-t=3ms）**。
+根因修正：SCC `FOR UPDATE` 为乐观「当前读锁定集」（cur_lock_seq 记读取时最新 seq，提交期写写冲突
+判定），事务期间不真正持排他行锁 → 并发 UPDATE 3ms 直接放行，并非原假设的「阻塞至主提交后成功」。
+结论：1205 收敛需行锁持有 + 等待/超时（锁生命周期重构），风险超本任务预期 → 走 Task-033「或明示
+差异」路径收口：SCC 无引擎改动；差异入已知边界；探针 outcome 两侧如实记录，回归全绿。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

@@ -360,6 +360,11 @@ TTL 删除扫描耗时（当前基准）
 > - 冷启动（10 万行 SST 全量加载重开）178.0ms。
 > 注：单点快照仅对比参考；37 探针 vs MySQL 分档/复测仍由宽表基准流程（user_guide/宽表SQL性能
 > 基准记录.md §9~§14）执行。
+> ✅ 10w 数值验收回填（2026-09-05，随 Task-033 会话）：干净双端 100k（MySQL ddl+load / SCC 新目录
+> wide-load + 重启 cidx 重建）全套探针（results-sqlrun-compare-100k）→ 5 项收益（Task-028/029/031/
+> 030/032）验收数值逐项回填至各任务注，含 1 项未达（Task-030 count_distinct_enum 65.49ms 未 ≤10ms，
+> 权威窗口扫描口径，倒排快路径未接——见 P115/该任务注）与 Task-033 outcome 实证（MySQL waiter-1205 /
+> SCC waiter-ok@3ms，行 37/76）。
 验收标准：
 
 基线数据已保存到 benchmarks/baseline_20260904.json
@@ -426,6 +431,10 @@ Task-028：组合索引（cidx）持久化 / 启动重建——重启丢键静�
 > 变更/正常重开三态）。全量 740 绿。
 > 收益锚点：报告 composite_idx_point 24ms/p99 148ms（实为 nocidx 声明缺失的 eval fallback——见 Task-029）；
 > 本项修的是「声明在、重启丢」的静默错误（正确性），两任务互为补充。
+> 数值验收回填（2026-09-05，10w 干净双端轮）：SCC 全新 data 目录 wide-load 100k 后重启（cidx 空 +
+> 签名缺失 → open 期回扫重建，cidx 落 4.1MB sst）→ 套件 composite_idx_point/multi_eq/range 均正常出数
+> （0.31/0.26/0.81ms，见 Task-029 回填），无「重启后 0 行」；首查即走 cidx <5ms ✅（正确性验收随 P112
+> 单测 + 本轮回填印证）。
 
 Task-029：AND(等值,等值) 等值后过滤批量取数——eval post_filter 逐 docid get 改块级 batch（10w 轮 #1 根因 B）
 > 根因：`status='active' AND ts=V`（ts 为数值/未索引等值）→ eval And 分支把 ts 等值当扫描叶在 status
@@ -449,6 +458,10 @@ Task-029：AND(等值,等值) 等值后过滤批量取数——eval post_filter 
 > 嵌套点路径叶保持逐 docid leaf_passes。+单测 task029（跨块候选/删除隐藏/0 命中全遍历/LIKE 组合）。
 > 全量 740 绿；数值收益随基准轮回填。
 > 收益锚点：报告 #1/#2 高风险项中「组合索引点查 24ms、p99 148ms」在无声明配置下的实际成因。
+> 数值验收回填（2026-09-05，10w 干净双端轮，SCC mean，cidx 声明配置套件）：composite_idx_point
+> **0.31ms**、composite_idx_multi_eq **0.26ms**、composite_idx_range **0.81ms**（MySQL 40.8/66.6/40.3ms，
+> 0.004~0.02×）——cidx 命中即索引点查，不再落到 nocidx 逐候选 post_filter；nocidx 兜底的块级批量
+> 后过滤路径（本任务主体）由单测 task029 覆盖，套件在 cidx 声明配置下不可直接复现其数值。
 
 Task-030：MySQL 语法面补齐——COUNT(DISTINCT col) 与 GROUP BY … ORDER BY <聚合表达式>（探针 SQL 报错根因）
 > 实测 1064：`SELECT COUNT(DISTINCT status)` → 「聚合期望右括号，实际 Ident("status")」（parser 不支持
@@ -476,6 +489,10 @@ Task-030：MySQL 语法面补齐——COUNT(DISTINCT col) 与 GROUP BY … ORDER
 > WHERE 过滤生效）；execute_group_by 排序支持聚合下标（数值比较、NULL 升序最前）且倒排快路径遇
 > 聚合排序自动交主路径。+单测 task030。全量 740 绿。注：COUNT(DISTINCT) 走权威窗口扫描
 > （status 等低基数字段 10w ~数十 ms，非倒排快路径；验收数值随基准轮回填）。
+> 数值验收回填（2026-09-05，10w 干净双端轮，SCC mean）：count_distinct_enum **65.49ms**（走权威窗口
+> 扫描口径，未达 ≤10ms——倒排/bitmap 去重快路径尚未接线，与 P115 注一致，作残余项记录）；高基数
+> count_distinct_highcard **87.61ms** ≈ MySQL 72.70ms（1.2×，≤全扫量级 ✅）；COUNT(DISTINCT) 与
+> GROUP BY…ORDER BY 聚合两探针正确性两侧行集一致（rows 等值）。
 
 Task-031：结果集行输出批量化（~25µs/行输出常数，10w 轮 ②⑤④ 行输出类探针共同瓶颈）
 > 实测（scc-sqlrun-100k 副本）：引擎侧同窗 COUNT(20k 行) 94ms ≈ **5µs/行**；SELECT id keys-only 20k 行
@@ -501,6 +518,10 @@ Task-031：结果集行输出批量化（~25µs/行输出常数，10w 轮 ②⑤
 > 包边界/seq 保留）；协议单元测试 task031（帧 = 逐包序列、seq 回绕、按长度前缀还原）。全量 740 绿；
 > 行输出常数数值收益随基准轮（rr-conformance --one 大窗 keys-only 前后对照）回填。
 > 收益锚点：报告风险 ②⑤④（IN 大批量、大 limit、长事务 3s+、深分页）的行输出部分。
+> 数值验收回填（2026-09-05，10w 干净双端轮，SCC mean）：pk_between_10000（1 万行 3 列）**31.38ms**
+> ≈3.1µs/行（旧 2 万行 keys-only 606ms ≈30µs/行 → 行常数 ~10× 下降，等值于验收 606ms→≤150ms 达成 ✅，
+> MySQL 13.10ms，2.4×）；txn_long_read 10 万行窗 **332ms**（旧 3.2s → ~10×，MySQL 129ms，2.6×）；
+> orderby_multi_limit500 258ms（排序/行式整窗 IO 残余，随 PAX/列 IO 远期）。
 
 Task-032：主键 IN 稀疏大批次批量定位（pk_in_1000/5000 逐键点查残余）
 > 根因：pk_in 随机 id 稀疏（跨度 ≫ 4×计数）→ get_many_pk_in_fields 稀疏分支逐 docid 点查（server/command/
@@ -522,13 +543,18 @@ Task-032：主键 IN 稀疏大批次批量定位（pk_in_1000/5000 逐键点查�
 > 超限自动回退 batch_get 不劣化），整行/投影两变体对齐。+单测 task032（4×~64× 窗口 =
 > 逐条 get、删除隐藏、投影子集等值）。全量 740 绿；pk_in_1000/5000 数值验收随基准轮回填。
 > 收益锚点：报告风险 ②（主键 IN 列表），Task-031 先行后残余再收敛。
+> 数值验收回填（2026-09-05，10w 干净双端轮 results-sqlrun-compare-100k，SCC mean）：
+> pk_in_1000 31ms → **4.66ms**（≤12ms ✅，MySQL 5.23ms，≈0.9×）；pk_in_5000 174ms → **51.78ms**
+> （≤60ms ✅，MySQL 23.27ms，2.2×——行数多时残余行输出/投影常数仍偏高，但验收达标）；
+> pk_in_50 **0.34ms**（0.7×，不回退 ✅）。
 
 Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或明示差异
 > 实测/根因：txn_lock_wait / txn_lock_mid_contend 探针（run_lock_wait）**主会话 FOR UPDATE 持锁后 sleep 4s**
 > 再 COMMIT —— 测量 4s 是探针设计的持锁时长（非引擎卡死）；副会话 UPDATE：MySQL（innodb_lock_wait_timeout=3）
 > 第 3s 报 1205；SCC txn/lock.rs 为「等待即失败」模型（acquire 冲突即 TxnConflict 由调用方重试），
 > 无超时参数 → waiter 阻塞至主会话提交后成功（无 1205 语义）。风险清单 #3「锁冲突 4s 卡死」系探针语义，
-> 应改判为**语义一致性项**：长持锁期间 SCC 无超时上限与 MySQL 行为不一致。
+> 应改判为**语义一致性项**：长持锁期间 SCC 无超时上限与 MySQL 行为不一致。⚠️ 原推断已被 P117 实测
+> 修正（SCC waiter 未阻塞、3ms 直接成功——FOR UPDATE 不持锁），见下方收口注。
 属性	内容
 优先级	P2（一致性/运维可预期性；并发 for update 长持锁的确定性）
 工作量	0.5~1 天
@@ -540,6 +566,23 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 □ 探针 outcome 收敛：SCC 副会话应报 waiter-1205 与 MySQL 一致（探针已设 3s）
 □ 单测：持锁 > 阈值 waiter 1205 / 阈值内成功 / 死锁 1213 不回退
 □ 验收：txn_lock_wait 两库 outcome 一致（waiter-1205）；延迟行从风险清单改判；回归全绿
+> ✅ 已收口（2026-09-05，P117，走「或明示差异」路径，不改引擎事务语义）：
+> - 探针修正（rr-conformance sqlrun.rs `run_lock_wait`）：`SET SESSION innodb_lock_wait_timeout=3`
+>   原 SET 在主连接，副（等待方）连接走 MySQL 默认 50s → 永不触发 1205（两侧都只是等主提交后拿到，
+>   即原 10w 轮「4s 两侧一致」的成因）；改为在副连接生效，并把 outcome（waiter-ok/waiter-1205/
+>   waiter-t=xxms）以 ⚑ 记入 stdout/summary.md（对比脚本视 ⚑ 为记录非失败）；另加 --only 探针过滤。
+> - 实测（干净 100k 双端，主会话 FOR UPDATE 持锁 sleep 4s 后 COMMIT，副会话同 id UPDATE）：
+>   MySQL 3316：**waiter-1205锁等待超时（waiter-t=3013ms**，3s 超时）；SCC 3317：**waiter-ok（先等锁后
+>   拿到 waiter-t=3ms）**——SCC 副会话**未阻塞、3ms 直接成功**。
+> - 根因修正：SCC `FOR UPDATE` 是乐观「当前读锁定集」（txn/mod.rs `cur_lock_seq` 记录读取时引擎最新
+>   seq + engine/txn.rs 提交期写写冲突判定），事务期间**不真正持排他行锁**，并发 UPDATE 放行；
+>   原「waiter 阻塞至主提交后成功」推断不成立（测量 4s 均为主会话固定 sleep，探针未测出阻塞）。
+> - 明示差异结论：1205 收敛需以「行锁持有 + 等待/超时」为前提（FOR UPDATE 持久持锁 + 等待队列/累计
+>   超时 + 死锁 1213 保持），属锁生命周期重构，风险高于本任务预期，列入远期深水区评估不在此盲改；
+>   风险清单 #3「锁冲突 4s 卡死」改判 = 探针持锁 sleep 4s 设计 + 上述锁语义差异（真实差异域：
+>   MySQL 副会话 1205 vs SCC 放行，业务如需 MySQL 式行锁等待需随远期重构）。
+> - 收敛口径：txn_lock_wait/txn_lock_mid_contend 两侧 outcome 如实入 summary（MySQL waiter-1205 /
+>   SCC waiter-ok@3ms），差异进已知边界；SCC 侧无引擎改动，回归全绿。
 
 测量处置说明（2026-09-05，10w 轮报告逐项复核，不改码）：
 - count_all 0.2ms ✅（Task-021 P96 O(1) 已生效；首调用基线扫描为 P107 已修 fresh-load 语义，此处为后次调用）；

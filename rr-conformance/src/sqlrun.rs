@@ -89,8 +89,11 @@ fn in_sql(rng: &mut StdRng, c: &Ctx, size: usize) -> String {
     format!("SELECT id,k,status FROM {tb} WHERE id IN ({})", ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
 }
 
-pub fn run(url: &str, out: &str, table: &str) -> i32 {
+pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
     let _ = TAB.set(table.to_string());
+    // --only 过滤：空 = 全量；支持逗号分隔（如 "txn_lock_wait,txn_lock_mid_contend"）
+    let want: Vec<&str> = only.split(',').filter(|s| !s.is_empty()).collect();
+    let filtered = !want.is_empty();
     let mut conn = match mysql::Conn::new(url) {
         Ok(c) => c,
         Err(e) => {
@@ -407,7 +410,9 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
         format!("UPDATE {tb} SET note='x9' WHERE id BETWEEN 1 AND 20000 AND status='active' LIMIT 200", tb = t())
     };
     let sql_longread = |_r: &mut StdRng, c: &Ctx, _i: usize| {
-        let a = _r.gen_range(1..c.n.saturating_sub(100_000));
+        // 窗宽 100k：干净 100k 库上 n-100000=0 → 采 [1..=1]（整表窗），避免空区间 panic
+        let lo = c.n.saturating_sub(100_000).max(1);
+        let a = _r.gen_range(1..=lo);
         format!("SELECT id,k,amount FROM {tb} WHERE id BETWEEN {a} AND {}", a + 100_000, tb = t())
     };
     let sql_biz500 = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
@@ -520,10 +525,14 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
     md.push_str("| # | 类别 | 探针 | 说明 | OK/n | 行/影响 | mean ms | p50 ms | p99 ms | max ms |\n|---|---|---|---|---|---|---|---|---|---|\n");
 
     for (idx, p) in list.iter().enumerate() {
+        if filtered && !want.contains(&p.name) {
+            continue;
+        }
         let mut rng = StdRng::seed_from_u64(100 + idx as u64);
         let mut ms: Vec<f64> = Vec::new();
         let mut ok = 0usize;
         let mut rows = 0usize;
+        let mut detail = String::new();
         let mut err_txt = String::new();
         for i in 0..p.n {
             let sql = (p.sql)(&mut rng, &ctx, i);
@@ -535,10 +544,11 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
             };
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             match r {
-                Ok((rn, _)) => {
+                Ok((rn, d)) => {
                     ms.push(dt);
                     ok += 1;
                     rows = rn;
+                    detail = d;
                 }
                 Err(e) => {
                     err_txt = e;
@@ -554,22 +564,36 @@ pub fn run(url: &str, out: &str, table: &str) -> i32 {
             let q = |f: f64| s[((s.len() as f64 * f).floor() as usize).min(s.len() - 1)];
             (s.iter().sum::<f64>() / s.len() as f64, q(0.5), q(0.99), s[s.len() - 1])
         };
+        let extra = if !detail.is_empty()
+            && detail != "ok"
+            && detail != "block"
+            && detail != "multi-dml"
+        {
+            format!("  ⚑ {detail}")
+        } else {
+            String::new()
+        };
+        let tail = if err_txt.is_empty() {
+            extra
+        } else {
+            format!("  ❌ {err_txt}")
+        };
         let note = format!("| {} | {} | {} | {} | {}/{} | {} | {:.2} | {:.2} | {:.2} | {:.2} |{}",
-                           idx + 1, p.cat, p.name, p.note, ok, p.n, rows, mean, p50, p99, mx,
-                           if err_txt.is_empty() { String::new() } else { format!("  ❌ {err_txt}") });
+                           idx + 1, p.cat, p.name, p.note, ok, p.n, rows, mean, p50, p99, mx, tail);
         println!("[{:02}] {} {:<22} ok={}/{} rows={} mean={:.2}ms p50={:.2} p99={:.2} max={:.2}{}",
-                 idx + 1, p.cat, p.name, ok, p.n, rows, mean, p50, p99, mx,
-                 if err_txt.is_empty() { String::new() } else { format!("  ERR: {err_txt}") });
+                 idx + 1, p.cat, p.name, ok, p.n, rows, mean, p50, p99, mx, tail);
         md.push_str(&note);
         md.push('\n');
     }
-    // 清理写区（upd 区保留；ins/del/delb/delc + 大插区 base+1501..46001 整区删除，恢复初始行数）
+    // 先落 summary（保证结果不依赖清理是否成功；SCC 大区间清理可能长时间挂起）
+    std::fs::write(format!("{out}/summary.md"), md).expect("写 summary");
+    println!("\n[sqlrun] 完成。summary: {out}/summary.md（环境={env_note}）");
+    // 清理写区（upd 区保留；ins/del/delb/delc + 大插区 base+1501..46001 整区删除，恢复初始行数；
+    // best-effort：失败/挂起不影响已落盘的 summary）
     let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.base + 1501, ctx.base + 46001, tb = t()));
     let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.delc_lo, ctx.delc_lo + 999, tb = t()));
     let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.delb_lo, ctx.delb_lo + 499, tb = t()));
     let _ = exec_stmt(&mut conn, &format!("DELETE FROM {tb} WHERE id BETWEEN {} AND {}", ctx.del_lo, ctx.del_lo + 99, tb = t()));
-    std::fs::write(format!("{out}/summary.md"), md).expect("写 summary");
-    println!("\n[sqlrun] 完成。summary: {out}/summary.md（环境={env_note}）");
     0
 }
 
@@ -641,10 +665,12 @@ fn run_multi_stat(conn: &mut mysql::Conn, upd_lo: u64) -> Result<(usize, String)
 }
 
 /// 锁等待探针：主连接 BEGIN + SELECT..FOR UPDATE 持锁 → 副连接对同 id UPDATE 等锁
-/// （innodb_lock_wait_timeout=3s → 预计 1205 超时）→ 主连接 sleep 4s 后 COMMIT。
+/// → 主连接 sleep 4s 后 COMMIT。超时语义对齐 MySQL：`innodb_lock_wait_timeout=3` 必须作用于
+/// **等待方会话**（副连接）——原实现 SET 在主连接上，副连接走 MySQL 默认 50s，探针永不触发
+/// 1205（两侧都只是等主提交后拿到），Task-033 实测收敛后修正于此。
+/// outcome 一律以 Ok 携带（waiter-ok / waiter-1205 / waiter-err），供套件逐轮记录对比。
 fn run_lock_wait(conn: &mut mysql::Conn, url: &str, body: &str) -> Result<(usize, String), String> {
     let tb = t();
-    let _ = exec_stmt(conn, "SET SESSION innodb_lock_wait_timeout=3");
     let r0 = exec_stmt(conn, "BEGIN");
     if r0.err.is_some() {
         return Err(format!("BEGIN: {}", r0.err.unwrap()));
@@ -667,10 +693,14 @@ fn run_lock_wait(conn: &mut mysql::Conn, url: &str, body: &str) -> Result<(usize
             Ok(c) => c,
             Err(e) => return Err(format!("副连接失败: {e}")),
         };
+        // 超时作用于等待方（副连接）会话：3s 未获锁 → MySQL 1205
+        let _ = exec_stmt(&mut c2, "SET SESSION innodb_lock_wait_timeout=3");
+        let w0 = std::time::Instant::now();
         let w = exec_stmt(&mut c2, &format!("UPDATE {tb} SET note='x9' WHERE id={id}", tb = t()));
+        let w_ms = w0.elapsed().as_secs_f64() * 1000.0;
         match w.err {
-            Some(e) => Err(e.to_string()),
-            None => Ok(()),
+            Some(e) => Err(format!("{e} (waiter-t={w_ms:.0}ms)")),
+            None => Ok(format!("waiter-t={w_ms:.0}ms")),
         }
     });
     std::thread::sleep(std::time::Duration::from_secs(4));
@@ -681,10 +711,11 @@ fn run_lock_wait(conn: &mut mysql::Conn, url: &str, body: &str) -> Result<(usize
     }
     let w = waiter.join().unwrap_or_else(|_| Err("waiter 线程异常".to_string()));
     let outcome = match &w {
-        Ok(()) => "waiter-ok(先等锁后拿到)".to_string(),
-        Err(e) if e.contains("1205") => "waiter-1205锁等待超时".to_string(),
+        Ok(d) => format!("waiter-ok(先等锁后拿到 {d})"),
+        Err(e) if e.contains("1205") => format!("waiter-1205锁等待超时({e})"),
         Err(e) => format!("waiter-err({e})"),
     };
+    // 1205 是 MySQL 预期收敛结果而非探针失败：以 Ok 返回并把 outcome 带给套件记录
     Ok((0, outcome))
 }
 

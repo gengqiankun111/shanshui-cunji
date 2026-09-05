@@ -1,4 +1,4 @@
-﻿<#
+<#
  宽表 SQL 对比（MySQL ↔ cjserver）一键基准脚本 —— 与《宽表SQL性能对比-测试步骤存档.md》配套。
 
  用法示例（在仓库根执行）：
@@ -34,7 +34,7 @@ param(
     [switch]$SkipMySqlLoad,
     [switch]$SkipSccReload,
     [switch]$SkipProbes,
-    [string]$ResultsBase = "results-sqlrun"
+    [string]$ResultsBase = "results\results-sqlrun"
 )
 
 $ErrorActionPreference = 'Stop'
