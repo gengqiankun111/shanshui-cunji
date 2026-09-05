@@ -55,24 +55,37 @@
 
 > 详细三档语法清单（已支持 / 待开发 / 待决策，含事务与 RR 语义现状）见 [语法.md](./语法.md)。
 
-### 4.1 已支持（经 cjserver 的 MySQL wire 协议）
+### 4.1 已支持（经 cjserver 的 MySQL wire 协议；2026-09-05 语法面收尾核对）
 
-- DDL 放行、INSERT/UPDATE/DELETE、事务语句 BEGIN/COMMIT/ROLLBACK、预处理语句（PREPARE/EXECUTE）；
-- SELECT：主键点查、`id BETWEEN / id IN` 范围、`WHERE f IN (…)` 值集合过滤、
-  字段条件过滤（倒排/下推）、`COUNT/SUM/AVG/MIN/MAX`、
-  `ORDER BY f [ASC|DESC]（多字段）`、`GROUP BY f1,f2 + COUNT/SUM/AVG/MIN/MAX`、`HAVING`、`LIMIT/OFFSET`。
+- **DDL 放行**、预处理语句（PREPARE/EXECUTE）、事务（BEGIN/COMMIT/ROLLBACK、RR/SERIALIZABLE、FOR UPDATE 当前读）；
+- **写**：INSERT 单行/多值/批量、`INSERT IGNORE`、`INSERT … ON DUPLICATE KEY UPDATE`（doc=整文档/col=VALUES(col)/自增/字面量）、
+  UPDATE（主键/字段条件批量、`col=col+N` 自增、`doc=…` 整文档替换）、DELETE（id/主键区间/字段条件/全表）；
+- **多表**：不同表独立主键空间（表级 docid 隔离，对齐 MySQL），AUTO_INCREMENT 端到端；
+- **SELECT 读**：主键点查 / `id BETWEEN` / `id IN (…)`；字段条件 `= != > < >= <=`、`f BETWEEN`、`f LIKE '%..'`、`f IN (…)`，
+  支持 `AND/OR/NOT` 组合与括号（含倒排收敛/范围下推/组合索引路由）；
+- **聚合**：标量 `COUNT(*) / COUNT(f) / COUNT(DISTINCT f) / SUM / AVG / MIN / MAX`；
+  `GROUP BY f1,f2` + 同组聚合 + `HAVING` + 组结果 `ORDER BY 聚合列/组字段` + `LIMIT/OFFSET`；无条件 `COUNT(*)` O(1)；
+- **排序/分页**：`ORDER BY 多字段 ASC/DESC`、`LIMIT/OFFSET`（Top-K 有界堆 + keyset 深分页守卫）；
+- **JOIN**：单 `INNER JOIN / LEFT JOIN … ON t1.f = t2.f`（等值、DocIdSet 交集执行）；
+- 会话/运维：SHOW PROCESSLIST / KILL（协议层）；执行计划推演走 HTTP `GET /explain`（MySQL 协议 EXPLAIN 未接，见 §8）。
 
-### 4.2 已知限制 / 不支持（对照 feature_remain 边界）
+### 4.2 已知限制 / 不支持（2026-09-05 核对 parser/executor 1064 守卫）
 
-| 能力 | 状态 |
+| 能力 | 说明 |
 | --- | --- |
-| JOIN / 子查询 / 多表复杂 SQL | ❌ 不提供语法；替代：二次查询合并、写入预连接（Enrich）、物化视图、导出 OLAP（见 [join_function.md](./join_function.md)） |
-| 无条件 `COUNT(*)` | ⚠️ 慢（~10× 级，key-only 全扫；无 WHERE 快路径待分域计数评估） |
-| 组结果 `ORDER BY 聚合列`（如 `ORDER BY COUNT(*)`） | ⏳ 未支持（组排序限分组字段） |
-| HAVING 无 GROUP BY 形态 | ⏳ 未支持 |
+| 子查询 / `IN (SELECT…)` / EXISTS | ❌ 不提供；替代：二次查询合并、JOIN（单表）、写入预连接、物化视图、导出 OLAP（见 join_function.md） |
+| UNION / INTERSECT / EXCEPT | ❌ 不提供 |
+| JOIN 扩展 | 仅单 JOIN（>1 个 JOIN 子句解析期 1064）；RIGHT/FULL/CROSS、非等值 ON、三表级联不支持 |
+| 行去重 `SELECT DISTINCT` / GROUP BY 内 `DISTINCT` 聚合 | ❌（仅标量 `COUNT(DISTINCT f)` 支持） |
+| HAVING 无 GROUP BY | ❌（HAVING 语义 = 分组后过滤，须配 GROUP BY） |
+| 无 GROUP BY 的多列/多聚合标量 SELECT | ❌（标量聚合仅单个；`SELECT *` 与 GROUP BY 混用不支持） |
+| 列表达式/函数值 | ❌ `amount*2`、CONCAT/LOWER/日期函数/CAST 等不支持；WHERE/ORDER BY 项限字段名与字面量（聚合列头除外） |
+| 窗口函数（ROW_NUMBER/RANK/OVER…） | ❌ 不提供 |
+| 值类型 | 比较按数值/字典序自动判定，无完整 MySQL 类型系统/隐式转换语义 |
 | 跨分片事务 / 跨分片 JOIN / 全局快照读 | ❌ 分布式集群 ≠ 分布式事务库（业务强事务请留在 MySQL/Redis） |
 
-> 详细开发项状态：功能清单 [feature.md](../feature.md)、未完成与评估 [feature_remain.md](../feature_remain.md)。
+> 详细开发项状态：功能清单 [feature.md](../feature.md)、未完成与评估 [feature_remain.md](../feature_remain.md)、
+> SQL 语法面剩余缺口审计与排期建议见 development_remain.md「二、待办」SQL 语法面收尾行。
 
 ---
 

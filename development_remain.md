@@ -795,7 +795,26 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 | **P-GB3（2026-09-05 追加）** | **标量 SUM/AVG/MIN/MAX WHERE 单等值 → term 载荷窗口守卫（#13 收敛）。根因**：#13 66.8ms——Ex-9.3 载荷快路径被 `!scoped` 门禁挡（server 恒传整表窗），退 P1-D 候选解码 ~3µs/行。**方案**：engine `live_count_window(posting,start,end)`（窗口∩活跃集计数，口径=权威扫描）+ Ex-9.3 放行窗口：**守卫 = term posting 窗口活跃数 == 载荷 n**（删除/复活/换值/跨表 → 不匹配回退保精确）。**10w 干净轮实测（P121）**：#13 66.8→**0.55ms**（MySQL 43.9）；#15/#28/#60/#81/#57/#61 维持 0.2~8.1ms 不回退。单测 pg_scalar_stats_guard_matches_scan | ✅ 已完成（2026-09-05，P121，数值回填） |
 | **UPDATE 10×+ 决策（2026-09-05 追加）** | **宽表 UPDATE 系（#17-19/73/75 = 8.7~15.3×）规避决策 + 触发式候选。实测与旁证**：INSERT 单行 0.5×、DELETE 0.1~0.5×、**txn 内 UPDATE #25/#35/#36 0.6~1.4×** → 引擎写能力非瓶颈；单语句 autocommit UPDATE ≈2ms/条（#17 1.99ms）——结构 = 读-改-写整文档 put_batch（P89：批尾单次落盘；单连接串行组提交窗口等满 ~2ms）+ 全量解码/倒排重索引。**决策（用户 2026-09-05）：宽表对比/使用场景规避 UPDATE，改用 INSERT 新 docid / DELETE+重建语义**；探针保留如实记录。触发式候选（UPDATE 成主流场景再立项）：①单字段 `SET f=v` 走 delta patch（免整行重写/重索引，与下方接线项 6 同源）；②单语句落盘等待对齐 INSERT 路径（组提交/异步 ack）。验收：update_id ≤2×（触发项）；不触发不排期 | 决策 ✅（2026-09-05，记录于本行） |
 
+### SQL 语法面收尾审计（2026-09-05，用户目标：MySQL 语法对齐 + 既定数据结构性能对比）
+
+- ✅ 已同步 user_guide/README.md §4.1/§4.2：JOIN（单 INNER/LEFT）、GROUP BY…ORDER BY 聚合列、
+  COUNT(DISTINCT f)、无条件 COUNT O(1)、多表隔离、INSERT IGNORE / ON DUPLICATE KEY UPDATE、
+  DELETE 全表、FOR UPDATE、预处理/事务档位等已落地项全部更正；限制表按 parser/executor 1064 守卫逐条核对。
+- 剩余语法缺口（未排期，待用户挑优先级；承接 M-6/M-7 接线评估）：
+  - ① 子查询 `IN (SELECT…)` / EXISTS —— 替代面已文档化（join_function.md：二次查询/JOIN/预连接/物化视图/导出 OLAP）；
+  - ② UNION / INTERSECT / EXCEPT；
+  - ③ `SELECT DISTINCT` 行去重（现仅标量 COUNT(DISTINCT f)）；
+  - ④ 多 JOIN（>1 子句现解析期 1064）/ RIGHT / FULL / CROSS / 非等值 ON；
+  - ⑤ 列表达式与函数值（算术/字符串/日期/CONCAT/CAST 等；WHERE/ORDER BY 现限字段名+字面量）；
+  - ⑥ 窗口函数（ROW_NUMBER/RANK/OVER…）；
+  - ⑦ 无 GROUP BY 的 HAVING（现 1064；若对齐 MySQL = "全表一组再过滤" 形态，语义需另定）。
+- 已核对为死边界（parser 明确 1064，不排）：GROUP BY 内 DISTINCT、`SELECT *` 与 GROUP BY 混用、
+  无 GROUP BY 的多列/多聚合标量、`SUM(*)` 等非 COUNT 星号参数。
+- 性能对比侧承接：P94 阶段②（EXPLAIN 标注/回退/.cs）+ 全 37 探针 110 万 vs MySQL 回填（既定行式/PAX/colstore 结构），
+  见本节 Task-024/P94 阶段② 与「一.4」基准流程。
+
 ### 接线盘点（2026-09-05 全量盘点：能力 53 / 已接线 40（其中 4 仅 bin 工具）/ 未接线 13）
+
 > 口径：对 src/engine、storage、inverted、txn、join、mv、bitmap、scale_out、redis、backup 的 pub 能力逐一在
 > src/sql、src/server、src/cli、src/bin 定向 Grep 统计非测试调用（明细见 P118 会话记录）。13 项未接线中：
 > **任务级 8 项（下表，逐项立项）**；**重复/内部 4 项不立项**（scan_stream_with_zonepred 与 scan_stream_parallel(zone_pred)
