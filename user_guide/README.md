@@ -67,6 +67,10 @@
   `GROUP BY f1,f2` + 同组聚合 + `HAVING` + 组结果 `ORDER BY 聚合列/组字段` + `LIMIT/OFFSET`；无条件 `COUNT(*)` O(1)；
 - **去重**：`SELECT DISTINCT f1[, f2…]`（显式列清单行去重；数值按值归组、缺列与 JSON null 同组；
   首版不与聚合/GROUP BY/HAVING/JOIN 组合、ORDER BY 列须 ∈ 列清单）；
+- **列表达式/函数值（阶段 A）**：SELECT 投影标量表达式——算术 `+ - * / %` 与括号、数值/字符串字面量、
+  `CONCAT / LOWER / UPPER / LENGTH / ROUND / ABS`；缺列与 JSON null → NULL 传播、除零/取模零 → NULL、
+  整型运算保持整型（除法浮点）；列名 = 表达式文本（MySQL 默认）；普通字段列可与表达式列混排
+  （表达式 + `*`/id 点查·区间·IN/嵌套路径列组合、表达式进 WHERE/ORDER BY/聚合 → 阶段 B）；
 - **排序/分页**：`ORDER BY 多字段 ASC/DESC`、`LIMIT/OFFSET`（Top-K 有界堆 + keyset 深分页守卫）；
 - **JOIN**：单 `INNER JOIN / LEFT JOIN … ON t1.f = t2.f`（等值、DocIdSet 交集执行）；
 - 会话/运维：SHOW PROCESSLIST / KILL（协议层）；执行计划推演走 HTTP `GET /explain`（MySQL 协议 EXPLAIN 未接，见 §8）。
@@ -81,7 +85,7 @@
 | GROUP BY 内 `DISTINCT` 聚合 / `SELECT DISTINCT` 组合形态 | ❌（`SELECT DISTINCT f1,f2…` 行去重已支持见 §4.1；`DISTINCT *`、与聚合/GROUP BY/HAVING/JOIN 混用、ORDER BY 非列清单列 → 1064） |
 | HAVING 无 GROUP BY | ❌（HAVING 语义 = 分组后过滤，须配 GROUP BY） |
 | 无 GROUP BY 的多列/多聚合标量 SELECT | ❌（标量聚合仅单个；`SELECT *` 与 GROUP BY 混用不支持） |
-| 列表达式/函数值 | ❌ `amount*2`、CONCAT/LOWER/日期函数/CAST 等不支持；WHERE/ORDER BY 项限字段名与字面量（聚合列头除外） |
+| 列表达式/函数值的其余位置 | ✅ SELECT 投影已支持（见 §4.1，阶段 A）；❌ WHERE 条件 / ORDER BY / 聚合参数内的表达式、表达式别名、嵌套路径（`amount*2`、`CONCAT(a,b)` 可投影；`WHERE amount*2>100`、`ORDER BY amount*2`、`COUNT(amount)+1` 未支持） |
 | 窗口函数（ROW_NUMBER/RANK/OVER…） | ❌ 不提供 |
 | 值类型 | 比较按数值/字典序自动判定，无完整 MySQL 类型系统/隐式转换语义 |
 | 跨分片事务 / 跨分片 JOIN / 全局快照读 | ❌ 分布式集群 ≠ 分布式事务库（业务强事务请留在 MySQL/Redis） |

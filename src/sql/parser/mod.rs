@@ -11,5 +11,5 @@ mod ast;
 mod lexer;
 mod parser;
 
-pub use ast::{CmpOp, Cond, HavingCond, HavingExpr, JoinClause, JoinKind, Select, WhereExpr};
+pub use ast::{BinOp, CmpOp, Cond, Expr, HavingCond, HavingExpr, JoinClause, JoinKind, Select, WhereExpr};
 pub use parser::{parse_select, parse_where_expr};

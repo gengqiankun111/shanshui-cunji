@@ -23,6 +23,7 @@
 //! `pub use sql as sqlish` 提供别名；全仓既有引用 db_adapter/demo/server 无需改动）。
 
 pub mod executor;
+pub mod expr;
 pub mod parser;
 
 // 兼容 re-export：原 sqlish.rs 模块根部的 pub 项（全仓既有 crate::sqlish::X 路径）。
@@ -30,8 +31,8 @@ pub use executor::aggregate::{execute_aggregate, execute_aggregate_window, AggSc
 pub use executor::group_by::{execute_group_by, execute_group_by_window, GroupResult, GroupRow};
 pub use executor::select::{doc_matches_where, docset_to_sorted, execute, get_docid_set};
 pub use parser::{
-    parse_select, parse_where_expr, CmpOp, Cond, HavingCond, HavingExpr, JoinClause, JoinKind,
-    Select, WhereExpr,
+    parse_select, parse_where_expr, CmpOp, Cond, Expr, HavingCond, HavingExpr, JoinClause,
+    JoinKind, Select, WhereExpr,
 };
 
 // 原 sqlish.rs 底部 mod tests（约 1700 行）整体迁移至 tests.rs；`use super::*` 取本模块

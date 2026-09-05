@@ -3044,3 +3044,73 @@ use crate::multitable::drop_table_range;
         };
         assert_eq!(qy.len(), 1);
     }
+
+    // ---------- 2026-09-05：SELECT 投影列表达式/函数值（阶段 A） ----------
+    #[test]
+    fn expr_projection_response_arithmetic_and_funcs() {
+        // 端到端（协议层 select_response）：算术/拼接/字符串函数投影输出计算列
+        let mut engine = test_engine();
+        let auto = AtomicU64::new(1);
+        for i in 1..=3u64 {
+            let sql = format!(
+                "INSERT INTO documents(id, doc) VALUES ({i}, '{{\"k\":{i},\"name\":\"n{i}\",\"flag\":true}}')"
+            );
+            insert_response(&mut engine, &sql, &auto);
+        }
+        // ① 算术投影（整型保持）；列名 = 表达式规范文本
+        let resp = select_response(&engine, "SELECT k * 2 FROM documents LIMIT 2");
+        let QueryResponse::Set { columns, rows } = resp else { panic!("应为 Set") };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], b"2");
+        assert_eq!(rows[1][0], b"4");
+        let colname = String::from_utf8_lossy(&columns[0]).to_string();
+        assert!(colname.contains("k * 2"), "表达式列名应为其规范文本: {colname}");
+        // ② 字符串函数 + CONCAT（NULL 不出现于此数据）
+        let resp2 = select_response(&engine, "SELECT CONCAT(name, '-x'), UPPER(name) FROM documents LIMIT 1");
+        let QueryResponse::Set { rows: rows2, .. } = resp2 else { panic!("应为 Set") };
+        assert_eq!(rows2[0][0], b"n1-x");
+        assert_eq!(rows2[0][1], b"N1");
+        // ③ 普通字段与表达式混排（plain 列 + 表达式列）
+        let resp3 = select_response(&engine, "SELECT name, k + 1 FROM documents LIMIT 1");
+        let QueryResponse::Set { rows: rows3, .. } = resp3 else { panic!("应为 Set") };
+        assert_eq!(rows3[0][0], b"n1");
+        assert_eq!(rows3[0][1], b"2");
+        // ④ 表达式列与主键点查/区间组合 → 阶段 B 1064（防静默错位）
+        assert!(matches!(
+            select_response(&engine, "SELECT k * 2 FROM documents WHERE id=2"),
+            QueryResponse::Err(1064, _)
+        ));
+        assert!(matches!(
+            select_response(&engine, "SELECT k * 2 FROM documents WHERE id BETWEEN 1 AND 2"),
+            QueryResponse::Err(1064, _)
+        ));
+    }
+
+    #[test]
+    fn expr_projection_division_null_and_guards() {
+        let mut engine = test_engine();
+        let auto = AtomicU64::new(1);
+        insert_response(&mut engine, "INSERT INTO documents(id, doc) VALUES (1, '{\"k\":10,\"b\":0,\"v\":null,\"s\":\"x\"}')", &auto);
+        insert_response(&mut engine, "INSERT INTO documents(id, doc) VALUES (2, '{\"k\":3}')", &auto);
+        // 除法 → 浮点；缺字段行 → NULL 传播（0xfb 哨兵 cell）
+        let rows = match select_response(&engine, "SELECT k / 2, k * 2 FROM documents ORDER BY id LIMIT 2") {
+            QueryResponse::Set { rows, .. } => rows,
+            QueryResponse::Err(c, m) => panic!("query err {c}: {m}"),
+            _ => panic!("非 Set 响应"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], b"5.0"); // 10/2 → DOUBLE 文本（serde f64 5.0 → "5.0"）
+        assert_eq!(rows[0][1], b"20");
+        assert_eq!(rows[1][0], b"1.5");
+        // 除零 → NULL（首行 doc1 k/b，b=0）；缺字段行同样 NULL 传播
+        let r2 = select_response(&engine, "SELECT k / b FROM documents LIMIT 1");
+        assert!(matches!(r2, QueryResponse::Set { rows, .. } if rows.len() == 1 && rows[0][0] == vec![0xfb]));
+        // NULL 字段引用 → NULL
+        let r3 = select_response(&engine, "SELECT v + 1 FROM documents LIMIT 1");
+        assert!(matches!(r3, QueryResponse::Set { rows, .. } if rows.len() == 1 && rows[0][0] == vec![0xfb]));
+        // 表达式 + 聚合 / GROUP BY → parser 1064
+        assert!(matches!(
+            select_response(&engine, "SELECT COUNT(*), k * 2 FROM documents"),
+            QueryResponse::Err(_, _)
+        ));
+    }

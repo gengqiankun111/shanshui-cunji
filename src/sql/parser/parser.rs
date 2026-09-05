@@ -2,7 +2,7 @@
 //! `parse_where_expr`（写路径 WHERE 段复用同一文法）。
 
 use crate::error::{Error, Result};
-use super::ast::{CmpOp, Cond, HavingCond, HavingExpr, JoinClause, JoinKind, Select, WhereExpr};
+use super::ast::{BinOp, CmpOp, Cond, Expr, HavingCond, HavingExpr, JoinClause, JoinKind, Select, WhereExpr};
 use super::lexer::{Lexer, Tok};
 use super::PRes;
 
@@ -71,6 +71,7 @@ impl Parser {
             }
         }
         let mut columns = Vec::new();
+        let mut col_exprs: Vec<Option<Expr>> = Vec::new();
         let mut plain: Vec<String> = Vec::new();
         let mut aggs: Vec<(String, Option<String>)> = Vec::new();
         let mut distincts: Vec<bool> = Vec::new();
@@ -80,7 +81,14 @@ impl Parser {
             match item {
                 Tok::Star => {
                     columns.push("*".into());
+                    col_exprs.push(None);
                     star_seen = true;
+                }
+                // 2026-09-05（列表达式/函数值 阶段 A）：以操作数/字面量开头的列项 → 表达式列
+                Tok::Num(_) | Tok::Str(_) | Tok::Plus | Tok::Minus | Tok::LParen => {
+                    let e = self.parse_scalar_from(item)?;
+                    columns.push(e.name());
+                    col_exprs.push(Some(e));
                 }
                 Tok::Ident(i) => {
                     // 7.95 聚合函数列：COUNT(*) / COUNT(f) / SUM(f) / AVG(f) / MIN(f) / MAX(f)
@@ -120,14 +128,30 @@ impl Parser {
                             } else {
                                 upper.clone()
                             });
+                            col_exprs.push(None);
                             aggs.push((upper.to_lowercase(), arg));
                             distincts.push(distinct);
+                        } else if matches!(upper.as_str(), "CONCAT" | "LOWER" | "UPPER" | "LENGTH" | "ROUND" | "ABS") {
+                            // 受支持函数列 → 表达式列（函数调用项，可续算术链）
+                            let e = self.parse_scalar_from(Tok::Ident(i))?;
+                            columns.push(e.name());
+                            col_exprs.push(Some(e));
                         } else {
                             return Err(format!("不支持的函数列: {i}"));
                         }
+                    } else if matches!(
+                        self.peek()?,
+                        Tok::Plus | Tok::Minus | Tok::Slash | Tok::Percent | Tok::Star
+                    ) || i.parse::<f64>().is_ok()
+                    {
+                        // 普通字段后跟算术运算符（amount*2）或数值字面量（5.0）→ 表达式列
+                        let e = self.parse_scalar_from(Tok::Ident(i))?;
+                        columns.push(e.name());
+                        col_exprs.push(Some(e));
                     } else {
                         plain.push(i.clone());
                         columns.push(i);
+                        col_exprs.push(None);
                     }
                 }
                 t => return Err(format!("期望列名或 *，实际 {t:?}")),
@@ -140,6 +164,7 @@ impl Parser {
                 }
             }
         }
+        let has_expr_col = col_exprs.iter().any(|c| c.is_some());
         self.expect_kw("FROM")?;
         let table = self.ident()?;
         // P0-D：JOIN 解析（`[INNER|LEFT] JOIN t2 ON t1.f1 = t2.f2`）
@@ -325,6 +350,30 @@ impl Parser {
                 }
             }
         }
+        // 2026-09-05（列表达式/函数值 阶段 A）形态守卫：首版限一般 SELECT（无 * / DISTINCT /
+        // 聚合 / GROUP BY / HAVING / JOIN 组合）；ORDER BY 表达式（排序列=表达式规范名）阶段 B。
+        if has_expr_col {
+            if star_seen {
+                return Err("SELECT 表达式列与 * 混用暂不支持".into());
+            }
+            if distinct
+                || !group_by.is_empty()
+                || !aggs.is_empty()
+                || having.is_some()
+                || join.is_some()
+            {
+                return Err(
+                    "SELECT 表达式列与 DISTINCT/聚合/GROUP BY/HAVING/JOIN 组合暂不支持（阶段 B）"
+                        .into(),
+                );
+            }
+            let expr_names: Vec<String> = col_exprs.iter().filter_map(|c| c.as_ref()).map(|e| e.name()).collect();
+            for (f, _) in &order_by {
+                if expr_names.iter().any(|n| n.eq_ignore_ascii_case(f)) {
+                    return Err(format!("ORDER BY 表达式列 {f} 暂不支持（阶段 B）"));
+                }
+            }
+        }
         if !group_by.is_empty() {
             if star_seen {
                 return Err("SELECT * 与 GROUP BY 混用不支持（须显式分组字段）".into());
@@ -361,6 +410,7 @@ impl Parser {
         }
         Ok(Select {
             columns,
+            col_exprs,
             distinct,
             table,
             where_expr,
@@ -375,6 +425,109 @@ impl Parser {
             join,
         })
     }
+    // ---- 2026-09-05（列表达式/函数值 阶段 A）：标量表达式（列清单项）解析 ----
+    // 优先级：加减 < 乘除模 < 一元负号/括号/函数/字面量/字段。停在顶层分隔符
+    // （逗号 / FROM / 子句关键字 / EOF）前，调用方继续既有列清单收尾。
+    // 说明：列项首个 token 已被调用方消费；一律经 `parse_scalar_from` 起步（不得
+    // push_back——会覆盖 peeked 中已缓存的后缀运算符，见 P126 修）。
+    fn parse_scalar_from(&mut self, first: Tok) -> PRes<Expr> {
+        let p0 = self.scalar_prim_of(first)?;
+        let m = self.parse_scalar_mul_cont(p0)?;
+        self.parse_scalar_add_cont(m)
+    }
+    fn parse_scalar_expr(&mut self) -> PRes<Expr> {
+        let p0 = self.parse_scalar_prim()?;
+        let m = self.parse_scalar_mul_cont(p0)?;
+        self.parse_scalar_add_cont(m)
+    }
+    fn parse_scalar_add_cont(&mut self, mut l: Expr) -> PRes<Expr> {
+        loop {
+            match self.peek()? {
+                Tok::Plus => {
+                    self.next()?;
+                    let r = self.parse_scalar_mul()?;
+                    l = Expr::Bin { op: BinOp::Add, l: Box::new(l), r: Box::new(r) };
+                }
+                Tok::Minus => {
+                    self.next()?;
+                    let r = self.parse_scalar_mul()?;
+                    l = Expr::Bin { op: BinOp::Sub, l: Box::new(l), r: Box::new(r) };
+                }
+                _ => return Ok(l),
+            }
+        }
+    }
+    fn parse_scalar_mul(&mut self) -> PRes<Expr> {
+        let p0 = self.parse_scalar_prim()?;
+        self.parse_scalar_mul_cont(p0)
+    }
+    fn parse_scalar_mul_cont(&mut self, mut l: Expr) -> PRes<Expr> {
+        loop {
+            let (op, next) = match self.peek()? {
+                Tok::Star => (BinOp::Mul, true),
+                Tok::Slash => (BinOp::Div, true),
+                Tok::Percent => (BinOp::Mod, true),
+                _ => (BinOp::Add, false),
+            };
+            if !next {
+                return Ok(l);
+            }
+            self.next()?;
+            let r = self.parse_scalar_prim()?;
+            l = Expr::Bin { op, l: Box::new(l), r: Box::new(r) };
+        }
+    }
+    fn parse_scalar_prim(&mut self) -> PRes<Expr> {
+        let t = self.next()?;
+        self.scalar_prim_of(t)
+    }
+    fn scalar_prim_of(&mut self, tok: Tok) -> PRes<Expr> {
+        match tok {
+            Tok::Num(n) => Ok(if n > i64::MAX as u64 {
+                Expr::NumF(n as f64)
+            } else {
+                Expr::NumI(n as i64)
+            }),
+            Tok::Str(s) => Ok(Expr::Str(s)),
+            Tok::Plus => self.parse_scalar_prim(), // 一元正号（无操作）
+            Tok::Minus => {
+                let inner = self.parse_scalar_prim()?;
+                Ok(Expr::Bin { op: BinOp::Sub, l: Box::new(Expr::NumI(0)), r: Box::new(inner) })
+            }
+            Tok::LParen => {
+                let e = self.parse_scalar_expr()?;
+                if !matches!(self.next()?, Tok::RParen) {
+                    return Err("表达式期望右括号 )".into());
+                }
+                Ok(e)
+            }
+            Tok::Ident(i) => {
+                if matches!(self.peek()?, Tok::LParen) {
+                    self.next()?; // LParen
+                    let mut args: Vec<Expr> = Vec::new();
+                    if !matches!(self.peek()?, Tok::RParen) {
+                        loop {
+                            args.push(self.parse_scalar_expr()?);
+                            match self.next()? {
+                                Tok::Comma => continue,
+                                Tok::RParen => break,
+                                t => return Err(format!("函数参数期望 , 或 )，实际 {t:?}")),
+                            }
+                        }
+                    } else {
+                        self.next()?; // 空参 ()
+                    }
+                    Ok(Expr::Call { name: i.to_uppercase(), args })
+                } else if let Ok(x) = i.parse::<f64>() {
+                    Ok(Expr::NumF(x)) // 浮点字面量（词法按 Ident 输出，如 5.0）
+                } else {
+                    Ok(Expr::Col(i))
+                }
+            }
+            t => Err(format!("表达式期望操作数，实际 {t:?}")),
+        }
+    }
+
     fn parse_expr(&mut self) -> PRes<WhereExpr> {
         self.parse_or()
     }

@@ -98,6 +98,43 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     }
     // 列投影：`SELECT id` → 仅 id 列；`SELECT status` → 字段列（类型按整列实际值推断）
     let proj = parse_projection(sql);
+    // 2026-09-05（列表达式/函数值 阶段 A）：SELECT 投影含标量表达式列 → 表达式响应。
+    // 首版 = 一般形态（无 WHERE / WHERE 普通字段条件，可带 ORDER BY 普通字段与 LIMIT/OFFSET）；
+    // 主键特殊形态（id 点查/BETWEEN/IN）、整 doc/嵌套列混排 → 阶段 B 拒绝（防静默错位）。
+    if let Ok(sel) = crate::sql::parse_select(sql) {
+        if sel.col_exprs.iter().any(|c| c.is_some()) {
+            if extract_point_id(sql).is_some()
+                || extract_between_range(sql).is_some()
+                || extract_target_ids(sql).is_some()
+            {
+                return QueryResponse::Err(
+                    1064,
+                    "表达式列与 id 主键点查/区间/IN 组合暂不支持（阶段 B）".into(),
+                );
+            }
+            for (i, c) in sel.columns.iter().enumerate() {
+                if sel.col_exprs[i].is_none() {
+                    let c = c.to_lowercase();
+                    if c == "doc" || c == "document" || c.contains('.') || c.contains('[') {
+                        return QueryResponse::Err(
+                            1064,
+                            "表达式列与整 doc/嵌套路径列混排暂不支持（阶段 B）".into(),
+                        );
+                    }
+                }
+            }
+            let mut rows = match crate::sqlish::execute(engine, sql, 10_000) {
+                Ok(r) => r,
+                Err(e) => return QueryResponse::Err(1064, format!("query error: {e}")),
+            };
+            // §26 M1b：非默认表限定本表 docid 区间（与 sqlish 兜底同语义）
+            let tid = table_id_for(&table_name_of(sql));
+            if tid != 0 {
+                rows.retain(|(d, _)| ((*d >> 48) as u16) == tid);
+            }
+            return expr_response(&sel, rows);
+        }
+    }
     let limit = extract_limit(sql);
     // MySQL 客户端以 `id` 为主键列 → 主键点查（sqlish 侧为 docid 特例）
     // §26 M1：SQL row_id → 引擎 docid（docid = table_id<<48 | row）
@@ -437,5 +474,82 @@ fn projection_pushdown_fields(proj: Option<&[ProjCol]>) -> Option<Vec<String>> {
         None
     } else {
         Some(fields)
+    }
+}
+
+/// 2026-09-05（列表达式/函数值 阶段 A）：表达式结果集构建。
+/// `sel.columns` 与 `sel.col_exprs` 对齐：Some = 标量表达式列（列名 = 表达式规范文本）；
+/// None = 普通顶层字段列（id/docid → 主键行号；其余按 doc 顶层字段取值）。
+/// 列类型按整列实际值推断（LONGLONG / DOUBLE / VAR_STRING，NULL 不计）；NULL cell = 0xfb。
+fn expr_response(sel: &crate::sql::Select, raw: Vec<(u64, Vec<u8>)>) -> QueryResponse {
+    let n_col = sel.columns.len();
+    // 每列类型聚合：0=未定/仅 null，1=LONGLONG，2=DOUBLE，3=VAR_STRING
+    let mut kinds: Vec<u8> = vec![0; n_col];
+    let mut data: Vec<Vec<Vec<u8>>> = Vec::with_capacity(raw.len());
+    for (id, doc_bytes) in raw {
+        let obj: serde_json::Value = serde_json::from_slice(&doc_bytes).unwrap_or(serde_json::Value::Null);
+        let mut row: Vec<Vec<u8>> = Vec::with_capacity(n_col);
+        for (i, c) in sel.columns.iter().enumerate() {
+            let lc = c.to_lowercase();
+            // id/docid/doc/document 直出 cell（不做类型推断）
+            if sel.col_exprs[i].is_none() && (lc == "id" || lc == "docid") {
+                row.push(row_id_of(id).to_string().into_bytes());
+                continue;
+            }
+            if sel.col_exprs[i].is_none() && (lc == "doc" || lc == "document") {
+                row.push(doc_bytes.clone());
+                continue;
+            }
+            let v = match sel.col_exprs[i].as_ref() {
+                Some(e) => crate::sql::expr::eval(e, &obj),
+                None => match obj.get(c) {
+                    Some(x) if !x.is_null() => x.clone(),
+                    _ => serde_json::Value::Null,
+                },
+            };
+            // 列类型按整列实际值聚合（表达式列与普通字段列一致；NULL 不计）
+            let k = match &v {
+                serde_json::Value::Number(n) if n.is_f64() => 2u8,
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => 1u8,
+                serde_json::Value::Null => 0u8,
+                _ => 3u8,
+            };
+            if k != 0 {
+                kinds[i] = kinds[i].max(k);
+            }
+            row.push(expr_cell(&v));
+        }
+        data.push(row);
+    }
+    let columns: Vec<Vec<u8>> = sel
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let (t, charset) = match kinds[i] {
+                1 => (MYSQL_TYPE_LONGLONG, 63),
+                2 => (MYSQL_TYPE_DOUBLE, 63),
+                _ => (MYSQL_TYPE_VAR_STRING, 45),
+            };
+            column_payload(name, t, charset)
+        })
+        .collect();
+    QueryResponse::Set { columns, rows: data }
+}
+
+/// 表达式/字段值 → 文本协议 cell（NULL → 0xfb 哨兵；布尔 1/0；数字 to_string）。
+fn expr_cell(v: &serde_json::Value) -> Vec<u8> {
+    match v {
+        serde_json::Value::Null => vec![MYSQL_NULL_CELL],
+        serde_json::Value::Bool(b) => {
+            if *b {
+                b"1".to_vec()
+            } else {
+                b"0".to_vec()
+            }
+        }
+        serde_json::Value::Number(n) => n.to_string().into_bytes(),
+        serde_json::Value::String(s) => s.clone().into_bytes(),
+        other => other.to_string().into_bytes(),
     }
 }

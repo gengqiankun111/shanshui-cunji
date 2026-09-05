@@ -810,7 +810,14 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
     3 新增单测（单/多列+WHERE+ORDER/LIMIT 值集、数值 5 vs 5.0 与缺列∪null 归组、1064 守卫）；
     全量 756 通过 + 3 ignored（seqlock 概率型偶发单跑复绿，无关）；
   - ④ 多 JOIN（>1 子句现解析期 1064）/ RIGHT / FULL / CROSS / 非等值 ON；
-  - ⑤ 列表达式与函数值（算术/字符串/日期/CONCAT/CAST 等；WHERE/ORDER BY 现限字段名+字面量）；
+  - ⑤ 列表达式与函数值 —— **✅ 阶段 A 已完成（2026-09-05，P126）**：SELECT 投影标量表达式
+    （算术 +-*/% 与括号、字面量、CONCAT/LOWER/UPPER/LENGTH/ROUND/ABS、NULL 传播、除零→NULL；
+    lexer 增算术 token、AST `Expr`/`Select.col_exprs`、parser `parse_scalar_from` 首 token 起步
+    （修 peeked 覆盖坑）、求值 `src/sql/expr.rs`、server 表达式结果集 `expr_response`）；守卫 1064
+    （* / DISTINCT / 聚合 / GROUP BY / HAVING / JOIN 组合、id 点查·区间·IN、嵌套路径/整 doc 混排）；
+    3 单测组（parser 组合守卫 + expr 求值 ×2 + server 端到端 ×2）；全量 lib 760 通过 + 3 ignored
+    （seqlock 概率型偶发单跑复绿）。**阶段 B 待开发**：表达式进 WHERE 条件 / ORDER BY / 聚合参数、
+    表达式别名（AS）、SELECT 表达式与 id 主键形态组合、表达式列类型进一步对齐（DECIMAL/CAST）。
   - ⑥ 窗口函数（ROW_NUMBER/RANK/OVER…）；
   - ⑦ 无 GROUP BY 的 HAVING（现 1064；若对齐 MySQL = "全表一组再过滤" 形态，语义需另定）。
 - 已核对为死边界（parser 明确 1064，不排）：GROUP BY 内 DISTINCT、`SELECT *` 与 GROUP BY 混用、

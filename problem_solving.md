@@ -1582,6 +1582,27 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 文档同步：README §4.1 增 DISTINCT 支持行、§4.2 限制表改为"组合形态 1064"；
   development_remain SQL 语法面审计 ③ 标记 ✅。
 
+**P126（列表达式/函数值 阶段 A，2026-09-05）MySQL 语法缺口 ⑤**
+- 范围：SELECT 投影标量表达式（算术 + - * / % 与括号、数值/字符串字面量、CONCAT/LOWER/UPPER/
+  LENGTH/ROUND/ABS）；MySQL 语义对齐（缺列/JSON null → NULL 传播、除零与取模零 → NULL、
+  整型运算保持整型、除法浮点、CONCAT 任一 NULL → NULL、ROUND 整数位回整型）；列名 = 表达式
+  规范文本（MySQL 无别名默认）。普通字段列可与表达式列混排（id/docid/doc 直出 cell）。
+- 落地：① lexer 增 Plus/Minus/Slash/Percent token；② AST `Expr`/`BinOp` + `Select.col_exprs`
+  （与 columns 对齐；Select 因含 f64 取消 Eq derive）；③ parser `parse_scalar_*`（precedence 递归
+  下降）+ 列清单触发（首 token 起步）；④ 求值 `src/sql/expr.rs`（serde_json::Value 往返，
+  供 server 复用类型推断）；⑤ server `select_response` 顶部表达式路由 + `expr_response`
+  （列类型按整列值聚合 LONGLONG/DOUBLE/VAR_STRING，NULL cell=0xfb）——在 id 点查/BETWEEN/IN
+  等特殊形态分支前拦截（防默认 2 列静默错位）。
+- 排障要点：初版列项用 `push_back(首 token)` 起解析会把 peeked 中已缓存的后缀运算符顶掉
+  （`k*2` 丢失 `*`）→ 重构为 `parse_scalar_from(first)`（scalar_prim_of + mul/add continuation）。
+- 守卫（1064）：表达式列与 `*`/DISTINCT/聚合/GROUP BY/HAVING/JOIN 组合、id 主键点查·区间·IN、
+  与整 doc/嵌套路径列混排、ORDER BY 表达式列（阶段 B 放开）。
+- 验证：parser 组合守卫 1 测、expr 求值 2 测（算术优先级/字符串函数与 CONCAT NULL）、server
+  端到端 2 测（算术+函数+混排列名与值、除法浮点/除零 NULL/缺列 NULL）；全量 lib **760 通过
+  + 3 ignored**（seqlock 概率型偶发失败单跑复绿，无关）。
+- 阶段 B（后续）：WHERE 条件表达式、ORDER BY 表达式、聚合参数表达式、AS 别名、与 id 主键
+  特殊形态组合、DECIMAL/CAST 类型对齐。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

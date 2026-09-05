@@ -22,6 +22,11 @@ pub(super) enum Tok {
     Lt,
     Ge,
     Le,
+    // 2026-09-05（列表达式/函数值）：算术运算符 token（仅表达式列解析消费；旧路径不触达）
+    Plus,
+    Minus,
+    Slash,
+    Percent,
     Kw(String),
     Eof,
 }
@@ -82,6 +87,22 @@ impl Lexer {
             '*' => {
                 self.pos += 1;
                 return Ok(Tok::Star);
+            }
+            '+' => {
+                self.pos += 1;
+                return Ok(Tok::Plus);
+            }
+            '-' => {
+                self.pos += 1;
+                return Ok(Tok::Minus);
+            }
+            '/' => {
+                self.pos += 1;
+                return Ok(Tok::Slash);
+            }
+            '%' => {
+                self.pos += 1;
+                return Ok(Tok::Percent);
             }
             ',' => {
                 self.pos += 1;

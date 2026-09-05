@@ -465,6 +465,31 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
     }
 
     #[test]
+    fn sql_expr_columns_parse_and_guard_combos() {
+        // 2026-09-05（列表达式/函数值 阶段 A）：列清单表达式解析 + 组合守卫
+        let s1 = parse_select("SELECT amount * 2 FROM t").unwrap();
+        assert_eq!(s1.columns, vec!["amount * 2"]);
+        assert_eq!(s1.col_exprs.len(), 1);
+        assert!(s1.col_exprs[0].is_some(), "amount*2 应为表达式列");
+        // 括号/优先级 + 多列（表达式 + 普通字段混排）
+        let s2 = parse_select("SELECT (amount + 1) * 2, city FROM t").unwrap();
+        assert_eq!(s2.columns.len(), 2);
+        assert!(s2.col_exprs[0].is_some());
+        assert!(s2.col_exprs[1].is_none(), "city 普通字段列");
+        assert_eq!(s2.columns[1], "city");
+        // 函数 + 字符串字面量 + 浮点字面量
+        let s3 = parse_select("SELECT CONCAT(city, '-', 'x'), k + 0.5 FROM t").unwrap();
+        assert_eq!(s3.columns[0], "CONCAT(city,'-','x')");
+        assert!(s3.col_exprs[1].is_some());
+        // 组合守卫：* / DISTINCT / 聚合 / GROUP BY / JOIN → 1064
+        assert!(parse_select("SELECT *, amount * 2 FROM t").is_err(), "* 与表达式列混排拒绝");
+        assert!(parse_select("SELECT DISTINCT amount * 2 FROM t").is_err(), "DISTINCT 组合拒绝");
+        assert!(parse_select("SELECT COUNT(*), amount * 2 FROM t").is_err(), "聚合组合拒绝");
+        assert!(parse_select("SELECT amount * 2 FROM t GROUP BY city").is_err(), "GROUP BY 组合拒绝");
+        assert!(parse_select("SELECT amount * 2 FROM t JOIN s ON t.city = s.city").is_err(), "JOIN 组合拒绝");
+    }
+
+    #[test]
     fn group_by_fast_inverted_matches_scan() {
         // Ex-9.3 ④b：无 WHERE 单字段 GROUP BY 倒排快路径结果与全扫一致（含 NULL 组；
         // 数值聚合遇缺字段行自动回退全扫）。

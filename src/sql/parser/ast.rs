@@ -14,6 +14,75 @@ pub enum CmpOp {
     Le,
 }
 
+/// 列表达式二元运算符（2026-09-05：SELECT 投影列表达式/函数值，阶段 A）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+/// 标量表达式（阶段 A：算术 + 括号 + 字符串/数值字面量 + 受支持函数 + 字段引用）。
+/// 求值规则（MySQL 对齐，见 crate::sql::expr::eval_expr）：字段缺失/JSON null → NULL 传播；
+/// 除零/取模零 → NULL；数值运算保持整型（除法 → 浮点）；CONCAT 等按 MySQL 字符串化。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// 整数字面量。
+    NumI(i64),
+    /// 浮点字面量。
+    NumF(f64),
+    /// 字符串字面量（SQL 单/双引号内容，已去引号）。
+    Str(String),
+    /// 顶层字段引用（v1：精确键名，不支持嵌套路径/下标）。
+    Col(String),
+    /// 二元运算。
+    Bin {
+        op: BinOp,
+        l: Box<Expr>,
+        r: Box<Expr>,
+    },
+    /// 函数调用（受支持集合见 expr 模块）。
+    Call { name: String, args: Vec<Expr> },
+}
+
+impl BinOp {
+    fn sym(&self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+        }
+    }
+}
+
+impl Expr {
+    /// 规范文本 = MySQL 无别名时的结果列名（列表达式默认列名取表达式文本）。
+    pub fn name(&self) -> String {
+        match self {
+            Expr::NumI(n) => n.to_string(),
+            Expr::NumF(x) => x.to_string(),
+            Expr::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            Expr::Col(c) => c.clone(),
+            Expr::Bin { op, l, r } => format!("{} {} {}", l.name(), op.sym(), r.name()),
+            Expr::Call { name, args } => {
+                let mut s = format!("{name}(");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&a.name());
+                }
+                s.push(')');
+                s
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cond {
     pub field: String,
@@ -53,10 +122,15 @@ pub enum HavingExpr {
 }
 
 /// 解析结果（SELECT 语句）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 注：含 f64 表达式 → 不实现 Eq（仅 PartialEq；比较用 assert_eq 足够）。
+#[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     /// 列清单（"*" = 全部）。
     pub columns: Vec<String>,
+    /// 列表达式（2026-09-05 阶段 A）：与 columns 对齐，Some = 该列为标量表达式（计算列，
+    /// columns[i] 为其规范文本 = MySQL 默认列名）；None = 普通列/聚合头/*。首版不与
+    /// DISTINCT/聚合/GROUP BY/HAVING/JOIN 组合（parser 1064），且列中不混 `*`。
+    pub col_exprs: Vec<Option<crate::sql::parser::ast::Expr>>,
     /// SELECT DISTINCT 行去重（2026-09-05 立项）：对显式列清单组合值去重。
     /// 首版限制（parser 1064 守卫）：非 `*`（须显式列）、不组合聚合/GROUP BY/HAVING/JOIN、
     /// ORDER BY 列须 ⊆ 列清单。语义 = 投影列值组合去重（缺列与 JSON null 同组、
