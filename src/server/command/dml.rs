@@ -391,8 +391,7 @@ pub(crate) fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                     return QueryResponse::Ok(0, 0);
                 }
                 // 流式消费（Bitmap/SortedList 已是物化集合；docid 高位含表 → 按表过滤）
-                let del = engine.delete_batch(set.iter().filter(|d| ((*d >> 48) as u16) == tid));
-                match del {
+                match engine.delete_batch(set.iter().filter(|d| ((*d >> 48) as u16) == tid)) {
                     Ok(n) => QueryResponse::Ok(n, 0),
                     Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
                 }
@@ -421,8 +420,8 @@ pub(crate) fn parse_pk_between(where_part: &str) -> Option<(u64, u64)> {
 }
 
 /// B2：主键闭区间批量删——docid ∈ [docid_for(tid,lo), docid_for(tid,hi)] 区间内
-/// **keys-only 扫描现存 docid** → `engine.delete_batch`（单次提交，无逐行 fsync）。
-/// 只删**现存**行（区间内缺失/已删的 docid 不计数，对齐 MySQL affected_rows）。
+/// **keys-only 扫描现存 docid** → `engine.delete_batch`（P122：引擎内已按 per-CPU 队列深度
+/// 预算拆子批防单 scope 超深背压死锁）。只删**现存**行（区间内缺失/已删不计数，对齐 MySQL）。
 pub(crate) fn delete_pk_range(engine: &mut Engine, tid: u16, lo: u64, hi: u64) -> QueryResponse {
     let start = docid_for(tid, lo);
     let end = docid_for(tid, hi);

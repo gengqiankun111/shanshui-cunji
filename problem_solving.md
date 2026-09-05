@@ -1492,6 +1492,25 @@ bd2debb）：
 5k/10k/15k 行二分复现确定触发阈值）。排查期间产生的 10w 全量探针结果（清理前）
 results/results-sqlrun-scc-10w-full/summary.md 保留为基线参考。
 
+**P123（P122 修复闭环）大区间删除锁死根因 = per-CPU WAL 单 scope 超队列深度 + 持写锁互锁**
+二分（fresh 30k 库、零并发 `DELETE id BETWEEN 2 AND N`）：3000 OK(10ms) / 4000 OK / **5000 HANG**、
+10000/20000 HANG——非单调但触发点恰在**单 scope 条目 ≈ 2×行数 > per_cpu_queue_depth(4096)** 量级
+（4000 OK 与该次运行队列空/无并发有关，属竞态边界）。阶段打点（P122_TRACE 门控）证明：`delete_batch`
+**内部循环完整跑完**（delbatch_loop_done → returning 均打印），卡点在其后 per-CPU 包装层
+`enqueue_scope → rt.submit → QueueInner::enqueue`：scope 条目 > queue depth(4096) 时进入**背压等待**
+（while depth+n>cap cond.wait），而此时调用方（SQL DELETE handler）**持引擎写锁**；per-CPU 消费线程
+写盘路径（段切换/CF 回调等）又需要引擎 → 互锁死锁：服务整体锁死、CPU 空闲、后续所有连接排队。
+修复（引擎层根治，任何调用方安全）：
+① src/engine/percpu_wal.rs `PerCpuWal::scope_doc_budget()`——docid 预算 = queue depth/2（≥1 上限 4096，
+   每 docid 删除至多 ~2 条 WAL（主墓碑+delta 前缀）→ 单 scope 恒 < depth）；
+② src/engine/write.rs `Engine::delete_batch`——per-CPU 启用时按预算**内部拆子批**（每子批独立
+   gseq scope 入队），防单 scope 超深背压；语义与一次性整批一致（幂等、计数累加）；未启用维持原路径。
+验证：fresh 30k 库 20k/10k/5k 区间删 **全部 OK**（70/27/14ms，此前恒 HANG）；**全量 81 探针 10w 轮
+65.9s 完整跑完**（此前卡死在收尾 44k 清理），收尾后服务正常响应。全量 lib 回归 744 绿（一次 seqlock
+概率型用例偶发失败单跑复绿，无关）。
+业务层补充（防再踩）：大删请按 per_cpu_queue_depth 控制单批（勿 >depth/2）；多线程并发删同一表 + 大批
+仍可能把队列写侧压满，建议串行或限并发；本修复兜底引擎 API 层，应用层分批+sleep+日志的实践仍推荐。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

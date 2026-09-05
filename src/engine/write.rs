@@ -363,6 +363,32 @@ impl Engine {
     /// 「1 次提交 + 摊销巡检」；语义与逐行 `delete` 完全一致（含删除密度计数、复活清位、快照版本判定）。
     /// Task-026：per-CPU 启用时整批单 gseq 组（批量原子：崩溃回放整组或跳过，无中间态）。
     pub fn delete_batch<I: Iterator<Item = u64>>(&mut self, docids: I) -> Result<u64> {
+        // P122：per-CPU WAL（默认开启）下，若单 gseq scope 条目 > queue depth，入队背压等待与
+        // 持引擎写锁的调用方互锁 → 服务整体锁死（见 problem_solving P122）。此处按队列深度预算
+        // **内部拆子批**（每个子批独立 scope 入队），任何调用方（SQL DELETE / 写定位 / CLI 等）都安全；
+        // 语义与一次性整批完全一致（幂等、计数逐批累加）。未启用 per-CPU 时维持原单 scope 路径。
+        if self.percpu.is_some() {
+            let budget = self.per_cpu_wal.scope_doc_budget();
+            if budget > 1 {
+                let mut n = 0u64;
+                let mut buf: Vec<u64> = Vec::with_capacity(budget);
+                for d in docids {
+                    buf.push(d);
+                    if buf.len() == budget {
+                        n += self.delete_batch_scope(buf.drain(..))?;
+                    }
+                }
+                if !buf.is_empty() {
+                    n += self.delete_batch_scope(buf.into_iter())?;
+                }
+                return Ok(n);
+            }
+        }
+        self.delete_batch_scope(docids)
+    }
+
+    /// 单个 per-CPU scope 的批量删除（内部辅助；未启用 per-CPU 时等同原 delete_batch 单 scope）。
+    fn delete_batch_scope<I: Iterator<Item = u64>>(&mut self, docids: I) -> Result<u64> {
         percpu_write!(self, self.delete_batch_inner(docids))
     }
 

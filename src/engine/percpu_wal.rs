@@ -47,6 +47,13 @@ pub(crate) struct PerCpuWal {
 const MAX_QUEUES: usize = 64;
 
 impl PerCpuWal {
+    /// P122：单次写 scope 的 **docid 预算**——每个 docid 删除至多 ~2 条 WAL（主墓碑 + delta 前缀），
+    /// 预算 = queue depth / 2（≥1，上限 4096）：按此拆批后单 scope 条目恒 < queue depth，
+    /// 永不触发入队背压等待（防「handler 持引擎写锁 + 消费线程需引擎」互锁死锁）。
+    pub(crate) fn scope_doc_budget(&self) -> usize {
+        (self.depth / 2).clamp(1, 4096)
+    }
+
     /// 从配置解析（阶段1：仅解析，不启动线程；启用但未接线写路径前保持不落地线程）。
     pub fn resolve(cfg: &crate::config::Config) -> Self {
         let enabled = cfg.storage.per_cpu_enabled;
