@@ -365,6 +365,27 @@ impl Engine {
         Ok(b.rank(end) - before)
     }
 
+    /// P-GB3（2026-09-05）：给定 posting（term 命中集，可含陈旧/删除 docid）在窗口内**活跃**
+    /// docid 数——口径 = 权威扫描（删除位图/墓碑已剔除、复活重计；跨表高位由窗口排外）。
+    /// 供 Ex-9.3 标量载荷路径在 server 整表窗口下做精确守卫（载荷 n == 窗口活跃数 才可用，
+    /// 否则回退行级/候选扫描保精确）。
+    pub fn live_count_window(
+        &self,
+        posting: &roaring::treemap::RoaringTreemap,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<u64> {
+        self.live_ensure()?;
+        let live = self.live_docids.lock().unwrap().clone().unwrap_or_default();
+        let mut n = 0u64;
+        for d in posting.iter() {
+            if live.contains(d) && start.map_or(true, |s| d >= s) && end.map_or(true, |e| d <= e) {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// 导出共享后台 IO 限速（design 20.5）：启用/关闭顺序扫描路径限速（MB/s；0 = 关闭）。
     /// 与 Compaction 的 `io_limiter` 同 Token Bucket 策略（默认低于前台读写）——导出读 SST
     /// 与后台合并共享同一后台 IO 预算语义，对在线业务影响 <5% 目标。

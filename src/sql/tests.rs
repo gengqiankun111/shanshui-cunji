@@ -750,6 +750,54 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         );
     }
 
+    /// P-GB3（2026-09-05）：标量 SUM/AVG/MIN/MAX WHERE 单等值 → term 载荷窗口守卫快路径
+    /// （posting 窗口∩活跃数 == 载荷 n 才放行；删除/复活后不匹配 → 回退精确路径），
+    /// = 权威扫描（AND amount>=0 逼非载荷路径）。
+    #[test]
+    fn pg_scalar_stats_guard_matches_scan() {
+        let mask = (1u64 << 48) - 1;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.inverted.stats_fields = vec!["amount".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, status: &str, amount: f64| {
+            let val = serde_json::json!({"docid": docid, "status": status, "amount": amount});
+            let bytes = serde_json::to_vec(&val).unwrap();
+            let terms = crate::server::extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(docid, bytes, &t).unwrap();
+        };
+        for i in 1..=120u64 {
+            put_doc(&mut e, i, if i % 2 == 0 { "active" } else { "inactive" }, (i * 10) as f64);
+        }
+        let agg = |e: &Engine, sql: &str| -> (bool, String) {
+            let r = execute_aggregate_window(e, sql, Some(0), Some(mask)).unwrap().unwrap();
+            (r.is_null, r.text)
+        };
+        // ① SUM/AVG WHERE 单等值（载荷守卫快路径）vs 权威（AND amount>=0 逼行级）
+        assert_eq!(
+            agg(&e, "SELECT SUM(amount) FROM t WHERE status='active'"),
+            agg(&e, "SELECT SUM(amount) FROM t WHERE status='active' AND amount>=0")
+        );
+        assert_eq!(
+            agg(&e, "SELECT AVG(amount) FROM t WHERE status='active'"),
+            agg(&e, "SELECT AVG(amount) FROM t WHERE status='active' AND amount>=0")
+        );
+        // ② 删除部分 active（载荷含其贡献 → 守卫不匹配 → 回退精确路径，结果仍一致）
+        let del: Vec<u64> = (1..=120u64).filter(|i| i % 2 == 0 && i % 10 == 0).collect();
+        e.delete_batch(del.iter().copied()).unwrap();
+        assert_eq!(
+            agg(&e, "SELECT SUM(amount) FROM t WHERE status='active'"),
+            agg(&e, "SELECT SUM(amount) FROM t WHERE status='active' AND amount>=0")
+        );
+        // ③ 复活同 docid（载荷重复累积 → n>活跃 → 回退，仍一致）
+        put_doc(&mut e, 10, "active", 100.0);
+        assert_eq!(
+            agg(&e, "SELECT AVG(amount) FROM t WHERE status='active'"),
+            agg(&e, "SELECT AVG(amount) FROM t WHERE status='active' AND amount>=0")
+        );
+    }
+
     #[test]
     fn sql_comparison_pushdown_single_pass_early_stop() {
         // 7.93：裸比较/BETWEEN 下推——单遍流式扫描 + LIMIT 早停，结果与旧 eval 路径一致

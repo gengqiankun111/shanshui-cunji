@@ -178,8 +178,10 @@ pub fn execute_aggregate_window(
     // Ex-9.3 第③步：`SUM/AVG/MIN/MAX(stats_field) ... WHERE f='v'`（裸等值、无排序/分组）
     // → 倒排 term 统计载荷免全扫（内存累积 + v5 段载荷；仅 stats_fields 声明字段可路由；
     // 未命中（未声明/term 无统计/多条件）→ 回落既有全量扫描，结果语义不变）。
-    // P1-3：表区间窗口禁用（倒排为引擎全库口径，跨表会串表）。
-    if !scoped && matches!(name.as_str(), "sum" | "avg" | "min" | "max") {
+    // P1-3：窗口场景（server 恒传本表整窗）默认禁用（载荷为引擎全库口径，跨表会串表）——
+    // P-GB3：**窗口守卫**——term posting 在窗口∩活跃集内的 docid 数 == 载荷 n 时载荷口径
+    // 恰为该窗口可见行（删除/墓碑剔除、跨表高位排外、陈旧值变更使 n 不匹配 → 回退精确路径）。
+    if matches!(name.as_str(), "sum" | "avg" | "min" | "max") {
         if let (Some(f), Some(WhereExpr::Cond(c))) = (field.as_ref(), sel.where_expr.as_ref()) {
             if c.op == CmpOp::Eq
                 && c.field != "docid"
@@ -191,22 +193,29 @@ pub fn execute_aggregate_window(
                 if let Some(st) = engine.inverted_term_stats(&term) {
                     if let Some(pos) = engine.stats_field_pos(f) {
                         if let Some(a) = st.get(pos) {
-                            if a.n > 0 {
-                                let text = match name.as_str() {
-                                    "sum" => fmt_num(a.sum),
-                                    "avg" => fmt_num(a.sum / a.n as f64),
-                                    "min" => fmt_num(a.min),
-                                    "max" => fmt_num(a.max),
-                                    _ => unreachable!(),
-                                };
+                            let guard_ok = if scoped {
+                                let posting = engine.inverted_posting(&term)?;
+                                engine.live_count_window(&posting, start, end)? == a.n
+                            } else {
+                                true // 无窗口 = 引擎全库口径与载荷同源
+                            };
+                            if guard_ok {
                                 let arg = field.as_deref().unwrap_or("*");
                                 let header = format!("{}({arg})", name.to_uppercase());
-                                return Ok(Some(AggScalar { header, is_null: false, text }));
+                                if a.n > 0 {
+                                    let text = match name.as_str() {
+                                        "sum" => fmt_num(a.sum),
+                                        "avg" => fmt_num(a.sum / a.n as f64),
+                                        "min" => fmt_num(a.min),
+                                        "max" => fmt_num(a.max),
+                                        _ => unreachable!(),
+                                    };
+                                    return Ok(Some(AggScalar { header, is_null: false, text }));
+                                }
+                                // 子集内无数值行 → SQL NULL（与全扫一致），仍走快路径
+                                return Ok(Some(AggScalar { header, is_null: true, text: String::new() }));
                             }
-                            // 子集内无数值行 → SQL NULL（与全扫一致），仍走快路径
-                            let arg = field.as_deref().unwrap_or("*");
-                            let header = format!("{}({arg})", name.to_uppercase());
-                            return Ok(Some(AggScalar { header, is_null: true, text: String::new() }));
+                            // 守卫不通过（载荷含删除/复活/换值/跨表贡献）→ 落下方行级/候选扫描
                         }
                     }
                 }

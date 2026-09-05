@@ -1462,6 +1462,18 @@ amount 求和（P-GB 位图路径仅覆盖 COUNT）。方案（复用 P-GB 基�
 +1 单测 pg_windowed_bitmap_group_stats_matches_scan ①~⑤（SUM/AVG/MIN/MAX=权威扫描等值；删除/复活/
 缺 amount → 守卫回退后仍一致）。边界同 P118/P119（值变更陈旧 → 守卫回退；非白名单/未配 stats_fields → 扫描）。
 
+**P121（P-GB3）标量 SUM/AVG/MIN/MAX WHERE 单等值 → term 载荷窗口守卫（#13 收敛）**
+根因：#13 sum_where_enum `SUM(amount) WHERE status='active'` 66.8ms（MySQL 43.9）——Ex-9.3 已实现
+term 载荷快路径但被 `!scoped` 门禁挡住（server 恒传整表窗 → scoped=true，见 select.rs L107），退行级
+P1-D 候选解码 ~3µs/行。修复（src/engine/scan.rs + src/sql/executor/aggregate.rs）：
+- engine `live_count_window(posting, start, end)`——posting 在窗口∩活跃集内的 docid 数（口径=权威扫描：
+  删除位图/墓碑剔除、复活重计、跨表高位排外）；
+- Ex-9.3 标量载荷路径放行窗口场景：**守卫 = term posting 窗口活跃数 == 载荷 n** 才走载荷
+  （n 含删除/复活/换值/跨表贡献或窗口外同 term 行 → 不匹配 → 回退行级/候选扫描保精确）。
+10w 干净轮实测：#13 66.8→**0.55ms**（MySQL 43.9 = 0.01×）；#15 3.4/#28 3.5/#60 8.1/#81 2.3/#57 0.5/
+#61 0.2ms 不回退（聚合家族全部 ms 级）。+1 单测 pg_scalar_stats_guard_matches_scan（SUM/AVG 载荷
+守卫 = 权威扫描；删除/复活后守卫回退仍一致）。边界同 P120（载荷脏化守卫回退宁慢勿错）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
