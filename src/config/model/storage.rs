@@ -111,6 +111,18 @@ pub struct StorageConfig {
     /// P4-A：写入爆发阈值（滑动窗口内新增 L0 段数），超过此值视为写入爆发，
     /// L1 触发阈值从 `l1_trigger_files` 降为 2 → 提前下沉 L1→L2，防 L0 爆胀。
     pub compaction_write_rate_burst: usize,
+    // ---- Task-026 Per-CPU WAL（research/range-scan-percpu-wal-design.md §二，2026-09-05）----
+    /// 每队列独立 `wal-{queue}-{gseq_start}.log` + N 个后台消费线程（组提交窗口）批量写，
+    /// 目标：多核高频非事务写的 WAL fsync 锁竞争摊薄（16 核预期 +36~59%）。全局 gseq 语义沿用。
+    /// **当前默认 false（安全回退全局组提交）**——阶段1 仅落地配置与路由骨架；核心线程写盘/
+    /// 恢复归并完成后翻转默认 true 并全量回归（回退 = false → 现有 WalBackend 全局组提交）。
+    pub per_cpu_enabled: bool,
+    /// 队列数：0 = 自动（CPU 核数，上限 64）；1 = 等效单队列（可作对照）；>64 截断到 64。
+    pub per_cpu_queues: usize,
+    /// 单队列最大缓冲条目数：队列满时写侧背压（阻塞/503），防无界内存。
+    pub per_cpu_queue_depth: usize,
+    /// 每队列组提交 fsync 窗口（µs；队列后台线程批量写窗口，语义同 group_commit_us）。
+    pub per_cpu_batch_window_us: u64,
 }
 
 impl Default for StorageConfig {
@@ -166,6 +178,11 @@ impl Default for StorageConfig {
             compaction_write_rate_window: 8,
             compaction_write_rate_burst: 4,
             composite_indexes: Vec::new(),
+            // Task-026：默认关闭（阶段1 安全回退），核心/恢复完成后翻 true 见 dev_remain。
+            per_cpu_enabled: false,
+            per_cpu_queues: 0,
+            per_cpu_queue_depth: 4096,
+            per_cpu_batch_window_us: 100,
         }
     }
 }

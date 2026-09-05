@@ -23,6 +23,7 @@ mod compact;
 mod engine;
 mod mvcc;
 mod open;
+mod percpu_wal;
 mod query;
 mod read;
 mod scan;

@@ -240,6 +240,7 @@ impl Engine {
             max_memory_mb: cfg.hotcache.max_memory_mb + cfg.blockcache.max_memory_mb,
             global_seq,
             group_commit: None,
+            per_cpu_wal: crate::engine::percpu_wal::PerCpuWal::resolve(cfg),
             gc_stop: None,
             gc_thread: None,
             flush_log_at_trx_commit: cfg.storage.flush_log_at_trx_commit,
