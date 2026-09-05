@@ -58,8 +58,8 @@ impl Metrics {
         mem_ratio: f64,
         disk_ratio: f64,
         flush_count: u64,
-        // 2026-09-05：组件内存计量 gauge（name, help, value）——/metrics 实时读取
-        mem_gauges: &[(&str, &str, u64)],
+        // 2026-09-05：运行时组件 gauge（name, help, value）：内存计量 + 快照生命周期，/metrics 实时读取
+        gauges: &[(&str, &str, u64)],
     ) -> String {
         let mut out = String::new();
         let mut counter = |name: &str, help: &str, value: u64| {
@@ -150,8 +150,8 @@ impl Metrics {
             "MySQL 当前活跃连接数",
             self.active_conns.load(Ordering::Relaxed).to_string(),
         );
-        // 2026-09-05：组件内存计量（引擎 memory_report）
-        for (name, help, value) in mem_gauges {
+        // 2026-09-05：运行时组件 gauge（引擎 memory_report + snapshot_report）
+        for (name, help, value) in gauges {
             gauge(name, help, value.to_string());
         }
         out
@@ -183,7 +183,7 @@ mod tests {
         m.read_ops.store(42, Ordering::Relaxed);
         m.record_latency(1_500_000);
         m.record_latency(2_500_000);
-        let text = m.render(3, 1, 0.5, 0.8, 5);
+        let text = m.render(3, 1, 0.5, 0.8, 5, &[]);
         assert!(text.contains("# TYPE shanshui_read_ops_total counter"));
         assert!(text.contains("shanshui_read_ops_total 42"));
         assert!(text.contains("shanshui_l0_segments 1"));

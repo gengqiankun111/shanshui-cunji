@@ -14,6 +14,13 @@ pub(crate) fn handle_admin_status(engine: &mut Engine) -> (u16, String) {
     }
 }
 
+/// 2026-09-05：运行时组件 gauge（内存计量 + MVCC 快照生命周期）。
+fn engine_runtime_gauges(engine: &Engine) -> Vec<(&'static str, &'static str, u64)> {
+    let mut g = engine.memory_report();
+    g.extend(engine.snapshot_report());
+    g
+}
+
 /// Prometheus 指标（X 项）：`GET /metrics` → 文本格式（计数/直方图/gauge 分层埋点）。
 pub(crate) fn handle_metrics(engine: &mut Engine) -> (u16, String) {
     let s = engine.stats();
@@ -21,7 +28,14 @@ pub(crate) fn handle_metrics(engine: &mut Engine) -> (u16, String) {
     let flush = engine.total_flush_count();
     let mut out = engine
         .metrics
-        .render(s.sst_file_count as u64, l0, s.mem_ratio, s.disk_ratio, flush, &engine.memory_report());
+        .render(
+            s.sst_file_count as u64,
+            l0,
+            s.mem_ratio,
+            s.disk_ratio,
+            flush,
+            &engine_runtime_gauges(engine),
+        );
     // 10 亿库阶段 D：分片级指标（docid 水位 + 读写计数 + 预警）
     out.push_str(&engine.shard_metrics_render());
     if !engine.shard_watermark_alerts().is_empty() {

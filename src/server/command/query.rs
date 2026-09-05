@@ -287,19 +287,20 @@ pub(crate) fn dispatch_query_read(engine: &Engine, sql: &str, session: &mut Sess
 }
 // ============ SQL 分发实现 ============
 
-/// 2026-09-05：SHOW MEMORY —— 组件内存计量（引擎 memory_report）行集。
+/// 2026-09-05：SHOW MEMORY —— 组件内存计量 + MVCC 快照生命周期行集。
 pub(crate) fn show_memory_response(engine: &Engine) -> QueryResponse {
     let columns = vec![
         column_payload("Variable_name", MYSQL_TYPE_VAR_STRING, 45),
         column_payload("Value", MYSQL_TYPE_VAR_STRING, 45),
     ];
-    let rows: Vec<Vec<Vec<u8>>> = engine
-        .memory_report()
+    let mut rep: Vec<(&str, &str, u64)> = engine.memory_report();
+    rep.extend(engine.snapshot_report());
+    let rows: Vec<Vec<Vec<u8>>> = rep
         .iter()
         .map(|(name, _help, v)| vec![name.as_bytes().to_vec(), v.to_string().into_bytes()])
         .collect();
     // 观测辅助：组件值同步打到服务端 stderr（诊断命令本身低频）
-    for (name, _help, v) in engine.memory_report() {
+    for (name, _help, v) in &rep {
         eprintln!("MEM {name}={v}");
     }
     QueryResponse::Set { columns, rows }

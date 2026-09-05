@@ -322,7 +322,7 @@ impl Engine {
             max_docid_loaded: AtomicBool::new(false),
             dd_min_ratio: cfg.storage.delete_density_min_ratio,
             dd_min_docs: cfg.storage.delete_density_min_docs,
-            active_snapshots: RwLock::new(std::collections::BTreeSet::new()),
+            active_snapshots: RwLock::new(std::collections::BTreeMap::new()),
             live_docids: std::sync::Mutex::new(None),
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,

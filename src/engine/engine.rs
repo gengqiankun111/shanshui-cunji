@@ -139,10 +139,11 @@ pub struct Engine {
     /// 删除密度触发阈值（`storage.delete_density_min_ratio` / `_min_docs`）。
     pub(crate) dd_min_ratio: f32,
     pub(crate) dd_min_docs: u64,
-    /// R4（review 2026-09-04）：活跃快照 seq 集合（RR/Serializable 事务注册，commit/rollback
+    /// R4（review 2026-09-04）：活跃快照注册表（RR/Serializable 事务注册，commit/rollback
     /// 注销）——compact 前取其最小值作 MVCC 保活水位（见 ColumnFamily::mvcc_keep_floor）：
     /// 最新 seq > floor 的 key 保留多版本，使删除/覆盖前旧快照在 compaction 后仍可回读。
-    pub(crate) active_snapshots: RwLock<std::collections::BTreeSet<u64>>,
+    /// value = 注册时刻（unix ms）——支撑快照生命周期计量/状态观测与受控逐出。
+    pub(crate) active_snapshots: RwLock<std::collections::BTreeMap<u64, u64>>,
     /// P1-C：活跃 docid 集（`COUNT(*)` O(1) 快路径基线）。None = 未初始化（首次
     /// `count_all_docs` 全键扫一次建基线后置 Some）；写路径增量维护（新 docid put 增 /
     /// delete 减 / 覆盖不变 / 复活增），purge 复位空集。语义 = 引擎最新视图（删除位图
@@ -211,6 +212,10 @@ pub struct EngineStats {
     pub cpu_active_queries: usize,
     /// CPU 并发查询上限。
     pub cpu_query_limit: usize,
+    /// 2026-09-05：活跃 MVCC 快照数（RR/Serializable 事务）。
+    pub active_snapshots: usize,
+    /// 2026-09-05：最老活跃快照存活 ms（长事务告警；0 = 无活跃快照）。
+    pub snapshot_oldest_ms: u64,
 }
 
 impl Engine {
@@ -333,6 +338,8 @@ impl Engine {
             disk_status,
             cpu_active_queries: self.watchdog.cpu_active(),
             cpu_query_limit: self.watchdog.cpu().limit(),
+            active_snapshots: self.active_snapshot_count(),
+            snapshot_oldest_ms: self.oldest_snapshot_age_ms(),
         }
     }
 
