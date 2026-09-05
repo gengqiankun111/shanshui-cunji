@@ -165,6 +165,10 @@ Task-027：HotCache TinyLFU 读回填准入（2026-09-05 用户定：**优先开
 □ 单测：zipf 频率误差 <5%；顺序全扫不污染（准入率低）；reset 后热点仍高/冷归零；删后重写可再准入
 □ 验收：ycsb c（全随机读）命中率/吞吐不降、内存受控；离线条带导出后点查 p50 劣化 ≤1.5×
 > 衰减问答（2026-09-05）：不配“查询次数”；按累计 Record 样本数触发，N/(读QPS)≈实际衰减秒数。
+> ✅ 已完成（2026-09-05，P101）：tinylfu.rs（CMS+可删除 Doorkeeper+采样衰减）、put/invalidate
+> on_write（计数减半+清门卫）、engine 读回填改走 read_backfill（点查 get/batch_get），
+> config tiny_lfu_*（enabled/admit=4/reset=2048）；hotcache 21 绿 + 全量 704 绿；
+> 验收（ycsb c/扫描后点查 p50）待下次基准回填。
 
 Task-026：Per-CPU WAL（可选项默认开启；**排期最靠后**，2026-09-05 定稿）
 > 定位：#17-19 单行更新 ~1.2ms（WAL fsync + LSM 写放大 + 全局锁）；Per-CPU WAL 主要解高并发写锁竞争

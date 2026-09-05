@@ -1157,6 +1157,27 @@
   SCC hotcache 复测（user_guide/性能对比-…md §4）。
 
 
+### P101. Task-027 HotCache 读回填 TinyLFU 准入（2026-09-05）
+
+- **背景**：读 miss→LSM 命中路径此前**无条件回填**（engine/read.rs get/batch_get 直接
+  `hotcache.put`）→ 全表扫/长尾单次访问可污染 HotCache。
+- **改动**：
+  - src/hotcache/tinylfu.rs：CMS（depth=4×width=512、4-bit 饱和 ≈1KB）+ 可删除 Doorkeeper
+    （32K 槽 ≈256KB、开放寻址+墓碑，写操作可精确清 key）；**首次访问只入门卫不计数**
+    （防扫描污染），≥2 次访问计入 CMS；Estimate ≥ 阈值（默认 4）准入；**采样衰减**：累计
+    Record ≥ reset_samples（默认 2048=width×depth）全量 >>1 并清 doorkeeper——按累计记录数
+    触发，非“查询次数”，85 万 QPS 读 miss 约 2.4ms 一次（用户定参）；
+  - 写操作（put/invalidate）→ 该 key 计数减半 + 清 doorkeeper（CMS 无法精确删单 key；
+    保留部分热度防缓存饥饿），写 put 仍直写不受准入限制；
+  - config：`tiny_lfu_enabled`（默认 true）/`admit_threshold`(4)/`reset_samples`(2048)；
+    engine/read.rs 点查与 batch_get 读回填改走 `read_backfill`（disabled 回退无条件）。
+- **测试**：首访/2000 单触扫描不污染（len=0）、热读第 5 次准入命中、写后需重新热读、
+  disabled 回退、小窗口（8）衰减下热 key 持续识别（hotcache 21 绿）。全量 **704**
+  （700+seqlock 4）绿。
+- **验收口径**：ycsb c（全随机读）命中率/吞吐不降、内存受控；离线条带导出后点查 p50
+  劣化 ≤1.5×（下次基准回填）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
