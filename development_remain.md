@@ -141,6 +141,11 @@ Task-025：范围查询提速——Partition Pruning 与 Parallel Scan（2026-09
   看门狗分批熔断；先覆盖 COUNT/SUM 聚合与导出，再覆盖通用扫描
 □ 验收：#5 pk_between 3.3ms → ≤1.5ms 量级；#11/范围类比值对齐 MySQL 2~3× 内；多核扫描 TPS/延迟按核数扩展
 > 设计档：research/range-scan-percpu-wal-design.md §一。
+> ✅ 阶段①（2026-09-05，P100，剖析 demo 定策）：文件/层/表/块四级剪枝已具备（Ex-8.2/P62/P3-A/
+> P1-E）；#5 小窗口 3.3ms 主因 = 固定 seek+块 IO+宽行返回（非剪枝缺口），转 Task-025b 并行/块 IO；
+> 数值列块级 zone 剪枝安全化（iter.rs f64 比较，防 `"10"<"9.0"` 字节误剪）已落地，**生效条件**：
+> 列须在 hot_fields（PAX）才产 zone 行 → #11 用 hot_fields 含 amount 的 PAX 库复测回填；
+> 并行扫描（Task-025b）保持规划（阶段 3）。
 
 Task-026：Per-CPU WAL（可选项默认开启；**排期最靠后**，2026-09-05 定稿）
 > 定位：#17-19 单行更新 ~1.2ms（WAL fsync + LSM 写放大 + 全局锁）；Per-CPU WAL 主要解高并发写锁竞争

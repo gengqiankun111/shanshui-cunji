@@ -1139,6 +1139,24 @@
   阶段②需 PAX(hot_fields) 数据布局复测（Task-024 阶段②）。
 
 
+### P100. Task-025 方案 A——数值 zone 剪枝安全化（#11，2026-09-05）+ zone 行产出核实
+
+- **背景/发现**：块级 Zone Map 剪枝为**字节序比较**——对定长整数字符串（ts）≈数值序，但对变长
+  小数/跨位数会**误剪有效块**（反例：zone.min=`"9.0"`、查询上界 `10`，字节 `"10"<"9.0"` → 含
+  9.x 的块被跳过 = 数据丢失级）；此即此前 zone_fields 留空（P4-C）根因。**核实产出条件**：
+  zone 行仅在 PAX(hot_fields) 块产出（sstable writer flush_block 行式分支 zones 为空）——默认
+  行式布局无 zone 行，#11 要生效须把 amount 等列加入 hot_fields 重装。
+- **改动（方案 A，不改格式）**：sstable/iter.rs 剪枝比较改为——zone 边界与查询界均可解析 f64 时
+  **按数值比较**，任一侧非数值回退字节序（字符串列语义安全）。
+- **测试**：task025_numeric_zone_between_no_false_skip——amount 1.0..31.0（跨 "10" 文本陷阱，
+  误剪会丢 9.x 行）行式(无 zone) vs PAX(含 amount zone) BETWEEN 1..10 命中均 = 0..=90。
+  全量 699（695+seqlock 4）绿。
+- **预期**：#11 amount BETWEEN 在 hot_fields 含 amount 的 PAX 库上启用块级数值 zone 剪枝
+  （窄区间跳不相交块），需复测回填。
+- MySQL 内存结论（归档执行）：1.1M 行 2G pool 充足**暂不加大**；公平对比按缓存预算口径或收紧
+  SCC hotcache 复测（user_guide/性能对比-…md §4）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
