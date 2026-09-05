@@ -732,8 +732,10 @@ pub(crate) fn scan_pushdown(
     let zp = leaf_to_zone_pred(leaf);
     // Task-025b 阶段④：范围/BETWEEN 谓词下推扫描走**跨文件扇出并行**（窗口命中 ≥2 SST
     // 时逐文件线程并行解码，主线程 k-way 归并；否则 CF 自动回退串行，零回归）。
+    // P109 压测（50万×4 交错 L0）：w2~w4 近最优（行式 ~1.6×、PAX ~3×），w≥4 主线程
+    // 归并/背压成瓶颈 → 上限取 4。
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 8))
+        .map(|n| n.get().clamp(2, 4))
         .unwrap_or(2);
     engine.scan_stream_parallel(None, None, workers, None, zp, |docid, doc| {
         scanned += 1;
