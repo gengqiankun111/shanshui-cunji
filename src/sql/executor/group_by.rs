@@ -9,7 +9,9 @@ use crate::sql::parser::{parse_select, CmpOp, HavingExpr, Select, WhereExpr};
 use serde_json::Value;
 
 use super::aggregate::{aggregate_needed_fields, fmt_num};
-use super::eval::{field_of, light_top_field, light_where_matches, LightVal};
+use super::eval::{
+    field_of, light_top_field, light_where_matches, subset_doc_bytes, LightVal,
+};
 
 /// P91：GROUP BY 全扫所需列 = WHERE 引用 ∪ 分组列 ∪ 聚合列（顶层键、去重）。
 /// 供 `scan_stream_fields` 投影解码（PAX 块只解这些列；消费端也只读这些列）。
@@ -460,21 +462,38 @@ pub fn execute_group_by_window(
     let guard = engine.query_guard();
     // P91：GROUP BY 全扫投影列 = WHERE 引用 ∪ 分组列 ∪ 聚合列（PAX 块只解这些列）
     let needed = group_scan_needed_fields(sel.where_expr.as_ref(), &fields, &specs);
+    // Task-024：行式布局下 scan_stream_fields 返回整行原文 → 每行先单遍只收 needed 的子集
+    // 字节（只构造所需列 Value），后续 where/分组键/聚合提取都在短子集上进行，免逐字段
+    // 整行 serde parse ×N（#14/#27 全扫分组热点）。仅顶层简单字段名可走子集（含 ./[ 回退）。
+    let simple_needed = needed.iter().all(|f| !f.contains('.') && !f.contains('['));
     // 复合组键 = 各分组 level 键向量；每组持每聚合列一个累积器（与 specs 对齐）。
     let mut groups: std::collections::HashMap<Vec<GroupKey>, Vec<AggState>> =
         std::collections::HashMap::new();
     let mut scanned = 0u64;
-    engine.scan_stream_fields(start, end, needed, |_docid, doc| {
+    engine.scan_stream_fields(start, end, needed.clone(), |_docid, doc| {
         scanned += 1;
         if scanned % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(
                 "GROUP BY 全量扫描超时（熔断中止）".into(),
             ));
         }
+        // 整行原文 → 子集字节（缺省：非对象/解析失败保持原文，行为与整行路径一致）
+        let mut owned_sub;
+        let work: &[u8] = if simple_needed {
+            match subset_doc_bytes(doc, &needed) {
+                Some(b) => {
+                    owned_sub = b;
+                    &owned_sub
+                }
+                None => doc,
+            }
+        } else {
+            doc
+        };
         if let Some(wh) = &sel.where_expr {
-            let hit = match light_where_matches(doc, wh) {
+            let hit = match light_where_matches(work, wh) {
                 Some(r) => r,
-                None => serde_json::from_slice::<Value>(doc)
+                None => serde_json::from_slice::<Value>(work)
                     .map(|v| wh.matches_doc(&v))
                     .unwrap_or(false),
             };
@@ -482,7 +501,7 @@ pub fn execute_group_by_window(
                 return Ok(true);
             }
         }
-        let key: Vec<GroupKey> = fields.iter().map(|f| group_key_of(doc, f)).collect();
+        let key: Vec<GroupKey> = fields.iter().map(|f| group_key_of(work, f)).collect();
         let states = groups.entry(key).or_insert_with(|| {
             (0..specs.len()).map(|_| AggState::new()).collect()
         });
@@ -490,12 +509,12 @@ pub fn execute_group_by_window(
             let st = &mut states[idx];
             match name.as_str() {
                 "count" => {
-                    if fld.is_none() || field_non_null(doc, fld.as_ref().unwrap()) {
+                    if fld.is_none() || field_non_null(work, fld.as_ref().unwrap()) {
                         st.count += 1;
                     }
                 }
                 _ => {
-                    if let Some(x) = numeric_field(doc, fld.as_ref().unwrap()) {
+                    if let Some(x) = numeric_field(work, fld.as_ref().unwrap()) {
                         st.n_num += 1;
                         st.sum += x;
                         if x < st.min {

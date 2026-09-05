@@ -9,6 +9,41 @@ use crate::sql::parser::{CmpOp, Cond, WhereExpr};
 use roaring::treemap::RoaringTreemap as RoaringBitmap;
 use serde_json::Value;
 
+/// Task-024：单遍只收顶层 `keep` 字段的 JSON 子集（非目标值 `IgnoredAny` 跳过，免整行
+/// 25 列 Value 构造/丢弃与大文本分配）→ 序列化为子集 JSON 字节。缺失字段省略（消费端
+/// “缺失 = NULL”语义与整行路径一致）。仅顶层简单字段名适用；含 `.`/`[` 由调用方回退整行。
+pub(crate) fn subset_doc_bytes(doc: &[u8], keep: &[String]) -> Option<Vec<u8>> {
+    use serde::Deserializer as _;
+    struct Pick<'a> {
+        keep: &'a [String],
+    }
+    impl<'de, 'a> serde::de::Visitor<'de> for Pick<'a> {
+        type Value = serde_json::Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = serde_json::map::Map::new();
+            while let Some(k) = a.next_key::<String>()? {
+                if self.keep.iter().any(|x| x == &k) {
+                    out.insert(k, a.next_value::<serde_json::Value>()?);
+                } else {
+                    let _skip: serde::de::IgnoredAny = a.next_value()?;
+                }
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(doc);
+    de.deserialize_map(Pick { keep })
+        .ok()
+        .and_then(|v| serde_json::to_vec(&v).ok())
+}
+
+
 // ---------------------------------------------------------------------------
 // 求值（引擎版：倒排 posting 位图 + 比较运算扫描过滤）
 // ---------------------------------------------------------------------------
