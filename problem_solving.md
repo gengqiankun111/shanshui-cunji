@@ -1105,6 +1105,23 @@
 - 排期：Task-022 → ✅；剩余 Task-023（#4 IN 批量定位）、Task-024（#29+#14/#27/#11 合并）。
 
 
+### P98. Task-023 主键 IN 稠密/稀疏批量定位（#4，2026-09-05）+ 范围/Per-CPU WAL 排期定稿
+
+- **背景**：`WHERE id IN (50)` 逐条 LSM 随机点查 1.73ms（MySQL 0.46ms = 3.8×）。
+- **改动**：
+  - 引擎（engine/read.rs）：`get_many_pk_in(ids)`——排序去重 → **稠密**（跨度 ≤4×计数，P92 判定）
+    走 `scan_range` 区间顺序读 + 集合过滤（块顺序读 + BlockCache 局部性）；**稀疏**复用 `batch_get`
+    （P2-D 按 SST 块分组）；可见性与 get 一致（删除位图/墓碑隐藏、HotCache/Delta）；
+  - server/command/select.rs `id IN` 读取分支接线（行序保持 IN 列表序、错误吞掉同旧路径）。
+- **测试**：`task023_pk_in_dense_sparse_matches_individual_get`（稠密/稀疏/不存在 id/重复 id/
+  删除隐藏 = 逐条 get 一致）。全量 698（lib 694 + seqlock 4 单独绿）通过。
+- **验收预期**：10 万 #4 pk_in_50 1.73ms → ≤0.5ms（下次复测回填）。
+- **排期定稿（2026-09-05）**：用户判定 Partition Pruning / Parallel Scan 为“金矿”**要开发** →
+  Task-025（剪枝先行 P0、并行扫描阶段 3）；块内索引暂缓、重叠度并入压缩参数；**Per-CPU WAL 可选项
+  默认开启 → Task-026，排在最靠后**；完整设计存 research/range-scan-percpu-wal-design.md。
+- 排期剩余：Task-024（#29+#14/#27/#11 合并）、Task-025（范围提速）、Task-026（Per-CPU WAL，最后）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
