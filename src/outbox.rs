@@ -42,6 +42,29 @@ impl Outbox {
         self.cf.sync_wal()
     }
 
+    /// Task-026：切换到 external WAL（engine 级 per-CPU 队列接管，cf_id=CF_OUTBOX）。
+    pub fn set_external_wal(&mut self, cf_id: u8, cb: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.cf.set_external_wal(cf_id, cb);
+    }
+
+    /// Task-026：engine 队列 WAL 回放（cf=outbox 条目分发到本 CF memtable）。
+    pub fn replay_external(
+        &mut self,
+        recs: &[crate::engine::percpu_wal::WalEntry],
+    ) -> Result<u64> {
+        self.cf.replay_external(recs)
+    }
+
+    /// 强制刷盘 outbox CF（迁移 / 备份一致性准备）。
+    pub fn flush(&mut self) -> Result<()> {
+        self.cf.switch_and_flush()
+    }
+
+    /// outbox CF memtable 字节数（迁移收尾判定：空则不刷，防空 L0 SST）。
+    pub fn memtable_bytes(&self) -> usize {
+        self.cf.memtable_bytes()
+    }
+
     /// 入队（与业务写共享全局 seq 与 fsync 点 → 本地原子）。seq 由 Engine 全局分配。
     pub fn enqueue(&mut self, docid: u64, seq: u64, payload: &[u8]) -> Result<u64> {
         let mut key = encode_docid(docid).to_vec();

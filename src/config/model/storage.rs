@@ -178,8 +178,8 @@ impl Default for StorageConfig {
             compaction_write_rate_window: 8,
             compaction_write_rate_burst: 4,
             composite_indexes: Vec::new(),
-            // Task-026：默认关闭（阶段1 安全回退），核心/恢复完成后翻 true 见 dev_remain。
-            per_cpu_enabled: false,
+            // Task-026：默认开启（2026-09-05 定稿）；false 回退全局组提交（压测对照）。
+            per_cpu_enabled: true,
             per_cpu_queues: 0,
             per_cpu_queue_depth: 4096,
             per_cpu_batch_window_us: 100,

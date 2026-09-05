@@ -13,6 +13,24 @@ use crate::engine::Engine;
 use crate::error::Result;
 use crate::keys::{encode_docid, encode_varlen};
 
+/// Task-026：per-CPU 写入口包裹——分配 gseq → push TLS scope（CF external 写收集条目）→
+/// 执行主体 → pop → 整组路由入队（≤ 窗口由队列消费线程落盘；失败路径已收集条目不丢——
+/// 与既有"WAL 先于 memtable"的崩溃语义一致）。未启用（`percpu=None`）：零开销直通。
+macro_rules! percpu_write {
+    ($self:expr, $body:expr) => {{
+        if $self.percpu.is_some() {
+            let gseq = $self.global_seq.fetch_add(1, Ordering::Relaxed);
+            crate::engine::percpu_wal::push_wal_scope(gseq);
+            let __res = $body;
+            let __scope = crate::engine::percpu_wal::pop_wal_scope();
+            $self.enqueue_scope(__scope)?;
+            return __res;
+        }
+        $body
+    }};
+}
+use crate::engine::percpu_wal::{PerCpuWal, WalScope};
+
 
 /// Ex-9.3 第①步：解析文档 JSON 中声明 stats 字段的数值（与 `stats_fields` 对齐；
 /// 缺字段 / JSON null / 非数值 → None 跳过；文档不可解析 → 全 None）。
@@ -27,10 +45,28 @@ fn engine_doc_stats(fields: &[String], value: &[u8]) -> Vec<Option<f64>> {
 const INVERTED_PENDING_CAP: usize = 8192;
 
 impl Engine {
+    /// 提交写批次 scope（`percpu_write!` 宏在主体执行后调用）：按当前 CPU 路由整组入队。
+    /// scope 为空（无 CF 条目 / 未启用时 None）→ no-op。
+    fn enqueue_scope(&self, scope: Option<WalScope>) -> Result<()> {
+        let Some(scope) = scope else { return Ok(()) };
+        if scope.entries.is_empty() {
+            return Ok(());
+        }
+        if let Some(rt) = &self.percpu {
+            let q = self.per_cpu_wal.route(PerCpuWal::current_cpu());
+            rt.submit(q, scope.entries)?;
+        }
+        Ok(())
+    }
+
     /// 组提交判定（M8）：关闭 → 逐条 fsync（现状强安全）；
     /// 开启 → 写路径零 fsync，由后台提交线程按窗口统一落盘（ack 后最多延迟 ≤ 窗口，
     /// 字节阈值触发也由后台线程判定）——避免写路径与后台线程双份 fsync + 锁竞争。
+    /// Task-026：per-CPU 启用时恒 no-op（每队列消费线程按窗口落盘，组提交线程停用）。
     fn maybe_group_commit(&mut self) -> Result<()> {
+        if self.percpu.is_some() {
+            return Ok(());
+        }
         if self.group_commit.is_none() {
             self.flush_wal()?;
         }
@@ -98,7 +134,13 @@ impl Engine {
     }
 
     /// 批量写入（不逐条 fsync，供亿级压测；结束时调用 `flush_wal` 统一提交）。
+    /// Task-026：per-CPU 启用时以单 gseq 组包裹（跨 CF 条目同组 → 崩溃回放原子）。
     pub fn put_nosync(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
+        percpu_write!(self, self.put_nosync_inner(docid, value, terms))
+    }
+
+    /// put_nosync 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
+    fn put_nosync_inner(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
         // ① 失效 HotCache 该 docid（批量导入模式跳过：只写不读，避免缓存膨胀挤爆内存，P40）
         if !self.skip_hotcache {
             self.hotcache.invalidate(docid);
@@ -212,6 +254,11 @@ impl Engine {
         if let Some(bm) = &self.deletion_bitmap {
             bm.flush()?;
         }
+        // Task-026：per-CPU 运行时——同步排空全部队列 + fsync + checkpoint 持久化/裁剪
+        // （各 CF 自身 sync_wal 在 external 模式为 no-op；强安全语义 = 队列全量落盘）
+        if let Some(rt) = &self.percpu {
+            return rt.flush_all();
+        }
         self.primary.sync_wal()?;
         self.delta.sync_wal()?;
         // Ex-1：outbox 消息与业务写同 fsync 点（本地原子：崩溃恢复按 seq 回放）
@@ -224,6 +271,15 @@ impl Engine {
     /// 强制刷盘主数据 MemTable → SST（测试 / 备份一致性准备用）。
     pub fn flush_primary(&mut self) -> Result<()> {
         self.primary.switch_and_flush()
+    }
+
+    /// Task-026：per-CPU WAL 健康度快照（SHOW STATUS 数据源：队列深度/消费/checkpoint）。
+    pub fn percpu_status(&self) -> String {
+        if let Some(rt) = &self.percpu {
+            format!("{} | {}", self.per_cpu_wal.status(), rt.status())
+        } else {
+            self.per_cpu_wal.status()
+        }
     }
 
     /// DROP TABLE / TRUNCATE（文档库唯一表统一映射 documents）purge：清空引擎全部数据并对齐
@@ -255,6 +311,10 @@ impl Engine {
         self.garbage_draining.store(false, Ordering::Relaxed);
         self.compact_pending.store(false, Ordering::Relaxed);
         self.inverted_gc_pending.store(false, Ordering::Relaxed);
+        // Task-026：per-CPU 队列运行时全清零（队列/文件/checkpoint 水位归零，重启空库可比）
+        if let Some(rt) = &self.percpu {
+            rt.reset_all()?;
+        }
         info!("引擎整库 purge 完成");
         Ok(())
     }
@@ -264,7 +324,13 @@ impl Engine {
     /// Tombstone（版本化，缺陷 B/C4 修复：复活清位后快照读仍能判定删除区间）** + WAL 删除记录
     /// （供增量备份/崩溃回放）。墓碑进入版本链，快照读按 seq 过滤（快照点在删除与复活之间
     /// → 不可见），与 MySQL RR 一致。关闭位图时回退传统 Tombstone 路径。
+    /// Task-026：per-CPU 启用时以单 gseq 组包裹（跨 CF 条目同组 → 崩溃回放原子）。
     pub fn delete(&mut self, docid: u64) -> Result<()> {
+        percpu_write!(self, self.delete_inner(docid))
+    }
+
+    /// delete 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
+    fn delete_inner(&mut self, docid: u64) -> Result<()> {
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.hotcache.invalidate(docid);
         match &self.deletion_bitmap {
@@ -295,7 +361,13 @@ impl Engine {
     /// 组提交关闭时回退单次 `flush_wal`），watchdog 批头检查一次 + 每 4096 行巡检。
     /// 收益：范围删 50 行从「50 次独立 fsync + 50 次 watchdog/热缓存/Delta 开销」降到
     /// 「1 次提交 + 摊销巡检」；语义与逐行 `delete` 完全一致（含删除密度计数、复活清位、快照版本判定）。
+    /// Task-026：per-CPU 启用时整批单 gseq 组（批量原子：崩溃回放整组或跳过，无中间态）。
     pub fn delete_batch<I: Iterator<Item = u64>>(&mut self, docids: I) -> Result<u64> {
+        percpu_write!(self, self.delete_batch_inner(docids))
+    }
+
+    /// delete_batch 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
+    fn delete_batch_inner<I: Iterator<Item = u64>>(&mut self, docids: I) -> Result<u64> {
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         let mut n = 0u64;
         for docid in docids {
@@ -348,7 +420,13 @@ impl Engine {
 
     /// 部分更新（阶段 1.5，design 4.7）：仅写入变更字段到 Delta CF（几十字节小记录），
     /// 读取时 Merge-on-Read 覆盖 Base；`null` 值表示删除该字段。替代全量 PUT，写入 IO 放大趋近 1。
+    /// Task-026：per-CPU 启用时整次 patch 单 gseq 组。
     pub fn patch(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
+        percpu_write!(self, self.patch_inner(docid, fields))
+    }
+
+    /// patch 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
+    fn patch_inner(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
         self.hotcache.invalidate(docid);
         for (f, v) in fields {
             let mut key = encode_docid(docid).to_vec();
@@ -363,7 +441,13 @@ impl Engine {
     /// 入队 outbox 消息（Ex-1.1）：docid + 全局 seq 幂等键，与业务写共享 fsync 点
     /// （`maybe_group_commit`）——崩溃恢复按 seq 回放，消息与业务写本地原子。
     /// 返回幂等键（docid, seq）；outbox 关闭时返回 Err(Unsupported)。
+    /// Task-026：per-CPU 启用时以单 gseq 组包裹（outbox 行随队列窗口落盘）。
     pub fn enqueue_outbox(&mut self, docid: u64, payload: &[u8]) -> Result<(u64, u64)> {
+        percpu_write!(self, self.enqueue_outbox_inner(docid, payload))
+    }
+
+    /// enqueue_outbox 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
+    fn enqueue_outbox_inner(&mut self, docid: u64, payload: &[u8]) -> Result<(u64, u64)> {
         let Some(ob) = &mut self.outbox else {
             return Err(crate::error::Error::Unsupported(
                 "outbox 未启用（config.outbox.enabled = true）".into(),
@@ -377,10 +461,18 @@ impl Engine {
 
     /// 投递器（Ex-1.2）：扫描 pending → 回调投递（true=成功）→ 标记 done。
     /// 返回投递成功数；失败留 pending（调用方退避重试）。投递成功后统一落盘
-    /// （done 状态持久，防重投）。
+    /// （done 状态持久，防重投）。Task-026：整批单 gseq 组 + 批尾 flush_wal（drain 队列）。
     pub fn dispatch_outbox(&mut self, deliver: impl FnMut(&[u8], &[u8]) -> bool) -> Result<usize> {
+        percpu_write!(self, self.dispatch_outbox_inner(deliver))
+    }
+
+    /// dispatch_outbox 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
+    fn dispatch_outbox_inner(
+        &mut self,
+        mut deliver: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<usize> {
         let n = match &mut self.outbox {
-            Some(ob) => ob.dispatch(deliver)?,
+            Some(ob) => ob.dispatch(&mut deliver)?,
             None => 0,
         };
         if n > 0 {

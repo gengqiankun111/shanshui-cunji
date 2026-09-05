@@ -51,6 +51,10 @@ pub struct Engine {
     /// Task-026 Per-CPU WAL（阶段1：配置/路由/队列状态骨架；`per_cpu_enabled=false` 时为
     /// 单队列回退形态，路由零开销）。阶段2 起承载队列后台写线程与独立 WAL 文件。
     pub(crate) per_cpu_wal: crate::engine::percpu_wal::PerCpuWal,
+    /// Task-026 Per-CPU WAL 运行时（`per_cpu_enabled=true` 时 Some）：队列消费线程、
+    /// 独立 `wal-{q}-{gseq_start}.log`、checkpoint（min 各 CF 刷盘水位）/段裁剪。None =
+    /// 走既有全局组提交（零回归）。
+    pub(crate) percpu: Option<std::sync::Arc<crate::engine::percpu_wal::WalRuntime>>,
     /// P2-A：事务 COMMIT 落盘档位（`storage.flush_log_at_trx_commit`）——1 = 每次 COMMIT
     /// `flush_wal`（强安全）；0/2 = COMMIT 走组提交窗口（`maybe_group_commit`：延迟耐久，
     /// 组提交关闭时自动回退强安全）。与 `group_commit`（非事务写窗口）正交。

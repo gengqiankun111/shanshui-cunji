@@ -49,10 +49,16 @@ impl ColumnFamily {
         };
         // P4-A：记录本次 flush 新增 L0 段数 → 写入速率自适应
         self.record_flush_new_l0(new_segments);
-        self.wal.lock().unwrap().set_flushed_seq(flushed_max);
-        // WAL 截断（M8-P5）：append 模式 flush 后全部记录已刷盘，清空 WAL 保持小文件
-        // （避免无限增长 + 大文件 fsync 拖慢写入）；ring 模式自带覆盖回收（no-op）
-        self.wal.lock().unwrap().truncate_and_reset()?;
+        // Task-026 external WAL：无自持文件——flush 完成即推进 engine 侧 CF 水位
+        // （checkpoint = min(各 CF 水位)，队列段裁剪依据）
+        if self.external_wal {
+            self.report_flushed(flushed_max);
+        } else {
+            self.wal.lock().unwrap().set_flushed_seq(flushed_max);
+            // WAL 截断（M8-P5）：append 模式 flush 后全部记录已刷盘，清空 WAL 保持小文件
+            // （避免无限增长 + 大文件 fsync 拖慢写入）；ring 模式自带覆盖回收（no-op）
+            self.wal.lock().unwrap().truncate_and_reset()?;
+        }
         Ok(())
     }
 

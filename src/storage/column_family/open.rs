@@ -238,6 +238,9 @@ impl ColumnFamily {
             next_sst_id: AtomicU64::new(next_sst_id),
             wal: Arc::new(Mutex::new(wal)),
             external_seq: None,
+            external_wal: false,
+            external_cf_id: 0,
+            flushed_cb: None,
         };
 
         // WAL 回放（幂等：以 seq 排序重放，同 key 后写覆盖先写）
@@ -277,6 +280,37 @@ impl ColumnFamily {
             self.seq.store(max_seq + 1, Ordering::Relaxed);
             info!(
                 "列族 [{}] WAL 回放 {} 条，seq 推进至 {}",
+                self.name,
+                recs.len(),
+                max_seq + 1
+            );
+        }
+        Ok(max_seq)
+    }
+
+    /// Task-026：engine 级队列 WAL 回放（external 模式；恢复按 gseq 归并后分发到各 CF）。
+    /// 与 `replay_records` 同语义（TTL 过期过滤、幂等覆盖），但记录来自 per-CPU 队列文件
+    /// （调用方已按目标 CF 过滤）。返回已回放最大 gseq。
+    pub fn replay_external(&self, recs: &[crate::engine::percpu_wal::WalEntry]) -> Result<u64> {
+        let mut max_seq = 0u64;
+        for r in recs {
+            match r.op {
+                OP_PUT => {
+                    if let Some(v) = &r.value {
+                        if !self.is_ttl_expired(v) {
+                            self.memtable.put(r.key.clone(), r.gseq, v.clone());
+                        }
+                    }
+                }
+                OP_DELETE => self.memtable.delete(r.key.clone(), r.gseq),
+                other => return Err(Error::Corrupted(format!("队列 WAL 未知 op {other}"))),
+            }
+            max_seq = max_seq.max(r.gseq);
+        }
+        if !recs.is_empty() {
+            self.seq.store(max_seq + 1, Ordering::Relaxed);
+            info!(
+                "列族 [{}] 队列 WAL 回放 {} 条，seq 推进至 {}",
                 self.name,
                 recs.len(),
                 max_seq + 1

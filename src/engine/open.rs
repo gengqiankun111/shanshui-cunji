@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::bitmap::DeletionBitmap;
 use crate::column_family::ColumnFamily;
 use crate::config::model::Config;
+use crate::engine::percpu_wal::{WalRuntime, CF_PRIMARY};
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::hotcache::HotCache;
@@ -43,6 +44,10 @@ pub struct BackupReport {
 /// 组提交（M8）清理：停后台兜底线程并 join，最终落盘待刷 WAL（保证正常退出不丢窗口尾部）。
 impl Drop for Engine {
     fn drop(&mut self) {
+        // Task-026：per-CPU 运行时停机——stop 消费线程 → join（尾部已排空）→ 终态 checkpoint
+        if let Some(rt) = &self.percpu {
+            rt.shutdown();
+        }
         if let Some(stop) = &self.gc_stop {
             stop.store(true, Ordering::Relaxed);
         }
@@ -107,7 +112,7 @@ impl Engine {
             }
         };
         #[cfg(target_os = "linux")]
-        let primary = {
+        let mut primary = {
             let mut cf = ColumnFamily::open_with_io_uring(
                 "primary",
                 &sst_root.join("primary"),
@@ -120,7 +125,7 @@ impl Engine {
             Arc::new(cf)
         };
         #[cfg(not(target_os = "linux"))]
-        let primary = {
+        let mut primary = {
             let mut cf = ColumnFamily::open_with_wal_dir(
                 "primary",
                 &sst_root.join("primary"),
@@ -153,7 +158,7 @@ impl Engine {
         if cfg.storage.io_rate_limit_mb > 0 {
             inverted.attach_io_budget(cfg.storage.io_rate_limit_mb * 1024 * 1024);
         }
-        let cidx = {
+        let mut cidx = {
             // V 项：Linux + 启用时注入 io_uring 池（cidx 可选 CF，失败容忍）
             #[cfg(target_os = "linux")]
             {
@@ -178,7 +183,7 @@ impl Engine {
         .ok()
         .map(Arc::new);
         #[cfg(target_os = "linux")]
-        let delta = Arc::new(ColumnFamily::open_with_io_uring(
+        let mut delta = Arc::new(ColumnFamily::open_with_io_uring(
             "delta",
             &sst_root.join("delta"),
             Some(wal_root),
@@ -186,7 +191,7 @@ impl Engine {
             iou.clone(),
         )?);
         #[cfg(not(target_os = "linux"))]
-        let delta = Arc::new(ColumnFamily::open_with_wal_dir(
+        let mut delta = Arc::new(ColumnFamily::open_with_wal_dir(
             "delta",
             &sst_root.join("delta"),
             Some(wal_root),
@@ -205,19 +210,38 @@ impl Engine {
             .map(|b| b.deleted_count())
             .unwrap_or(0);
         // 本地消息表（Ex-1）：开启时打开 outbox 列族（数据盘，与 primary 同崩溃安全模型）
-        let outbox = if cfg.outbox.enabled {
+        let mut outbox = if cfg.outbox.enabled {
             Some(Outbox::open(&sst_root.join("outbox"), cfg)?)
         } else {
             None
         };
-        // MVCC 全局 seq（M7-1）：以各列族 WAL 恢复后的 next_seq 取最大作为全局起点，
-        // 此后 primary / delta / outbox 写入共享同一计数器（跨列族快照隔离正确）。
-        let global_seq = Arc::new(AtomicU64::new(
-            primary
-                .wal_next_seq()
-                .max(delta.wal_next_seq())
-                .max(outbox.as_ref().map_or(0, |o| o.wal_next_seq())),
-        ));
+        // Task-026（`per_cpu_enabled`）：engine 级队列 WAL 接管各 CF 持久化。
+        // - 构建队列运行时（每队列独立文件/消费线程/checkpoint）；
+        // - CF 切 external（写收集走 TLS scope；flush 完成回调推进刷盘水位）；
+        // - 旧自身 WAL 残留（迁移期）→ 强制 flush 落 SST（此后不依赖旧文件）；
+        // - 队列文件 gseq 全局归并回放（> checkpoint）到各 CF memtable；
+        // - global_seq 以 checkpoint/队列 max/旧 WAL next_seq 取大续接。
+        let per_cpu_enabled = cfg.storage.per_cpu_enabled;
+        let mut percpu: Option<Arc<WalRuntime>> = None;
+        let global_seq: Arc<AtomicU64> = if per_cpu_enabled {
+            let (gs, rt) = Self::prepare_per_cpu_open(
+                cfg,
+                &wal_root,
+                &mut primary,
+                &mut delta,
+                &mut cidx,
+                &mut outbox,
+            )?;
+            percpu = Some(rt);
+            gs
+        } else {
+            Arc::new(AtomicU64::new(
+                primary
+                    .wal_next_seq()
+                    .max(delta.wal_next_seq())
+                    .max(outbox.as_ref().map_or(0, |o| o.wal_next_seq())),
+            ))
+        };
         // P72：open 阶段 worker 尚未 clone Arc → get_mut 唯一引用可行（此后 CF 内部 &self 维护）
         let mut primary = primary;
         Arc::get_mut(&mut primary)
@@ -241,6 +265,7 @@ impl Engine {
             global_seq,
             group_commit: None,
             per_cpu_wal: crate::engine::percpu_wal::PerCpuWal::resolve(cfg),
+            percpu,
             gc_stop: None,
             gc_thread: None,
             flush_log_at_trx_commit: cfg.storage.flush_log_at_trx_commit,
@@ -316,8 +341,143 @@ impl Engine {
         }
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
-        engine.start_group_commit(cfg);
+        // Task-026：per-CPU 启用 → 每队列消费线程启动（替代组提交后台线程）。
+        if engine.percpu.is_some() {
+            engine.percpu.as_ref().unwrap().start()?;
+        } else {
+            engine.start_group_commit(cfg);
+        }
         Ok(engine)
+    }
+
+    /// Task-026：per-CPU WAL 打开准备（`per_cpu_enabled=true` 分支；设计
+    /// research/percpu-wal-stage2-design.md §3/§4）。步骤：
+    /// 1. 构建队列运行时，加载持久化 checkpoint 作为水位下限；
+    /// 2. CF 切 external（写经 TLS scope 收集；flush 完成回调推进刷盘水位）;
+    ///    不存在的 CF（cidx/outbox 关闭）水位标记 +∞（不约束 cp）；
+    /// 3. 旧自身 WAL 回放进 memtable 的残留（迁移期）→ 强制 flush 落 SST；
+    /// 4. 队列文件 gseq 全局归并回放（> checkpoint）到各 CF memtable；
+    /// 5. global_seq = max(checkpoint+1, 队列 max+1, 旧 WAL next_seq) 续接。
+    fn prepare_per_cpu_open(
+        cfg: &Config,
+        wal_root: &Path,
+        primary: &mut Arc<ColumnFamily>,
+        delta: &mut Arc<ColumnFamily>,
+        cidx: &mut Option<Arc<ColumnFamily>>,
+        outbox: &mut Option<Outbox>,
+    ) -> Result<(Arc<AtomicU64>, Arc<WalRuntime>)> {
+        use crate::engine::percpu_wal::{CF_CIDX, CF_DELTA, CF_OUTBOX, CF_PRIMARY};
+        let pc = crate::engine::percpu_wal::PerCpuWal::resolve(cfg);
+        let rt = Arc::new(WalRuntime::build(
+            wal_root.join("percpu-wal"),
+            pc.queues,
+            pc.depth,
+            pc.window_us,
+        ));
+        // 持久化 checkpoint = 已收敛下限（此前已刷盘数据不回退重放）
+        let cp = rt.load_checkpoint();
+        rt.cp.store(cp, Ordering::Relaxed);
+        for w in rt.cf_watermarks.iter() {
+            w.store(cp, Ordering::Relaxed);
+        }
+        if cidx.is_none() {
+            rt.mark_cf_absent(CF_CIDX);
+        }
+        if outbox.is_none() {
+            rt.mark_cf_absent(CF_OUTBOX);
+        }
+        // CF 切 external + 刷盘水位回调
+        {
+            let cb: Arc<dyn Fn(u64) + Send + Sync> = {
+                let rt = Arc::clone(&rt);
+                Arc::new(move |m| rt.note_flush(CF_PRIMARY, m))
+            };
+            Arc::get_mut(primary)
+                .ok_or_else(|| crate::error::Error::Unsupported("primary Arc 非唯一".into()))?
+                .set_external_wal(CF_PRIMARY, cb);
+        }
+        {
+            let cb: Arc<dyn Fn(u64) + Send + Sync> = {
+                let rt = Arc::clone(&rt);
+                Arc::new(move |m| rt.note_flush(CF_DELTA, m))
+            };
+            Arc::get_mut(delta)
+                .ok_or_else(|| crate::error::Error::Unsupported("delta Arc 非唯一".into()))?
+                .set_external_wal(CF_DELTA, cb);
+        }
+        if let Some(c) = cidx.as_mut() {
+            let cb: Arc<dyn Fn(u64) + Send + Sync> = {
+                let rt = Arc::clone(&rt);
+                Arc::new(move |m| rt.note_flush(CF_CIDX, m))
+            };
+            Arc::get_mut(c)
+                .ok_or_else(|| crate::error::Error::Unsupported("cidx Arc 非唯一".into()))?
+                .set_external_wal(CF_CIDX, cb);
+        }
+        if let Some(ob) = outbox.as_mut() {
+            let cb: Arc<dyn Fn(u64) + Send + Sync> = {
+                let rt = Arc::clone(&rt);
+                Arc::new(move |m| rt.note_flush(CF_OUTBOX, m))
+            };
+            ob.set_external_wal(CF_OUTBOX, cb);
+        }
+        // 迁移收尾：旧自身 WAL 回放进 memtable 的残留 → 强制刷盘落 SST（此后不依赖旧文件；
+        // 空 memtable 不刷——空 flush 会产出空 L0 SST，污染紧凑度/GC 调度）
+        if primary.memtable_bytes() > 0 {
+            primary.switch_and_flush()?;
+        }
+        if delta.memtable_bytes() > 0 {
+            delta.switch_and_flush()?;
+        }
+        if let Some(c) = cidx.as_ref() {
+            if c.memtable_bytes() > 0 {
+                c.switch_and_flush()?;
+            }
+        }
+        if let Some(ob) = outbox.as_mut() {
+            if ob.memtable_bytes() > 0 {
+                ob.flush()?;
+            }
+        }
+        // 队列文件 gseq 全局归并回放（> checkpoint）
+        let since = rt.cp.load(Ordering::Relaxed);
+        let entries = rt.records_after(since)?;
+        let mut max_g = since;
+        if !entries.is_empty() {
+            let mut by_cf: [Vec<crate::engine::percpu_wal::WalEntry>; 4] =
+                std::array::from_fn(|_| Vec::new());
+            for e in &entries {
+                if (e.cf as usize) < 4 {
+                    by_cf[e.cf as usize].push(e.clone());
+                }
+                max_g = max_g.max(e.gseq);
+            }
+            primary.replay_external(&by_cf[CF_PRIMARY as usize])?;
+            delta.replay_external(&by_cf[CF_DELTA as usize])?;
+            if let Some(c) = cidx.as_ref() {
+                c.replay_external(&by_cf[CF_CIDX as usize])?;
+            }
+            if let Some(ob) = outbox.as_mut() {
+                ob.replay_external(&by_cf[CF_OUTBOX as usize])?;
+            }
+            // 播种入队水位：已回放未刷条目约束 cp（防裁剪越过 memtable 中未刷数据）
+            for cf in [CF_PRIMARY, CF_DELTA, CF_CIDX, CF_OUTBOX] {
+                if let Some(last) = by_cf[cf as usize].last() {
+                    rt.note_enqueued(cf, last.gseq);
+                }
+            }
+        }
+        // global_seq 起点：checkpoint+1 / 队列 max+1 / 旧 WAL next_seq 取大
+        let next = cp
+            .saturating_add(1)
+            .max(max_g.saturating_add(1))
+            .max(primary.wal_next_seq())
+            .max(delta.wal_next_seq())
+            .max(cidx.as_ref().map_or(0, |c| c.wal_next_seq()))
+            .max(outbox.as_ref().map_or(0, |o| o.wal_next_seq()));
+        rt.persist_checkpoint()?;
+        rt.trim_segments();
+        Ok((Arc::new(AtomicU64::new(next)), rt))
     }
 
     /// 启动组提交（M8）：窗口 + 字节阈值触发；spawn 后台线程兜底窗口尾部落盘。
@@ -376,7 +536,28 @@ impl Engine {
         // 组提交（M8）前置落盘：保证导出的 WAL 记录已持久化（否则崩溃恢复可能丢失 → 备份与恢复不一致）
         self.flush_wal()?;
         let until_seq = self.current_seq();
-        let (oldest, records) = self.primary.wal_records_since(since_seq)?;
+        // Task-026：per-CPU 模式从队列文件取（primary 记录；恢复回放按 engine put/delete 语义）
+        let (oldest, records) = if let Some(rt) = &self.percpu {
+            let mut es: Vec<crate::wal::WalRecord> = rt
+                .records_after(since_seq)?
+                .into_iter()
+                .filter(|e| e.cf == CF_PRIMARY)
+                .map(|e| crate::wal::WalRecord {
+                    seq: e.gseq,
+                    op: e.op,
+                    key: e.key,
+                    value: e.value,
+                })
+                .collect();
+            let oldest = es.iter().map(|r| r.seq).min().unwrap_or(u64::MAX);
+            // records_after 按 gseq 升序（CF 过滤后仍升序）
+            if oldest == u64::MAX {
+                es.clear();
+            }
+            (oldest, es)
+        } else {
+            self.primary.wal_records_since(since_seq)?
+        };
         if since_seq != 0 && oldest > since_seq + 1 {
             return Err(crate::error::Error::Unsupported(format!(
                 "增量备份缺口：可用 WAL 最旧 seq {oldest} > 上次备份点 {since_seq}+1，请先做全量备份"

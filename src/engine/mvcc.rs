@@ -12,8 +12,10 @@ use crate::keys::encode_docid;
 
 impl Engine {
     /// 获取当前快照点（已分配的最大 seq）：此后以该值为快照的 `get_at` 读到一致视图。
+    /// Task-026：per-CPU external WAL 下 CF 自身 wal 不推进 → 以 engine 全局 seq 为准
+    /// （= 已分配最大 gseq；与 `current_seq` 同源）。
     pub fn begin_snapshot(&self) -> u64 {
-        self.primary.wal_next_seq().saturating_sub(1)
+        self.global_seq.load(Ordering::Relaxed).saturating_sub(1)
     }
 
     /// R4：注册活跃快照 seq（RR/Serializable 事务 begin 时调用；commit/rollback 注销）。

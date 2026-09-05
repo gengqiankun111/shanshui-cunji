@@ -216,6 +216,24 @@ impl ColumnFamily {
         self.external_seq = Some(seq);
     }
 
+    /// Task-026：切换到 external WAL（engine 级 per-CPU 队列接管本 CF 持久化）。
+    /// - `cf_id`：本 CF 编号（WalEntry.cf）；
+    /// - `flushed_cb`：flush 完成后回调（已刷盘最大 gseq → engine checkpoint 推进）。
+    /// 此后写路径不再 append 自身 WalBackend，改经 engine 写批次 scope 收集；
+    /// `sync_wal` 变 no-op（持久性由队列窗口/`flush_wal` 承担）。internal（默认）不受影响。
+    pub fn set_external_wal(&mut self, cf_id: u8, flushed_cb: Arc<dyn Fn(u64) + Send + Sync>) {
+        self.external_wal = true;
+        self.external_cf_id = cf_id;
+        self.flushed_cb = Some(flushed_cb);
+    }
+
+    /// external 模式下上报刷盘水位（switch_and_flush 完成回调）。
+    pub(crate) fn report_flushed(&self, max_gseq: u64) {
+        if let Some(cb) = &self.flushed_cb {
+            cb(max_gseq);
+        }
+    }
+
     /// M3（§26 多表）：开启按表切分输出（仅主数据列族调用——全键为 docid 定长 8 字节，
     /// 高位 table_id 边界即文件边界；cidx 组合键 / outbox 等不定长键列族必须保持关闭）。
     pub fn enable_table_split(&mut self) {

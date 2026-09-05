@@ -174,7 +174,10 @@ use crate::optimizer::QuerySpec;
     }
 
     fn gc_cfg(window_us: u64) -> Config {
+        // 组提交（M8）机制本体测试：Task-026 默认开启 per-CPU WAL 会替代组提交线程 →
+        // 这些 legacy 机制测试显式关闭 per-CPU（Engine 全量默认路径另由 percpu_tests 覆盖）
         let mut c = cfg();
+        c.storage.per_cpu_enabled = false;
         c.storage.group_commit_us = window_us;
         c
     }
@@ -1480,9 +1483,11 @@ use crate::optimizer::QuerySpec;
     fn group_commit_default_enabled_drop_persists_tail() {
         // 组提交默认开（1000µs，Task-005 采纳）：drop 时窗口尾批必须 flush，
         // 重开数据完整（崩溃恢复语义：进程内正常关闭不丢尾批）
+        // Task-026：本测试验证**既有组提交机制**（per-CPU WAL 默认开启时代替该线程）
         let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.storage.per_cpu_enabled = false; // 组提交机制本体（legacy 路径）
         {
-            let c = cfg();
             assert_eq!(c.storage.group_commit_us, 1000, "默认组提交窗口应为 1000µs");
             let mut e = Engine::open(dir.path(), &c).unwrap();
             assert!(e.group_commit.is_some(), "默认应开启组提交");
@@ -1490,7 +1495,7 @@ use crate::optimizer::QuerySpec;
                 e.put(i, format!("doc-{i}").into_bytes(), &["t"]).unwrap();
             }
         }
-        let mut e2 = Engine::open(dir.path(), &cfg()).unwrap();
+        let mut e2 = Engine::open(dir.path(), &c).unwrap();
         assert_eq!(e2.get(49).unwrap().unwrap(), b"doc-49");
     }
 
@@ -2745,7 +2750,10 @@ use crate::optimizer::QuerySpec;
 
     #[test]
     fn composite_prefix_query() {
-        let mut e = Engine::open(&tmp(), &cfg()).unwrap();
+        // 直接向 cidx CF 注入索引条目的夹具（绕过 engine 写路径）→ legacy 模式
+        let mut c = cfg();
+        c.storage.per_cpu_enabled = false;
+        let mut e = Engine::open(&tmp(), &c).unwrap();
         // 组合索引：写入索引条目（key = composite(fields, docid)）
         if let Some(cidx) = &mut e.cidx {
             for docid in [10u64, 20, 30] {

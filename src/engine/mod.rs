@@ -23,7 +23,7 @@ mod compact;
 mod engine;
 mod mvcc;
 mod open;
-mod percpu_wal;
+pub(crate) mod percpu_wal;
 mod query;
 mod read;
 mod scan;
@@ -32,6 +32,8 @@ mod write;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod percpu_tests;
 
 pub use compact::CompactTargets;
 pub use engine::{Engine, EngineStats, PagedRows, QueryRow};

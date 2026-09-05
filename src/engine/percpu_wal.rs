@@ -500,6 +500,9 @@ pub(crate) struct WalRuntime {
     pub(crate) cp: AtomicU64,
     /// 各 CF 已刷盘水位（索引 = WalEntry.cf；flush 完成回调推进）。
     pub(crate) cf_watermarks: [AtomicU64; 4],
+    /// 各 CF 曾入队最大 gseq（submit/回放播种）：从未入队（last=0）的 CF 不约束 cp
+    /// （无其条目可回放/丢失 → 视作 +∞，避免空转 CF 把 checkpoint 钉死在 0）。
+    pub(crate) last_enqueued: [AtomicU64; 4],
     /// 已持久化 checkpoint（重启恢复回放起点）。
     persisted_cp: AtomicU64,
     checkpoint_path: PathBuf,
@@ -520,6 +523,7 @@ impl WalRuntime {
             queues: (0..queues).map(QueueInner::new).collect(),
             cp: AtomicU64::new(0),
             cf_watermarks: std::array::from_fn(|_| AtomicU64::new(0)),
+            last_enqueued: std::array::from_fn(|_| AtomicU64::new(0)),
             persisted_cp: AtomicU64::new(0),
             checkpoint_path: dir.join("checkpoint.json"),
             trim: TrimState::new(),
@@ -553,13 +557,36 @@ impl WalRuntime {
         Ok(())
     }
 
-    /// CF flush 完成回调：推进该 CF 水位并重算 checkpoint（cp = min(各 CF 水位)）。
+    /// CF flush 完成回调：推进该 CF 水位并重算 checkpoint（cp = min(各 CF 水位)；
+    /// 从未入队的 CF 不约束 → 空转/只读 CF 不把 cp 钉死在 0）。
     pub fn note_flush(&self, cf: u8, flushed_max: u64) {
         if (cf as usize) < self.cf_watermarks.len() {
             self.cf_watermarks[cf as usize].fetch_max(flushed_max, Ordering::Relaxed);
         }
-        let cp = self.cf_watermarks.iter().map(|w| w.load(Ordering::Relaxed)).min().unwrap_or(0);
-        self.cp.store(cp, Ordering::Relaxed);
+        self.recompute_cp();
+    }
+
+    /// 播种"该 CF 曾入队最大 gseq"（submit 自动维护；恢复回放后调用 → 已回放未刷条目
+    /// 参与 cp 约束，防裁剪越过未刷数据）。从未入队的 CF 保持 0（不约束 cp）。
+    pub fn note_enqueued(&self, cf: u8, gseq: u64) {
+        if (cf as usize) < self.last_enqueued.len() {
+            self.last_enqueued[cf as usize].fetch_max(gseq, Ordering::Relaxed);
+        }
+    }
+
+    /// 重算 cp：`cp = min(各 CF 约束)`，约束 = 有入队历史 CF 的已刷盘水位
+    /// （未刷=0 → 钉住 0）；无入队历史 CF 视作 +∞。
+    pub fn recompute_cp(&self) {
+        let mut m = u64::MAX;
+        for c in 0..4 {
+            let l = self.last_enqueued[c].load(Ordering::Relaxed);
+            if l == 0 {
+                continue; // 无该 CF 条目 → 不约束
+            }
+            let w = self.cf_watermarks[c].load(Ordering::Relaxed);
+            m = m.min(w);
+        }
+        self.cp.store(if m == u64::MAX { 0 } else { m }, Ordering::Relaxed);
     }
 
     /// 标记某 CF 不存在（engine 未打开，如 cidx/outbox 关闭）：不参与 checkpoint 约束
@@ -585,10 +612,14 @@ impl WalRuntime {
         *segs = keep;
     }
 
-    /// 路由入队（engine 写入口；当前 CPU → queue）。
+    /// 路由入队（engine 写入口；当前 CPU → queue）。顺带维护各 CF 入队水位
+    /// （cp 约束输入：从未入队的 CF 不钉死 checkpoint）。
     pub(crate) fn submit(&self, q: usize, entries: Vec<WalEntry>) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
+        }
+        for e in &entries {
+            self.note_enqueued(e.cf, e.gseq);
         }
         self.queues[q].enqueue(entries, self.depth_cap)
     }
@@ -613,7 +644,8 @@ impl WalRuntime {
     }
 
     /// 启动每队列消费线程（窗口批量写盘 + fsync；Drop/显式关闭前 `shutdown`）。
-    pub fn start(&mut self) -> Result<()> {
+    /// `&self`：句柄可经 Arc 共享（CF 刷盘回调 / 消费线程克隆），线程句柄存内部 Mutex。
+    pub fn start(&self) -> Result<()> {
         if self.started.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
@@ -677,9 +709,39 @@ impl WalRuntime {
         let _ = self.flush_all();
     }
 
+    /// DROP TABLE / TRUNCATE（purge_all）对齐：丢弃全部队列条目与文件，checkpoint 归零。
+    pub fn reset_all(&self) -> Result<()> {
+        for qi in &self.queues {
+            let _ = qi.drain();
+            qi.depth.store(0, Ordering::Relaxed);
+            qi.consumed.store(0, Ordering::Relaxed);
+            if let Some(w) = qi.writer.lock().unwrap().take() {
+                let _ = w.close();
+            }
+        }
+        self.trim.segs.lock().unwrap().clear();
+        if self.dir.exists() {
+            for e in std::fs::read_dir(&self.dir)? {
+                let p = e?.path();
+                if parse_queue_file_name(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).is_some() {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        for w in &self.cf_watermarks {
+            w.store(0, Ordering::Relaxed);
+        }
+        self.cp.store(0, Ordering::Relaxed);
+        self.persist_checkpoint()?;
+        Ok(())
+    }
+
     /// 恢复用：读取全部队列文件，返回 `gseq > since` 的条目（gseq 全局归并，组序稳定）。
     pub fn records_after(&self, since: u64) -> Result<Vec<WalEntry>> {
         let mut all: Vec<WalEntry> = Vec::new();
+        if !self.dir.exists() {
+            return Ok(all); // 尚无队列文件（首次 external 打开/全空）
+        }
         let entries = std::fs::read_dir(&self.dir)?;
         for e in entries.flatten() {
             let p = e.path();
@@ -714,8 +776,8 @@ mod tests {
 
     #[test]
     fn percpu_resolve_disabled_is_single_queue() {
-        let c = Config::default();
-        assert!(!c.storage.per_cpu_enabled, "阶段1 默认关闭（安全回退）");
+        let mut c = Config::default();
+        c.storage.per_cpu_enabled = false; // 显式回退（Task-026 定稿后默认开启）
         let w = PerCpuWal::resolve(&c);
         assert_eq!(w.queues, 1);
         assert_eq!(w.route(None), 0);

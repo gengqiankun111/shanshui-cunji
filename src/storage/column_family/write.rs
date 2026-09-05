@@ -43,7 +43,12 @@ impl ColumnFamily {
 
     /// 统一提交 WAL 缓冲（批量写入结束时调用）。
     /// 环形 WAL 落盘若需回绕覆盖未刷盘记录 → 强制 Flush 后重试。
+    /// Task-026 external WAL：本 CF 无自持文件 → no-op（持久性由 engine 队列窗口/
+    /// `flush_wal` 承担；单写线程串行保证调用序即提交序）。
     pub fn sync_wal(&self) -> Result<()> {
+        if self.external_wal {
+            return Ok(());
+        }
         let r = self.wal.lock().unwrap().sync();
         match r {
             Ok(()) => Ok(()),
@@ -107,7 +112,11 @@ impl ColumnFamily {
     }
 
     /// 环形 WAL 满处理：先落盘缓冲；仍满（回绕需覆盖未刷盘记录）则强制 Flush 后重试。
+    /// Task-026 external WAL：无自持环形文件 → no-op。
     fn ensure_wal_room(&self) -> Result<()> {
+        if self.external_wal {
+            return Ok(());
+        }
         let r = self.wal.lock().unwrap().sync();
         match r {
             Ok(()) => Ok(()),
@@ -135,7 +144,19 @@ impl ColumnFamily {
         Ok(deleted)
     }
     /// 分配 seq 并追加 WAL 记录：外部全局 seq 优先（engine MVCC），否则内部自增。
+    /// Task-026 external WAL：不 append 自身 WalBackend——把 (op,key,value) 交给 engine
+    /// 写批次 TLS scope（`wal_collect`，组 gseq），返回组 gseq 供 memtable 定序。
+    /// 无活动 scope = 调用方未走 engine 写入口（external 模式禁止）→ Err 防静默丢数据。
     fn wal_append(&self, op: u8, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
+        if self.external_wal {
+            let gseq = crate::engine::percpu_wal::wal_collect(self.external_cf_id, op, key, value)
+                .ok_or_else(|| {
+                    Error::Unsupported(
+                        "external_wal 写路径缺少 engine 写批次 scope（Task-026）".into(),
+                    )
+                })?;
+            return Ok(gseq);
+        }
         match &self.external_seq {
             Some(ext) => {
                 let seq = ext.fetch_add(1, Ordering::Relaxed);

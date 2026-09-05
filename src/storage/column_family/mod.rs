@@ -177,6 +177,16 @@ pub struct ColumnFamily {
     /// 外部全局 seq（MVCC，engine 层统一分配，M7-1）：Some 时写入走外部计数（跨列族一致）；
     /// None = 独立列族（测试 / 单 CF 场景）用内部 WAL seq。
     external_seq: Option<Arc<AtomicU64>>,
+    /// Task-026 external WAL（research/percpu-wal-stage2-design.md 方案 A）：true 时本 CF
+    /// **不再自持磁盘 WAL**——写路径把 (op,key,value) 交给 engine 写批次 TLS scope
+    /// （`wal_collect`，组 gseq），持久化由 engine 级 per-CPU 队列接管。false（默认）逐字节
+    /// 保持既有行为（自身 WalBackend append/组提交）。Engine 按 `per_cpu_enabled` 打开后设置。
+    external_wal: bool,
+    /// external 模式下本 CF 编号（WalEntry.cf；primary=0/delta=1/cidx=2/outbox=3）。
+    external_cf_id: u8,
+    /// 刷盘水位回调：flush 完成后上报本 CF 已刷盘最大 gseq（engine 侧推进 checkpoint =
+    /// min(各 CF 水位)，供队列段裁剪）。None（internal 模式）= 不回调。
+    flushed_cb: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// Compaction 结果报告（design 4.5 阶段 3 / 二期 Leveled，M6-2）。
