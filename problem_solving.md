@@ -1086,6 +1086,25 @@
   根因转化 + 残余/内存观察）；一键复跑脚本 `user_guide/宽表SQL对比-基准.ps1`。
 
 
+### P97. Task-022 点查/IN 投影列解码瘦身（#2/#3/#9，2026-09-05）
+
+- **背景**：点查 `SELECT 10 列`（0.46ms）比 `SELECT*`（0.22ms）慢 2×——旧路径整行 parse 全量
+  Object（含超长 txt/desc 列）后逐字段取 cell，解码开销随整行列数而非投影列数；P86② 字节级
+  提取基建仅接排序/Top-K/聚合，协议输出层（build_result_set）未接。
+- **改动**（server/protocol/response.rs）：
+  - 新增 `stream_projected_map`：单遍 serde MapAccess **只收目标顶层字段**（非目标值以
+    `IgnoredAny` 跳过，免构造/丢弃 25 列 Value 与大文本分配）；
+  - `build_result_set` 含字段列时改走子集流式；**点号/下标嵌套投影**（addr.city / arr[0]，
+    doc_field_kind_cell 深查）自动回退整行 parse（语义不变）；SELECT id/doc 纯列零解析直通保持
+    （#1 不回退）；列类型推断/聚合（FieldAgg）不变。
+- **测试**：`task022_stream_projection_matches_full_parse_semantics`（缺失/null/嵌套/数组/超长
+  非目标文本/转义 → 子集 cell 与整行 parse 逐字节一致）、`task022_select_star_keeps_raw_bytes_no_parse`
+  （直通原字节）；全量 697（lib 693 + seqlock 4 单独绿；seqlock 低频写重试率为**既有并发调度
+  偶发**，满载下偶失败、单独跑 4/4 通过，与本次无关）。
+- **验收预期**：10 万 #2 pk_point_proj10 0.46ms → ≤0.22ms（#3/#9 同步受益，下次复测回填）。
+- 排期：Task-022 → ✅；剩余 Task-023（#4 IN 批量定位）、Task-024（#29+#14/#27/#11 合并）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

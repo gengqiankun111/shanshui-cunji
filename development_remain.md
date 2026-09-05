@@ -59,6 +59,10 @@ Task-022：点查/IN 投影列解码瘦身（#2 pk_point_proj10 2.9× / #3 pk_in
 
 - 10 万 #2 pk_point_proj10 0.46ms → ≤0.22ms（= #1 SELECT* 量级）；#3/#9 同步受益不回退
 - 全量回归通过
+> ✅ 已完成（2026-09-05，P97）：server/protocol/response.rs `stream_projected_map`（单遍 MapAccess
+> 只收目标顶层字段，非目标 IgnoredAny 跳过）接入 build_result_set；点号/下标嵌套投影回退整行
+> parse（语义不变）；SELECT id/doc 纯列零解析直通保持。单测：子集 = 整行 parse 逐字节等值
+> （缺失/null/嵌套/转义/长文本）+ 直通回归；全量 697（lib 693+seqlock 4 单独绿）通过。
 
 Task-023：主键 IN 列表批量定位（#4 pk_in_50 1.73ms vs MySQL 0.46ms = 3.8×）
 
