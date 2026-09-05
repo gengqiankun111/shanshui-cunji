@@ -9,6 +9,45 @@ use std::net::TcpStream;
 use crate::error::Result;
 use crate::server::*;
 
+/// Task-022：单遍 MapAccess **只收目标顶层字段**的 JSON 子集提取——未请求字段用
+/// `IgnoredAny` 跳过（免为整行 25 列构造/丢弃 Value 与超长文本分配），替代
+/// “整行 parse 全量 Object 后逐字段取”。语义与整行路径逐字节一致：
+/// - 缺失字段不进子集 → 消费端按“缺失 = NULL”处理（与原整行 lookup 一致）；
+/// - null / 嵌套对象数组 / 数字文本化均由消费端按 Value 同路径生成（结果不变）。
+fn stream_projected_map(
+    doc: &[u8],
+    wanted: &std::collections::HashSet<&str>,
+) -> Option<serde_json::Value> {
+    use serde::Deserializer as _;
+    struct Pick<'a> {
+        wanted: &'a std::collections::HashSet<&'a str>,
+    }
+    impl<'de, 'a> serde::de::Visitor<'de> for Pick<'a> {
+        type Value = serde_json::Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = serde_json::map::Map::new();
+            while let Some(k) = a.next_key::<String>()? {
+                if self.wanted.contains(k.as_str()) {
+                    // 目标字段：正常反序列化（与整行 parse 的 Value 完全一致）
+                    out.insert(k, a.next_value::<serde_json::Value>()?);
+                } else {
+                    // 非目标字段：整值跳过（不构造 Value）
+                    let _skip: serde::de::IgnoredAny = a.next_value()?;
+                }
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(doc);
+    de.deserialize_map(Pick { wanted }).ok()
+}
+
 
 /// COM_QUERY 响应（OK / ERR / ResultSet）。
 pub(crate) enum QueryResponse {
@@ -262,17 +301,41 @@ pub(crate) fn build_result_set(
     limit: Option<usize>,
 ) -> QueryResponse {
     let cols: Vec<ProjCol> = proj.unwrap_or(DEFAULT_PROJ).to_vec();
+    // Task-022：含字段列时预收集“目标字段集合” → 行内单遍只收目标成员（跳过其余列），
+    // 免整行 25 列 Value 构造/丢弃 + 大文本分配（SELECT 10 列 ≈ SELECT* 量级）。
+    // 仅顶层简单字段名可走子集流式；点号/下标嵌套路径（addr.city / arr[0]）须整行 parse
+    // 深查 → 回退旧全量路径（语义不变）。
+    let field_names: Option<Vec<&str>> = {
+        let names: Vec<&str> = cols
+            .iter()
+            .filter_map(|c| match c {
+                ProjCol::Field(f) => Some(f.as_str()),
+                _ => None,
+            })
+            .collect();
+        if names.is_empty() {
+            None
+        } else {
+            Some(names)
+        }
+    };
+    let simple_projection = field_names
+        .as_ref()
+        .map(|v| v.iter().all(|f| !f.contains('.') && !f.contains('[')))
+        .unwrap_or(true);
+    let wanted: Option<std::collections::HashSet<&str>> =
+        field_names.as_ref().map(|v| v.iter().copied().collect());
     let mut aggs: Vec<Option<FieldAgg>> = vec![None; cols.len()];
     let mut data: Vec<(u64, Vec<Vec<u8>>)> = Vec::with_capacity(raw.len());
     for (id, doc) in raw {
-        // 仅当结果集含字段列才 parse doc（SELECT id/doc 纯列保持零解析热路径）
-        let obj = if cols.iter().any(|c| matches!(c, ProjCol::Field(_))) {
-            match serde_json::from_slice::<serde_json::Value>(&doc) {
-                Ok(serde_json::Value::Object(m)) => Some(m),
+        // 仅当结果集含字段列才做提取（SELECT id/doc 纯列保持零解析热路径）
+        let obj = match &wanted {
+            Some(w) if simple_projection => stream_projected_map(&doc, w),
+            Some(_) => match serde_json::from_slice::<serde_json::Value>(&doc) {
+                Ok(serde_json::Value::Object(m)) => Some(serde_json::Value::Object(m)),
                 _ => None,
-            }
-        } else {
-            None
+            },
+            None => None,
         };
         let mut row = Vec::with_capacity(cols.len());
         for (i, c) in cols.iter().enumerate() {
@@ -280,7 +343,7 @@ pub(crate) fn build_result_set(
                 ProjCol::Id => row.push(row_id_of(id).to_string().into_bytes()),
                 ProjCol::Doc => row.push(doc.clone()),
                 ProjCol::Field(f) => {
-                    let (k, cell) = doc_field_kind_cell(obj.as_ref(), f);
+                    let (k, cell) = doc_field_kind_cell(obj.as_ref().and_then(|v| v.as_object()), f);
                     aggs[i].get_or_insert_with(FieldAgg::default).add(k);
                     row.push(cell);
                 }
@@ -318,4 +381,76 @@ pub(crate) fn sort_limit_by_docid(
         rows.truncate(l.min(rows.len()));
     }
     rows.into_iter().map(|(_, r)| r).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::protocol::response::{build_result_set, parse_projection, ProjCol};
+
+    /// 旧实现参考：整行 parse 全量 Object → 逐字段取 cell（用于 Task-022 子集提取等值对照）。
+    fn reference_cells(doc: &[u8], id: u64, cols: &[ProjCol]) -> Vec<Vec<u8>> {
+        let obj = if cols.iter().any(|c| matches!(c, ProjCol::Field(_))) {
+            match serde_json::from_slice::<serde_json::Value>(doc) {
+                Ok(serde_json::Value::Object(m)) => Some(m),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        cols.iter()
+            .map(|c| match c {
+                ProjCol::Id => row_id_of(id).to_string().into_bytes(),
+                ProjCol::Doc => doc.to_vec(),
+                ProjCol::Field(f) => doc_field_kind_cell(obj.as_ref(), f).1,
+            })
+            .collect()
+    }
+
+    fn set_rows(resp: QueryResponse) -> Vec<Vec<Vec<u8>>> {
+        match resp {
+            QueryResponse::Set { rows, .. } => rows,
+            _ => panic!("expected result set"),
+        }
+    }
+
+    #[test]
+    fn task022_stream_projection_matches_full_parse_semantics() {
+        // 行文档覆盖：缺失字段 / JSON null / 嵌套对象 / 数组 / 超长非目标文本 /
+        // 数字（整/浮）/ 带引号与反斜杠转义字符串 / 目标字段重复出现
+        let docs: Vec<(u64, Vec<u8>)> = vec![
+            (1, br#"{"id":1,"k":7,"amount":73564.5,"status":"active","city":"bei\"jing","note":"x\\y","nested":{"a":1},"arr":[1,2],"big":"AAAA...BBBB","txt_b":"skip_me_0123456789"}"#.to_vec()),
+            (2, br#"{"id":2,"k":null,"status":"closed"}"#.to_vec()), // 大量字段缺失
+            (3, br#"{"id":3,"k":-42,"amount":0,"status":"pending"}"#.to_vec()),
+        ];
+        // SELECT k, status, amount, note, big（非目标大文本/嵌套被跳过）
+        let sql = "SELECT k,status,amount,note,big FROM t WHERE id IN (1,2,3)";
+        let proj = parse_projection(sql).unwrap();
+        let want_fields: Vec<&str> = proj
+            .iter()
+            .filter_map(|c| match c {
+                ProjCol::Field(f) => Some(f.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(want_fields, vec!["k", "status", "amount", "note", "big"]);
+
+        let resp = build_result_set(Some(&proj), docs.clone(), false, None);
+        let rows = set_rows(resp);
+        for (i, (id, doc)) in docs.iter().enumerate() {
+            let expect = reference_cells(doc, *id, &proj);
+            assert_eq!(rows[i], expect, "投影 cell 与整行 parse 语义逐字节一致 row={id}");
+        }
+    }
+
+    #[test]
+    fn task022_select_star_keeps_raw_bytes_no_parse() {
+        // SELECT id,doc（无字段列）：保持零解析热路径——doc cell 为原字节直通
+        let doc = br#"{"k":1,"status":"a\u00e9","txt":"\u0001raw"}"#.to_vec();
+        let sql = "SELECT id,doc FROM t";
+        let proj = parse_projection(sql).unwrap();
+        let resp = build_result_set(Some(&proj), vec![(9, doc.clone())], false, None);
+        let rows = set_rows(resp);
+        assert_eq!(rows[0], vec![b"9".to_vec(), doc], "SELECT id,doc 直通原字节");
+    }
 }
