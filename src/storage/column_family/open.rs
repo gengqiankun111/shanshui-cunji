@@ -204,6 +204,8 @@ impl ColumnFamily {
             // Ex-8.11：L1/L2 段数触发阈值（0 = 现行为）
             l1_trigger_files: AtomicUsize::new(cfg.storage.l1_trigger_files),
             l2_trigger_files: cfg.storage.l2_trigger_files,
+            // P129：多表 per-table L0 压实触发阈值（0 = 关闭；单表库由多表门控自动不启用）
+            per_table_l0_trigger: cfg.storage.per_table_l0_trigger,
             seq_min: RwLock::new(std::collections::HashMap::new()),
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),

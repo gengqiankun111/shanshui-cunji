@@ -1622,6 +1622,119 @@
         assert_eq!(cf.scan_range(None, None).unwrap().len(), 1000);
     }
 
+    // ---------- P129 per-table L0 优先压实（多表单批 flush 每表 1 文件的全局计数失配治理） ----------
+
+    #[test]
+    fn p129_hot_table_compacted_alone_others_stay_l0() {
+        // 多表 per-table 模式：热点表（表 1）L0 ≥2 段 → 单轮只合并表 1（并入其 L1 同表段），
+        // 表 7 仅 1 段留在 L0 不参与（旧全局逻辑会把 3 段一起全量合并下沉）。
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.enable_table_split();
+        // 表 1：两批 flush（行 2..4 重叠版本）→ L0 ×2
+        for row in 1..=3u64 {
+            cf.put(tdoc(1, row), format!("t1-a{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        for row in 2..=4u64 {
+            cf.put(tdoc(1, row), format!("t1-b{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        // 表 7：一批 flush（L0 单段）
+        for row in 1..=2u64 {
+            cf.put(tdoc(7, row), format!("t7-r{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_count(), 3, "L0 = t1×2 + t7×1");
+        // 单轮 compact：只合并热点表 t1 的 2 段
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.merged_ssts, 2, "应只合并表 1 的 2 段，实际 {}", rep.merged_ssts);
+        assert_eq!(rep.out_level, 1, "输出下沉 L1");
+        let snap = cf.ssts.load();
+        assert_eq!(snap.ssts.len(), 2, "合并后 2 文件（t1→L1 1 段 + t7→L0 1 段）");
+        let mut lv_of: Vec<(u16, u32)> = snap
+            .ssts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.table_id().unwrap(), snap.levels[i]))
+            .collect();
+        lv_of.sort();
+        assert_eq!(lv_of, vec![(1, 1), (7, 0)], "t1 已下沉 L1，t7 留 L0（他表不参与）");
+        assert!(!cf.needs_compact(), "t1 收敛 1 段 + t7 1 段 → 无触发");
+        // 语义：t1 两批去重合并（后写覆盖先写，行 1..4 各 1 条），t7 原值
+        let t1 = cf.scan_range(Some(tdoc(1, 0)), Some(tdoc(1, TROW_MAX))).unwrap();
+        assert_eq!(t1.len(), 4, "t1 去重 4 行");
+        assert_eq!(cf.get(tdoc(1, 2)).unwrap().unwrap().0, b"t1-b2", "覆盖生效");
+        assert_eq!(cf.get(tdoc(1, 1)).unwrap().unwrap().0, b"t1-a1", "未覆盖保持");
+        let t7 = cf.scan_range(Some(tdoc(7, 0)), Some(tdoc(7, TROW_MAX))).unwrap();
+        assert_eq!(t7.len(), 2);
+        // 再 flush t1 两批（新行 5..6、7..8）→ L0 t1 2 段 → 合并去重输出 **L1 新段**
+        // （不并入既有 L1 旧段：单次压实量有界，防每批 flush 重写全表历史；L1 同表 2 段
+        // 版本重读正确，L0 空时由 bottom split 收敛）
+        for row in 5..=6u64 {
+            cf.put(tdoc(1, row), format!("t1-c{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        for row in 7..=8u64 {
+            cf.put(tdoc(1, row), format!("t1-d{row}").into_bytes()).unwrap();
+        }
+        cf.switch_and_flush().unwrap();
+        let rep2 = cf.compact().unwrap();
+        assert!(rep2.merged_ssts >= 2, "L0 t1 两段应合并下沉");
+        assert_eq!(rep2.out_level, 1);
+        let snap2 = cf.ssts.load();
+        assert_eq!(snap2.ssts.len(), 3, "t1 L1×2（旧+新）+ t7 L0×1");
+        let t1_l0_left = snap2
+            .ssts
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| s.table_id() == Some(1) && snap2.levels[*i] == 0)
+            .count();
+        assert_eq!(t1_l0_left, 0, "t1 L0 无残留（已全部下沉 L1）");
+        let t7_lv = snap2
+            .ssts
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.table_id() == Some(7))
+            .map(|(i, _)| snap2.levels[i])
+            .unwrap();
+        assert_eq!(t7_lv, 0, "t7 单段留 L0 不参与");
+        let t1c = cf.scan_range(Some(tdoc(1, 0)), Some(tdoc(1, TROW_MAX))).unwrap();
+        assert_eq!(t1c.len(), 8, "t1 四批去重后 8 行");
+        assert_eq!(cf.get(tdoc(1, 7)).unwrap().unwrap().0, b"t1-d7");
+        assert_eq!(cf.get(tdoc(1, 5)).unwrap().unwrap().0, b"t1-c5");
+        assert_eq!(cf.get(tdoc(1, 2)).unwrap().unwrap().0, b"t1-b2", "覆盖跨批保持");
+    }
+
+    #[test]
+    fn p129_multi_table_single_segments_no_global_trigger() {
+        // 20 表 × L0 各 1 段（单批 flush 切 20 文件）：全局 20 段远超旧全局阈值 12，
+        // 但每表 ≤1 段 = 按表收敛 → 多表模式不触发任何压实（不降层不重写；每表点查 O(1) 段）；
+        // 旧全局逻辑会在此全量合并 20 段（写放大爆）。验证 needs/compact 均为 no-op。
+        let dir = tmp();
+        let cfg = small_cfg(64);
+        let mut cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        cf.enable_table_split();
+        for t in 0..20u16 {
+            for row in 1..=2u64 {
+                cf.put(tdoc(t, row), format!("t{t}-r{row}").into_bytes()).unwrap();
+            }
+        }
+        cf.switch_and_flush().unwrap();
+        assert_eq!(cf.sst_count(), 20, "20 表一次 flush 应切 20 个单表 SST");
+        assert!(!cf.needs_compact(), "每表 1 段 = 收敛态，全局计数不应触发");
+        let rep = cf.compact().unwrap();
+        assert_eq!(rep.merged_ssts, 0, "无目标表 → no-op（旧逻辑 20>12 会全量合并）");
+        assert_eq!(cf.sst_count(), 20, "文件数不变（不降层不重写）");
+        for t in 0..20u16 {
+            for row in 1..=2u64 {
+                let got = cf.get(tdoc(t, row)).unwrap().expect("行应可读");
+                assert_eq!(got.0, format!("t{t}-r{row}").into_bytes());
+            }
+        }
+    }
+
     #[test]
     fn m3_drop_table_range_files_physically_removes_table_ssts() {
         // 实施清单④：表切分后 DROP TABLE 物理删该表区间专属文件，manifest 同步、他表不受影响

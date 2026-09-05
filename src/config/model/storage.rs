@@ -96,6 +96,15 @@ pub struct StorageConfig {
     pub l1_trigger_files: usize,
     /// Ex-8.11：L2 段数触发阈值（L1 下沉后 L2 收敛为单段的触发数）。0 = 现行为（L2>1 即收敛）。
     pub l2_trigger_files: usize,
+    /// P129（2026-09-05）：**per-table L0 压实触发阈值**——多表（split_by_table，每段单表）
+    /// 场景下，全局 L0 计数与表数强耦合（每批 flush 产出 N 表文件，N 大时全局阈值 [8,12]
+    /// 导致每写必全量 L0 合并或热点表段数失控）。开启后：**某表在 L0 的段数 ≥ 该值 → 只压实
+    /// 该表段**（L0 同表段 + L1 同表段并入，输出 L1 单段；其余表不参与），全局计数保留为
+    /// 最坏兜底。0 = 关闭（单表库/旧全局行为）。**默认 2**：同表 ≥2 段 = 可能重叠（同表多批
+    /// flush 版本叠加）即压实 → 稳态每表 L0 ≤1 段、点查 O(1) 段，每批 flush 每表一次小合并
+    /// （写放大 ≈2×，对比 N 表"每写必全量合并"的多倍放大）。
+    /// 仅 `split_by_table` 且 L0 含 ≥2 表时启用（单表行为零回归）。
+    pub per_table_l0_trigger: usize,
     /// Ex-8.7：删除密度 Compaction（删除位图置位率驱动的 GC 合并）——置位率 ≥
     /// `delete_density_min_ratio` 且自上次 GC 以来新增置位 ≥ `delete_density_min_docs` 时，
     /// compaction 紧迫度增加删除密度维度并把删除密集段（含收敛后单底层段）重写回收空间。
@@ -175,6 +184,8 @@ impl Default for StorageConfig {
             // L2 触发默认 0 = 现行为（L2>1 收敛）。
             l1_trigger_files: 8,
             l2_trigger_files: 0,
+            // P129：多表 per-table L0 压实默认 2（同表 ≥2 段即压；单表库由门控自动关闭）
+            per_table_l0_trigger: 2,
             // Ex-8.7：删除密度 GC 默认开启——置位率 ≥10% 且自上次 GC 新增置位 ≥1000 时触发
             // （防小批量删除/历史置位误触发整段重写；删除密集负载空间回收依赖此路径）。
             delete_density_min_ratio: 0.10,

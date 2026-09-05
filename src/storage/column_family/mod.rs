@@ -180,6 +180,12 @@ pub struct ColumnFamily {
     pub(crate) l1_trigger_files: AtomicUsize,
     /// Ex-8.11：L2 段数触发阈值（0 = 现行为：L2>1 即收敛为单段）。
     pub(crate) l2_trigger_files: usize,
+    /// P129：多表 per-table L0 压实触发阈值（`storage.per_table_l0_trigger`；0 = 关闭）——
+    /// 某表在 L0 的段数 ≥ 该值 → compact() 只压实该表段子集（L1 同表并入），其余表不参与；
+    /// 仅 split_by_table 且 L0 含 ≥2 表时启用（默认 2：同表 ≥2 段=可能重叠即压 → 稳态每表
+    /// L0 ≤1 段、点查 O(1) 段；多表单批 flush 每表 1 文件场景防"每写必全量 L0 合并"，
+    /// 单表库零回归）。
+    pub(crate) per_table_l0_trigger: usize,
     /// Ex-8.6：文件级**最小 put seq** 惰性记忆（path → min seq of put rows）。
     /// 快照读（get_bytes_at / scan_stream_at，snapshot<MAX）整段剪枝用：文件所有 put
     /// 行的 seq 均 > 快照点 → 该段对快照贡献为空，O(1) 跳过（免建迭代器/免读块）。

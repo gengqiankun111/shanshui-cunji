@@ -12,7 +12,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::error::Result;
-use crate::storage::column_family::{key_table_id, ColumnFamily, CompactReport};
+use crate::storage::column_family::{key_table_id, ColumnFamily, CompactReport, SstSnapshot};
 
 // column_family::tests 直接引用 `crate::storage::sstable::compaction::{...}` 模块路径 →
 // 拆分后经下方 re-export 保持该路径可解析（函数实体在 merge.rs）；本文件入口方法亦经此调用。
@@ -23,11 +23,89 @@ pub(crate) use super::merge::{
 };
 
 impl ColumnFamily {
+    // ============ P129：per-table L0 优先压实（多表单批 flush 每表 1 文件的全局计数失配治理） ============
+    //
+    // split_by_table 下每批 flush 产出 N 表 × 每表 1 个 L0 文件——全局 L0 阈值（动态 [8,12]）
+    // 与表数强耦合：N 大时每写必触发全量 L0 合并（全部表参与、写放大爆）或调高阈值致热点表
+    // 段数失控。本路径把 L0 压实决策改为按表：某表 L0 段数 ≥ per_table_l0_trigger（默认 2）
+    // 时只压实该表段子集（L1 同表段并入防层内重叠），其余表不参与；全局计数仅在单表/未开启
+    // 时保留为原语义（单表库零回归）。
+
+    /// P129：per-table 压实模式是否生效——split_by_table + 阈值 >0 且 L0 层现存 ≥2 个不同表
+    /// （单表库 / L0 空 → 回退原全局逻辑，行为零回归）。L0 含未归属段（旧库混表段，table_id
+    /// 无法提取）→ 回退全局（防无人治理）。
+    fn per_table_active(&self, snap: &SstSnapshot) -> bool {
+        if !self.split_by_table || self.per_table_l0_trigger == 0 {
+            return false;
+        }
+        let mut tids = std::collections::BTreeSet::new();
+        for (i, lv) in snap.levels.iter().enumerate() {
+            if *lv == 0 {
+                match snap.ssts[i].table_id() {
+                    Some(t) => {
+                        tids.insert(t);
+                    }
+                    None => return false, // 混表/未知段 → 全局语义（旧行为）
+                }
+            }
+        }
+        tids.len() > 1
+    }
+
+    /// P129：目标表压实输入子集——L0 段数最多且 ≥ 阈值的表：该表全部 L0 段。
+    /// 输入合并去重后**输出 L1 新段**（不并入既有 L1 同表段——对齐 leveled"单次压实量 =
+    /// 单批有界"，避免每批 flush 重写该表全部历史致写放大无界；L1 同表多段版本重读正确，
+    /// 由 L0 空时的 bottom split 收敛为单段）。无触发 → None（回退原全局选段/空转）。
+    fn table_l0_subset(&self, snap: &SstSnapshot) -> Option<Vec<usize>> {
+        // 每表 L0 段下标（reader.table_id 取 min_key 高 2 字节；split_by_table 每段单表前提）
+        let mut per: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
+        for (i, lv) in snap.levels.iter().enumerate() {
+            if *lv != 0 {
+                continue;
+            }
+            if let Some(t) = snap.ssts[i].table_id() {
+                per.entry(t).or_default().push(i);
+            }
+        }
+        let trig = self.per_table_l0_trigger;
+        // 目标表 = L0 段数最多且 ≥ 触发阈值的表（同表 ≥2 段 = 可能重叠，需合并去重）
+        let target = per
+            .iter()
+            .filter(|(_, v)| v.len() >= trig)
+            .max_by_key(|(_, v)| v.len())
+            .map(|(t, _)| *t)?;
+        let mut sel = per[&target].clone();
+        sel.sort_unstable(); // 快照顺序（新→旧），key 归并正确
+        if sel.len() <= 1 {
+            return None; // 单段无收益
+        }
+        Some(sel)
+    }
+
     /// 基础 Compaction（无删除位图过滤）。Ex-5.8：无重叠 L0 段合并走**数据块级复用**
     /// （只重建元数据区），否则回退全量合并（等价 `compact_filtered(&|_| false)`）。
+    /// P129：多表 per-table 模式下优先压实"段数最多的表"子集（每轮只动一张表）。
     /// O 项第③步：`&self`（ssts 快照 load/store 原子发布）——后台合并线程读锁下执行。
     pub fn compact(&self) -> Result<CompactReport> {
         let snap = self.ssts.load();
+        // P129：多表 per-table 压实（目标表 L0→L1，输出合并去重；同表段天然无跨表重叠）
+        if self.per_table_active(&snap) {
+            if let Some(sel) = self.table_l0_subset(&snap) {
+                if let Some(rep) = self.try_meta_only_compact(&sel, 1)? {
+                    return Ok(rep);
+                }
+                return self.compact_merge(&sel, 1, &|_| false);
+            }
+            // 多表模式无目标表（各表 ≤1 段 = 按表收敛态）：每表 L0 ≤1 段读放大 O(1)，
+            // 不触发全量合并（全局计数在多表模式不作为触发——每表段数受控 ⇒ 全局有界）
+            return Ok(CompactReport {
+                merged_ssts: 0,
+                kept_keys: 0,
+                freed_bytes: 0,
+                out_level: 0,
+                dropped_keys: 0,
+            });
+        }
         let heat: Vec<u64> = snap.ssts.iter().map(|s| s.heat()).collect();
         // Ex-8.11：L1 段数上限（L0 活跃时纳入 L0+L1 合并的"已满"界限）——>0 时用 l1_trigger_files
         let l1_tf = self.l1_trigger_files.load(Ordering::Relaxed);
@@ -236,6 +314,11 @@ impl ColumnFamily {
     /// P 项：启用 `l0_max_size_mb` 时叠加**大小阈值**——L0 文件总字节超限即触发（防大段少量堆积）。
     pub fn needs_compact(&self) -> bool {
         let snap = self.ssts.load();
+        // P129：多表 per-table 模式——主触发 = 存在表 L0 段数 ≥ 阈值（每表受控 ⇒ 全局有界，
+        // 全局段数/大小阈值在此模式不作触发——L0 总量 = N 表 × ≤1 段为收敛态）；L0 空 → 原 bottom。
+        if self.per_table_active(&snap) {
+            return self.table_l0_subset(&snap).is_some();
+        }
         let l0 = snap.levels.iter().filter(|l| **l == 0).count();
         let l1 = snap.levels.iter().filter(|l| **l == 1).count();
         let l2 = snap.levels.iter().filter(|l| **l >= 2).count();
