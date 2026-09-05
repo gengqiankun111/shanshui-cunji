@@ -42,7 +42,7 @@ impl ColumnFamily {
         let start_key = start.map(|s| encode_docid(s).to_vec());
         let end_key = end.map(|e| encode_docid(e).to_vec());
         let mut out = Vec::new();
-        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), None, None, |key, val| {
+        self.scan_stream_at(snapshot_seq, start_key.as_deref(), end_key.as_deref(), None, None, 1, |key, val| {
             let docid = decode_docid(key)
                 .map_err(|_| Error::Corrupted("scan_at key 非 docid 编码".into()))?;
             out.push((docid, val.to_vec()));
@@ -97,7 +97,7 @@ impl ColumnFamily {
         f: F,
     ) -> Result<()> {
         // 最新视图 = 快照 seq 无上限（取最大版本）
-        self.scan_stream_at(u64::MAX, start, end, None, None, f)
+        self.scan_stream_at(u64::MAX, start, end, None, None, 1, f)
     }
 
     /// P91：投影列流式扫描（最新视图）——语义同 `scan_stream`，但请求列非空时
@@ -110,7 +110,7 @@ impl ColumnFamily {
         fields: Vec<String>,
         f: F,
     ) -> Result<()> {
-        self.scan_stream_at(u64::MAX, start, end, None, Some(fields), f)
+        self.scan_stream_at(u64::MAX, start, end, None, Some(fields), 1, f)
     }
 
     /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
@@ -123,12 +123,15 @@ impl ColumnFamily {
         f: F,
     ) -> Result<()> {
         // 最新视图 = 快照 seq 无上限（取最大版本）
-        self.scan_stream_at(u64::MAX, start, end, zone_pred, None, f)
+        self.scan_stream_at(u64::MAX, start, end, zone_pred, None, 1, f)
     }
 
     /// 快照范围流式扫描（M 项，事务类查询优化 P0）：同 key 多版本取
     /// **seq ≤ snapshot_seq 的最大版本**（对齐 `get_bytes_at` 快照语义）；
     /// 快照点前为删除（Tombstone）→ 跳过该 key。其余与 `scan_stream` 一致。
+    /// `workers >= 2` 且窗口命中 ≥2 个 SST 时走 **Task-025b 阶段④ 跨文件扇出并行**：
+    /// 每 SST 源由 scoped 线程批量推进（块读/解压/解码并行），memtable 源内联，
+    /// 主线程沿用 k-way 归并（同 key 折叠/快照/删除语义完全一致，见 `fanout_merge_at`）。
     pub fn scan_stream_at<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
         &self,
         snapshot_seq: u64,
@@ -136,6 +139,7 @@ impl ColumnFamily {
         end: Option<&[u8]>,
         zone_pred: Option<crate::sstable::ZonePredicate>,
         project: Option<Vec<String>>,
+        workers: usize,
         mut f: F,
     ) -> Result<()> {
         // 源：memtable（immutable + mutable）+ SST。P72：memtable 迭代器借用内部 RwLock 读锁
@@ -318,6 +322,225 @@ impl ColumnFamily {
                     }
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Task-025b 阶段④：**跨文件扇出并行**流式扫描——与 `scan_stream_at` 语义逐行一致
+    /// （快照/同 key 折叠/Tombstone/Zone 谓词/投影/回调 false 提前终止），但当窗口命中
+    /// **≥2 个 SST** 且 `workers ≥ 2` 时，把各 SST 源的推进（块读/解压/解码，逐文件顺序 IO
+    /// 的耗时大头）分散到 scoped 工作线程批量执行，主线程仅做 k-way 归并输出——单窗口多段/
+    /// 重叠 L0（#5/#11 主杠杆）下 IO 与解码并行，避免串行逐源轮转时各文件读延迟相加。
+    /// memtable 源内联主线程（通常小）；`workers < 2` 或命中 <2 SST → 委托串行
+    /// `scan_stream_at`（零行为/性能回归）。与后台 IO 预算（Ex-8.9）共用现有
+    /// `scan_limiter`（输出行字节节流，位置不变）。
+    pub fn scan_stream_at_parallel<F: FnMut(&[u8], &[u8]) -> Result<bool>>(
+        &self,
+        snapshot_seq: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        zone_pred: Option<crate::sstable::ZonePredicate>,
+        project: Option<Vec<String>>,
+        workers: usize,
+        f: F,
+    ) -> Result<()> {
+        if workers < 2 {
+            return self.scan_stream_at(snapshot_seq, start, end, zone_pred, project, 1, f);
+        }
+        // 预检：窗口相交的 SST 数 < 2 → 无扇出收益，委托串行（避免重复建迭代器）
+        {
+            let snap = self.ssts.load();
+            let hit = snap
+                .ssts
+                .iter()
+                .filter(|sst| sst_intersects_window(sst, start, end))
+                .count();
+            if hit < 2 {
+                drop(snap);
+                return self.scan_stream_at(snapshot_seq, start, end, zone_pred, project, 1, f);
+            }
+        }
+        // 扇出：每 SST 源 scoped 线程批量推进 → mpsc channel → 主线程堆归并。
+        // 归并语义逐字对齐串行堆分支（heap 版，源数 ≥2）；worker 块读错误经 channel 回传。
+        type Row = (Vec<u8>, Option<Vec<u8>>, u64);
+        const FAN_BATCH: usize = 512;
+        let mut f = f;
+        self.memtable.with_iter_range(start, end, |mut mem_iters| {
+            let snap = self.ssts.load();
+            let mut sst_iters: Vec<crate::sstable::SstRangeIter> = Vec::new();
+            for sst in snap.ssts.iter() {
+                if !sst_intersects_window(sst, start, end) {
+                    continue;
+                }
+                if snapshot_seq != u64::MAX && self.sst_min_seq(sst)? > snapshot_seq {
+                    continue;
+                }
+                let mut it = crate::sstable::SstRangeIter::new_cached(
+                    sst,
+                    start,
+                    end,
+                    std::sync::Arc::clone(&self.block_cache),
+                )?;
+                if let Some(ref zp) = zone_pred {
+                    it.set_zone_pred(zp.clone());
+                }
+                if let Some(fields) = project.clone() {
+                    it.set_project_fields(fields);
+                }
+                sst_iters.push(it);
+            }
+            if sst_iters.len() < 2 {
+                // 预检后仍可能（min_seq 剪枝等）少于 2 → 委托串行（重建一次，边界罕见）
+                return self.scan_stream_at(snapshot_seq, start, end, zone_pred, project, 1, f);
+            }
+            let mem_count = mem_iters.len();
+            let sst_count = sst_iters.len();
+            let total = mem_count + sst_count;
+            type Payload = std::result::Result<Vec<Row>, crate::error::Error>;
+            let (txs, rxs): (
+                Vec<std::sync::mpsc::SyncSender<Payload>>,
+                Vec<std::sync::mpsc::Receiver<Payload>>,
+            ) = (0..sst_count)
+                .map(|_| std::sync::mpsc::sync_channel::<Payload>(2))
+                .unzip();
+            let merge_result: Result<()> = std::thread::scope(move |sc| {
+                let mut handles = Vec::with_capacity(sst_count);
+                // 每 SST 源一个生产者线程：批量 next() 后 send；主侧断连（提前终止）→ send Err 退出
+                for (i, mut it) in sst_iters.into_iter().enumerate() {
+                    let tx = txs[i].clone();
+                    handles.push(sc.spawn(move || -> Result<()> {
+                        let mut batch: Vec<Row> = Vec::with_capacity(FAN_BATCH);
+                        loop {
+                            match it.next() {
+                                Some(Ok(r)) => batch.push(r),
+                                Some(Err(e)) => {
+                                    let _ = tx.send(Err(e));
+                                    return Ok(());
+                                }
+                                None => break,
+                            }
+                            if batch.len() >= FAN_BATCH {
+                                if tx.send(Ok(std::mem::take(&mut batch))).is_err() {
+                                    return Ok(()); // 主侧已终止
+                                }
+                            }
+                        }
+                        if !batch.is_empty() {
+                            let _ = tx.send(Ok(batch));
+                        }
+                        Ok(())
+                    }));
+                }
+                // 关键：spawn 后立即丢弃原始 Sender 集（worker 各持克隆）——否则 scope 闭包
+                // 一直持有每源 sender，worker 结束后 channel 永不关闭，主线程末批 recv 永久阻塞。
+                drop(txs);
+                // 主线程：memtable 源内联 + fan 源批量拉取，堆归并（语义同串行堆分支）
+                let mut pulls: Vec<std::collections::VecDeque<Row>> = vec![std::collections::VecDeque::new(); sst_count];
+                let mut done: Vec<bool> = vec![false; sst_count];
+                // advance(i)：返回源 i 的下一行（Result 化 Option）
+                let mut advance = |i: usize, pulls: &mut Vec<std::collections::VecDeque<Row>>, done: &mut Vec<bool>, rxs: &[std::sync::mpsc::Receiver<Payload>]| -> Result<Option<Row>> {
+                    if i < mem_count {
+                        return mem_iters[i].next().transpose();
+                    }
+                    let k = i - mem_count;
+                    if done[k] {
+                        return Ok(None);
+                    }
+                    if let Some(r) = pulls[k].pop_front() {
+                        return Ok(Some(r));
+                    }
+                    match rxs[k].recv() {
+                        Ok(Ok(batch)) => {
+                            let mut b = batch;
+                            let first = b.drain(..1).next();
+                            pulls[k].extend(b);
+                            Ok(first)
+                        }
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => {
+                            done[k] = true;
+                            Ok(None)
+                        }
+                    }
+                };
+                // 各源当前行（堆的初始候选）
+                let mut cur: Vec<Option<Row>> = Vec::with_capacity(total);
+                for i in 0..total {
+                    cur.push(advance(i, &mut pulls, &mut done, &rxs)?);
+                }
+                let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
+                    std::collections::BinaryHeap::new();
+                for (i, c) in cur.iter().enumerate() {
+                    if let Some((k, _, _)) = c {
+                        heap.push(std::cmp::Reverse((k.clone(), i)));
+                    }
+                }
+                loop {
+                    let Some(std::cmp::Reverse((min_key, i0))) = heap.pop() else {
+                        break;
+                    };
+                    let mut to_advance: Vec<usize> = vec![i0];
+                    while let Some(std::cmp::Reverse((k, i))) = heap.peek() {
+                        if *k == min_key {
+                            to_advance.push(*i);
+                            heap.pop();
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut best_seq = 0u64;
+                    let mut best_val: Option<Vec<u8>> = None;
+                    let mut frontier = to_advance;
+                    let mut advanced: Vec<usize> = Vec::new();
+                    loop {
+                        let mut nxt: Vec<usize> = Vec::new();
+                        for i in frontier {
+                            let (k, v, seq) = cur[i].take().unwrap();
+                            debug_assert!(k == min_key, "同 key 归并");
+                            if seq <= snapshot_seq && seq >= best_seq {
+                                best_seq = seq;
+                                best_val = v;
+                            }
+                            cur[i] = advance(i, &mut pulls, &mut done, &rxs)?;
+                            advanced.push(i);
+                            if matches!(&cur[i], Some((nk, _, _)) if *nk == min_key) {
+                                nxt.push(i);
+                            }
+                        }
+                        if nxt.is_empty() {
+                            break;
+                        }
+                        frontier = nxt;
+                    }
+                    // 推进后的源重新入堆（其残余 key 已越过 min_key）；同一源多轮吞并只保留最终游标
+                    advanced.sort_unstable();
+                    advanced.dedup();
+                    for i in advanced {
+                        if let Some((nk, _, _)) = &cur[i] {
+                            heap.push(std::cmp::Reverse((nk.clone(), i)));
+                        }
+                    }
+                    if let Some(v) = best_val {
+                        if let Some(limiter) = self.scan_limiter.lock().unwrap().as_mut() {
+                            limiter.acquire(v.len() as u64)?;
+                        }
+                        if !f(min_key.as_slice(), &v)? {
+                            break; // 提前终止：drop 各 rx → worker send 失败退出
+                        }
+                    }
+                }
+                // 显式释放接收端，解除可能阻塞在 send 的 worker（提前终止路径）
+                drop(pulls);
+                drop(done);
+                drop(rxs);
+                // 回收 worker（rx 已断 → 至多再解一窗即退出）；聚合各源错误
+                for h in handles {
+                    h.join().unwrap()?;
+                }
+                Ok(())
+            });
+            // 归并/worker 错误传播
+            merge_result?;
             Ok(())
         })
     }

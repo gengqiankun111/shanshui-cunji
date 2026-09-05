@@ -1637,6 +1637,89 @@ use crate::optimizer::QuerySpec;
         );
     }
 
+    // ---------- Task-025b 阶段④：跨文件扇出并行（逐 SST 线程 + k-way 归并） ----------
+
+    #[test]
+    fn task025b4_scan_stream_parallel_matches_serial_multi_l0() {
+        // 阶段④：Engine::scan_stream_parallel（CF scan_stream_at_parallel 扇出）须与串行
+        // scan_stream 逐行一致——多 L0 重叠 + memtable 未刷盘行 + 覆盖写（跨段同 key 多版本）
+        // + 删除位图隐藏 + 投影列 + 回调早停。auto_compact 关 → flush 逐段保留多 L0 文件。
+        for pax in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = cfg();
+            c.storage.auto_compact = false;
+            c.memtable.max_size_mb = 1;
+            if pax {
+                c.storage.hot_fields = vec!["v".into(), "s".into()];
+            }
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            for seg in 0..4u64 {
+                for i in seg * 1000..seg * 1000 + 1000 {
+                    let doc = serde_json::json!({"v": (i as i64) * 2, "s": (i % 7) as i64});
+                    e.put(i, serde_json::to_vec(&doc).unwrap(), &["v"]).unwrap();
+                }
+                e.flush_primary().unwrap(); // 每段一 L0 文件
+            }
+            // 覆盖写（L0 间同 key 多版本）+ 删除 + memtable 尾行
+            for i in (500..700).step_by(2) {
+                let doc = serde_json::json!({"v": 9999i64, "s": 1i64});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &["v"]).unwrap();
+            }
+            for d in [150u64, 2500, 3901] {
+                e.delete(d).unwrap();
+            }
+            for i in 4000..4020u64 {
+                let doc = serde_json::json!({"v": (i as i64), "s": 0i64});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &["v"]).unwrap();
+            }
+            let collect = |e: &Engine, workers: usize, project: Option<Vec<String>>, stop_at: Option<usize>| {
+                let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+                e.scan_stream_parallel(Some(0), Some(5000), workers, project, None, |d, v| {
+                    out.push((d, v.to_vec()));
+                    Ok(stop_at.map(|n| out.len() < n).unwrap_or(true))
+                })
+                .unwrap();
+                out
+            };
+            for workers in [2usize, 4, 8] {
+                let par = collect(&e, workers, None, None);
+                let ser = collect(&e, 1, None, None);
+                assert_eq!(
+                    par.len(),
+                    ser.len(),
+                    "pax={pax} workers={workers} 扇出行数须与串行一致"
+                );
+                assert_eq!(par, ser, "pax={pax} workers={workers} 须逐行一致（含覆盖/删除/尾行）");
+                assert!(
+                    par.windows(2).all(|w| w[0].0 < w[1].0),
+                    "pax={pax} workers={workers} 须全局升序"
+                );
+                // 回调 false 早停：扇出与串行截断点一致
+                let par5 = collect(&e, workers, None, Some(5));
+                let ser5 = collect(&e, 1, None, Some(5));
+                assert_eq!(par5, ser5, "pax={pax} workers={workers} 早停前缀须一致");
+            }
+            // 投影列并行（PAX 列解码 / 行式按需）== 串行整行子集（值层等值）
+            let fields = vec!["v".into()];
+            let par_f: Vec<(u64, Vec<u8>)> = collect(&e, 4, Some(fields.clone()), None);
+            let full: std::collections::HashMap<u64, Vec<u8>> = collect(&e, 1, None, None)
+                .into_iter()
+                .collect();
+            assert_eq!(par_f.len(), full.len(), "pax={pax} 投影行数与整行一致");
+            for (d, sub_bytes) in par_f {
+                let sub: serde_json::Value = serde_json::from_slice(&sub_bytes).unwrap();
+                let whole: serde_json::Value =
+                    serde_json::from_slice(full.get(&d).unwrap()).unwrap();
+                assert_eq!(
+                    sub.get("v"),
+                    whole.get("v"),
+                    "pax={pax} docid={d} 投影列 v 值一致"
+                );
+            }
+        }
+    }
+
+
     // ---------- 批量导入模式（P40） ----------
 
     #[test]

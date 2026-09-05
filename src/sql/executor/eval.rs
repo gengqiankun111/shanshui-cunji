@@ -730,7 +730,12 @@ pub(crate) fn scan_pushdown(
     let mut skipped = 0u64;
     let mut scanned = 0u64;
     let zp = leaf_to_zone_pred(leaf);
-    engine.scan_stream_with_zonepred(None, None, zp, |docid, doc| {
+    // Task-025b 阶段④：范围/BETWEEN 谓词下推扫描走**跨文件扇出并行**（窗口命中 ≥2 SST
+    // 时逐文件线程并行解码，主线程 k-way 归并；否则 CF 自动回退串行，零回归）。
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(2);
+    engine.scan_stream_parallel(None, None, workers, None, zp, |docid, doc| {
         scanned += 1;
         if scanned % 4096 == 0 && guard.is_expired() {
             return Err(Error::QueryTooExpensive(format!(

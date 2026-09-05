@@ -202,6 +202,35 @@ impl Engine {
             })
     }
 
+    /// Task-025b 阶段④：跨文件扇出并行流式扫描（同 `scan_stream` 契约）——
+    /// 窗口命中 ≥2 SST 且 workers≥2 时 CF 逐文件线程并行（块读/解压/解码），主线程
+    /// k-way 归并；否则自动回退串行 `scan_stream`（零行为/性能回归）。
+    /// `project`/`zone_pred` 与 `scan_stream_fields`/`scan_stream_with_zonepred` 语义一致。
+    pub fn scan_stream_parallel<F: FnMut(u64, &[u8]) -> Result<bool>>(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        workers: usize,
+        project: Option<Vec<String>>,
+        zone_pred: Option<crate::sstable::ZonePredicate>,
+        mut f: F,
+    ) -> Result<()> {
+        let sk = start.map(|s| encode_docid(s).to_vec());
+        let ek = end.map(|e| encode_docid(e).to_vec());
+        self.primary
+            .scan_stream_at_parallel(u64::MAX, sk.as_deref(), ek.as_deref(), zone_pred, project, workers, |key, val| {
+                let docid = decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan parallel key 非 docid 编码".into())
+                })?;
+                if let Some(bm) = &self.deletion_bitmap {
+                    if bm.is_deleted(docid) {
+                        return Ok(true);
+                    }
+                }
+                f(docid, val)
+            })
+    }
+
     /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
     /// 但额外在 SST 块级检查 `zone_pred` 的 min/max，不相交块跳过（免 IO/解压）。
     /// 适用于 SQL 范围查询（`ts BETWEEN`、`amount > N`）的扫描下推路径。
