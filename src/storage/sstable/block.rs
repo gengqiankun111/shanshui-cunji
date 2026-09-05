@@ -416,12 +416,44 @@ pub fn assemble_subset_json(fields: &[String], vals: &[Option<Vec<u8>>]) -> Vec<
 /// P87②/P86②：整行 JSON → 指定顶层字段的 JSON 值字节（serde 语义：缺键 → None；
 /// 键存在且值为 JSON null → Some(b"null")）。非 JSON / 非对象行 → 全部 None（对齐
 /// `sort_key` 解析失败返回 Null 的语义——行式块回退按需字段提取，正确性护栏保留）。
+/// 缺口①（P106）复测修正：改 **单遍流式** 只收目标字段（未请求键 `IgnoredAny` 跳过），
+/// 替代整行全量 `Value` 树构造——行式冷读逐行提取不再多一次全树 parse（P105 前路径
+/// 与响应端流式子集提取同量级），PAX/热缓存路径不变。语义与全量树逐字节一致。
 pub fn extract_fields_from_json_row(row: &[u8], fields: &[String]) -> Vec<Option<Vec<u8>>> {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(row) else {
-        return vec![None; fields.len()];
-    };
-    let Some(map) = v.as_object() else {
-        return vec![None; fields.len()];
+    use serde::Deserializer as _;
+    struct Pick<'a> {
+        wanted: &'a std::collections::HashSet<&'a str>,
+    }
+    impl<'de, 'a> serde::de::Visitor<'de> for Pick<'a> {
+        type Value = serde_json::Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = serde_json::map::Map::new();
+            while let Some(k) = a.next_key::<String>()? {
+                if self.wanted.contains(k.as_str()) {
+                    out.insert(k, a.next_value::<serde_json::Value>()?);
+                } else {
+                    let _skip: serde::de::IgnoredAny = a.next_value()?;
+                }
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+    }
+    let n = fields.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let wanted: std::collections::HashSet<&str> = fields.iter().map(|s| s.as_str()).collect();
+    let mut de = serde_json::Deserializer::from_slice(row);
+    let obj = de.deserialize_map(Pick { wanted: &wanted }).ok();
+    let map = match obj {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => return vec![None; n],
     };
     fields
         .iter()
