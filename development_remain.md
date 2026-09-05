@@ -150,6 +150,8 @@ Task-025：范围查询提速——Partition Pruning 与 Parallel Scan（2026-09
 Task-027：HotCache TinyLFU 读回填准入（2026-09-05 用户定：**优先开发**，先于 Task-025b/PAX 复测与 Task-026）
 > 设计：research/cache_TinyLFU.md §二/§三（Count-Min + Doorkeeper + 衰减；衰减采样阈值 N 默认
 > 4×width≈104 万次 Record，可配覆盖，非“查询次数”）。
+> 定参（2026-09-05 用户确认）：sketch **固定 4 哈希 ×512×512 ×4-bit ≈1MB**（不做动态宽度）；
+> 统计/准入**仅读回填**（engine 读 miss 后 LSM 命中走准入），写 put 直写不回绝。
 属性	内容
 优先级	P0（优先开发，置于 Task-026 之前）
 工作量	sketch+doorkeeper 1 天、reset 0.5 天、接线（engine 读回填准入）1 天、单测验收 0.5 天
