@@ -255,6 +255,19 @@ Task-026：Per-CPU WAL（可选项默认开启；**排期最靠后**，2026-09-0
 > **阶段2/3 设计细化已定稿**（research/percpu-wal-stage2-design.md：方案 A engine 级外置队列 WAL、
 > WalEntry(cf,op,key,value)+gseq 原子组、wal-{q}-{gseq_start}.log 命名与 checkpoint 裁剪、旧文件
 > 迁移共存、gseq 归并恢复与洞跳过、2a-3b 分步实现顺序）→ 核心/恢复按该文档在专门会话推进。
+> ✅ **已完成（2026-09-05，P110，提交 0c1897b/7c1d7e3/810f182）**：2a WalEntry 编解码 + 队列文件 IO；
+> 2b/2c CF external_wal（TLS scope 单 gseq 组收集 + flush 水位回调）+ Engine 全写入口接线 + 每队列
+> 消费线程按窗口写独立文件 + flush_all 同步排空 + checkpoint.json 持久化/段裁剪 + 背压；3a 打开准备
+> （cp 加载/旧 WAL 迁移防空 L0/队列 gseq 归并回放/last_enqueued 防空转 CF 钉死 cp/global_seq 续接/
+> begin_snapshot 改 global_seq/backup/purge/status 适配）；3b 默认翻 true 定稿。+10 引擎级 + 4 运行时
+> 单测，全量 736 绿。
+> **压测回填（2026-09-05，本机 12 逻辑核，非 16 核）**：ycsb 增 `--per-cpu-wal true|false` +
+> `--per-cpu-window-us`（测量为共享引擎 Mutex 串行 op 模型）。workload a、records=10 万、12 线程×
+> ops=2 万，best-of-3：PerCpu（队列窗口 100µs）run **109.8k ops/s**（p50 9.3µs / p99 1.06ms；load
+> 26.6 万 w/s）vs Global 组提交 1000µs **67.7k ops/s**（p99 1.99ms）与 Global 组提交 100µs **41.6k**
+> （单后台线程高频窗口锁竞争最差）。PerCpu vs Global 最优档 **TPS +62%**、p99 ≈ -47%、load ≈ +55%——
+> 与设计 16 核预期（+36~59%）方向一致；注：串行锁模型仅反映 WAL fsync 路径收益（N 队列并行窗口 vs
+> 单后台线程组提交），真实 16 核多写者/无锁摊薄场景收益另由专属压测计（待办）。
 
 > 2026-09-04 收敛说明：原 20 项插队任务经与 development.md / 本文件其余内容逐项对照，**Task-001/003/004/006/008~020 已移除**——原因：与既有实现同主题重复（FST 字典 7.34+P4-B、倒排回表批量 P2-D/P85~P87、TTL 按天分桶整目录 O(1) 删除、WAL 延迟删除异步 unlink、组提交/环形 WAL、Bloom 分区布隆、基准/验收体系等，均已实现 ✅）或属随父项销项（Task-004/017→Task-002、Task-011/015/018→Task-007/Task-014、Task-012→Task-006~011）。**仅保留以下 3 项独立任务**（真实缺口，与插队族解耦，各自单独排期执行）：
 

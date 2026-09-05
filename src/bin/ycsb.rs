@@ -71,12 +71,22 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ycsb-{}", std::process::id())));
+    // Task-026 A/B：`--per-cpu-wal true|false`（默认 = Config 默认 true）；
+    // `--per-cpu-window-us` 可调队列 fsync 窗口（对照组用 Config 默认 100µs）。
+    let per_cpu = args
+        .iter()
+        .position(|a| a == "--per-cpu-wal")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s != "false")
+        .unwrap_or(true);
+    let per_cpu_window_us = get("--per-cpu-window-us", 100);
     if dir.exists() {
         let _ = std::fs::remove_dir_all(&dir);
     }
     println!(
         "[ycsb] workload={workload} records={records} ops/thread={ops} threads={threads} \
-         warm={warm} fsync={} group_commit_us={group_commit_us} wal_mode={wal_mode} dir={}",
+         warm={warm} fsync={} group_commit_us={group_commit_us} wal_mode={wal_mode} \
+         per_cpu_wal={per_cpu} per_cpu_window_us={per_cpu_window_us} dir={}",
         !no_fsync,
         dir.display()
     );
@@ -85,6 +95,8 @@ fn main() {
     cfg.storage.group_commit_us = group_commit_us;
     cfg.storage.wal_mode = wal_mode;
     cfg.storage.wal_ring_size_mb = ring_size_mb;
+    cfg.storage.per_cpu_enabled = per_cpu;
+    cfg.storage.per_cpu_batch_window_us = per_cpu_window_us;
     let mut engine = Engine::open(&dir, &cfg).unwrap();
 
     // ---------- load 阶段 ----------
