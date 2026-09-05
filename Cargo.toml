@@ -66,6 +66,9 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "shanshui-cunji-ycsb"
 path = "src/bin/ycsb.rs"
+[[bin]]
+name = "shanshui-cunji-baseline"
+path = "src/bin/baseline.rs"
 
 [[bin]]
 name = "cjserver"

@@ -349,6 +349,17 @@ TTL 删除扫描耗时（当前基准）
 冷启动时间
 
 □ 保存基线数据用于后续对比
+> ✅ 已完成（2026-09-05）：新增探针 bin `shanshui-cunji-baseline`（src/bin/baseline.rs，复用引擎公开
+> API + ycsb 补多线程，不另起体系）→ 本机 12 逻辑核单点快照落 `benchmarks/baseline_20260904.json`：
+> - bulk 写（put_nosync+flush_wal）345,213 w/s；持久写 `put`（Per-CPU 队列窗口 100µs 落盘，入队 ack）
+>   350,301 tps（p50 1.4 / p95 2.7 / p99 5.1µs）；
+> - 点查 warm-hotcache 28,680 qps（p95 319µs，单线程循环冷热抖动所致）；**冷读多线程（ycsb c 12t）
+>   222,793 qps（p50 3.3 / p95 172 / p99 233µs）**；
+> - 倒排单 term（city=c3 ≈1 万命中，**含回表**）223 qps（p50 1.07ms / p99 5.6ms）；
+> - TTL 过期桶删除扫描（10 万行全过期，open 期整目录 O(1) 清理）3.73ms，存活 0；
+> - 冷启动（10 万行 SST 全量加载重开）178.0ms。
+> 注：单点快照仅对比参考；37 探针 vs MySQL 分档/复测仍由宽表基准流程（user_guide/宽表SQL性能
+> 基准记录.md §9~§14）执行。
 验收标准：
 
 基线数据已保存到 benchmarks/baseline_20260904.json
