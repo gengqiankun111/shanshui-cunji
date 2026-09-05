@@ -157,6 +157,15 @@ Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09
 > ③ #29/#5 残余 = 行读+块 IO/跨文件扇出 → Task-025b 阶段④。
 > ④ #11 数值 zone 运行时路由待核：若 BETWEEN 行级走 scan_all 未带 zonepred，zone 只生效于
 >   scan_pushdown 路径（正确性已由 task025 单测保障；运行时收益待接线）。
+>    ✅ 核实完成（2026-09-05，P108）：**无运行时缺口**——裸 BETWEEN/比较谓词 100% 走
+>    scan_pushdown（带 ZonePredicate）：cost-based 分支（select.rs L621，range-only 无倒排候选
+>    必 FullScan）与兜底分支（L643 scan_leaf）双路直达，scan_all 仅服务 AND/OR 复合内范围臂
+>    （已先经倒排位图收敛，zone 不适用）。iter 层块级跳块（f64 安全比较 + 字节序回退）与
+>    CF/Engine scan_stream_with_zonepred 链路完整。P105 #11 仅 -7% 归因 = amount 列**随机非
+>    聚类**：每块 ~50-60 行随机样本的 zone min-max ≈ 全表跨度 → 与任何窄窗口相交、跳块率≈0；
+>    zone 收益须列随 docid 聚类（ts/自增类）。**可选后续（不排期，仅计划精度）**：select.rs
+>    L613 `zone_fields` 恒空 → cost 模型固定 effectiveness=0.3，可传 PAX hot_fields 提升
+>    计划精度（range-only 下仍走 FullScan，无行为影响）。
 > 内存口径备注（2026-09-05）：1.1M 行 MySQL 2G pool 充足，暂不加大；公平对比应按“缓存预算”口径
 > 或把 SCC hotcache 收紧至实际 ~2G（如 512MB）复测（详见 user_guide/性能对比-2026-09-05-P85-P92后-10万与110万.md §4）。
 

@@ -1290,6 +1290,27 @@
   （N=100000 精确）。临时验证库（db-gap2-check）已删除。
 
 
+### P108. Task-024 阶段② 缺口④——#11 数值 zone 运行时路由核实（2026-09-05）
+
+- **疑点（P105 ④）**：#11 amount BETWEEN 仅 -7%，怀疑"BETWEEN 行级走 scan_all 未带 zonepred，
+  zone 只生效于 scan_pushdown 路径"（运行时收益待接线）。
+- **核实结论：无运行时缺口**。静态走查 sql/executor/select.rs 路由：
+  - cost-based 分支（L594-626）：裸 Between 且无倒排等值 → `choose_best_plan` 无 Inverted 候选，
+    必回 `FullScan` → `scan_pushdown`（L621，`leaf_to_zone_pred` 产 ZonePredicate）；
+  - 兜底分支（L642-643）：`scan_leaf` 命中裸 Between/Cmp → 同样 `scan_pushdown`；
+  - `scan_all` 仅服务 AND/OR 复合内的范围臂（eval_cond / post_filter，先经倒排位图收敛后逐
+    docid 判范围——该场景 zone 本不适用）；
+  - iter.rs `advance_block` 块级跳块（f64 安全比较 + 字节序回退护栏）与 CF/Engine
+    `scan_stream_with_zonepred` 链路完整，正确性由 P1-E 与 task025_numeric_zone_between_no_false_skip
+    单测保障。
+- **P105 #11 仅 -7% 的数据侧归因**：amount 列值**随机、非随 docid 聚类**——每块 ~50-60 行随机
+  样本的 zone min-max 已 ≈ 全表数值跨度 → 与任何 50 宽窗口相交，跳块率≈0；zone 剪枝收益的前提
+  是列随 docid 单调/聚类（ts、自增类）。属结构性收益边界，非接线缺陷。
+- **可选后续（不排期，仅计划精度，无行为影响）**：select.rs L613 `zone_fields` 恒空 → cost 模型
+  固定 `effectiveness=0.3`；可改传 PAX hot_fields 使计划评估反映真实 zone 覆盖率（range-only
+  下仍选 FullScan，不影响正确性）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
