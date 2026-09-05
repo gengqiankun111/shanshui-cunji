@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::sql::parser::{parse_select, CmpOp, Select, WhereExpr};
 use roaring::treemap::RoaringTreemap as RoaringBitmap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use super::eval::{eval, full_docids, read_target_value, scan_leaf, scan_pushdown, skip_value, ws, Leaf, LightVal};
 use super::join::execute_join;
@@ -699,6 +700,141 @@ pub fn doc_matches_where(sql: &str, doc: &[u8]) -> bool {
     }
 }
 
+/// DISTINCT 键单列规范化：None（缺列/JSON null）同组；数字开头 token 按 f64 **值**归组
+/// （1 与 1.0 同组、-0.0 与 0.0 同组）；其余（字符串带引号/布尔/容器原文）按原文字节归组。
+/// 前缀防跨类碰撞（数字 "1" 与字符串 "\"1\"" 不同组）。
+fn distinct_part(b: Option<&[u8]>) -> String {
+    match b {
+        None => "\u{0}null".to_string(),
+        Some(raw) if !raw.is_empty() && (raw[0] == b'-' || raw[0].is_ascii_digit()) => {
+            match std::str::from_utf8(raw).ok().and_then(|s| s.parse::<f64>().ok()) {
+                Some(v) => format!("\u{1}{}", if v == 0.0 { 0u64 } else { v.to_bits() }),
+                None => format!("\u{2}{}", String::from_utf8_lossy(raw)),
+            }
+        }
+        Some(raw) => format!("\u{3}{}", String::from_utf8_lossy(raw)),
+    }
+}
+
+/// SELECT DISTINCT 行去重执行（2026-09-05 立项；首版形态）。
+/// 逻辑顺序对齐 MySQL：WHERE 收敛候选 → 按显式列组合值**去重** → ORDER BY（列 ⊆ 列清单）→
+/// OFFSET/LIMIT。语义护栏：缺列与 JSON null 同组；数值按值归组（1 与 1.0 同组）；
+/// 去重后代表行保留首见 docid（候选位图升序 → 输出确定）。
+/// 内存护栏：去重组数 > SORT_MAX_ROWS → QueryTooExpensive（建议 WHERE 收敛/按键分页）；
+/// 看门狗逐块熔断。parser 已 1064 组合限制（* / 聚合 / GROUP BY / HAVING / JOIN）。
+pub(crate) fn execute_distinct(
+    engine: &Engine,
+    sel: &Select,
+    guard: &crate::watchdog::QueryGuard,
+) -> Result<Vec<QueryRow>> {
+    // 候选集：全量（去重前不可提前截断——后续候选可能仍是未见组合或重复值）。
+    let set = get_docid_set(engine, sel.where_expr.as_ref(), None, guard)?;
+    let bitmap = match &set {
+        crate::docset::DocIdSet::Bitmap(b) => b.clone(),
+        crate::docset::DocIdSet::Empty => return Ok(Vec::new()),
+        crate::docset::DocIdSet::SortedList(v) => {
+            let mut b = RoaringBitmap::new();
+            for &d in v {
+                b.insert(d);
+            }
+            b
+        }
+        crate::docset::DocIdSet::All => match engine.colstore_all_bitmap() {
+            Some(b) => b,
+            None => full_docids(engine, guard)?,
+        },
+    };
+    let fields: Vec<String> = sel.columns.clone();
+    let order_fields: Vec<String> = sel.order_by.iter().map(|(f, _)| f.clone()).collect();
+    let mut rep: HashMap<Vec<String>, u64> = HashMap::new(); // 去重键 → 代表 docid
+    let mut first_seen: Vec<u64> = Vec::new(); // 候选升序保序输出
+    let mut scanned = 0u64;
+    const CHUNK: usize = 512;
+    let mut buf: Vec<u64> = Vec::with_capacity(CHUNK);
+    let mut it = bitmap.iter();
+    loop {
+        buf.clear();
+        let mut got = 0usize;
+        for _ in 0..CHUNK {
+            match it.next() {
+                Some(d) => {
+                    buf.push(d);
+                    got += 1;
+                }
+                None => break,
+            }
+        }
+        if got == 0 {
+            break;
+        }
+        scanned += got as u64;
+        if guard.is_expired() {
+            return Err(Error::QueryTooExpensive(format!(
+                "SELECT DISTINCT 扫描超时（已扫 {scanned} 条，熔断中止）"
+            )));
+        }
+        let batch = engine.batch_get(&buf)?;
+        for (d, v_opt) in buf.iter().copied().zip(batch.into_iter()) {
+            let Some(doc) = v_opt else { continue };
+            let vals = crate::engine::colstore::light_top_fields(&doc, &fields)
+                .unwrap_or_else(|| vec![None; fields.len()]);
+            let key: Vec<String> = vals.iter().map(|b| distinct_part(*b)).collect();
+            if !rep.contains_key(&key) {
+                if rep.len() >= SORT_MAX_ROWS {
+                    return Err(Error::QueryTooExpensive(format!(
+                        "SELECT DISTINCT 去重组数超上限 {}（建议 WHERE 收敛或按键分页）",
+                        SORT_MAX_ROWS
+                    )));
+                }
+                rep.insert(key, d);
+                first_seen.push(d);
+            }
+        }
+    }
+    if first_seen.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = sel.limit.unwrap_or(u64::MAX);
+    // DISTINCT → ORDER BY：按代表行排序（parser 已保证排序列 ⊆ 列清单）
+    let mut win: Vec<u64> = first_seen;
+    if !order_fields.is_empty() {
+        let docs = engine.batch_get(&win)?;
+        let mut items: Vec<(u64, Vec<SortKey>)> = Vec::with_capacity(win.len());
+        for (d, v_opt) in win.iter().copied().zip(docs.into_iter()) {
+            let Some(doc) = v_opt else { continue };
+            items.push((d, row_sort_keys(&doc, &order_fields)));
+        }
+        items.sort_by(|a, b| {
+            for (((_, desc), k1), k2) in sel.order_by.iter().zip(&a.1).zip(&b.1) {
+                let mut ord = cmp_sort_key(k1, k2);
+                if *desc {
+                    ord = ord.reverse();
+                }
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        win = items.into_iter().map(|(d, _)| d).collect();
+    }
+    let out_ids: Vec<u64> = win
+        .into_iter()
+        .skip(sel.offset as usize)
+        .take(limit as usize)
+        .collect();
+    if out_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch = engine.batch_get(&out_ids)?;
+    let mut out = Vec::new();
+    for (d, v_opt) in out_ids.into_iter().zip(batch.into_iter()) {
+        let Some(doc) = v_opt else { continue };
+        out.push((d, doc));
+    }
+    Ok(out)
+}
+
 /// 执行类 SQL：解析 + 求值 + 回表 + LIMIT/OFFSET（`cap` 为无 LIMIT 时的上限保护）。
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
@@ -707,6 +843,12 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
         return Err(Error::Config(
             "GROUP BY 查询须经分组执行入口 execute_group_by".into(),
         ));
+    }
+    // SELECT DISTINCT（2026-09-05 立项）：行去重独立路径（parser 已限组合形态）——
+    // 在组合索引/JOIN 等路由之前（去重须作用于全候选，不做集合裁剪）。
+    if sel.distinct {
+        let guard = engine.query_guard();
+        return execute_distinct(engine, &sel, &guard);
     }
     // P0-D：JOIN 路由——有 JOIN 子句时走 execute_join（参考 research/optimizer_proces.md 阶段 2）。
     // review 修复（2026-09-04）：须在组合索引之前——若主表 WHERE 命中 composite_indexes，

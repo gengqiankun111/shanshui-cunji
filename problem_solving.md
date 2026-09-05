@@ -1563,6 +1563,25 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 阶段②（EXPLAIN 标注 TableScan: Columnar/RowStore、回退开关一键、flush 派生 .cs 落盘/增量）
   留排期后续。
 
+**P125（SELECT DISTINCT 行去重立项闭环，2026-09-05）MySQL 语法面缺口 ③**
+- 现状核对：parser 仅支持标量 `COUNT(DISTINCT f)`；顶层 `SELECT DISTINCT` 会把 DISTINCT 当列名
+  （Token Ident）解析错位。README §4.2 曾长期写"行去重不支持"。
+- 落地：① parser `Select.distinct`（SELECT 后识别 DISTINCT 修饰，不进列名）+ 形态守卫 1064
+  （非 `*`、不组合聚合/GROUP BY/HAVING/JOIN、ORDER BY 列须 ∈ 列清单——防去重-排序语义错位）；
+  ② executor `execute_distinct`（src/sql/executor/select.rs）：候选全量（WHERE→DocIdSet，
+  All 分支复用 P94 colstore_all_bitmap / full_docids 位图）→ 512/块 batch_get → 逐行
+  `light_top_fields`（engine/colstore pub(crate) 化）抽列值 → 组合键去重（数字按 f64 值归组
+  `1 与 1.0`、`-0.0 与 0.0`；缺列与 JSON null 同组；字符串/容器按原文字节；前缀防跨类碰撞）→
+  ORDER BY（按代表行 row_sort_keys）→ OFFSET/LIMIT；护栏：去重组数 >SORT_MAX_ROWS →
+  QueryTooExpensive，看门狗逐块熔断。
+- 语义对齐点：DISTINCT 先于 ORDER BY/LIMIT（MySQL 逻辑顺序）；代表行 = 候选位图升序首见 → 输出确定；
+  NULL 组 asc 最小（ORDER BY 排序键复用 SortKey::Null < Str < Num 已有序）。
+- 验证：3 新增单测（单/多列+WHERE+DISTINCT+ORDER BY+LIMIT/OFFSET 值集断言；数值 5 vs 5.0 同组与
+  缺列∪null 同组；1064 守卫含 ORDER BY 非列清单拒绝）；全量 lib **756 通过 + 3 ignored**
+  （seqlock 概率型用例偶发失败单跑复绿，无关）。
+- 文档同步：README §4.1 增 DISTINCT 支持行、§4.2 限制表改为"组合形态 1064"；
+  development_remain SQL 语法面审计 ③ 标记 ✅。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

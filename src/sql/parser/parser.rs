@@ -62,6 +62,14 @@ impl Parser {
     }
     fn parse_select(&mut self) -> PRes<Select> {
         self.expect_kw("SELECT")?;
+        // 2026-09-05（行去重立项）：识别 `SELECT DISTINCT <列清单>`（DISTINCT 为保留词，不进列名）。
+        let mut distinct = false;
+        if let Tok::Ident(k) = self.peek()? {
+            if k.eq_ignore_ascii_case("distinct") {
+                self.next()?;
+                distinct = true;
+            }
+        }
         let mut columns = Vec::new();
         let mut plain: Vec<String> = Vec::new();
         let mut aggs: Vec<(String, Option<String>)> = Vec::new();
@@ -298,6 +306,25 @@ impl Parser {
         let mut agg = None;
         let mut agg_distinct = false;
         let group_aggs = aggs.clone();
+        // 2026-09-05（行去重立项）：SELECT DISTINCT 形态守卫——首版限显式列清单，
+        // 不与聚合/GROUP BY/HAVING/JOIN 组合；ORDER BY 列须 ∈ 列清单（防去重-排序语义错位）。
+        if distinct {
+            if star_seen {
+                return Err("SELECT DISTINCT * 暂不支持（须显式列清单）".into());
+            }
+            if !group_by.is_empty() || !aggs.is_empty() || having.is_some() || join.is_some() {
+                return Err(
+                    "SELECT DISTINCT 与聚合/GROUP BY/HAVING/JOIN 组合暂不支持".into(),
+                );
+            }
+            for (f, _) in &order_by {
+                if !plain.iter().any(|c| c.eq_ignore_ascii_case(f)) {
+                    return Err(format!(
+                        "SELECT DISTINCT 下 ORDER BY 列 {f} 须在 SELECT 列清单内"
+                    ));
+                }
+            }
+        }
         if !group_by.is_empty() {
             if star_seen {
                 return Err("SELECT * 与 GROUP BY 混用不支持（须显式分组字段）".into());
@@ -334,6 +361,7 @@ impl Parser {
         }
         Ok(Select {
             columns,
+            distinct,
             table,
             where_expr,
             limit,

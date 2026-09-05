@@ -367,6 +367,103 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         }
     }
 
+    /// 从返回行整文档取顶层字段值（字符串原样、其他 to_string），供 DISTINCT 断言。
+    fn top_val(doc: &[u8], f: &str) -> String {
+        match serde_json::from_slice::<serde_json::Value>(doc) {
+            Ok(v) => match v.get(f) {
+                Some(Value::String(s)) => s.clone(),
+                Some(x) if !x.is_null() => x.to_string(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
+    }
+
+    #[test]
+    fn sql_select_distinct_row_dedup() {
+        // 2026-09-05（SELECT DISTINCT 行去重）：单列/多列去重组数 + WHERE 收敛 + 值集断言。
+        let mut e = engine_with_docs();
+        // ① 单列：city 3 组（beijing 34 / shanghai 33 / shenzhen 33）
+        let r1 = execute(&mut e, "SELECT DISTINCT city FROM t", 1000).unwrap();
+        let mut cities: Vec<String> = r1.iter().map(|r| top_val(&r.1, "city")).collect();
+        cities.sort();
+        assert_eq!(cities, vec!["beijing", "shanghai", "shenzhen"], "单列去重 = 3 城市");
+        // ② 多列组合：city×status（active 仅 beijing）→ 3 组合
+        let r2 = execute(&mut e, "SELECT DISTINCT city, status FROM t", 1000).unwrap();
+        let mut pairs: Vec<(String, String)> = r2
+            .iter()
+            .map(|r| (top_val(&r.1, "city"), top_val(&r.1, "status")))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("beijing".into(), "active".into()),
+                ("shanghai".into(), "inactive".into()),
+                ("shenzhen".into(), "inactive".into())
+            ],
+            "多列组合去重"
+        );
+        // ③ WHERE 收敛 + 去重：beijing 全 active → 1 组
+        let r3 = execute(&mut e, "SELECT DISTINCT status FROM t WHERE city='beijing'", 1000).unwrap();
+        let sts: Vec<String> = r3.iter().map(|r| top_val(&r.1, "status")).collect();
+        assert_eq!(sts, vec!["active"], "WHERE 收敛后去重");
+        // ④ DISTINCT → ORDER BY（列 ∈ 列清单）→ LIMIT/OFFSET
+        let r4 = execute(&mut e, "SELECT DISTINCT city FROM t ORDER BY city LIMIT 2", 1000).unwrap();
+        let c4: Vec<String> = r4.iter().map(|r| top_val(&r.1, "city")).collect();
+        assert_eq!(c4, vec!["beijing", "shanghai"], "DISTINCT+ORDER BY+LIMIT");
+        let r5 = execute(&mut e, "SELECT DISTINCT city FROM t ORDER BY city DESC LIMIT 1 OFFSET 1", 1000)
+            .unwrap();
+        let c5: Vec<String> = r5.iter().map(|r| top_val(&r.1, "city")).collect();
+        assert_eq!(c5, vec!["shanghai"], "DESC+OFFSET 切片在去重后行上生效");
+    }
+
+    #[test]
+    fn sql_select_distinct_numeric_and_null_grouping() {
+        // 数值按“值”归组（5 与 5.0 同组）；缺列与 JSON null 同组（投影 NULL 语义）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put = |e: &mut Engine, id: u64, d: serde_json::Value| {
+            e.put(id, serde_json::to_vec(&d).unwrap(), &[]).unwrap();
+        };
+        // g：数值形态混合（5 / 5.0 同值不同原文）
+        put(&mut e, 1, serde_json::json!({ "g": 5 }));
+        put(&mut e, 2, serde_json::json!({ "g": 5.0 }));
+        put(&mut e, 3, serde_json::json!({ "g": 6 }));
+        let rg = execute(&mut e, "SELECT DISTINCT g FROM t", 1000).unwrap();
+        let mut gs: Vec<f64> = rg.iter().map(|r| top_val(&r.1, "g").parse().unwrap()).collect();
+        gs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(gs, vec![5.0, 6.0], "数值 5 与 5.0 同组去重");
+        // v：'a'/'b'/缺列/null → 3 组（g 行与缺列/null 行合并为 1 组，代表行 = 首见 docid 1）
+        put(&mut e, 4, serde_json::json!({ "v": "a", "i": 4 }));
+        put(&mut e, 5, serde_json::json!({ "v": "b", "i": 5 }));
+        put(&mut e, 6, serde_json::json!({ "i": 6 })); // v 缺
+        put(&mut e, 7, serde_json::json!({ "v": null, "i": 7 }));
+        let rv = execute(&mut e, "SELECT DISTINCT v FROM t", 1000).unwrap();
+        let mut ids: Vec<u64> = rv.iter().map(|r| r.0).collect();
+        ids.sort_unstable();
+        assert_eq!(rv.len(), 3, "a / b / (缺列∪null) 共 3 组");
+        assert_eq!(ids, vec![1, 4, 5], "缺列与 null 同组，代表行取首见（doc1 属缺列组）");
+        // DISTINCT + ORDER BY v ASC：NULL 组排最前（对齐 MySQL NULL 最小）
+        let ro = execute(&mut e, "SELECT DISTINCT v FROM t ORDER BY v LIMIT 1", 1000).unwrap();
+        assert_eq!(ro.len(), 1);
+        assert_eq!(ro[0].0, 1, "NULL 组 asc 最小");
+    }
+
+    #[test]
+    fn sql_select_distinct_guards_reject_unsupported_shapes() {
+        // 1064 守卫：* / 聚合 / GROUP BY / JOIN / ORDER BY 非列清单 → 解析期拒绝
+        assert!(parse_select("SELECT DISTINCT * FROM t").is_err());
+        assert!(parse_select("SELECT DISTINCT status FROM t GROUP BY status").is_err());
+        assert!(parse_select("SELECT DISTINCT COUNT(*) FROM t").is_err());
+        assert!(parse_select("SELECT DISTINCT note FROM t ORDER BY amount").is_err(), "排序列须在列清单");
+        assert!(parse_select("SELECT DISTINCT city FROM t JOIN s ON t.city = s.city").is_err());
+        // 对照组：合法形态可解析
+        assert!(parse_select("SELECT DISTINCT city FROM t").is_ok());
+        assert!(parse_select("SELECT DISTINCT status FROM t WHERE city='beijing' ORDER BY status LIMIT 3").is_ok());
+    }
+
     #[test]
     fn group_by_fast_inverted_matches_scan() {
         // Ex-9.3 ④b：无 WHERE 单字段 GROUP BY 倒排快路径结果与全扫一致（含 NULL 组；

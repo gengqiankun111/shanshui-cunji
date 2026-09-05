@@ -803,7 +803,12 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 - 剩余语法缺口（未排期，待用户挑优先级；承接 M-6/M-7 接线评估）：
   - ① 子查询 `IN (SELECT…)` / EXISTS —— 替代面已文档化（join_function.md：二次查询/JOIN/预连接/物化视图/导出 OLAP）；
   - ② UNION / INTERSECT / EXCEPT；
-  - ③ `SELECT DISTINCT` 行去重（现仅标量 COUNT(DISTINCT f)）；
+  - ~~③ `SELECT DISTINCT` 行去重~~ —— **✅ 已完成（2026-09-05，P125）**：显式列清单行去重
+    （parser `Select.distinct` + executor `execute_distinct`：候选全量 → 组合值去重（数字按值、缺列与
+    null 同组）→ ORDER BY（列 ⊆ 列清单）→ OFFSET/LIMIT；去重组数 >SORT_MAX_ROWS 守卫 + 看门狗熔断；
+    引擎 `light_top_fields` 提 pub(crate) 复用）；1064 限 `*`/聚合/GROUP BY/HAVING/JOIN 组合（留后续扩展）；
+    3 新增单测（单/多列+WHERE+ORDER/LIMIT 值集、数值 5 vs 5.0 与缺列∪null 归组、1064 守卫）；
+    全量 756 通过 + 3 ignored（seqlock 概率型偶发单跑复绿，无关）；
   - ④ 多 JOIN（>1 子句现解析期 1064）/ RIGHT / FULL / CROSS / 非等值 ON；
   - ⑤ 列表达式与函数值（算术/字符串/日期/CONCAT/CAST 等；WHERE/ORDER BY 现限字段名+字面量）；
   - ⑥ 窗口函数（ROW_NUMBER/RANK/OVER…）；

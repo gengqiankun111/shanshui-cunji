@@ -21,7 +21,7 @@
 
 mod compact;
 mod engine;
-mod colstore;
+pub(crate) mod colstore; // P94 列存派生模块：light_top_fields 供 SQL executor（DISTINCT 键提取）复用
 mod mvcc;
 mod open;
 pub(crate) mod percpu_wal;

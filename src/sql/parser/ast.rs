@@ -57,6 +57,11 @@ pub enum HavingExpr {
 pub struct Select {
     /// 列清单（"*" = 全部）。
     pub columns: Vec<String>,
+    /// SELECT DISTINCT 行去重（2026-09-05 立项）：对显式列清单组合值去重。
+    /// 首版限制（parser 1064 守卫）：非 `*`（须显式列）、不组合聚合/GROUP BY/HAVING/JOIN、
+    /// ORDER BY 列须 ⊆ 列清单。语义 = 投影列值组合去重（缺列与 JSON null 同组、
+    /// 数值按值 1 与 1.0 同组），去重后再 ORDER BY/OFFSET/LIMIT。
+    pub distinct: bool,
     pub table: String,
     pub where_expr: Option<WhereExpr>,
     pub limit: Option<u64>,

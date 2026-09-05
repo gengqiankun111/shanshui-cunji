@@ -152,7 +152,8 @@ fn val_end(b: &[u8], mut i: usize) -> Option<usize> {
 /// 单遍抽取对象顶层字段原文 token。返回 `Some(vals)`：`vals[ci]` = 该列值原文切片
 /// （JSON null/缺列 → None；重复键取**最后**一个，对齐 serde_json 覆盖语义）。
 /// 结构畸形（非对象/转义错/截断）→ `None`（调用方回退整行 serde 解析，保既有派生语义）。
-fn light_top_fields<'a>(doc: &'a [u8], names: &[String]) -> Option<Vec<Option<&'a [u8]>>> {
+/// pub(crate) 供 SQL executor（SELECT DISTINCT 键提取等）跨模块复用。
+pub(crate) fn light_top_fields<'a>(doc: &'a [u8], names: &[String]) -> Option<Vec<Option<&'a [u8]>>> {
     let n = doc.len();
     let mut i = ws(doc, 0);
     if i >= n || doc[i] != b'{' {
