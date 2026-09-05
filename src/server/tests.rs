@@ -1108,6 +1108,135 @@ use crate::multitable::drop_table_range;
         );
     }
 
+    // ---------- P127 组合 WHERE 收敛（主键区间 ∩ 等值定位 + LIMIT 早停） ----------
+
+    /// 偶数 active / 奇数 closed，文档含 id 字段（值 = docid）+ status + n。
+    fn p127_lib(e: &mut crate::engine::Engine) {
+        for i in 1..=4000u64 {
+            let (status, term): (&str, &str) = if i % 2 == 0 {
+                ("active", "status=active")
+            } else {
+                ("closed", "status=closed")
+            };
+            let doc = serde_json::json!({"id": i, "status": status, "n": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[term]).unwrap();
+        }
+        e.flush_wal().unwrap();
+    }
+
+    #[test]
+    fn p127_combo_pk_range_update_limit_and_full() {
+        // 组合 WHERE：id BETWEEN ∩ status='active' → docid 区间 keys-only ∩ active 位图。
+        // LIMIT 50 只改升序前 50 命中（id 2..=100 偶），无 LIMIT 全区间 active 全改（不截断）。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        p127_lib(&mut e);
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET n='-1' WHERE id BETWEEN 1 AND 1000 AND status='active' LIMIT 50",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 50, "LIMIT 50 只改 50 行"),
+            super::QueryResponse::Err(c, m) => panic!("p127 update limit 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        let mut changed = 0u64;
+        for i in 1..=1000u64 {
+            let v: serde_json::Value =
+                serde_json::from_slice(&e.get(i).unwrap().unwrap()).unwrap();
+            if i % 2 == 0 && i <= 100 {
+                assert_eq!(v["n"], "-1", "docid={i} 应被改（前 50 active）");
+                changed += 1;
+            } else {
+                assert_eq!(v["n"], serde_json::json!(i), "docid={i} 不应被改");
+            }
+        }
+        assert_eq!(changed, 50);
+        // 无 LIMIT：区间 1001..2000 active 500 行全改（不截断）
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET n='-2' WHERE id BETWEEN 1001 AND 2000 AND status='active'",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 500, "区间内 active 500 行全改"),
+            super::QueryResponse::Err(c, m) => panic!("p127 update full 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 1001..=2000u64 {
+            let v: serde_json::Value =
+                serde_json::from_slice(&e.get(i).unwrap().unwrap()).unwrap();
+            if i % 2 == 0 {
+                assert_eq!(v["n"], "-2", "docid={i} 应全量改");
+            } else {
+                assert_eq!(v["n"], serde_json::json!(i), "docid={i} closed 不改");
+            }
+        }
+    }
+
+    #[test]
+    fn p127_combo_pk_range_delete_limit_and_full() {
+        // DELETE 组合主键区间收敛：LIMIT 100 只删前 100 命中（id 2..=200 偶），
+        // 无 LIMIT 全区间 active 全删。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        p127_lib(&mut e);
+        match super::delete_response(
+            &mut e,
+            "DELETE FROM documents WHERE id BETWEEN 1 AND 400 AND status='active' LIMIT 100",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 100, "LIMIT 100 只删 100 行"),
+            super::QueryResponse::Err(c, m) => panic!("p127 delete limit 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 1..=400u64 {
+            let exists = e.get(i).unwrap().is_some();
+            if i % 2 == 0 && i <= 200 {
+                assert!(!exists, "docid={i} 应被删（前 100 active）");
+            } else {
+                assert!(exists, "docid={i} 应保留");
+            }
+        }
+        // 无 LIMIT：区间 401..800 active 全删（200 行）
+        match super::delete_response(
+            &mut e,
+            "DELETE FROM documents WHERE id BETWEEN 401 AND 800 AND status='active'",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 200, "区间 active 全删"),
+            super::QueryResponse::Err(c, m) => panic!("p127 delete full 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        for i in 401..=800u64 {
+            let exists = e.get(i).unwrap().is_some();
+            if i % 2 == 0 {
+                assert!(!exists, "docid={i} 偶数应全删");
+            } else {
+                assert!(exists, "docid={i} closed 保留");
+            }
+        }
+    }
+
+    #[test]
+    fn p127_combo_select_avoids_composite_full_rescan() {
+        // composite 前缀路由守卫：WHERE = 等值(status=active) + 主键区间(id BETWEEN) →
+        // 回退 eval 收敛（此前 composite 前缀命中会全 active 物化+复筛：100k 62ms→1100k
+        // 582ms ≈9.4× 恒定窗口的根因）。正确性：LIMIT 200 = 升序前 200 active（even 2..=400）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.storage.composite_indexes = vec![vec!["status".into()]];
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        p127_lib(&mut e);
+        let rows = crate::sqlish::execute(
+            &e,
+            "SELECT id,status FROM t WHERE id BETWEEN 1 AND 20000 AND status='active' LIMIT 200",
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 200, "组合 SELECT LIMIT 200 行数");
+        for (k, (d, _)) in rows.iter().enumerate() {
+            assert_eq!(*d, 2 + 2 * k as u64, "第 {k} 行应 = active 升序第 {k}");
+        }
+    }
+
     #[test]
     fn insert_dup_pk_1062() {
         // a：INSERT 主键重复 → MySQL 1062（同语句重复 / 库中已存在；预校验 → 无部分写入）

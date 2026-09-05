@@ -264,17 +264,51 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
         Ok((where_part, field, expr)) => {
             // §26 M1：SQL row_id / 字段候选 → 本表 docid
             let tid = table_id_for(&table_name_of(sql));
+            // P127：剥离 `UPDATE ... LIMIT n`（只更新前 n 命中行，对齐 MySQL；定位早停）
+            let (cond, upd_limit) = strip_where_limit(&where_part);
             // P88：写定位——主键形态（id=/docid=/id IN）保持 resolve+route（row → docid）；
-            // 字段/复合条件 → WhereExpr → get_docid_set（limit=None 不截断，防大命中漏行）
-            let ids = if where_is_primary_key(&where_part) {
-                match resolve_where_ids(engine, &where_part)
-                    .map(|v| route_where_ids(tid, &where_part, v))
-                {
-                    Ok(v) => v,
+            // 字段/复合条件 → P127 组合主键区间收敛（id BETWEEN∩等值 → 区间 keys-only∩位图，
+            // LIMIT 早停）或 WhereExpr → get_docid_set（limit 截断；无 LIMIT 不截断防漏行）
+            let ids = if where_is_primary_key(&cond) {
+                match resolve_where_ids(engine, &cond).map(|v| route_where_ids(tid, &cond, v)) {
+                    Ok(v) => {
+                        if let Some(l) = upd_limit {
+                            let mut v = v;
+                            v.truncate(l as usize);
+                            v
+                        } else {
+                            v
+                        }
+                    }
                     Err(e) => return QueryResponse::Err(1064, format!("update where: {e}")),
                 }
             } else {
-                match write_locate_table_ids(engine, tid, &where_part) {
+                match crate::sqlish::parse_where_expr(&cond)
+                    .and_then(|we| match extract_pk_between_comb(&we) {
+                        Some((lo, hi, rest)) => locate_pk_range_converged(
+                            engine,
+                            tid,
+                            lo,
+                            hi,
+                            rest.as_ref(),
+                            upd_limit,
+                        ),
+                        None => {
+                            // 无主键区间：通用求值收敛；UPDATE ... LIMIT → 求值限早停/截断
+                            let guard = engine.query_guard();
+                            let set = crate::sqlish::get_docid_set(
+                                &*engine,
+                                Some(&we),
+                                upd_limit,
+                                &guard,
+                            )?;
+                            Ok(set
+                                .iter()
+                                .filter(|d| ((*d >> 48) as u16) == tid)
+                                .collect())
+                        }
+                    })
+                {
                     Ok(v) => v,
                     Err(e) => return QueryResponse::Err(1064, format!("update where: {e}")),
                 }
@@ -377,21 +411,47 @@ pub(crate) fn delete_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                     Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
                 }
             } else {
-                let w = where_part.trim().trim_end_matches(';').trim();
-                let we = match crate::sqlish::parse_where_expr(w) {
+                // P127：剥离 DELETE ... LIMIT n（只删前 n 命中行）
+                let (cond, del_limit) = strip_where_limit(&where_part);
+                let we = match crate::sqlish::parse_where_expr(&cond) {
                     Ok(we) => we,
                     Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
                 };
                 let guard = engine.query_guard();
-                let set = match crate::sqlish::get_docid_set(&*engine, Some(&we), None, &guard) {
-                    Ok(s) => s,
-                    Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+                let ids: Vec<u64> = match extract_pk_between_comb(&we) {
+                    // P127 组合主键区间：keys-only 区间 ∩ 其余条件位图，LIMIT 早停
+                    // （替代 get_docid_set 全候选遍历——组合 WHERE 定位收敛核心）
+                    Some((lo, hi, rest)) => {
+                        match locate_pk_range_converged(engine, tid, lo, hi, rest.as_ref(), del_limit)
+                        {
+                            Ok(v) => v,
+                            Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
+                        }
+                    }
+                    None => {
+                        // 通用求值（LIMIT → 求值早停/截断）
+                        let set =
+                            match crate::sqlish::get_docid_set(&*engine, Some(&we), del_limit, &guard)
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    return QueryResponse::Err(1064, format!("delete where: {e}"))
+                                }
+                            };
+                        let mut v: Vec<u64> = set
+                            .iter()
+                            .filter(|d| ((*d >> 48) as u16) == tid)
+                            .collect();
+                        if let Some(l) = del_limit {
+                            v.truncate(l as usize);
+                        }
+                        v
+                    }
                 };
-                if set.is_empty() {
+                if ids.is_empty() {
                     return QueryResponse::Ok(0, 0);
                 }
-                // 流式消费（Bitmap/SortedList 已是物化集合；docid 高位含表 → 按表过滤）
-                match engine.delete_batch(set.iter().filter(|d| ((*d >> 48) as u16) == tid)) {
+                match engine.delete_batch(ids.into_iter()) {
                     Ok(n) => QueryResponse::Ok(n, 0),
                     Err(e) => QueryResponse::Err(1064, format!("delete error: {e}")),
                 }

@@ -29,6 +29,27 @@ pub(crate) fn extract_eq_conds(e: &WhereExpr) -> Vec<(String, String)> {
     out
 }
 
+/// P127：WHERE 是否含主键区间叶（`id BETWEEN`/`docid BETWEEN` 数值）——组合路由守卫用。
+/// 主键区间是强约束（= docid 区间），composite 等值前缀路由会先物化大候选再复筛；
+/// eval AND 快路径（post_filter + LIMIT 早停）在区间∩等值上毫秒级 → 命中即回退 eval。
+fn where_has_pk_between(e: &WhereExpr) -> bool {
+    match e {
+        WhereExpr::Between { field, low, high } => {
+            let f = field.to_lowercase();
+            (f == "id" || f == "docid")
+                && !field.contains('.')
+                && !field.contains('[')
+                && low.parse::<u64>().is_ok()
+                && high.parse::<u64>().is_ok()
+        }
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            where_has_pk_between(a) || where_has_pk_between(b)
+        }
+        WhereExpr::Not(x) => where_has_pk_between(x),
+        _ => false,
+    }
+}
+
 /// P0-A：声明式组合索引路由。
 /// 检查 WHERE 等值条件是否匹配 engine 的 composite_indexes 最左前缀。
 /// 匹配时走 `query_by_composite_prefix`（cidx 前缀扫描 → 回表），避免全扫/逐行过滤。
@@ -38,6 +59,15 @@ fn try_composite_index(
     sel: &Select,
     cap: u64,
 ) -> Result<Option<Vec<QueryRow>>> {
+    // P127 守卫：WHERE = 等值(可能命中 composite 前缀) + 主键区间(id/docid BETWEEN)组合 →
+    // 回退 eval（主键区间是强 docid 区间约束；composite 等值前缀路由在此会全候选物化+复筛
+    // ——组合 SELECT 0.5s 恒定的根因（100k 62ms→1100k 582ms ≈ 9.4×）；eval AND 快路径
+    // 区间∩等值毫秒级）。纯主键区间（无等值）不拦——composite 单列 id 范围路由仍可用。
+    if let Some(we) = &sel.where_expr {
+        if !extract_eq_conds(we).is_empty() && where_has_pk_between(we) {
+            return Ok(None);
+        }
+    }
     if engine.composite_indexes.is_empty() || sel.where_expr.is_none() {
         return Ok(None);
     }

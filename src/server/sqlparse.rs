@@ -5,9 +5,11 @@
 //! （split_values / unquote / find_matching_paren / parse_insert* / odku_apply_set 等）、
 //! WHERE 写定位（resolve_where_ids / write_locate_table_ids / parse_pk_between 等）。
 
+use crate::docset::DocIdSet;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::server::*;
+use crate::sql::parser::WhereExpr;
 
 
 // ============ §26 M1：多表命名空间（docid = table_id<<48 | row_id）============
@@ -453,6 +455,159 @@ pub(crate) fn write_locate_table_ids(engine: &mut Engine, tid: u16, where_part: 
         .iter()
         .filter(|d| ((*d >> 48) as u16) == tid)
         .collect())
+}
+
+// ============ P127：组合 WHERE 主键区间收敛（UPDATE/DELETE 定位 + LIMIT 早停）============
+
+/// 剥离 WHERE 段尾部 `LIMIT n`（MySQL UPDATE/DELETE 行数上限）→ (纯条件, 上限)。
+/// 无 LIMIT → 原样返回；`LIMIT` 后非数值 → 原样（parse 层会报错）。
+pub(crate) fn strip_where_limit(where_part: &str) -> (String, Option<u64>) {
+    let w = where_part.trim();
+    let lower = w.to_lowercase();
+    if let Some(pos) = lower.rfind("limit") {
+        let head = w[..pos].trim();
+        let tail = w[pos + 5..].trim().trim_end_matches(';').trim();
+        if let Some(n) = tail
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.parse::<u64>().ok())
+        {
+            return (head.to_string(), Some(n));
+        }
+    }
+    (w.trim_end_matches(';').to_string(), None)
+}
+
+/// 主键闭区间叶：`id BETWEEN a AND b` / `docid BETWEEN a AND b`（SQL row_id 闭区间）。
+/// 注意：顶层字段语义（文档含 id 列且值 = row_id）与主键语义数值等价（cjserver 写路径
+/// `id=`/`id IN`/`parse_pk_between` 一律按 row → docid_for 映射），可安全收敛。
+fn pk_between_leaf(e: &WhereExpr) -> Option<(u64, u64)> {
+    if let WhereExpr::Between { field, low, high } = e {
+        let f = field.to_lowercase();
+        if (f == "id" || f == "docid") && !field.contains('.') && !field.contains('[') {
+            if let (Ok(a), Ok(b)) = (low.parse::<u64>(), high.parse::<u64>()) {
+                if a <= b {
+                    return Some((a, b));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// P127：从 WHERE AST 提取主键闭区间叶 → (lo, hi, 其余条件 Option——None = 仅区间)。
+/// 仅在纯 AND 链（含链式右/左嵌套）中可拆；其余条件保持与未拆分时**等价**（主键区间
+/// 由 docid 区间承担，其余子树原样）。
+/// 保守回退：主键条件被 OR / NOT 包裹（语义不可分割）→ None（调用方走通用求值路径）。
+pub(crate) fn extract_pk_between_comb(we: &WhereExpr) -> Option<(u64, u64, Option<WhereExpr>)> {
+    if let Some(r) = pk_between_leaf(we) {
+        return Some((r.0, r.1, None));
+    }
+    match we {
+        WhereExpr::And(a, b) => {
+            if let Some(r) = pk_between_leaf(a) {
+                return Some((r.0, r.1, Some((**b).clone())));
+            }
+            if let Some(r) = pk_between_leaf(b) {
+                return Some((r.0, r.1, Some((**a).clone())));
+            }
+            // 链式 And((Between ∧ R1) ∧ R2)：递归左侧/右侧提取，其余并入。
+            if let Some((lo, hi, rest)) = extract_pk_between_comb(a) {
+                let merged = match rest {
+                    Some(r) => WhereExpr::And(Box::new(r), b.clone()),
+                    None => (**b).clone(),
+                };
+                return Some((lo, hi, Some(merged)));
+            }
+            if let Some((lo, hi, rest)) = extract_pk_between_comb(b) {
+                let merged = match rest {
+                    Some(r) => WhereExpr::And(a.clone(), Box::new(r)),
+                    None => (**a).clone(),
+                };
+                return Some((lo, hi, Some(merged)));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// DocIdSet 成员判定（Bitmap O(1) / SortedList 升序二分 / Empty false / All true）。
+fn docset_contains(s: &DocIdSet, d: u64) -> bool {
+    match s {
+        DocIdSet::Bitmap(bm) => bm.contains(d),
+        DocIdSet::SortedList(v) => v.binary_search(&d).is_ok(),
+        DocIdSet::Empty => false,
+        DocIdSet::All => true,
+    }
+}
+
+/// P127：组合主键区间写定位——主键闭区间 [lo, hi]（row → docid 区间）**keys-only 扫描**
+/// 现存 docid（升序）∩ 其余条件集（DocIdSet contains）→ 消费；`limit` 命中即停
+/// （UPDATE/DELETE ... LIMIT 语义对齐 MySQL，免全候选遍历/全量写）。
+/// 其余条件空 → 区间现存全集（与 `delete_pk_range` 语义一致）。
+pub(crate) fn locate_pk_range_converged(
+    engine: &mut Engine,
+    tid: u16,
+    lo: u64,
+    hi: u64,
+    rest: Option<&WhereExpr>,
+    limit: Option<u64>,
+) -> Result<Vec<u64>> {
+    // 其余条件集（eval 位图/列表；仅当能产出 docid 集合——等值/倒排/复合均可）
+    let rest_set = match rest {
+        Some(r) => {
+            let guard = engine.query_guard();
+            let s = crate::sqlish::get_docid_set(&*engine, Some(r), None, &guard)?;
+            if s.is_empty() {
+                return Ok(Vec::new()); // 其余条件 0 命中 → 整 WHERE 0 行（AND）
+            }
+            Some(s)
+        }
+        None => None,
+    };
+    let start = docid_for(tid, lo);
+    let end = docid_for(tid, hi);
+    let mut ids: Vec<u64> = Vec::new();
+    engine.scan_stream_ids(Some(start), Some(end), |d| {
+        if d < start || d > end {
+            return Ok(true); // 防御：区间外跳过
+        }
+        let hit = match &rest_set {
+            Some(s) => docset_contains(s, d),
+            None => true,
+        };
+        if hit {
+            ids.push(d);
+            if let Some(l) = limit {
+                if ids.len() as u64 >= l {
+                    return Ok(false); // LIMIT 达标：终止扫描（早停）
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(ids)
+}
+
+/// P127：WHERE AST 是否含主键区间叶（`id BETWEEN`/`docid BETWEEN` 数值）——供 SELECT
+/// 组合索引路由守卫（组合含主键区间时应走 eval 收敛而非 composite 全候选复筛）。
+pub(crate) fn where_has_pk_between(e: &WhereExpr) -> bool {
+    match e {
+        WhereExpr::Between { field, low, high } => {
+            let f = field.to_lowercase();
+            (f == "id" || f == "docid")
+                && !field.contains('.')
+                && !field.contains('[')
+                && low.parse::<u64>().is_ok()
+                && high.parse::<u64>().is_ok()
+        }
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            where_has_pk_between(a) || where_has_pk_between(b)
+        }
+        WhereExpr::Not(x) => where_has_pk_between(x),
+        _ => false,
+    }
 }
 
 /// 解析 `id = 123`（WHERE 子句内；事务内单点路径 parse_update/parse_delete 调用）。

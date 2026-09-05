@@ -1603,6 +1603,32 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 阶段 B（后续）：WHERE 条件表达式、ORDER BY 表达式、聚合参数表达式、AS 别名、与 id 主键
   特殊形态组合、DECIMAL/CAST 类型对齐。
 
+**P127（组合 WHERE 定位收敛闭环：UPDATE/DELETE 候选定位 + composite 全候选复筛，2026-09-05）**
+- 触发：Task-005 回填 #75 `UPDATE … WHERE id BETWEEN 1..20000 AND status='active' LIMIT 200`
+  110 万 223.9×（582ms vs MySQL 2.6ms），100k→1100k ≈9.4× 线性爆炸；同条件 SELECT 499ms。
+- profile demo（src/demo/p127-combo-where，20 万行 active 50%，无/有 composite 双版）拆出两慢点：
+  ① **写定位全候选遍历**——`get_docid_set(limit=None)` → eval AND 快路径 `post_filter(base=
+  active posting, limit=MAX)` 遍历全 active posting 逐块读 id 字段判定窗口（20 万 52ms →
+  110 万 ≈550ms，线性 9.4×；定位与窗口宽度无关、随 active 全库量线性）；② **composite 前缀
+  命中全候选复筛**——声明 `[status]` 单列组合索引后组合 SELECT LIMIT 200 = 181ms@20 万
+  （110 万 ≈500ms 恒定窗口，即用户实测 SELECT 499ms 的根因；无 composite 时组合 SELECT
+  走 eval 早停仅 0.09ms）。附带发现：UPDATE ... LIMIT 200 此前被**忽略**（where_part 含 LIMIT，
+  parse 丢 limit → 全候选全量写），语义偏差 + 无谓全写。
+- 落地：① server 写定位（dml.rs update_response/delete_response 字段/复合路径）经 sqlparse.rs
+  三 helper 收敛——`strip_where_limit`（剥离尾部 LIMIT n → 只改/删前 n 命中行 + 定位早停）、
+  `extract_pk_between_comb`（纯 AND 链提取主键 id/docid BETWEEN 叶为 docid 区间，OR/NOT 包裹
+  保守回退通用求值保语义）、`locate_pk_range_converged`（row 闭区间 → docid 区间 **keys-only**
+  扫描现存升序 ∩ 其余条件 DocIdSet.contains，LIMIT 命中即停）；② executor composite 路由守卫
+  （select.rs try_composite_index）：WHERE = 等值 + 主键区间组合 → 回退 eval 收敛（composite
+  等值前缀物化大候选再复筛 id 区间），纯主键区间（无等值）不拦（composite 单列 id 范围路由保留）。
+- 语义边界：主键 id/docid BETWEEN 在 cjserver = SQL row_id 闭区间（写路径 id=/IN/parse_pk_between
+  一贯 row→docid_for 映射）；文档 id 字段值 = row_id → 字段求值语义数值等价，收敛安全。
+- 验证：3 新增单测（server/tests.rs：组合 UPDATE/DELETE 的 LIMIT 只动前 n 行 + 无 LIMIT 全量不截断
+  逐行断言、组合 SELECT 守卫后行序 = active 升序前 200）；全量 lib **772 通过 + 3 ignored**
+  （seqlock 概率型 flaky 单跑复绿，无关）。
+- 待办：110 万基准复测 #75（写定位 ~550ms → 区间 keys-only 2 万行级；UPDATE 全链 ≤ MySQL 10×
+  验收回填；UPDATE ... LIMIT 影响行数对齐 MySQL 200）。
+
 **P128（P0 观测三项补齐闭环：Bloom 分层 / 块缓存计数 / L0 按表段数，2026-09-05）**
 - 触发：用户"Bloom 优化优先级"总结（P0 观测先行 + 分层 fpr + per-table L0 压实）。代码核查先行——
   三处前提对照现实现修正：①"L0 元数据冷 IO"不成立——SstReader open 即常驻 min/max、legacy/分区布隆、
