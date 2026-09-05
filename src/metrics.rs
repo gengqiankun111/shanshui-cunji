@@ -58,8 +58,9 @@ impl Metrics {
         mem_ratio: f64,
         disk_ratio: f64,
         flush_count: u64,
-        // 2026-09-05：运行时组件 gauge（name, help, value）：内存计量 + 快照生命周期，/metrics 实时读取
-        gauges: &[(&str, &str, u64)],
+        // 2026-09-05：运行时组件 gauge（name, help, value）：内存计量 + 快照生命周期 + Bloom
+        // 分层/块缓存/L0 按表（后三类含动态行名），/metrics 实时读取
+        gauges: &[(String, String, u64)],
     ) -> String {
         let mut out = String::new();
         let mut counter = |name: &str, help: &str, value: u64| {
@@ -150,9 +151,9 @@ impl Metrics {
             "MySQL 当前活跃连接数",
             self.active_conns.load(Ordering::Relaxed).to_string(),
         );
-        // 2026-09-05：运行时组件 gauge（引擎 memory_report + snapshot_report）
+        // 2026-09-05：运行时组件 gauge（引擎 memory_report + snapshot_report + bloom 分层等）
         for (name, help, value) in gauges {
-            gauge(name, help, value.to_string());
+            gauge(name.as_str(), help.as_str(), value.to_string());
         }
         out
     }

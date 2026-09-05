@@ -1603,6 +1603,33 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 阶段 B（后续）：WHERE 条件表达式、ORDER BY 表达式、聚合参数表达式、AS 别名、与 id 主键
   特殊形态组合、DECIMAL/CAST 类型对齐。
 
+**P128（P0 观测三项补齐闭环：Bloom 分层 / 块缓存计数 / L0 按表段数，2026-09-05）**
+- 触发：用户"Bloom 优化优先级"总结（P0 观测先行 + 分层 fpr + per-table L0 压实）。代码核查先行——
+  三处前提对照现实现修正：①"L0 元数据冷 IO"不成立——SstReader open 即常驻 min/max、legacy/分区布隆、
+  table_id、L1 summary，仅 L2 full_index 首访懒加载一次后常驻；②"blockcache 元数据被 LRU 淘汰"不成立——
+  filter/索引根本不进 blockcache（常驻 reader），blockcache 只缓存**数据块**（LRU + 冷表优先淘汰）；
+  ③ per-table L0 计数确为真空缺（compaction 触发只看全局动态阈值 [8,12]，选段无表维度）。
+- 落地：
+  - ① BlockCache 增 `hits/misses/evicts` 原子计数（get 命中/未命中分计；adaptive_evict 每次 pop 记淘汰；
+    clear/同 key 覆盖不计）→ `cache_stats()` → CF `blockcache_stats` → engine `blockcache_report`
+    `shanshui_blockcache_{hits,misses,evicts}_total`（primary+delta+cidx 聚合）；
+  - ② `BloomCounters` 单桶 → `layers: [BloomLayerCounters; 3]`（每层 minmax/legacy/probe/skip/pass/fp），
+    读路径 `get/get_bytes/get_bytes_at/get_many` 在层循环内取 `self.bloom.layer(lv)` 传桶（自由函数
+    签名 `&BloomCounters` → `&BloomLayerCounters`）；导出 18 行 `shanshui_bloom_{...}_total_{l0,l1,l2}`
+    （engine `bloom_layer_report`），既有 6 总口径 `bloom_counts`= 三层 `totals()` 保留（不破旧脚本）；
+  - ③ CF `l0_table_counts`：遍历 L0 层 `layer_indices[0]` 按 `sst.table_id()` 计数（split_by_table
+    每段单表前提）→ engine `l0_table_report` `shanshui_l0_sst_count_table_{tid}`（动态行名）。
+  - `/metrics` 与 `SHOW MEMORY` 行集扩展；metrics.render 与 engine_runtime_gauges/query gauges 改
+    `(String,String,u64)`（支持动态名，原 `&'static str` report 保持不变仅调用点 String 化）。
+- 排障要点：① 新测试 `.sum()` 无类型标注 → E0283（冗余断言行直接删除）；② blockcache 冷读单测首版
+  miss=0——引擎 `get` 先命中 **put 直写**的 HotCache（read.rs:99 注释"写 put 仍直写"）不经块缓存 →
+  改用 CF 层 `primary.get` 直读主列族（bloom miss 类测试不受影响：miss key 不回填 hotcache）。
+- 验证：4 新增单测（blockcache 计数含淘汰、分层落桶 L0→L1 compact 下沉后计数落 L1 桶、CF 冷热读
+  hit/miss 增长、多表 flush 后 l0_table_counts 每表 ≥1）；全量 lib **769 通过 + 3 ignored**。
+- 决策接口：压测脚本（L0 4/8/12/16 + miss 点查）采集 `shanshui_bloom_*_total_l0`（段数线性斜率）+
+  `shanshui_blockcache_*`（块 miss/淘汰）+ `shanshui_l0_sst_count_table_*`（单表堆积）→ 分层 fpr 与
+  per-table 优先压实是否立项由其数据驱动（见 development_remain P128 行）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

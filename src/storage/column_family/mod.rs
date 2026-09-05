@@ -31,7 +31,7 @@
 //! 在 `crate::storage::sstable::compaction` 中实现（同类型 impl，按主题外置）。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
@@ -77,14 +77,60 @@ pub struct SstSnapshot {
 /// - `part_probe / part_skip / part_pass`：v5 分区布隆（目标块）校验进入/拒绝/放行；
 /// - `fp_est`：误报估计——分区布隆放行并读块后该段未命中（近似，多版本/删除会低估；
 ///   真实命中在其他更旧段不减少本段计数）。
+///
+/// **2026-09-05（P0 观测升级）：计数按层（L0/L1/L2）分桶**——读路径层级固定三层
+/// （layer_indices 0..=2），每段过滤发生在所属层桶内。观测可区分"L0 段线性放大"
+/// （L0 桶 minmax_skip/part_probe 随段数线性）与"L1/L2 布隆 miss"（L1/L2 桶
+/// probe/skip/pass），为 per-table L0 压实与分层 fpr 调参提供数据。
 #[derive(Debug, Default)]
 pub(crate) struct BloomCounters {
+    /// 每层一组计数（索引 = 层号 lv；越界层号防御性落 L2 末桶，理论不发生）。
+    pub(crate) layers: [BloomLayerCounters; 3],
+}
+
+impl BloomCounters {
+    /// 取指定层计数桶（lv ≥ 已知层数 → 落 L2 末桶防御；读路径恒 0..=2）。
+    #[inline]
+    pub(crate) fn layer(&self, lv: usize) -> &BloomLayerCounters {
+        &self.layers[lv.min(self.layers.len() - 1)]
+    }
+
+    /// 跨层聚合 6 元组（minmax/legacy/probe/skip/pass/fp）——既有观测总口径。
+    pub(crate) fn totals(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let mut t = [0u64; 6];
+        for lay in &self.layers {
+            let v = lay.values();
+            for (i, x) in v.iter().enumerate() {
+                t[i] += x;
+            }
+        }
+        (t[0], t[1], t[2], t[3], t[4], t[5])
+    }
+}
+
+/// 单层布隆过滤计数桶（P0 分层观测；字段语义同上结构注释）。
+#[derive(Debug, Default)]
+pub(crate) struct BloomLayerCounters {
     pub(crate) minmax_skip: AtomicU64,
     pub(crate) legacy_skip: AtomicU64,
     pub(crate) part_probe: AtomicU64,
     pub(crate) part_skip: AtomicU64,
     pub(crate) part_pass: AtomicU64,
     pub(crate) fp_est: AtomicU64,
+}
+
+impl BloomLayerCounters {
+    /// 本桶 6 计数（minmax/legacy/probe/skip/pass/fp，与既有 `bloom_counts` 顺序一致）。
+    pub(crate) fn values(&self) -> [u64; 6] {
+        [
+            self.minmax_skip.load(Ordering::Relaxed),
+            self.legacy_skip.load(Ordering::Relaxed),
+            self.part_probe.load(Ordering::Relaxed),
+            self.part_skip.load(Ordering::Relaxed),
+            self.part_pass.load(Ordering::Relaxed),
+            self.fp_est.load(Ordering::Relaxed),
+        ]
+    }
 }
 
 /// 列族：主数据 / 组合索引 / Delta 共用骨架。

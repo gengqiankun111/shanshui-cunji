@@ -14,11 +14,20 @@ pub(crate) fn handle_admin_status(engine: &mut Engine) -> (u16, String) {
     }
 }
 
-/// 2026-09-05：运行时组件 gauge（内存计量 + MVCC 快照生命周期 + Bloom 分层过滤计数）。
-fn engine_runtime_gauges(engine: &Engine) -> Vec<(&'static str, &'static str, u64)> {
-    let mut g = engine.memory_report();
-    g.extend(engine.snapshot_report());
-    g.extend(engine.bloom_report());
+/// 2026-09-05：运行时组件 gauge（内存计量 + MVCC 快照生命周期 + Bloom 过滤计数[跨层 +
+/// 分层] + 块缓存命中/淘汰 + L0 按表段数）。后三类为 P0 观测新增——供压测脚本采集
+/// 定位"L0 段线性放大 vs 块缓存 miss vs L1/L2 布隆 miss"的瓶颈层。
+fn engine_runtime_gauges(engine: &Engine) -> Vec<(String, String, u64)> {
+    let mut g: Vec<(String, String, u64)> = engine
+        .memory_report()
+        .into_iter()
+        .chain(engine.snapshot_report())
+        .chain(engine.bloom_report())
+        .chain(engine.blockcache_report())
+        .map(|(n, h, v)| (n.to_string(), h.to_string(), v))
+        .collect();
+    g.extend(engine.bloom_layer_report());
+    g.extend(engine.l0_table_report());
     g
 }
 

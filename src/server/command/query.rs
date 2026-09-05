@@ -293,9 +293,17 @@ pub(crate) fn show_memory_response(engine: &Engine) -> QueryResponse {
         column_payload("Variable_name", MYSQL_TYPE_VAR_STRING, 45),
         column_payload("Value", MYSQL_TYPE_VAR_STRING, 45),
     ];
-    let mut rep: Vec<(&str, &str, u64)> = engine.memory_report();
-    rep.extend(engine.snapshot_report());
-    rep.extend(engine.bloom_report());
+    let mut rep: Vec<(String, String, u64)> = engine
+        .memory_report()
+        .into_iter()
+        .chain(engine.snapshot_report())
+        .chain(engine.bloom_report())
+        .chain(engine.blockcache_report())
+        .map(|(n, h, v)| (n.to_string(), h.to_string(), v))
+        .collect();
+    // P0 观测：Bloom 分层 + L0 按表段数（动态行名）
+    rep.extend(engine.bloom_layer_report());
+    rep.extend(engine.l0_table_report());
     let rows: Vec<Vec<Vec<u8>>> = rep
         .iter()
         .map(|(name, _help, v)| vec![name.as_bytes().to_vec(), v.to_string().into_bytes()])

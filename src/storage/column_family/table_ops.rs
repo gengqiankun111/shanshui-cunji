@@ -50,6 +50,11 @@ impl ColumnFamily {
         self.block_cache.used_bytes()
     }
 
+    /// 2026-09-05（P0 观测）：块缓存 (命中, 未命中, 容量淘汰) 计数。
+    pub fn blockcache_stats(&self) -> (u64, u64, u64) {
+        self.block_cache.cache_stats()
+    }
+
     /// P90：列族是否完全无数据（内存双缓冲 + 磁盘段均空）——delta 列族"无 patch"判定。
     pub fn data_empty(&self) -> bool {
         if self.memtable_bytes() > 0 {

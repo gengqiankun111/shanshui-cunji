@@ -3560,3 +3560,109 @@ use crate::optimizer::QuerySpec;
         assert!(after.0 > before.0, "minmax skip 应增长（段外 key）");
         assert!(after.2 > before.2, "分区布隆 probe 应增长");
     }
+
+    // ---------- P0 观测（2026-09-05）：分层布隆计数 + 块缓存计数 + L0 按表段数 ----------
+
+    #[test]
+    fn bloom_layer_counts_land_on_current_sst_layer() {
+        // 偶数 docid 分批 flush（全 L0）→ 奇数 miss 点查：计数应落 **L0 桶**（L1/L2 空）；
+        // compact 下沉 L1 后再查同 key：计数应落 **L1 桶**（验证按层分桶而非单桶）。
+        let dir = tmp();
+        let mut e = Engine::open(&dir, &cfg()).unwrap();
+        let n = 4_000u64;
+        let chunk = 1_000u64;
+        let mut flushed = 0u64;
+        for d in 1..=n {
+            if d % 2 != 0 {
+                continue;
+            }
+            e.put_nosync(d, format!("v{d}").into_bytes(), &[]).unwrap();
+            flushed += 1;
+            if flushed % chunk == 0 {
+                e.flush_primary().unwrap();
+            }
+        }
+        e.flush_wal().unwrap();
+        assert!(e.primary.sst_count() > 0);
+        let l0_before = e.primary.bloom_layer_counts();
+        assert_eq!(l0_before[0], [0, 0, 0, 0, 0, 0], "起始 L0 计数应清零");
+        for d in (1..=n).step_by(2) {
+            assert!(e.get(d).unwrap().is_none(), "段内缺失奇数应 miss");
+        }
+        let l0_after = e.primary.bloom_layer_counts();
+        assert!(l0_after[0][2] > 0, "L0 分区布隆 probe 应增长: {l0_after:?}");
+        assert!(l0_after[0][3] > 0, "L0 分区布隆 skip 应增长: {l0_after:?}");
+        assert_eq!(l0_after[1], [0, 0, 0, 0, 0, 0], "尚无 L1 段 → L1 桶应空");
+        assert_eq!(l0_after[2], [0, 0, 0, 0, 0, 0], "尚无 L2 段 → L2 桶应空");
+        // compact：L0 全量输入 → 输出下沉 L1
+        let rep = e.compact().unwrap();
+        assert!(rep.merged_ssts > 0, "L0 应发生合并下沉: {rep:?}");
+        let before_l1 = e.primary.bloom_layer_counts();
+        for d in (1..=n).step_by(2) {
+            assert!(e.get(d).unwrap().is_none());
+        }
+        let after_l1 = e.primary.bloom_layer_counts();
+        assert!(
+            after_l1[1][2] > before_l1[1][2],
+            "compact 后查询应落 L1 桶: {before_l1:?} → {after_l1:?}"
+        );
+    }
+
+    #[test]
+    fn blockcache_hit_miss_flow_into_report() {
+        // 块缓存计数经 CF → engine blockcache_report 聚合：冷查（miss→读盘回填）后
+        // 命中查询命中（hit 增长）；引擎报告含三行 gauge。
+        // 注：走 CF 层 primary.get（引擎 get 会先命中 put 直写的 HotCache，不触块缓存）。
+        let dir = tmp();
+        let cfg = cfg();
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        for d in 1..=2_000u64 {
+            e.put_nosync(d, format!("v{d}").into_bytes(), &[]).unwrap();
+        }
+        e.flush_primary().unwrap();
+        // 冷读（miss → 读盘 + put）
+        assert!(e.primary.get(1).unwrap().is_some());
+        let (h0, m0, _) = e.primary.blockcache_stats();
+        assert!(m0 > 0, "冷读应产生块缓存 miss: m={m0}");
+        // 热读（命中）
+        assert!(e.primary.get(1).unwrap().is_some());
+        assert!(e.primary.get(1).unwrap().is_some());
+        let (h1, m1, _) = e.primary.blockcache_stats();
+        assert!(h1 > h0, "热读应产生命中: {h0} → {h1}");
+        assert_eq!(m1, m0, "命中读不再新增 miss");
+        // engine 聚合报告
+        let rep = e.blockcache_report();
+        assert_eq!(rep.len(), 3);
+        assert!(rep.iter().any(|(n, _, v)| n.contains("hits") && *v >= h1));
+    }
+
+    #[test]
+    fn l0_table_counts_split_by_table_after_flush() {
+        // 多表写入 + 一次 flush → split_by_table 每表一个 L0 SST：
+        // per-table 计数应覆盖每表（>=1 段），engine 报告动态名行数一致。
+        let dir = tmp();
+        let mut e = Engine::open(&dir, &cfg()).unwrap();
+        let tids = [0u16, 5u16, 9u16];
+        for &t in &tids {
+            for r in 1..=800u64 {
+                let d = ((t as u64) << 48) | r;
+                e.put_nosync(d, format!("v{t}-{r}").into_bytes(), &[]).unwrap();
+            }
+        }
+        e.flush_primary().unwrap();
+        e.flush_wal().unwrap();
+        assert!(e.primary.sst_count() >= tids.len(), "应有多表段文件");
+        let counts = e.primary.l0_table_counts();
+        for &t in &tids {
+            assert!(
+                counts.iter().any(|(tid, n)| *tid == t && *n >= 1),
+                "表 {t} 应有 L0 段: {counts:?}"
+            );
+        }
+        let sum: usize = counts.iter().map(|(_, n)| n).sum();
+        assert!(sum >= tids.len(), "总 L0 段数 ≥ 表数: {counts:?}");
+        // engine 动态名报告
+        let rep = e.l0_table_report();
+        assert_eq!(rep.len(), counts.len());
+        assert!(rep.iter().any(|(n, _, _)| n.contains("table_5")), "含表 5 动态行");
+    }

@@ -86,6 +86,22 @@ impl ColumnFamily {
         c
     }
 
+    /// 2026-09-05（P0 观测 ③）：**L0 层按表（table_id）段数分布**——
+    /// 多表（split_by_table，每段单表）场景观测"全局 L0 未满但单表 L0 堆积"：
+    /// 热点表 flush 频次高 → 其 L0 段数随每批 flush 单调增，读放大 O(段数)。
+    /// 返回 (table_id, L0 段数) 升序；单表（table_id=0）场景仅一条/空。
+    pub fn l0_table_counts(&self) -> Vec<(u16, usize)> {
+        let snap = self.ssts.load();
+        let mut m: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+        if let Some(l0) = snap.layer_indices.first() {
+            for &i in l0 {
+                let tid = snap.ssts[i].table_id().unwrap_or(0);
+                *m.entry(tid).or_insert(0) += 1;
+            }
+        }
+        m.into_iter().collect()
+    }
+
     /// 从 docid 编码 key 中提取 table_id（高 16 位）。
     /// key 为 encode_docid 的 8 字节大端编码，前 2 字节 = table_id。
     pub(crate) fn table_id_from_key(key: &[u8]) -> Option<u16> {

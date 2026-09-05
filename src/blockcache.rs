@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use dashmap::DashMap;
@@ -52,6 +53,13 @@ pub struct BlockCache {
     per_entry_estimate: usize,
     /// 软水位：触发全局重分配阈值（占总预算比例）。
     eviction_high_water: f64,
+    /// 2026-09-05（P0 观测）：跨表聚合命中计数（读命中 = 免磁盘 IO 次数）。
+    hits: AtomicU64,
+    /// 2026-09-05（P0 观测）：跨表聚合未命中计数（miss → 读盘 + put）。
+    misses: AtomicU64,
+    /// 2026-09-05（P0 观测）：容量淘汰条目数（adaptive_evict 实际 pop 次数；
+    /// 同 key 覆盖写回与 clear() 显式清空不计——观测缓存淘汰压力）。
+    evicts: AtomicU64,
 }
 
 impl BlockCache {
@@ -65,6 +73,9 @@ impl BlockCache {
             block_size,
             per_entry_estimate: per_entry,
             eviction_high_water: 0.85,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evicts: AtomicU64::new(0),
         }
     }
 
@@ -82,15 +93,22 @@ impl BlockCache {
 
     pub fn get(&self, key: &BlockCacheKey) -> Option<Vec<u8>> {
         let mut partitions = self.partitions.lock().unwrap();
-        let partition = partitions.get_mut(&key.table_id)?;
+        // 该表无分区 = 必然未缓存（块从未被写入）→ 直接 miss
+        let Some(partition) = partitions.get_mut(&key.table_id) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         let result = partition.cache.get(key).cloned();
         if result.is_some() {
             partition.access_count += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
             // 无锁记录全局统计
             self.access_stats
                 .entry(key.table_id)
                 .and_modify(|c| *c = c.saturating_add(1))
                 .or_insert(1);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -146,6 +164,7 @@ impl BlockCache {
                     let sz = old.len().max(1) + 64;
                     partition.used_bytes = partition.used_bytes.saturating_sub(sz);
                     evicted = evicted.saturating_add(sz);
+                    self.evicts.fetch_add(1, Ordering::Relaxed);
                 } else {
                     break;
                 }
@@ -191,6 +210,16 @@ impl BlockCache {
     pub fn table_access_count(&self, table_id: u16) -> u64 {
         self.access_stats.get(&table_id).map(|e| *e.value()).unwrap_or(0)
     }
+
+    /// 2026-09-05（P0 观测）：跨表聚合 (命中, 未命中, 容量淘汰) 计数——
+    /// 命中率 = hits/(hits+misses)；淘汰压力 = evicts 增速（与读放大对照）。
+    pub fn cache_stats(&self) -> (u64, u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+            self.evicts.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +235,20 @@ mod tests {
         let c = BlockCache::new(1024 * 1024, 16 * 1024);
         c.put(key(1, 0), b"block-data".to_vec());
         assert_eq!(c.get(&key(1, 0)).unwrap(), b"block-data");
+    }
+
+    #[test]
+    fn hit_miss_evict_counters() {
+        // 预算 2KB（per_entry ≈ 1088）：仅容纳 1 条目 → 第二次 put 触发容量淘汰。
+        let c = BlockCache::new(2 * 1024, 1024);
+        c.put(key(1, 0), vec![0u8; 1024]);
+        assert!(c.get(&key(1, 0)).is_some(), "首查应命中"); // hits=1
+        assert!(c.get(&key(99, 0)).is_none(), "缺失块应 miss"); // misses=1
+        c.put(key(2, 0), vec![0u8; 1024]); // 超预算 → 淘汰 1 条
+        let (h, m, e) = c.cache_stats();
+        assert_eq!(h, 1, "命中计数 {h}");
+        assert_eq!(m, 1, "未命中计数 {m}");
+        assert!(e >= 1, "超预算 put 应触发容量淘汰 {e}");
     }
 
     #[test]

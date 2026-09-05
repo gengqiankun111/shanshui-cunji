@@ -337,6 +337,102 @@ impl Engine {
         ]
     }
 
+    /// 2026-09-05（P0 观测 ②）：布隆读路径过滤计数**按层**（L0/L1/L2）gauge——
+    /// 聚合 primary + delta + cidx 三列族。定位"瓶颈层"：
+    /// - L0 桶 `minmax_skip`/`part_probe` 随 L0 段数线性增长 → 段数管理（per-table 压实）；
+    /// - L1/L2 桶 `probe/pass` 高而 `skip` 低 → 分层 fpr/布隆覆盖调优候选。
+    /// 名称 = `shanshui_bloom_{minmax_skip|legacy_skip|partition_probe|partition_skip|
+    /// partition_pass|fp_est}_total_{l0|l1|l2}`。
+    pub fn bloom_layer_report(&self) -> Vec<(String, String, u64)> {
+        let p = self.primary.bloom_layer_counts();
+        let d = self.delta.bloom_layer_counts();
+        let c = match &self.cidx {
+            Some(cf) => cf.bloom_layer_counts(),
+            None => [[0u64; 6]; 3],
+        };
+        let mut agg = [[0u64; 6]; 3];
+        for (lv, col) in agg.iter_mut().enumerate() {
+            for (i, cell) in col.iter_mut().enumerate() {
+                *cell = p[lv][i] + d[lv][i] + c[lv][i];
+            }
+        }
+        const METRIC: [&str; 6] = [
+            "minmax_skip",
+            "legacy_skip",
+            "partition_probe",
+            "partition_skip",
+            "partition_pass",
+            "fp_est",
+        ];
+        const HELP: [&str; 6] = [
+            "段级 min/max 粗筛跳过（精确）",
+            "v3/v4 整文件布隆 miss",
+            "v5 分区布隆校验进入（目标块）",
+            "v5 分区布隆拒绝",
+            "v5 分区布隆放行（真正读块）",
+            "误报估计（放行后段未命中）",
+        ];
+        const LV: [&str; 3] = ["l0", "l1", "l2"];
+        let mut out = Vec::with_capacity(18);
+        for lv in 0..3usize {
+            for i in 0..6usize {
+                out.push((
+                    format!("shanshui_bloom_{}_total_{}", METRIC[i], LV[lv]),
+                    format!("[{}] {}", LV[lv].to_uppercase(), HELP[i]),
+                    agg[lv][i],
+                ));
+            }
+        }
+        out
+    }
+
+    /// 2026-09-05（P0 观测 ①）：块缓存 (命中/未命中/容量淘汰) 计数 gauge——
+    /// 聚合 primary + delta + cidx 三列族。命中率与淘汰增速是读放大主判据：
+    /// 命中低 + 淘汰高 → 数据块 LRU/预算压力（区别于 L0 段线性放大）。
+    pub fn blockcache_report(&self) -> Vec<(&'static str, &'static str, u64)> {
+        let (ph, pm, pe) = self.primary.blockcache_stats();
+        let (dh, dm, de) = self.delta.blockcache_stats();
+        let (ch, cm, ce) = match &self.cidx {
+            Some(cf) => cf.blockcache_stats(),
+            None => (0, 0, 0),
+        };
+        vec![
+            (
+                "shanshui_blockcache_hits_total",
+                "块缓存命中（读块免磁盘 IO，三列族聚合）",
+                ph + dh + ch,
+            ),
+            (
+                "shanshui_blockcache_misses_total",
+                "块缓存未命中（读盘回填，三列族聚合）",
+                pm + dm + cm,
+            ),
+            (
+                "shanshui_blockcache_evicts_total",
+                "块缓存容量淘汰条目（LRU 压力，三列族聚合）",
+                pe + de + ce,
+            ),
+        ]
+    }
+
+    /// 2026-09-05（P0 观测 ③）：**L0 层按表段数** gauge——主列族（split_by_table，
+    /// 每段单表）每表 L0 段数。多表热点场景观测"全局 L0 未满但单表 L0 堆积"
+    /// （该表点查读放大 O(段数)），为 per-table L0 优先压实调度提供输入。
+    /// 名称 = `shanshui_l0_sst_count_table_{tid}`；行数随活跃表数增长。
+    pub fn l0_table_report(&self) -> Vec<(String, String, u64)> {
+        self.primary
+            .l0_table_counts()
+            .into_iter()
+            .map(|(tid, n)| {
+                (
+                    format!("shanshui_l0_sst_count_table_{tid}"),
+                    format!("主列族表 {tid} L0 段数（全局 L0 计数下该表堆积观测）"),
+                    n as u64,
+                )
+            })
+            .collect()
+    }
+
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。
     pub fn stats(&self) -> EngineStats {
         // P52：磁盘剩余空间占比（syscall 带缓存，1s 间隔）
