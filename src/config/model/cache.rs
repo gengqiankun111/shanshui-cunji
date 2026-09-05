@@ -19,6 +19,13 @@ pub struct HotCacheConfig {
     pub max_document_size_bytes: usize,
     pub eviction_high_water: f64,
     pub eviction_low_water: f64,
+    /// Task-027：读回填 TinyLFU 准入（仅读 miss→LSM 命中路径；写 put 直写不回绝）。
+    pub tiny_lfu_enabled: bool,
+    /// 准入阈值：Estimate ≥ 该值才回填（默认 4，防扫描型污染）。
+    pub tiny_lfu_admit_threshold: u32,
+    /// 衰减采样数：累计 Record 样本 ≥ 该值全量计数器 >>1（默认 width×depth=2048，
+    /// 非“查询次数”；高 QPS 自动更频繁衰减）。
+    pub tiny_lfu_reset_samples: u32,
 }
 
 impl Default for HotCacheConfig {
@@ -33,6 +40,9 @@ impl Default for HotCacheConfig {
             max_document_size_bytes: 102_400,
             eviction_high_water: DEFAULT_EVICTION_HIGH_WATER,
             eviction_low_water: DEFAULT_EVICTION_LOW_WATER,
+            tiny_lfu_enabled: true,
+            tiny_lfu_admit_threshold: 4,
+            tiny_lfu_reset_samples: 2048,
         }
     }
 }

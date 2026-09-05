@@ -97,7 +97,8 @@ impl Engine {
         }
         let merged =
             serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-        self.hotcache.put(docid, merged.clone());
+        // Task-027：读回填走 TinyLFU 准入（防扫描型污染；写 put 仍直写）
+        self.hotcache.read_backfill(docid, merged.clone());
         self.metrics.record_latency(t.elapsed().as_nanos() as u64);
         Ok(Some(merged))
     }
@@ -146,7 +147,7 @@ impl Engine {
             // 键序差异不影响 JSON 消费端语义；hotcache 缓存原字节（保持 get 同构缓存）。
             if !overrides.contains_key(&d) {
                 let v = bv.clone();
-                self.hotcache.put(d, v.clone());
+                self.hotcache.read_backfill(d, v.clone());
                 out[i] = Some(v);
                 continue;
             }
@@ -176,7 +177,7 @@ impl Engine {
             }
             let merged = serde_json::to_vec(&map)
                 .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-            self.hotcache.put(d, merged.clone());
+            self.hotcache.read_backfill(d, merged.clone());
             out[i] = Some(merged);
         }
         Ok(out)

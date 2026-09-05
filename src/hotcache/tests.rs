@@ -249,3 +249,69 @@ fn concurrent_reads_with_write_invalidate_no_stale() {
     reader.join().unwrap();
     assert!(c.get(1).is_some(), "写后 key1 应在缓存");
 }
+
+// ---------- Task-027：TinyLFU 读回填准入 ----------
+
+#[test]
+fn task027_scan_single_touch_never_backfills() {
+    // 扫描型：每个 docid 只读一次 → 首访只入门卫（不计数不入缓存），缓存不被全表扫污染
+    let c = HotCache::new(small_cfg(16));
+    for i in 0..2000u64 {
+        c.read_backfill(i, format!("doc-{i}").into_bytes());
+    }
+    assert_eq!(c.len(), 0, "首访单次访问不应回填缓存");
+}
+
+#[test]
+fn task027_hot_doc_admitted_after_repeats() {
+    let c = HotCache::new(small_cfg(16));
+    // 首访入门卫；第 5 次访问起（est≥4）准入回填
+    for _ in 0..6 {
+        c.read_backfill(7, b"hot".to_vec());
+    }
+    assert!(c.get(7).is_some(), "重复热读应准入回填并命中");
+}
+
+#[test]
+fn task027_write_halves_heat_and_needs_reheat() {
+    let c = HotCache::new(small_cfg(16));
+    for _ in 0..6 {
+        c.read_backfill(9, b"hot".to_vec());
+    }
+    assert!(c.get(9).is_some());
+    // 写操作：计数减半 + 清 doorkeeper → 一次读不再准入（重新积累热度），但部分热度保留
+    c.put(9, b"new".to_vec());
+    assert!(c.get(9).is_some(), "写后直写回填应命中");
+    c.invalidate(9);
+    assert!(c.get(9).is_none());
+    // 写后首访只入门卫（不入缓存）
+    c.read_backfill(9, b"after".to_vec());
+    assert!(c.get(9).is_none(), "写后首访不应立即回填（需重新热读）");
+}
+
+#[test]
+fn task027_disabled_falls_back_to_unconditional() {
+    let mut cfg = small_cfg(16);
+    cfg.tiny_lfu_enabled = false;
+    let c = HotCache::new(cfg);
+    c.read_backfill(42, b"v".to_vec());
+    assert!(c.get(42).is_some(), "关闭准入应回退无条件读回填");
+}
+
+#[test]
+fn task027_tinylfu_decay_keeps_hot_and_drops_cold() {
+    use super::tinylfu::TinyLfu;
+    // 小衰减窗口（8 次 Record）验证：热 key 持续被识别；冷 key（单次）恒 0
+    let lf = TinyLfu::new(8);
+    let mut hot_admits = 0u32;
+    for _ in 0..60 {
+        if lf.record_admit(1, 4) {
+            hot_admits += 1;
+        }
+    }
+    assert!(hot_admits >= 2, "衰减窗口下热 key 仍应多次准入（实际 {hot_admits}）");
+    // 冷/扫描 key：每次都是新 key → 只入门卫，恒不入 CMS
+    for i in 0..500u64 {
+        assert!(!lf.record_admit(1000 + i, 4), "首次访问不应准入（key{}）", 1000 + i);
+    }
+}

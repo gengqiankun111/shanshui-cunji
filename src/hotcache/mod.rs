@@ -36,6 +36,11 @@ use crate::config::model::HotCacheConfig;
 
 mod entry;
 mod policy;
+mod tinylfu;
+
+use tinylfu::TinyLfu;
+
+pub(crate) use tinylfu::{LFU_DEPTH, LFU_WIDTH};
 #[cfg(test)]
 mod tests;
 
@@ -59,6 +64,8 @@ pub struct HotCache {
     /// 访问统计：docid → 访问计数（DashMap 无锁——读命中计数不阻塞并行读；
     /// 供 LFU 淘汰与 hot_threshold 预热判断）。
     stats: DashMap<u64, u64>,
+    /// Task-027：读回填 TinyLFU 准入过滤器（独立锁，读路径计数不阻塞主 RwLock）。
+    lfu: TinyLfu,
 }
 
 impl HotCache {
@@ -66,6 +73,7 @@ impl HotCache {
         // P41：条目容量 unbounded，淘汰**完全由字节预算控制**——否则
         // LruCache 容量满后内部淘汰不通知 stats/used_bytes（stats 泄漏 + used_bytes 虚增），
         // 且 evict 找不到真实 victim 导致超预算死循环（大批量回表查询灌满缓存后写路径卡死）。
+        let lfu = TinyLfu::new(config.tiny_lfu_reset_samples);
         Self {
             config,
             inner: RwLock::new(HotCacheInner {
@@ -75,6 +83,7 @@ impl HotCache {
                 promotions: 0,
             }),
             stats: DashMap::new(),
+            lfu,
         }
     }
 
@@ -111,10 +120,35 @@ impl HotCache {
 
     /// 写入：超过 max_document_size_bytes 不缓存；热点 key 直接更新保护区（保留热度）；
     /// 写入后按需淘汰至预算内。写锁独占（与读路径 RwLock 互斥）。
+    /// Task-027：写操作先触发 TinyLFU `on_write`（该 key 计数减半 + 清 doorkeeper——
+    /// 保留部分热度避免缓存饥饿）；写入本身**直写回填**，不受读准入限制。
     pub fn put(&self, docid: u64, value: Vec<u8>) {
+        self.lfu.on_write(docid);
         if value.len() > self.config.max_document_size_bytes {
             return; // 大对象不缓存
         }
+        self.insert_bytes(docid, value);
+    }
+
+    /// Task-027：读回填准入——engine 读 miss→LSM 命中后调用。TinyLFU 门卫：
+    /// 首次访问不入 CMS、Estimate ≥ 阈值（默认 4）才回填（防扫描型单次访问污染）；
+    /// `tiny_lfu_enabled=false` 时退化为原“无条件读回填”。
+    pub fn read_backfill(&self, docid: u64, value: Vec<u8>) {
+        if value.len() > self.config.max_document_size_bytes {
+            return;
+        }
+        let admit = if self.config.tiny_lfu_enabled {
+            self.lfu.record_admit(docid, self.config.tiny_lfu_admit_threshold)
+        } else {
+            true
+        };
+        if admit {
+            self.insert_bytes(docid, value);
+        }
+    }
+
+    /// 实际插入（写锁独占）：热点 key 更新保护区不重置热度；仅新条目 stats 置 1。
+    fn insert_bytes(&self, docid: u64, value: Vec<u8>) {
         let mut inner = self.inner.write().unwrap();
         if inner.protected.contains(&docid) {
             // 热点 key 更新：留在保护区（热度不重置）
@@ -140,7 +174,9 @@ impl HotCache {
     }
 
     /// 写失效链：删除该 docid 缓存（主缓存 + 保护区），保证不读到旧版本。写锁独占。
+    /// Task-027：删除也属写操作 → TinyLFU 计数减半 + 清 doorkeeper。
     pub fn invalidate(&self, docid: u64) {
+        self.lfu.on_write(docid);
         let mut inner = self.inner.write().unwrap();
         if let Some(old) = inner.cache.pop(&docid) {
             inner.used_bytes = inner.used_bytes.saturating_sub(old.len());
