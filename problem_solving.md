@@ -1626,9 +1626,22 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   改用 CF 层 `primary.get` 直读主列族（bloom miss 类测试不受影响：miss key 不回填 hotcache）。
 - 验证：4 新增单测（blockcache 计数含淘汰、分层落桶 L0→L1 compact 下沉后计数落 L1 桶、CF 冷热读
   hit/miss 增长、多表 flush 后 l0_table_counts 每表 ≥1）；全量 lib **769 通过 + 3 ignored**。
-- 决策接口：压测脚本（L0 4/8/12/16 + miss 点查）采集 `shanshui_bloom_*_total_l0`（段数线性斜率）+
-  `shanshui_blockcache_*`（块 miss/淘汰）+ `shanshui_l0_sst_count_table_*`（单表堆积）→ 分层 fpr 与
-  per-table 优先压实是否立项由其数据驱动（见 development_remain P128 行）。
+- 决策接口 → 实测回填（2026-09-05）：demo `src/demo/l0-bloom-scale`（release，偶数 8000 行交错写
+  S 段 + 奇数 miss 5000 次）产出：
+  | L0 段数 | p50 µs | p99 µs | mean µs | probe/q | skip/q | pass/q(fp) | blockcache misses/q |
+  |---|---|---|---|---|---|---|---|
+  | 4 | 1.20 | 8.50 | 1.57 | 4.00 | 3.96 | 0.036 | 0.00 |
+  | 8 | 1.80 | 6.20 | 2.10 | 7.99 | 7.92 | 0.072 | 0.00 |
+  | 12 | 2.60 | 7.40 | 3.06 | 11.99 | 11.88 | 0.106 | 0.00 |
+  | 16 | 3.50 | 12.10 | 4.18 | 15.98 | 15.84 | 0.132 | 0.00 |
+  结论：① `probe/q ≈ 段数` 直证 miss 点查逐段遍历全部 L0（每段一次 v5 分区布隆 probe），
+  mean 斜率 ≈0.21µs/段——段数线性**只罚 miss/已删除点查**，命中 key 在新段早停（O(1~2) 段）；
+  ② `misses/q≈0` 证 miss 开销全在每段 二分+分区布隆反序列化+位测试（元数据常驻 CPU/内存），
+  非磁盘块读（与 P0① 认知修正一致）；③ `pass/q≈fp 0.9%` 校准 fpr 0.01 ✓。
+  **决策**：per-table L0 优先压实中低优先（保留监控防热点表数十段，不单独立项调度）；
+  分层 fpr 调优对纯 miss 场景无意义（真 miss 无假阳性），仅命中场景假阳性读块受益 → 需另测
+  命中档方可立项，暂缓；布隆反序列化缓存量级 ≈0.2µs/段不单独立项。下一开发候选回 P127
+  组合 WHERE 收敛（见 development_remain P128 行 / P127 行）。
 
 ## 环境备忘（不入库）
 
