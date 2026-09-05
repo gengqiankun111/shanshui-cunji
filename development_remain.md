@@ -146,6 +146,14 @@ Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09
 >    结论：缺口① 无系统性回归，冷读列解码收益需 PAX 布局大库重建后另行评估。
 > ② #12 COUNT(*) O(1)：fresh-load 多 L0 快照不 eligible → 回退 43ms 全扫；放宽为活跃 docid
 >   rank 计数（不依赖单层快照形态）。
+>    ✅ 已完成（2026-09-05，P107）：活跃 docid rank 计数（count_docs_range/count_all_docs）本已
+>    层形态无关（P96）；根因 = fresh-load 场景 cjserver 空数据目录打开 → live 基线 None → load 期
+>    put/delete 不记账 → 首个 COUNT 触发一次性全键扫基线（~200ms 拖高 5 次均值 43ms）。修复 =
+>    engine/open.rs **空库打开即播种空活跃集**（primary.data_empty() → Some(空)），load 全程增量
+>    记账 → 首个 COUNT 亦 O(1)（免基线全扫）。单测 gap2_count_o1_fresh_load_empty_open_multi_l0
+>    （空库播种 + 小 memtable 多 L0 + PAX + 删除/复活/多表高位隔离 = keys-only 口径）。fresh-load
+>    10万 PAX 实测（results-gap2-scc-100k）：#12 42.84ms → **0.27ms**（p50 0.28/p99 0.29，5 次全
+>    O(1)），验收 ≤1ms 达成；harness 首个 COUNT 亦 O(1)。全量 709 绿。
 > ③ #29/#5 残余 = 行读+块 IO/跨文件扇出 → Task-025b 阶段④。
 > ④ #11 数值 zone 运行时路由待核：若 BETWEEN 行级走 scan_all 未带 zonepred，zone 只生效于
 >   scan_pushdown 路径（正确性已由 task025 单测保障；运行时收益待接线）。

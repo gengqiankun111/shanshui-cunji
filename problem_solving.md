@@ -1272,6 +1272,24 @@
   劣化（L0 累积）所致，与接线无关；冷读列解码收益验证需 PAX 布局大库（重建）另行评估。
 
 
+### P107. Task-024 阶段② 缺口②——#12 COUNT(*) O(1) fresh-load 放宽（2026-09-05）
+
+- **根因（P105 ②）**：#12 10万 PAX fresh-load 42.84ms 均值——活跃 docid rank 计数（P96，
+  count_all_docs/count_docs_range）本已层形态无关；真正的慢在 **fresh-load 场景首个 COUNT**：
+  cjserver 在空数据目录上打开（live 基线 None）→ rr wide-load 期间 put/delete 不记账 → 首个
+  COUNT 触发一次性全键扫基线（~200ms 拖高 5 次均值 ≈ 43ms），与"多 L0 快照 eligible"无关。
+- **修复**：engine/open.rs 在 primary.data_empty()（memtable + SST 全空）时把 live_docids 播种为
+  `Some(空)`——load 期 put/delete/delete_batch 全程增量记账（P1-C 记账全链路），首个 COUNT(*)
+  亦 O(1)（活跃集 rank，免基线全扫）。非空库保持 None（懒建，避免 open 期全扫拖慢启动）；
+  purge_all 复位 Some(空) 语义不变。
+- **单测（+1）**：`gap2_count_o1_fresh_load_empty_open_multi_l0`——空库播种 + 小 memtable 多
+  flush 成多 L0 + PAX 块（fresh-load 形态）全程增量记账 = keys-only 扫描口径（覆盖写/删除/复活）
+  + 整表窗口 count_docs_range 一致 + 多表高位不串表。全量 **709** 绿。
+- **实测回填（fresh-load 10万 PAX，results-gap2-scc-100k）**：#12 42.84ms → **0.27ms**
+  （p50 0.28 / p99 0.29，5 次全 O(1)），验收 ≤1ms 达成；sqlrun harness 自身首个 COUNT 亦 O(1)
+  （N=100000 精确）。临时验证库（db-gap2-check）已删除。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
