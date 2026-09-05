@@ -1192,6 +1192,19 @@
   与跨文件扇出并行（对应 #5/#11 多段场景）。
 
 
+### P103. Task-025b 阶段②——通用 WHERE 并行 + GROUP BY 分片合并（2026-09-05）
+
+- **通用 WHERE 并行**（aggregate.rs）：并行路径解除“无 WHERE”限制——worker 逐行执行与串行
+  acc 一致的 WHERE 判定（light_where_matches 优先、serde 回退），投影子集含 WHERE 引用列，
+  语义等价；仍限 ORDER/LIMIT 空 + 窗口有限（标量聚合本无行序依赖）。
+- **GROUP BY 分片合并**（group_by.rs）：窗口两端有限时按核（2..=8）等分子窗并发构建局部分组
+  （子集化/WHERE/分组键/聚合提取与串行分支逐值一致），按组键+累加器逐项合并（count/n_num/
+  sum 相加、min/max 取极值，交换律保证一致）；无界/错误回退串行；组数 cap 在分片内即熔断。
+- **测试**（task025b_*，5000 行双状态含 null）：WHERE COUNT/SUM/AVG 并行=串行；GROUP BY
+  COUNT/SUM/MIN/MAX 分片合并 = 无界串行逐组一致。全量 **705**（701+seqlock 4）绿。
+- 后续：导出/条带扫描并行与跨文件扇出并行（#5/#11 多段场景，Task-025b 阶段③）。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
