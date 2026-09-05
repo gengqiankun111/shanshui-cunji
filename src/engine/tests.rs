@@ -528,6 +528,52 @@ use crate::optimizer::QuerySpec;
     }
 
     #[test]
+    fn gap2_count_o1_fresh_load_empty_open_multi_l0() {
+        // 缺口②（P105-②）：**空库打开即播种活跃集**（Some(空)）→ fresh-load（小 memtable
+        // 多次 flush → 多 L0 + PAX 块，复现 P105 10万 fresh-load 形态）全程 put/delete/
+        // delete_batch 增量记账，首个 COUNT(*) 即 O(1)（活跃集 rank，无需一次性全键扫基线）。
+        // 正确性 = keys-only 扫描口径；覆盖覆盖写/删除/复活/多表高位隔离。
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.memtable.max_size_mb = 1; // 小 memtable → 多次 flush 成多 L0 段
+        c.storage.hot_fields = vec!["a".into()]; // PAX 块（fresh-load 形态）
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        assert!(e.primary.data_empty(), "空库打开时 primary 应无数据");
+        for i in 0..5000u64 {
+            let doc = serde_json::json!({"a": i, "b": i * 2});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &["a"]).unwrap();
+            if i % 1000 == 999 {
+                e.flush_primary().unwrap(); // 分段落盘 → 多 L0
+            }
+        }
+        e.flush_primary().unwrap();
+        e.delete(3).unwrap();
+        e.delete(2999).unwrap();
+        e.put(3, br#"{"a":3,"b":0}"#.to_vec(), &["a"]).unwrap(); // 复活
+        e.flush_primary().unwrap();
+        let mut scan = 0u64;
+        e.scan_stream_ids(None, None, |_| {
+            scan += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(
+            e.count_all_docs().unwrap(),
+            scan,
+            "空库播种 + load 期增量记账 = keys-only 口径（含删除/复活）"
+        );
+        let mask = (1u64 << 48) - 1;
+        assert_eq!(e.count_docs_range(0, mask).unwrap(), scan, "整表窗口区间基数一致");
+        // 多表高位隔离：t7 行不串入默认表窗口；全库含他表
+        let tid2 = crate::multitable::table_base(7);
+        e.put(tid2 | 1, br#"{"a":1}"#.to_vec(), &["a"]).unwrap();
+        e.put(tid2 | 2, br#"{"a":2}"#.to_vec(), &["a"]).unwrap();
+        e.delete(tid2 | 1).unwrap();
+        assert_eq!(e.count_docs_range(0, mask).unwrap(), scan, "默认表窗口不受他表高位影响");
+        assert_eq!(e.count_all_docs().unwrap(), scan + 1, "全库计数含他表存活行");
+    }
+
+    #[test]
     fn scan_collapses_within_source_multi_versions() {
         // Ex-8.1（demo range-window 发现的折叠缺口）：同 docid 覆盖写后未 compaction 收敛刷盘，
         // 同源（memtable/SST）连续同 key 多版本行——scan/流式/count 均应折叠为最新版本

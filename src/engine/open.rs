@@ -303,6 +303,16 @@ impl Engine {
             metrics: crate::metrics::Metrics::default(),
             shard_metrics: std::sync::Mutex::new(None),
         };
+        // 缺口②（P105-②）：**空库打开即播种活跃 docid 空集**（`Some(空)`）——fresh-load
+        // 场景（cjserver 空数据目录启动 → wide-load 装数）下 put/delete/delete_batch 全程
+        // 增量记账，首个 `COUNT(*)`/区间基数即 O(1)（活跃集 rank），不再触发一次性全键扫
+        // 基线（P105 #12 43ms 均值根因：打开时基线 None → load 期不记账 → 首个 COUNT
+        // 触发全扫 ~200ms 拖高 5 次均值）。非空库（SST/memtable 有数据）保持 None →
+        // 首次 COUNT 懒建基线（P1-C 语义，避免 open 期全扫拖慢启动）；purge_all 复位
+        // `Some(空)` 不变。
+        if engine.primary.data_empty() {
+            *engine.live_docids.lock().unwrap() = Some(roaring::treemap::RoaringTreemap::new());
+        }
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
         engine.start_group_commit(cfg);
