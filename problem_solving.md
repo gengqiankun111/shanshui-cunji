@@ -1205,6 +1205,19 @@
 - 后续：导出/条带扫描并行与跨文件扇出并行（#5/#11 多段场景，Task-025b 阶段③）。
 
 
+### P104. Task-025b 阶段③——条带并行全扫导出构建块（2026-09-05）
+
+- **Engine::scan_range_parallel**（engine/scan.rs）：[lo..hi] 按核（≤16）等分子窗并发
+  `scan_range`，各窗 docid 升序后 **K 路归并**输出全局升序；与 `scan_range` 同契约
+  （删除位图/Delta/memtable 可见性一致），workers≤1 退化单线程。供导出/备份/离线读等
+  条带消费端直接复用（备份文件拷贝类无需改）。
+- **覆盖矩阵**：条带并行（本步，行扫描）；聚合/分组窗口并行（阶段①/②：无 WHERE/通用
+  WHERE/GROUP BY 分片合并）；**跨文件扇出并行**（#5/#11 多段场景 = CF 层逐文件并发 +
+  k-way 归并，需 CF scan 层改造）→ 单列 **Task-025b 阶段④**（独立、深）。
+- **测试**：20k 行 + 删除位图 + flush 后尾批，8 窗并行 = 串行逐行一致且全局升序。
+  全量 **706**（702+seqlock 4）绿。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

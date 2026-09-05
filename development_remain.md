@@ -153,7 +153,11 @@ Task-025：范围查询提速——Partition Pruning 与 Parallel Scan（2026-09
 > ✅ Task-025b 阶段②（2026-09-05，P103）：**通用 WHERE 并行**（worker 内与串行 acc 一致判定，
 > 解除无 WHERE 限制）+ **GROUP BY 分片合并**（局部分组按组键/累加器逐项合并，count/n_num/sum
 > 相加、min/max 极值）；双状态 5000 行 WHERE 聚合与 GROUP BY 并行=串行逐组一致，全量 705 绿。
-> 阶段③（导出/条带与**跨文件扇出并行**，对应 #5/#11 多段场景）后续。
+> ✅ Task-025b 阶段③（2026-09-05，P104）：**Engine::scan_range_parallel** 条带并行全扫
+> （等分子窗并发 + K 路归并，同 scan_range 契约）作为导出/条带构建块；聚合/分组窗口并行
+> 已覆盖（①/②）。全量 706 绿。
+> **Task-025b 阶段④（独立、深，未开发）**：跨文件扇出并行——CF scan 层逐文件并发 + k-way
+> 归并（#5/#11 多段/重叠 L0 场景主杠杆），需 CF scan_stream_at 层改造（与 Ex-8.9/IO 预算结合）。
 
 Task-027：HotCache TinyLFU 读回填准入（2026-09-05 用户定：**优先开发**，先于 Task-025b/PAX 复测与 Task-026）
 > 设计：research/cache_TinyLFU.md §二/§三（Count-Min + Doorkeeper + 衰减；衰减采样阈值 N 默认
