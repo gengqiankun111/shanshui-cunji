@@ -1626,8 +1626,25 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 验证：3 新增单测（server/tests.rs：组合 UPDATE/DELETE 的 LIMIT 只动前 n 行 + 无 LIMIT 全量不截断
   逐行断言、组合 SELECT 守卫后行序 = active 升序前 200）；全量 lib **772 通过 + 3 ignored**
   （seqlock 概率型 flaky 单跑复绿，无关）。
-- 待办：110 万基准复测 #75（写定位 ~550ms → 区间 keys-only 2 万行级；UPDATE 全链 ≤ MySQL 10×
-  验收回填；UPDATE ... LIMIT 影响行数对齐 MySQL 200）。
+- 分支 B（SELECT 读路径主键区间语义 bug 修复，2026-09-05，用户指定）：
+  - 根因深化：cjserver INSERT 的 id 列**提取为主键、不进文档 JSON**（sqlparse parse_insert_multi
+    match "id"|"docid" → idv）→ executor eval 把 WHERE `id BETWEEN` 当文档字段条件求值 → 文档无
+    id 字段恒 0 行且全扫慢（110 万验收实测组合 SELECT = 0 行 + 12s）。UPDATE/DELETE 因组合主键
+    区间收敛（P127 主修复）已正确；SELECT 读路径未覆盖。
+  - 修复：`execute_with_tid(engine, sql, cap, tid)`（新 pub，sql/mod re-export；`execute` 委托
+    tid=0 零回归）——server select_response 两处 execute 调用传 `table_id_for(table_name_of(sql))`；
+    executor 新增主键区间收敛 `pk_range_select`（纯 AND 提取 row 闭区间 → tid_base|row docid 区间
+    keys-only ∩ 其余条件 DocIdSet.contains → 收集 ≤ offset+limit 早停 → 回表 → 升序）；rest 仍含
+    主键谓词/row 越界/OFFSET+无 LIMIT 等守卫；含 ORDER BY 不收敛（需全候选，归排序族）。
+  - 110 万复测（3317 新 binary）：组合 SELECT 0 行 + 12s → **200 行、p50 16.1ms**（MySQL 同 SQL
+    p50 0.49ms → 33×；750× 提速；残余 = 宽表 200 行整 doc 回表解码，归"行式解码/回表"家族）。
+  - 新发现独立慢点：纯主键区间 SELECT（server extract_between_range 快速路径）110 万 p50 296ms
+    （历史 P127 立项记录 169ms 同源）——该窗口路径远慢于组合收敛路径（16ms），后续小项建议
+    extract_between_range 复用 pk_range_select（rest=None 快路径）。
+  - 验证：1 新单测（真实形态 doc 无 id 字段：组合 LIMIT 50 升序 2..100 / 无 LIMIT 1000 / OFFSET 20→42
+    / 纯区间 LIMIT 5 首行 1）；全量 lib **775 通过 + 3 ignored**。
+- 待办（复测回填）：#75（110 万）已回填（见 development_remain P127 行）；UPDATE 写链地板
+  ~12-21ms（宽表整文档重写 + 倒排 + 组提交）与纯主键区间 SELECT 296ms 均按"规避/后续小项"记录。
 
 **P128（P0 观测三项补齐闭环：Bloom 分层 / 块缓存计数 / L0 按表段数，2026-09-05）**
 - 触发：用户"Bloom 优化优先级"总结（P0 观测先行 + 分层 fpr + per-table L0 压实）。代码核查先行——

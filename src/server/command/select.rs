@@ -123,12 +123,15 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
                     }
                 }
             }
-            let mut rows = match crate::sqlish::execute(engine, sql, 10_000) {
+            // P127 分支 B：带表号执行——SQL 主键 id/docid BETWEEN 按 row → docid 区间收敛
+            // （cjserver 文档无 id 字段，字段语义求值组合主键区间恒 0 行慢查）
+            let tid = table_id_for(&table_name_of(sql));
+            let mut rows = match crate::sqlish::execute_with_tid(engine, sql, 10_000, tid) {
                 Ok(r) => r,
                 Err(e) => return QueryResponse::Err(1064, format!("query error: {e}")),
             };
-            // §26 M1b：非默认表限定本表 docid 区间（与 sqlish 兜底同语义）
-            let tid = table_id_for(&table_name_of(sql));
+            // §26 M1b：非默认表限定本表 docid 区间（与 sqlish 兜底同语义；execute_with_tid
+            // 仅对主键区间形态在 executor 内按 tid 收敛，其余形态仍返回全库行）
             if tid != 0 {
                 rows.retain(|(d, _)| ((*d >> 48) as u16) == tid);
             }
@@ -417,7 +420,8 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
         Err(e) => return QueryResponse::Err(1064, format!("query error: {e}")),
     }
     // 一般 SELECT → sqlish 引擎（结果按投影列裁剪；limit/排序 sqlish 内部处理）
-    match crate::sqlish::execute(engine, sql, 10_000) {
+    // P127 分支 B：带表号执行（主键 id/docid BETWEEN 组合按 row → docid 区间收敛）
+    match crate::sqlish::execute_with_tid(engine, sql, 10_000, tid) {
         Ok(mut rows) => {
             // §26 M1b：非默认表纯字段谓词 → 兜底行限定本表区间（防跨表泄漏）
             if tid != 0 {

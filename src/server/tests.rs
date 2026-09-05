@@ -1238,6 +1238,65 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn p127_b_select_combo_pk_range_no_id_field_in_doc() {
+        // P127 分支 B（真实形态）：cjserver INSERT 的 id 列提取为主键、**文档 JSON 无 id 字段**
+        // → 组合 `id BETWEEN ∩ status=` 此前 executor 字段语义求值恒 0 行慢查（110 万验收实测
+        // 0 行 + 12s）→ execute_with_tid 主键区间收敛（row→docid 区间 keys-only ∩ 其余条件集）
+        // 应按 MySQL 主键语义返回正确行。e.put doc 与真实一致：仅 status/n、无 id 字段。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        for i in 1..=3000u64 {
+            let status = if i % 2 == 0 { "active" } else { "closed" };
+            let doc = serde_json::json!({"status": status, "n": i});
+            let term: &str = if i % 2 == 0 { "status=active" } else { "status=closed" };
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[term]).unwrap();
+        }
+        e.flush_wal().unwrap();
+        // ① LIMIT 50：组合主键区间收敛 → 升序前 50 active（偶数 2..=100）
+        let rows = crate::sqlish::execute_with_tid(
+            &e,
+            "SELECT id,status FROM t WHERE id BETWEEN 1 AND 2000 AND status='active' LIMIT 50",
+            10_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 50, "组合 SELECT LIMIT 50 行数（修复前 0 行）");
+        for (k, (d, _)) in rows.iter().enumerate() {
+            assert_eq!(*d, 2 + 2 * k as u64, "第 {k} 行应 = active 升序第 {k}");
+        }
+        // ② 无 LIMIT → 窗口内全量 active（1..2000 偶数 = 1000 行）
+        let rows2 = crate::sqlish::execute_with_tid(
+            &e,
+            "SELECT id FROM t WHERE id BETWEEN 1 AND 2000 AND status='active'",
+            10_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows2.len(), 1000, "无 LIMIT 全窗口 active");
+        // ③ OFFSET 生效（第 21 个 active = id 42）
+        let rows3 = crate::sqlish::execute_with_tid(
+            &e,
+            "SELECT id FROM t WHERE id BETWEEN 1 AND 2000 AND status='active' LIMIT 10 OFFSET 20",
+            10_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows3.len(), 10);
+        assert_eq!(rows3[0].0, 2 + 2 * 20, "OFFSET 20 后首个 = 42");
+        // ④ 纯主键区间（无其余条件）同样收敛
+        let rows4 = crate::sqlish::execute_with_tid(
+            &e,
+            "SELECT id FROM t WHERE id BETWEEN 1 AND 100 LIMIT 5",
+            10_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows4.len(), 5);
+        assert_eq!(rows4[0].0, 1, "纯区间升序首行 = docid 1");
+    }
+
+    #[test]
     fn insert_dup_pk_1062() {
         // a：INSERT 主键重复 → MySQL 1062（同语句重复 / 库中已存在；预校验 → 无部分写入）
         let dir = tempfile::tempdir().unwrap();

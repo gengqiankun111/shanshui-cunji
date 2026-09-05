@@ -3,6 +3,7 @@
 //! `get_docid_set`/`docset_to_sorted` + `try_composite_index`/`extract_eq_conds`。
 //! 行级字节扫描/位图求值基建在 `super::eval`；JOIN 在 `super::join`。
 
+use crate::docset::DocIdSet;
 use crate::engine::{Engine, QueryRow};
 use crate::error::{Error, Result};
 use crate::sql::parser::{parse_select, CmpOp, Select, WhereExpr};
@@ -865,9 +866,179 @@ pub(crate) fn execute_distinct(
     Ok(out)
 }
 
+// ================= P127 分支 B：SELECT 主键区间收敛（row → docid 区间） =================
+//
+// SQL 主键 `id`/`docid` 是 row_id（cjserver INSERT 的 id 列提取为主键、不进文档 JSON）。
+// eval 字段语义求值 `id BETWEEN a AND b` → 文档无 id 字段恒 0 行且全扫慢（P127 验收实测
+// 110 万 0 行 + 12s）。本组函数把主键区间按 **docid 区间 keys-only ∩ 其余条件集** 收敛，
+// 语义对齐 MySQL（与 UPDATE/DELETE 写定位 locate_pk_range_converged 同口径）。
+
+/// DocIdSet 成员判定（Bitmap O(1) / SortedList 升序二分 / Empty false / All true）。
+fn docset_contains(s: &DocIdSet, d: u64) -> bool {
+    match s {
+        DocIdSet::Bitmap(bm) => bm.contains(d),
+        DocIdSet::SortedList(v) => v.binary_search(&d).is_ok(),
+        DocIdSet::Empty => false,
+        DocIdSet::All => true,
+    }
+}
+
+/// 主键闭区间叶（field=id/docid，数值 lo ≤ hi）——SQL row 闭区间。
+fn pk_row_leaf(e: &WhereExpr) -> Option<(u64, u64)> {
+    if let WhereExpr::Between { field, low, high } = e {
+        let f = field.to_lowercase();
+        if (f == "id" || f == "docid") && !field.contains('.') && !field.contains('[') {
+            if let (Ok(a), Ok(b)) = (low.parse::<u64>(), high.parse::<u64>()) {
+                if a <= b {
+                    return Some((a, b));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// WHERE 是否含任何主键谓词（id/docid 等值或区间）——多主键组合保守回退判定。
+fn where_has_pk_any(e: &WhereExpr) -> bool {
+    match e {
+        WhereExpr::Cond(c) => {
+            let f = c.field.to_lowercase();
+            (f == "id" || f == "docid") && !c.field.contains('.') && !c.field.contains('[')
+        }
+        WhereExpr::Between { field, .. } => {
+            let f = field.to_lowercase();
+            (f == "id" || f == "docid") && !field.contains('.') && !field.contains('[')
+        }
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            where_has_pk_any(a) || where_has_pk_any(b)
+        }
+        WhereExpr::Not(x) => where_has_pk_any(x),
+        _ => false,
+    }
+}
+
+/// 纯 AND 链提取主键闭区间叶 → **docid 闭区间** + 其余条件（None = 仅区间）。
+/// OR/NOT 包裹 → 保守 None（回通用求值路径）；row → docid = tid_base | row。
+fn extract_pk_docid_range(
+    e: &WhereExpr,
+    tid: u16,
+) -> Option<(u64, u64, Option<WhereExpr>)> {
+    let base = (tid as u64) << 48;
+    if let Some((a, b)) = pk_row_leaf(e) {
+        return Some((base | a, base | b, None));
+    }
+    match e {
+        WhereExpr::And(a, b) => {
+            if let Some((a0, b0)) = pk_row_leaf(a) {
+                return Some((base | a0, base | b0, Some((**b).clone())));
+            }
+            if let Some((a0, b0)) = pk_row_leaf(b) {
+                return Some((base | a0, base | b0, Some((**a).clone())));
+            }
+            if let Some((lo, hi, rest)) = extract_pk_docid_range(a, tid) {
+                let merged = match rest {
+                    Some(r) => WhereExpr::And(Box::new(r), b.clone()),
+                    None => (**b).clone(),
+                };
+                return Some((lo, hi, Some(merged)));
+            }
+            if let Some((lo, hi, rest)) = extract_pk_docid_range(b, tid) {
+                let merged = match rest {
+                    Some(r) => WhereExpr::And(a.clone(), Box::new(r)),
+                    None => (**a).clone(),
+                };
+                return Some((lo, hi, Some(merged)));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// P127 分支 B 收敛执行：主键 docid 区间 keys-only 扫描（现存升序）∩ 其余条件集 → 收集
+/// ≤ offset+limit（早停）→ 回表 → 升序行集。非收敛形态（无主键区间 / 其余条件仍含主键
+/// 谓词 / row 越界）→ None（调用方回通用求值路径）。空集 → Some(vec![])。
+fn pk_range_select(
+    engine: &Engine,
+    sel: &Select,
+    cap: u64,
+    tid: u16,
+) -> Result<Option<Vec<QueryRow>>> {
+    let Some(we) = sel.where_expr.as_ref() else {
+        return Ok(None);
+    };
+    let Some((lo, hi, rest)) = extract_pk_docid_range(we, tid) else {
+        return Ok(None);
+    };
+    // row 越界防御（超 48bit row 上限 → 空集；防 base|row 串入下一表区间）
+    if lo >> 48 != (tid as u64) || hi >> 48 != (tid as u64) {
+        return Ok(Some(Vec::new()));
+    }
+    let limit = sel.limit.unwrap_or(cap).min(cap);
+    let offset_u = sel.offset as u64;
+    let guard = engine.query_guard();
+    // 其余条件集（rest 仍含主键谓词 → 多主键组合保守回退原路径）
+    let rest_set = match &rest {
+        Some(r) => {
+            if where_has_pk_any(r) {
+                return Ok(None);
+            }
+            let s = get_docid_set(engine, Some(r), None, &guard)?;
+            if s.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            Some(s)
+        }
+        None => None,
+    };
+    let need = limit.saturating_add(offset_u).max(1);
+    let mut ids: Vec<u64> = Vec::new();
+    engine.scan_stream_ids(Some(lo), Some(hi), |d| {
+        if d < lo || d > hi {
+            return Ok(true);
+        }
+        let hit = match &rest_set {
+            Some(s) => docset_contains(s, d),
+            None => true,
+        };
+        if hit {
+            ids.push(d);
+            if ids.len() as u64 >= need {
+                return Ok(false); // LIMIT+OFFSET 上限达标：终止扫描（早停）
+            }
+        }
+        Ok(true)
+    })?;
+    let out_ids: Vec<u64> = ids.into_iter().skip(sel.offset as usize).collect();
+    if out_ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let batch = engine.batch_get(&out_ids)?;
+    let mut out = Vec::new();
+    for (d, v_opt) in out_ids.into_iter().zip(batch.into_iter()) {
+        if let Some(doc) = v_opt {
+            out.push((d, doc));
+        }
+    }
+    Ok(Some(out))
+}
+
 /// 执行类 SQL：解析 + 求值 + 回表 + LIMIT/OFFSET（`cap` 为无 LIMIT 时的上限保护）。
 /// 看门狗：扫描过滤/回表逐批熔断（超时返回 QueryTooExpensive，不挂起 server）。
 pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
+    execute_with_tid(engine, sql, cap, 0)
+}
+
+/// P127 分支 B：`execute` 带表号（tid）版本——SQL 主键 `id/docid` 是 **row_id**（cjserver
+/// INSERT 的 id 列提取为主键、不进文档 JSON，故 executor 字段语义求值 `id BETWEEN` 恒 0 行
+/// 慢查）；server select_response（有表名 → tid）传此以做 row → docid 区间收敛，语义对齐
+/// MySQL。不带 tid 的调用（默认表 documents，tid=0，row == docid）行为不受影响。
+pub fn execute_with_tid(
+    engine: &Engine,
+    sql: &str,
+    cap: u64,
+    tid: u16,
+) -> Result<Vec<QueryRow>> {
     let sel = parse_select(sql)?;
     if !sel.group_by.is_empty() {
         return Err(Error::Config(
@@ -885,6 +1056,16 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
     // 组合索引会返回纯主表行并把 JOIN 静默丢弃（错结果）。
     if sel.join.is_some() {
         return execute_join(engine, &sel, cap);
+    }
+    // P127 分支 B：主键区间收敛——WHERE 纯 AND 链含主键 id/docid BETWEEN 时按 SQL row
+    // 主键区间（tid → docid 区间）keys-only ∩ 其余条件集收敛 + 回表 LIMIT/OFFSET。
+    // cjserver 文档**无 id 字段**（INSERT id 列提取为主键不进 JSON），executor 字段语义
+    // 求值此形态恒 0 行慢查（P127 验收实测 0 行 + 12s）→ 此处按 MySQL 主键语义修正。
+    // 排序需全候选 → 仅无 ORDER BY 走收敛（组合+ORDER BY 归排序族专项）。
+    if sel.order_by.is_empty() {
+        if let Some(rows) = pk_range_select(engine, &sel, cap, tid)? {
+            return Ok(rows);
+        }
     }
     // P0-A：声明式组合索引路由——WHERE 等值前缀匹配 composite_indexes 时走 cidx 前缀扫描。
     // 匹配规则：提取 WHERE 中所有等值条件 → 按 composite_indexes 最左前缀匹配 → 取最长匹配。
