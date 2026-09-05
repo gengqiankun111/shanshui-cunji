@@ -1218,6 +1218,21 @@
   全量 **706**（702+seqlock 4）绿。
 
 
+### P105. Task-024 阶段②——PAX(hot_fields) 10 万复测轮（2026-09-05）
+
+- **做法**：基准库以 hot_fields=[k,amount,ts,status,city,region]（PAX 列存，tmp-cfg-wide-2g-pax）
+  重建 100k 重跑 37 探针（results-pax-sqlrun-compare-100k），对照行式 results-sqlrun-compare-100k。
+- **结果（SCC mean ms / 比值）**：#9 3.60→2.73（-24%，5.5→4.0×，倒排回表受益）；#11 58.05→54.22
+  （-7%，1.5→1.3×）；#14 68.61→63.31（-8%，2.7→2.4×）；#15/#28/#30/#31 保持 SCC 快档（0.5×/0.0×）。
+- **未达验收 → 暴露接线缺口（新开发项，非复测可补）**：
+  ① 点查/IN 投影下推：#2 0.46→0.45、#4 1.73 持平——点查仍走 engine.get 整行解码（PAX 行不解列），
+     需 engine 投影点查（get_fields）接线；
+  ② #12 COUNT(*) 43ms：fresh-load 多 L0 快照不 eligible → O(1) 只对收敛层生效；需活跃 docid rank 计数；
+  ③ #29 235ms（4.7×）/ #5 3.11ms（11×）：行读+块 IO，归 Task-025b 阶段④（跨文件扇出/块IO）；
+  ④ #11 数值 zone 运行时路由待核（zone 收益或仅在 scan_pushdown 路径；正确性已由 task025 单测保障）。
+- 决策：上述 ①-④ 转开发排期（dev_remain Task-024 阶段② 缺口注）；本复测为基线存档，不回溯旧排期项。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
