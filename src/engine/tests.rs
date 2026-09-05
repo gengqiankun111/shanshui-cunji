@@ -18,6 +18,63 @@ use crate::optimizer::QuerySpec;
             .join(name)
     }
 
+    /// Task-028：cidx 存量补齐（open 期重建）——无 composite_indexes 写入的存量库，
+    /// 后加声明重开 → 前缀查询不再静默空；签名变更/重复重开不丢行。
+    #[test]
+    fn task028_cidx_rebuild_on_open_after_config_add() {
+        let dir = tmp();
+        // 阶段 1：无 composite_indexes 配置写入存量（模拟旧库/配置后加）
+        let cfg0 = Config::default();
+        let exp_active_bj;
+        {
+            let mut e0 = Engine::open(&dir, &cfg0).unwrap();
+            let mut cnt = 0usize;
+            for i in 0..2000u64 {
+                let status = if i % 3 == 0 { "active" } else { "closed" };
+                let region = if i % 2 == 0 { "beijing" } else { "shanghai" };
+                let doc = serde_json::to_vec(&serde_json::json!({
+                    "status": status, "region": region, "note": format!("n{i}")
+                }))
+                .unwrap();
+                let t: &[&str] = &[];
+                e0.put(i, doc, t).unwrap();
+                if status == "active" && region == "beijing" {
+                    cnt += 1;
+                }
+            }
+            e0.flush_wal().unwrap();
+            exp_active_bj = cnt;
+        }
+        assert!(exp_active_bj > 0);
+        // 阶段 2：声明 (status,region) 重开 → open 期重建 → 前缀查询非空且计数正确
+        let mut cfg2 = Config::default();
+        cfg2.storage.composite_indexes = vec![vec!["status".into(), "region".into()]];
+        {
+            let e2 = Engine::open(&dir, &cfg2).unwrap();
+            let hits = e2.query_by_composite_prefix(&[b"active", b"beijing"]).unwrap();
+            assert_eq!(hits.len(), exp_active_bj, "cidx 重建后前缀查询计数须等于存量");
+            assert!(hits.len() > 0, "Task-028 修复点：重建后不得静默空");
+            let sig = std::fs::read_to_string(dir.join("cidx.sig")).unwrap();
+            assert_eq!(sig, "status.region", "签名标记应落盘");
+        }
+        // 阶段 3：正常重开（标记一致 + cidx 非空）→ 结果不回退
+        {
+            let e3 = Engine::open(&dir, &cfg2).unwrap();
+            let hits3 = e3.query_by_composite_prefix(&[b"active", b"beijing"]).unwrap();
+            assert_eq!(hits3.len(), exp_active_bj, "正常重开后结果不回退");
+        }
+        // 阶段 4：索引字段变更（签名不符）→ 触发重建并覆盖新索引
+        let mut cfg4 = Config::default();
+        cfg4.storage.composite_indexes = vec![vec!["note".into()]];
+        {
+            let e4 = Engine::open(&dir, &cfg4).unwrap();
+            let sig = std::fs::read_to_string(dir.join("cidx.sig")).unwrap();
+            assert_eq!(sig, "note", "签名应更新为新索引");
+            let hits = e4.query_by_composite_prefix(&[b"n1999"]).unwrap();
+            assert_eq!(hits.len(), 1);
+        }
+    }
+
     #[test]
     fn shard_metrics_attach_and_render() {
         // 10 亿库阶段 D：挂载分片指标 → 水位上报 → /metrics 渲染 + 预警

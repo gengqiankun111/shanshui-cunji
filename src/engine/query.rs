@@ -312,4 +312,109 @@ impl Engine {
         self.inverted.bitmap_and(terms).map(|b| b.len())
     }
 
+    /// Task-028：cidx 存量补齐（open 期调用）。声明了 `composite_indexes` 但 cidx 与 primary
+    /// 不一致（配置后加 / 旧库无 cidx / 崩溃丢键 / 索引字段变更）时，cidx 前缀查询会静默返回
+    /// 空/残缺结果——本方法从 primary 全量回扫重建，flush 落 SST 后写 `cidx.sig` 签名标记。
+    ///
+    /// 判定（幂等、重启安全）：
+    /// - 未声明索引 / cidx 不可用（None）→ no-op；
+    /// - primary 为空 → 空库即同步（补写标记）；
+    /// - `cidx.sig` 标记签名 ≠ 当前声明签名 或 cidx 无任何条目（SST+memtable 皆空）→ 重建；
+    /// - 其余（标记一致且 cidx 非空，正常会话/队列 WAL 恢复）→ 零开销跳过。
+    pub(crate) fn ensure_composite_index_backfill(&self) -> Result<()> {
+        let indexes = &self.composite_indexes;
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let Some(cidx) = &self.cidx else { return Ok(()) };
+        let sig = composite_index_sig(indexes);
+        let marker = self.data_dir.join("cidx.sig");
+        let cur = std::fs::read_to_string(&marker).unwrap_or_default();
+        if self.primary.data_empty() {
+            // 空库：cidx 空 = 同步；补写标记供后续签名比对
+            if cur != sig {
+                write_sig_marker(&marker, &sig)?;
+            }
+            return Ok(());
+        }
+        let cidx_empty = cidx.sst_count() == 0 && cidx.memtable_bytes() == 0;
+        if cur == sig && !cidx_empty {
+            return Ok(()); // 正常：标记一致且已有条目（含队列 WAL 恢复路径）
+        }
+        // —— 重建：primary 存量 → 提取各声明索引组字段值 → 复合键入 cidx（无 WAL，批量）——
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(8192);
+        self.primary.scan_stream(None, None, |key, val| {
+            let docid = crate::keys::decode_docid(key).map_err(|_| {
+                crate::error::Error::Corrupted("cidx 重建扫描 key 非 docid 编码".into())
+            })?;
+            if self
+                .deletion_bitmap
+                .as_ref()
+                .map(|b| b.is_deleted(docid))
+                .unwrap_or(false)
+            {
+                return Ok(true); // 删除位图已删：不入索引（重建后查询 get 亦跳过）
+            }
+            let Ok(vobj) = serde_json::from_slice::<serde_json::Value>(val) else {
+                return Ok(true); // 非 JSON 原始字节文档：无字段可取，与写路径语义一致
+            };
+            for fields in indexes {
+                let mut field_vals: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+                let mut all_present = true;
+                for f in fields {
+                    match vobj.get(f) {
+                        Some(serde_json::Value::String(s)) => {
+                            field_vals.push(s.as_bytes().to_vec())
+                        }
+                        Some(serde_json::Value::Number(n)) => {
+                            field_vals.push(n.to_string().into_bytes())
+                        }
+                        Some(serde_json::Value::Bool(b)) => field_vals.push(
+                            if *b { b"true".to_vec() } else { b"false".to_vec() },
+                        ),
+                        _ => {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                }
+                if all_present {
+                    let refs: Vec<&[u8]> =
+                        field_vals.iter().map(|v| v.as_slice()).collect();
+                    keys.push(crate::keys::encode_composite_key(&refs, docid));
+                }
+            }
+            if keys.len() >= 65_536 {
+                for k in keys.drain(..) {
+                    cidx.memtable_put_nolog(k, Vec::new());
+                }
+            }
+            Ok(true)
+        })?;
+        for k in keys {
+            cidx.memtable_put_nolog(k, Vec::new());
+        }
+        // 持久化：cidx memtable 统一落 SST → 写签名标记（标记在 flush 之后写，崩溃丢标记即重做）
+        cidx.switch_and_flush()?;
+        write_sig_marker(&marker, &sig)?;
+        Ok(())
+    }
+
+}
+
+/// 组合索引声明签名：字段组按 `.` 连接、组间按 `|` 连接（配置变更 → 签名变 → 触发重建）。
+fn composite_index_sig(indexes: &[Vec<String>]) -> String {
+    indexes
+        .iter()
+        .map(|v| v.join("."))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// 原子写签名标记（tmp + rename）。
+fn write_sig_marker(path: &std::path::Path, sig: &str) -> Result<()> {
+    let tmp = path.with_extension("sig.tmp");
+    std::fs::write(&tmp, sig)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }

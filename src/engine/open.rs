@@ -339,6 +339,10 @@ impl Engine {
         if engine.primary.data_empty() {
             *engine.live_docids.lock().unwrap() = Some(roaring::treemap::RoaringTreemap::new());
         }
+        // Task-028：cidx 存量补齐——声明 composite_indexes 但 cidx 空/签名不符（配置后加/
+        // 旧库无 cidx/崩溃丢键）时 open 期从 primary 回扫重建（正常会话零开销跳过）。
+        // 置于 worker 启动前：重建期无并发写，flush 落 SST + 写 cidx.sig 标记幂等。
+        engine.ensure_composite_index_backfill()?;
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
         // Task-026：per-CPU 启用 → 每队列消费线程启动（替代组提交后台线程）。

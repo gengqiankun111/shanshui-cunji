@@ -41,6 +41,15 @@ impl ColumnFamily {
         Ok(seq)
     }
 
+    /// Task-028：cidx 存量重建——**直接入 memtable，不写任何 WAL**。
+    /// 仅 open 期使用：重建源为 primary 存量（回调即权威数据），入 memtable 后由调用方
+    /// 统一 `switch_and_flush` 落 SST（持久化）并写 `cidx.sig` 签名标记；若期间崩溃未
+    /// flush → 下次 open 依签名标记缺失/不符自动重做（幂等，不丢键）。
+    pub(crate) fn memtable_put_nolog(&self, key: Vec<u8>, value: Vec<u8>) {
+        let s = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.memtable.put(key, s, value);
+    }
+
     /// 统一提交 WAL 缓冲（批量写入结束时调用）。
     /// 环形 WAL 落盘若需回绕覆盖未刷盘记录 → 强制 Flush 后重试。
     /// Task-026 external WAL：本 CF 无自持文件 → no-op（持久性由 engine 队列窗口/

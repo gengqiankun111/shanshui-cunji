@@ -9,13 +9,14 @@
 
 | 目标 | 命令 | 说明 |
 | --- | --- | --- |
-| 静态检查 | `make check` / `quality/check.ps1` | fmt + clippy + 构建 + 测试 |
+| 静态检查 | §2 四步命令（原一键链存 `tmp/quality/check.ps1`） | fmt + clippy + 构建 + 测试 |
 | 全量测试 | `make test-all` | cargo test（含 demo 冒烟） |
 | 基准测试 | `make benchmark` | release 构建 + demo 压测报告 |
-| 质量报告 | `quality/report.ps1` | 汇总生成 `quality/quality_report_*.md` |
+| 质量报告 | 手写（模板见 §8） | 报告提交 `user_guide/quality-report/` |
 | 依赖审计 | `make audit` | cargo audit + cargo deny |
 
-> Windows 开发机直接执行 `quality/check.ps1`；Linux（CI/服务器）执行 `quality/check.sh`。
+> 2026-09-05 仓库清理：`quality/` 目录（一键脚本 + 08-27 基线原始产物）整体移出仓库，
+> 存档于本地 `tmp/quality/`（不入库）；需入库的质量证据（报告/评审）统一提交 `user_guide/quality-report/`。
 > 命令均为幂等、可重复，保证**可复现**。
 
 ---
@@ -40,7 +41,7 @@ cargo install cargo-tarpaulin     # 覆盖率（Linux，Windows 不支持）
 | 工具 | 用途 | 触发时机 | 项目落地状态 |
 | --- | --- | --- | --- |
 | Gitee CodeCheck（华为云） | 圈复杂度 / 重复率 / 有效代码行 | 开源仓库免费开通 | ⏳ 待 Gitee 仓库启用（README 亮截图） |
-| cargo fmt / clippy | 格式 + 650+ lint | 每次 commit | ✅ 已纳入 check.ps1（六步链第 1-2 步） |
+| cargo fmt / clippy | 格式 + 650+ lint | 每次 commit | ✅ fmt/clippy 零告警（§2 静态检查链） |
 | cargo audit + auditable | CVE 扫描 + 二进制内嵌依赖树 | 每次 CI | ✅ audit 已执行（0 漏洞）；auditable 待 Linux |
 | cargo deny | 许可证合规 + 重复依赖 | 每次 release | ✅ 已执行（advisories/bans/licenses/sources ok） |
 | cargo geiger | unsafe 占比（目标 <5%） | 里程碑 | ✅ 当前 unsafe=0（grep 确认）；geiger 报告待 Linux |
@@ -82,7 +83,7 @@ cargo test --lib                  # 单元测试
 cargo audit                       # 依赖漏洞
 cargo deny check                  # 许可证/重复依赖
 cargo geiger --threshold 5        # unsafe < 5%
-cargo tarpaulin --out Html --output-dir quality/coverage   # 覆盖率 ≥ 80%
+cargo tarpaulin --out Html --output-dir tmp/coverage-<date>   # 覆盖率 ≥ 80%（HTML 体积大，不入库）
 ```
 
 ---
@@ -91,7 +92,7 @@ cargo tarpaulin --out Html --output-dir quality/coverage   # 覆盖率 ≥ 80%
 
 1. 收集产物：`design.md` + `development.md` + 核心模块（sstable / wal / engine / inverted / optimizer）；
 2. 用第 2 层 Prompt 模板发起 AI 评审；
-3. 输出 `quality/architecture-review-{Mx}.md`：风险清单（高/中/低）+ 整改项；
+3. 输出评审：风险清单（高/中/低）+ 整改项（需入库提交 `user_guide/quality-report/architecture-review-{Mx}.md`）；
 4. 整改闭环：高风险项必须修复并在下个里程碑复评；无法短期修复的写入 problem_solving.md 挂起区。
 
 ---
@@ -107,13 +108,13 @@ cargo tarpaulin --out Html --output-dir quality/coverage   # 覆盖率 ≥ 80%
 ## 5. 单元 / 集成测试
 
 ```bash
-cargo test            # 全量（当前 133 个）
+cargo test            # 全量单元测试（首次基线 133，见 §10）
 cargo test --lib server::tests::http_end_to_end_crud_and_search   # HTTP 端到端
-cargo run -- demo --scale 100000 --out images/<fn>                # 冒烟（10 项基准）
+cargo run -- demo --scale 100000 --out user_guide/images/<fn>   # 冒烟（10 项基准，截图存档）
 ```
 
 **覆盖目标**：关键路径（LSM CRUD / WAL 崩溃恢复 / Tombstone / PAX 拆合 / TTL 过期 / Delta 合并 / HTTP）必须有测试；
-新功能先写测试再写实现（TDD）；覆盖率报告存档 `quality/coverage/`。
+新功能先写测试再写实现（TDD）；覆盖率原始数据（lcov/HTML）落 `tmp/`，摘要随质量报告提交 `user_guide/quality-report/`。
 
 ---
 
@@ -121,11 +122,11 @@ cargo run -- demo --scale 100000 --out images/<fn>                # 冒烟（10 
 
 ```bash
 cargo build --release
-./target/release/shanshui-cunji demo --scale 100000 --out quality/bench/10w
-# 规模递进：100w / 1000w / 5000w（脚本 images/run_test.ps1 可复用）
+./target/release/shanshui-cunji demo --scale 100000 --out user_guide/images/<规模标签>
+# 规模递进：100w / 1000w / 5000w（截图 + report.html 存档 user_guide/images/perf-*；运行脚本在 tmp/function_test/）
 ```
 
-**记录**：TPS/QPS、P50/P90/P99、内存峰值 → `quality/bench/bench_report_{scale}.md`；
+**记录**：TPS/QPS、P50/P90/P99、内存峰值 → 汇总结论提交 `user_guide/`（如「性能对比-*.md」）；
 与上里程碑对比，退化 >20% 需定位（回滚或优化）。
 
 ---
@@ -144,7 +145,7 @@ MVP 已完成（步骤 16，`column_family` / `engine` / `inverted` 测试）：
 
 ## 8. 质量报告生成
 
-`quality/report.ps1`（或手写）：
+手写模板如下（原一键脚本存档 `tmp/quality/` 供参考）：
 
 ```markdown
 # quality_report_{YYYYMMDD}.md
@@ -155,7 +156,7 @@ MVP 已完成（步骤 16，`column_family` / `engine` / `inverted` 测试）：
 - 已知问题：挂起清单
 ```
 
-存档位置：`quality/`（构建产物与临时文件不入库，仅报告入库）。
+存档位置：入库报告提交 `user_guide/quality-report/`（历史基线见 §10）；原始产物（lcov/HTML/geiger 文本/一键脚本）落 `tmp/` 不入库。
 
 ---
 
@@ -170,7 +171,7 @@ steps:
   - name: Audit
     run: cargo audit && cargo deny check
   - name: Coverage
-    run: cargo tarpaulin --out Html --output-dir quality/coverage
+    run: cargo tarpaulin --out Html --output-dir tmp/coverage   # 原始数据不入库，摘要进质量报告
 ```
 
 ---
@@ -178,7 +179,7 @@ steps:
 ## 10. 当前执行状态（初始基线）
 
 > 首次执行：2026-08-27，本机 Windows（x86_64-pc-windows-gnu 工具链）
-> 执行方式：`powershell -ExecutionPolicy Bypass -File quality/check.ps1`（一键跑通）
+> 执行方式：一键脚本 `quality/check.ps1`（2026-09-05 移出仓库，存 `tmp/quality/check.ps1`）
 
 | 检查项 | 结果 |
 | --- | --- |
@@ -191,9 +192,9 @@ steps:
 | unsafe 统计 | ✅ 全代码 0 处 unsafe（`grep -c unsafe src` = 0） |
 | cargo audit | ✅ **99 个依赖，0 漏洞、0 警告**（2026-08-27 执行） |
 | cargo deny check | ✅ **advisories / bans / licenses / sources 全 ok**（2026-08-27 执行） |
-| cargo geiger | ✅ **项目自身 unsafe = 0**（0/958 函数，0/64881 表达式；报告 quality/geiger_report.txt） |
-| cargo tarpaulin | ✅ **核心引擎 89.01%**（2026-08-27 阿里云 Debian 执行，见 quality_report_20260827.md） |
-| 覆盖率 | ✅ 核心 lib 89.01%（含 CLI 壳 70.55%）；报告 lcov 存档 quality/coverage/ |
+| cargo geiger | ✅ **项目自身 unsafe = 0**（0/958 函数，0/64881 表达式；明细 tmp/quality/geiger_report.txt） |
+| cargo tarpaulin | ✅ **核心引擎 89.01%**（2026-08-27 阿里云 Debian 执行，完整报告 tmp/quality/quality_report_20260827.md） |
+| 覆盖率 | ✅ 核心 lib 89.01%（含 CLI 壳 70.55%）；lcov 原始数据 tmp/quality/coverage/ |
 
 **本轮修复闭环**：clippy 52 处警告清零（P18）、check.ps1 PS 5.1 stderr 误判修复（P17）、
 lru 0.12→0.18 升级消除 2 个 unsound 警告（P19）、deny.toml schema 适配 0.20（P20）——详见 [problem_solving.md](problem_solving.md)。

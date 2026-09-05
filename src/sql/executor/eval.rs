@@ -631,9 +631,23 @@ fn scan_backfill_bitmap(
     Ok(bm)
 }
 
+/// 扫描叶目标顶层字段名（点路径/下标嵌套叶不在此列——批量取数仅顶层简单名）。
+fn leaf_field<'a>(leaf: &'a Leaf) -> &'a str {
+    match leaf {
+        Leaf::Cmp(c) => c.field.as_str(),
+        Leaf::Between { field, .. } => field,
+        Leaf::Like { field, .. } => field,
+    }
+}
+
 /// 后过滤：只检查 `bitmap` 内已命中的文档（AND 快路径——扫描域 = 另一分支位图；逐批熔断）。
 /// `limit` 下推：找到 limit 个命中即停——比较/BETWEEN 作后过滤时避免遍历全量命中集
 /// （千万级库 status=active 上 LIMIT 50 的 BETWEEN 若全量遍历 = 数百秒，提前停 = 毫秒级）。
+/// Task-029：候选取数改**块级批量**——顶层简单字段叶（无点路径/下标）按 512/块走
+/// `engine.get_many_pk_in_fields`（HotCache 直通 / 稠密区间流式 / 稀疏 batch_get_fields
+/// 子集，对齐 P87/P1-D 批量回表），块内字节级判定，替代逐 docid `engine.get` 全行点查
+/// （0 命中全遍历成本从 O(候选)×点查常数 收敛到 O(候选/512)×批量常数）；无法批量
+/// （点路径/转义等需整行深查）的叶保持逐 docid `leaf_passes`（语义不变）。
 fn post_filter(
     engine: &Engine,
     bitmap: RoaringBitmap,
@@ -643,6 +657,38 @@ fn post_filter(
 ) -> Result<RoaringBitmap> {
     let mut out = RoaringBitmap::new();
     let mut n = 0u64;
+    let field = leaf_field(leaf);
+    // 仅顶层简单字段名可走批量投影取数（与 light/scan_row_matches 契约一致）；否则回退逐点
+    let batchable = !field.contains('.') && !field.contains('[');
+    const CHUNK: usize = 512;
+    // 消费一块候选：批量取数 + 块内判定；返回 Ok(true) = 命中已达 limit（调用方终止）。
+    let mut consume = |chunk: &mut Vec<u64>, out: &mut RoaringBitmap| -> Result<bool> {
+        if batchable {
+            let found = engine.get_many_pk_in_fields(chunk, &[field.to_string()])?;
+            for &d in chunk.iter() {
+                if let Some(bytes) = found.get(&d) {
+                    if scan_row_matches(bytes, leaf) {
+                        out.insert(d);
+                        if out.len() as u64 >= limit {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        } else {
+            for &d in chunk.iter() {
+                if leaf_passes(engine, d, leaf)? {
+                    out.insert(d);
+                    if out.len() as u64 >= limit {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        chunk.clear();
+        Ok(false)
+    };
+    let mut chunk: Vec<u64> = Vec::with_capacity(CHUNK);
     for docid in bitmap {
         n += 1;
         if n % 4096 == 0 && guard.is_expired() {
@@ -650,12 +696,13 @@ fn post_filter(
                 "类 SQL 后过滤超时（已查 {n} 条，熔断中止），建议缩小倒排等值条件范围"
             )));
         }
-        if leaf_passes(engine, docid as u64, leaf)? {
-            out.insert(docid);
-            if out.len() as u64 >= limit {
-                break;
-            }
+        chunk.push(docid);
+        if chunk.len() == CHUNK && consume(&mut chunk, &mut out)? {
+            break;
         }
+    }
+    if !chunk.is_empty() && consume(&mut chunk, &mut out)? {
+        // limit 已满
     }
     Ok(out)
 }

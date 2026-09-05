@@ -67,7 +67,7 @@ cargo fmt --all -- --check \
 输出：风险清单 + 改进建议。
 ```
 
-- **产出**：`quality/architecture-review-{milestone}.md`（风险清单 + 整改闭环）。
+- **产出**：`user_guide/quality-report/architecture-review-{milestone}.md`（风险清单 + 整改闭环）。
 
 ### 第 3 层 · 代码审查（AI 辅助 + 自检清单）
 
