@@ -349,6 +349,22 @@ impl Engine {
         // 旧库无 cidx/崩溃丢键）时 open 期从 primary 回扫重建（正常会话零开销跳过）。
         // 置于 worker 启动前：重建期无并发写，flush 落 SST + 写 cidx.sig 标记幂等。
         engine.ensure_composite_index_backfill()?;
+        // P130（2026-09-05）：open 回放后 memtable **超阈** → 主动刷盘落 SST——open 期
+        // WAL/队列回放不逐批 flush（回放直接进 memtable，阈值检查只在写路径），只读服务
+        // 启动后大 memtable 无限期驻留：区间/全表扫描需跨 memtable+段 k 路归并，实测慢 ~10×
+        // （#75/组合 SELECT 160-760ms 临时退化，flush 后回 19-21ms）。空/未超阈不刷（防空 L0）。
+        // 置于 worker/组提交启动前：无并发写，flush 安全（external 模式回调已注册推进水位）。
+        if engine.primary.memtable_over_threshold() {
+            engine.primary.switch_and_flush()?;
+        }
+        if engine.delta.memtable_over_threshold() {
+            engine.delta.switch_and_flush()?;
+        }
+        if let Some(c) = engine.cidx.as_ref() {
+            if c.memtable_over_threshold() {
+                c.switch_and_flush()?;
+            }
+        }
         // 组提交（M8）：`storage.group_commit_us > 0` 时开启——窗口内写入攒批一次 fsync，
         // 后台线程兜底窗口尾部落盘；默认 0 = 关闭（保持逐条 fsync 强安全）。
         // Task-026：per-CPU 启用 → 每队列消费线程启动（替代组提交后台线程）。

@@ -1622,6 +1622,25 @@
         assert_eq!(cf.scan_range(None, None).unwrap().len(), 1000);
     }
 
+    #[test]
+    fn p130_memtable_over_threshold_flag() {
+        // P130：回放后主动 flush 判定（open 收尾依据）——mutable ≥ max_size 为"超"
+        // （与 maybe_flush 同判据）；空/小 memtable 不触发（防空 L0 / 无谓启动刷盘）。
+        let dir = tmp();
+        let cfg = small_cfg(1); // max_size_mb = 1
+        let cf = ColumnFamily::open("primary", &dir, &cfg).unwrap();
+        assert!(!cf.memtable_over_threshold(), "空 memtable 不超阈");
+        // 直接灌 1.4MB 进 mutable（不经 maybe_flush——模拟 open WAL 回放直入 memtable）
+        let big = vec![b'x'; 64 * 1024];
+        let mut k = 0u64;
+        while cf.memtable.mutable_bytes() < 1_400_000 {
+            cf.memtable.put(format!("k{k:010}").into_bytes(), k, big.clone());
+            k += 1;
+        }
+        assert!(cf.memtable.mutable_bytes() >= 1024 * 1024, "已灌超 1MB");
+        assert!(cf.memtable_over_threshold(), "回放超阈应判 true");
+    }
+
     // ---------- P129 per-table L0 优先压实（多表单批 flush 每表 1 文件的全局计数失配治理） ----------
 
     #[test]

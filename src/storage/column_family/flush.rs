@@ -21,6 +21,13 @@ impl ColumnFamily {
         self.switch_and_flush()
     }
 
+    /// P130（2026-09-05）：回放后主动 flush 判定——mutable ≥ 阈值（与 `maybe_flush`
+    /// 同判据的"超"语义）。open 期 WAL/队列回放不逐批 flush（回放直接进 memtable），
+    /// 只读服务可能无限期驻留大 memtable（阈值检查只在写路径）→ open 收尾据此主动刷盘。
+    pub fn memtable_over_threshold(&self) -> bool {
+        self.memtable.mutable_bytes() >= self.cfg.max_size_mb * 1024 * 1024
+    }
+
     /// 冻结 Mutable → 刷盘为 SST → 更新 Manifest → 释放 Immutable。
     /// P72：`&self`——memtable 冻结经内部 RwLock 写锁；ssts 发布经 `sst_mutate` 互斥。
     pub fn switch_and_flush(&self) -> Result<()> {
