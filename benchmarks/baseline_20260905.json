@@ -1,0 +1,41 @@
+{
+  "name": "shanshui-cunji Task-005 baseline（2026-09-05）",
+  "generated_at_epoch": 1788606006,
+  "env": {
+    "os": "windows",
+    "arch": "x86_64",
+    "logical_cores": 12,
+    "cpu": "Intel64 Family 6 Model 165 Stepping 2, GenuineIntel"
+  },
+  "tool": "shanshui-cunji-baseline（单机探针）；多线程点查/混合写另由 shanshui-cunji-ycsb 采集并入",
+  "config": {
+    "per_cpu_enabled": true,
+    "records": 100000
+  },
+  "metrics": {
+    "bulk_write_w_s": 247236.0,
+    "cold_start_ms": 229.77100000000002,
+    "point_read_warm": {
+      "qps": 25693.0,
+      "p50_us": 1.4,
+      "p95_us": 365.6,
+      "p99_us": 455.70000000000005
+    },
+    "sync_write": {
+      "tps": 382607.0,
+      "p50_us": 1.4,
+      "p95_us": 2.6,
+      "p99_us": 5.0
+    },
+    "term_query": {
+      "term": "city=c3",
+      "qps": 235.45636093011385,
+      "p50_us": 1012.3000000000001,
+      "p95_us": 2419.9,
+      "p99_us": 5271.299999999999,
+      "note": "含回表"
+    },
+    "ttl_scan_ms": 3.7448,
+    "ttl_survived": 0
+  }
+}
