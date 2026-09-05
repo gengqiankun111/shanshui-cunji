@@ -77,6 +77,7 @@ pub mod term_cache;
 pub mod txn;
 pub mod value;
 pub mod watchdog;
+pub mod timing_wheel;
 
 // reconstruct.md 目录规划：storage 引擎层已归入 src/storage/ 目录。
 // 根部 re-export 保持既有调用路径（crate::column_family / crate::sstable / ...）不变。

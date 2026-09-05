@@ -1338,6 +1338,19 @@
   上限 clamp 2..=4。行数 + docid 和值跨 workers 一致校验通过。
 
 
+### P110. Task-026 Per-CPU WAL 全链落地三坑（2026-09-05）
+- **现象/根因/修复**：
+  1. **空 flush 产出空 L0 SST 污染 GC 调度**：Engine 打开时对全部 CF（含 delta/cidx/outbox）无条件 `switch_and_flush` 做"迁移收尾"→ 空 memtable 也会落一个空 L0 文件 → 删除密度 GC 轮里 delta/cidx urgency=10 恒高于 primary GC（DD=6），主列族删除回收永远排不上（排空轮全 0 丢弃、`needs_compact` 不收敛）。修复：迁移仅当 `memtable_bytes()>0` 才刷（空 flush 无收益）。
+  2. **从未入队的 CF 把 checkpoint 钉死在 0**：cp = min(各 CF 刷盘水位)，而 cidx/outbox CF 即使打开也可能从不写（无组合索引/无 outbox 消息）→ 永不 flush → cp=0 → 队列文件永不裁剪、重开重复回放。修复：运行时维护"各 CF 曾入队最大 gseq（last_enqueued）"，从未入队的 CF 不参与 cp 约束（视作 +∞）；恢复回放后播种（防裁剪越过 memtable 未刷数据）。
+  3. **begin_snapshot 依赖 CF 自身 WAL 计数**：external 模式下 primary 的 WalBackend 不再推进 → 快照点恒 0，全部 RR/快照读隔离失效（几十个 txn 测试红）。修复：改以 engine `global_seq` 为准（与 current_seq 同源）。
+- **提交**：`0c1897b`（2a 编解码/队列文件 IO）、`7c1d7e3`（2c 队列运行时）、`810f182`（2b/2c 接线 + 3a 恢复 + 默认翻 true）；全量 736 绿（seqlock 计时偶发单跑绿，P48 已知）。
+
+### P111. Task-007 层级时间轮推进正确性两坑（2026-09-05）
+- **现象/根因/修复**：
+  1. **级联下放复用 insert 双计 expiry_set → 推进死循环/任务不触发**：expiry_set（跳步快进的下一到期秒）在 schedule/insert 都自增，级联把任务从高轮移到低轮时重复计数 → 到期触发只减一次留下 stale 计数 → `next_event_at` 返回过期秒，advance 卡死（测试挂起）；修复：expiry_set 只在 schedule / fire / cancel / restore 维护，insert（兼做级联下放）不计数。
+  2. **事件恰落 advance 目标点未处理 + 天轮候选命中"已过去的当天"**：跳到 target 即 break 不执行 `process_at` → 恰好整点/到期在 target 的任务漏触发（1 年 TTL 最后一秒不触发）；天轮桶槽号 = 日序 %365，若与当前日同余会给出已过去的当天整点（stale）→ 级联永不发生。修复：`t == target` 时处理后再结束；候选激活严格 `> now`（同余取下一周期）。
+- **提交**：见 Task-007 提交（本会话）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
