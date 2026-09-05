@@ -146,7 +146,37 @@ curl 'http://localhost:8080/search?filter=status%3Dactive'
 | `[memtable] max_size_mb` | 跳表上限 |
 | `[hotcache]/[blockcache] max_memory_mb` | 缓存上限（隔离） |
 | `[storage] group_commit_us / l0_stall_*` | 组提交窗口 / L0 写退避 |
+| `[storage] hot_fields / colstore_enabled` | PAX 热列声明 / 热列列存旁路开关（见 7.1） |
 | `[runtime] async_* / compute_pool_size / io_*` | 协程/计算/IO 线程池 |
+
+### 7.1 热列（hot_fields）与热列列存旁路（colstore_enabled）
+
+**声明**（配置在 `[storage]` 段，无需建表语法，引擎级生效、客户端零感知）：
+
+```toml
+[storage]
+# 热字段白名单：全表排序/高频数值扫描/聚合引用频率高的列（k/amount/ts/status…）
+hot_fields = ["k", "amount", "ts", "status", "region", "score"]
+# 热列列存旁路（P94 双轨）开关：true = 惰性派生“docid 数组 + 每热列独立区域”的内存列存
+#（排序等大窗扫描只解热列，IO -90%+，如 110 万行全表 ORDER BY 9.5s → 0.2~0.3s）；
+# false = 关闭（默认，零回归，全部走行式主）。
+colstore_enabled = true
+```
+
+**作用与路由规则**（排序/投影/聚合触达列 vs 热列的二元 ⊆ 判定）：
+
+| 判定 | 走向 |
+| --- | --- |
+| 排序键列 ⊆ hot_fields 且扫描窗口大、区间无脏行/未超派生水位 | Columnar：只解热列，胜出行整行回行式主 |
+| 任一排序键非热列 / 窗口小 / 区间含脏 / 有超水位新行 / 需要整行投影 | RowStore：行式主（结果与默认布局逐字节一致） |
+
+- **取舍提示**：热列占全行 ~10–30% 时列存收益最大；声明过少 → 排序/扫描仍走行式；
+  声明过多 → 派生内存与写侧 flush 成本上升。建议只放**排序键 + 高频数值范围/分组列**，
+  大文本列（note/title/…）永远不要进 hot_fields。
+- **正确性护栏**：colstore 只服务「派生水位内、未删除、派生后未再写」的行；一旦命中脏行/
+  超水位即整查询回退行式主（宁慢勿错）；派生失败/关闭开关 → 自动回退，无数据语义差异。
+- **冷启动**：派生在首次命中查询时惰性执行（110 万行一次性 ~秒级~分钟级，与整行解析量相关），
+  随后常驻；重启后按需重建（内存常驻版）。
 
 ---
 

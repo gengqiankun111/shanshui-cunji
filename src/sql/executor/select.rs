@@ -286,7 +286,34 @@ pub(crate) fn row_sort_keys(doc: &[u8], fields: &[String]) -> Vec<SortKey> {
 
 /// P87②：字段 JSON 值字节 → 排序键（serde 解析标量；缺失/null/非标量 → Null）。
 /// 与 `sort_key` 从整行取字段的语义等值（缺失与 JSON null 均 Null）。
+/// P94②：字段值字节 → 排序键。输入为 JSON 标量原字节（colstore 列区域存的 `serde_json::to_vec`
+/// 规范字节 / 行式 light 提取的原文 token）。快路径：数字直解 f64、无转义字符串去引号即比
+/// （UTF-8 字节序 = 码点序），免去原实现的每字段一次 `serde_json::from_slice` 全量 JSON 解析
+/// （P94 实测 100k 行 ×2 列 ~95ms → 该解析占 ~0.5µs/列）；畸形/转义/非标量回退 serde 保语义。
 fn field_bytes_to_sort_key(b: &[u8]) -> SortKey {
+    if b.is_empty() {
+        return SortKey::Null;
+    }
+    let c = b[0];
+    // 数字：'-' 或数字开头（JSON 无前导零/NaN/Inf，serde 同规则）→ 原字节直接 f64
+    if c == b'-' || c.is_ascii_digit() {
+        if let Ok(s) = std::str::from_utf8(b) {
+            if let Ok(x) = s.parse::<f64>() {
+                return SortKey::Num(x);
+            }
+        }
+        // 畸形数字 → 落到 serde 兜底（保持 Null/语法语义一致）
+    } else if c == b'"' && b.len() >= 2 {
+        // 无转义（反斜杠）的简单字符串 → 去引号快路径（UTF-8 字节序比较等价码点序）
+        let inner = &b[1..b.len() - 1];
+        if !inner.contains(&b'\\') {
+            if let Ok(s) = std::str::from_utf8(inner) {
+                return SortKey::Str(s.to_string());
+            }
+        }
+        // 含转义 → 落 serde 精确反解（防语义偏差）
+    }
+    // 其余（null/true/false/对象/数组/畸形）：serde 语义 = 非字符串非数值 → Null；含字符串兜底
     let v: Value = match serde_json::from_slice(b) {
         Ok(v) => v,
         Err(_) => return SortKey::Null,
@@ -485,82 +512,112 @@ pub(crate) fn topk_sort(
     if dense {
         let lo = bitmap.min().unwrap() as u64;
         let hi = bitmap.max().unwrap() as u64;
-        let span = hi - lo + 1;
-        // P93：大候选稠密 top-K → [lo..hi] 按 docid 等分子窗**并行**投影扫描，每片独立
-        // 维护局部 top-K 堆，全局 top-K = 各片局部堆并集的 top-K（经典正确性：片外淘汰的
-        // 行必不可能进全局 top-K）。针对 #29 全表 ORDER BY LIMIT：110 万行整表整块
-        // 解压 + 逐行 JSON 解码是 CPU/IO 双瓶颈，串行单核受限；并行后解压/解码摊到多核
-        // （块缓存热时近似 CPU-bound → ~核心数倍收益）。阈值 20 万行避免小库线程开销。
-        // 候选/单核：默认**串行**（P93-110万实测：并行分片扫描在块缓存 put 速率超淘汰时内存
-        // 超预算膨胀 + 多核利用率不足，未达验收前默认关闭；P93_PARALLEL=1 显式开启实验）。
-        let nw_avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let big = std::env::var_os("P93_PARALLEL").is_some()
-            && len >= 200_000
-            && nw_avail >= 2
-            && span / (k.max(1) as u64) >= nw_avail as u64;
-        if big {
-            let nw = (nw_avail as u64).min(16);
-            let step = span / nw;
-            std::thread::scope(|s| -> Result<()> {
-                let mut handles: Vec<std::thread::ScopedJoinHandle<Result<Vec<SortLite>>>> =
-                    Vec::with_capacity(nw as usize);
-                for i in 0..nw {
-                    let s0 = lo + i * step;
-                    let e0 = if i + 1 == nw {
-                        hi
-                    } else {
-                        lo + (i + 1) * step - 1
-                    };
-                    if e0 < s0 {
-                        continue;
+        // P94：colstore 热列旁路优先——排序键 ∈ 热列时只解目标列（列 IO -90%+，免整块解压）；
+        // 命中返回 Ok(true)；未命中（未启用/非热列/超水位/脏区间）回退下方行式扫描，语义不变。
+        let mut served = false;
+        if engine.colstore_enabled() {
+            if let Some(idxs) = engine.colstore_field_indices(&fields) {
+                served = engine.colstore_try_scan_cols(lo, hi, |docid, row| {
+                    // 与下方行式分支一致：稠密区间内的非候选洞须剔除（dense = span≤4×len，非满区间）
+                    if !bitmap.contains(docid) {
+                        return Ok(true);
                     }
-                    let fields = fields.clone();
-                    handles.push(s.spawn(move || -> Result<Vec<SortLite>> {
-                        let mut local: Vec<SortLite> = Vec::with_capacity(k + 1);
-                        engine.scan_stream_fields(Some(s0), Some(e0), fields.clone(), |docid, doc| {
-                            if !bitmap.contains(docid) {
-                                return Ok(true);
-                            }
-                            if guard.is_expired() {
-                                return Err(Error::QueryTooExpensive(format!(
-                                    "Top-K 排序超时（并行分片熔断中止）"
-                                )));
-                            }
-                            let keys = row_sort_keys(doc, &fields);
-                            topk_heap_push(&mut local, SortLite { docid, keys }, k, order_by);
-                            Ok(true)
-                        })?;
-                        Ok(local)
-                    }));
-                }
-                for h in handles {
-                    let local = h
-                        .join()
-                        .map_err(|_| Error::QueryTooExpensive("Top-K worker panic".into()))??;
-                    for row in local {
-                        topk_heap_push(&mut heap, row, k, order_by);
+                    scanned += 1;
+                    if guard.is_expired() {
+                        return Err(Error::QueryTooExpensive(format!(
+                            "Top-K 排序超时（colstore 熔断中止）"
+                        )));
                     }
-                }
-                Ok(())
-            })?;
-            scanned = len;
-        } else {
-            // 小候选/单核：原串行稠密投影流式扫描
-            engine.scan_stream_fields(Some(lo), Some(hi), fields.clone(), |docid, doc| {
-                if !bitmap.contains(docid) {
-                    return Ok(true);
-                }
-                scanned += 1;
-                // 看门狗逐行检查（原子，开销可忽略）：保 P87 熔断语义（首个候选即中止）
-                if guard.is_expired() {
-                    return Err(Error::QueryTooExpensive(format!(
-                        "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
-                    )));
-                }
-                let keys = row_sort_keys(doc, &fields);
-                topk_heap_push(&mut heap, SortLite { docid, keys }, k, order_by);
-                Ok(true)
-            })?;
+                    let mut keys: Vec<SortKey> = Vec::with_capacity(idxs.len());
+                    for &ci in &idxs {
+                        keys.push(match row.field(ci) {
+                            Some(b) => field_bytes_to_sort_key(b),
+                            None => SortKey::Null,
+                        });
+                    }
+                    topk_heap_push(&mut heap, SortLite { docid, keys }, k, order_by);
+                    Ok(true)
+                })?;
+            }
+        }
+        if !served {
+            // P93：大候选稠密 top-K → [lo..hi] 按 docid 等分子窗**并行**投影扫描，每片独立
+            // 维护局部 top-K 堆，全局 top-K = 各片局部堆并集的 top-K（经典正确性：片外淘汰的
+            // 行必不可能进全局 top-K）。针对 #29 全表 ORDER BY LIMIT：110 万行整表整块
+            // 解压 + 逐行 JSON 解码是 CPU/IO 双瓶颈，串行单核受限；并行后解压/解码摊到多核
+            // （块缓存热时近似 CPU-bound → ~核心数倍收益）。阈值 20 万行避免小库线程开销。
+            // 候选/单核：默认**串行**（P93-110万实测：并行分片扫描在块缓存 put 速率超淘汰时内存
+            // 超预算膨胀 + 多核利用率不足，未达验收前默认关闭；P93_PARALLEL=1 显式开启实验）。
+            let span = hi - lo + 1;
+            let nw_avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let big = std::env::var_os("P93_PARALLEL").is_some()
+                && len >= 200_000
+                && nw_avail >= 2
+                && span / (k.max(1) as u64) >= nw_avail as u64;
+            if big {
+                let nw = (nw_avail as u64).min(16);
+                let step = span / nw;
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles: Vec<std::thread::ScopedJoinHandle<Result<Vec<SortLite>>>> =
+                        Vec::with_capacity(nw as usize);
+                    for i in 0..nw {
+                        let s0 = lo + i * step;
+                        let e0 = if i + 1 == nw {
+                            hi
+                        } else {
+                            lo + (i + 1) * step - 1
+                        };
+                        if e0 < s0 {
+                            continue;
+                        }
+                        let fields = fields.clone();
+                        handles.push(s.spawn(move || -> Result<Vec<SortLite>> {
+                            let mut local: Vec<SortLite> = Vec::with_capacity(k + 1);
+                            engine.scan_stream_fields(Some(s0), Some(e0), fields.clone(), |docid, doc| {
+                                if !bitmap.contains(docid) {
+                                    return Ok(true);
+                                }
+                                if guard.is_expired() {
+                                    return Err(Error::QueryTooExpensive(format!(
+                                        "Top-K 排序超时（并行分片熔断中止）"
+                                    )));
+                                }
+                                let keys = row_sort_keys(doc, &fields);
+                                topk_heap_push(&mut local, SortLite { docid, keys }, k, order_by);
+                                Ok(true)
+                            })?;
+                            Ok(local)
+                        }));
+                    }
+                    for h in handles {
+                        let local = h
+                            .join()
+                            .map_err(|_| Error::QueryTooExpensive("Top-K worker panic".into()))??;
+                        for row in local {
+                            topk_heap_push(&mut heap, row, k, order_by);
+                        }
+                    }
+                    Ok(())
+                })?;
+                scanned = len;
+            } else {
+                // 小候选/单核：原串行稠密投影流式扫描
+                engine.scan_stream_fields(Some(lo), Some(hi), fields.clone(), |docid, doc| {
+                    if !bitmap.contains(docid) {
+                        return Ok(true);
+                    }
+                    scanned += 1;
+                    // 看门狗逐行检查（原子，开销可忽略）：保 P87 熔断语义（首个候选即中止）
+                    if guard.is_expired() {
+                        return Err(Error::QueryTooExpensive(format!(
+                            "Top-K 排序超时（已扫 {scanned} 条，熔断中止）"
+                        )));
+                    }
+                    let keys = row_sort_keys(doc, &fields);
+                    topk_heap_push(&mut heap, SortLite { docid, keys }, k, order_by);
+                    Ok(true)
+                })?;
+            }
         }
     } else {
         // P87①：分块流式扫描（Roaring iter 惰性；产出 top-K 即停，块内 watchguard 熔断）
@@ -736,7 +793,14 @@ pub fn execute(engine: &Engine, sql: &str, cap: u64) -> Result<Vec<QueryRow>> {
         let bitmap = match &set {
             crate::docset::DocIdSet::Bitmap(bm) => bm.clone(),
             crate::docset::DocIdSet::Empty => RoaringBitmap::new(),
-            crate::docset::DocIdSet::All => full_docids(engine, &guard)?,
+            crate::docset::DocIdSet::All => {
+                // P94③：colstore 已派生且覆盖全表（无脏/无超水位新行）→ cs docid 位图直供，
+                // 免 full_docids primary 全扫物化整行（All→大窗 ORDER BY 的主开销）；否则原路径。
+                match engine.colstore_all_bitmap() {
+                    Some(b) => b,
+                    None => full_docids(engine, &guard)?,
+                }
+            }
             crate::docset::DocIdSet::SortedList(v) => {
                 let mut b = RoaringBitmap::new();
                 for &d in v {

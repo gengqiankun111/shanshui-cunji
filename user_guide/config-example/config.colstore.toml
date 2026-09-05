@@ -1,0 +1,52 @@
+# 热列列存旁路（P94 双轨）示例配置 —— 展示 hot_fields / colstore_enabled 的完整用法
+#
+# 场景：宽表（25 列，~950B/行）全表排序 / 高频数值范围 / 聚合慢。
+# 声明热列后，colstore_enabled=true 时引擎为这些列惰性派生内存列存（docid 数组 +
+# 每热列独立区域），全表 ORDER BY 等大窗扫描只解热列（实测 110 万行 #29 全表排序
+# 9.5s → 0.2~0.3s）；行式 SST 仍是主存储（全列/点查/SELECT * 语义与性能不变）。
+#
+# 路由规则（自动，无需 SQL 改动）：
+#   排序键列 ⊆ hot_fields 且窗口大、区间干净            → 列存旁路（只解热列）
+#   任一排序键非热列 / 窗口小 / 区间含脏 / 超派生水位     → 行式主（结果逐字节一致）
+#
+# 取值建议：
+#   - 只放「排序键 + 高频数值范围/分组列」；大文本列（note/title/url/…）勿进热列；
+#   - 热列过多 → 派生内存与 flush 成本上升；过少 → 排序/扫描仍走行式；
+#   - 关闭 colstore_enabled（或删除该行）即一键回退全行式，零回归。
+
+[storage]
+data_dir = "D:/shanshui-data/db-colstore"
+group_commit_us = 2000          # 组提交窗口（写吞吐）
+flush_log_at_trx_commit = 2     # COMMIT 落盘交给组提交（基准配置）
+composite_indexes = [["status", "ts"], ["ts"]]   # 组合索引（可选）
+auto_compact = true
+l0_max_size_mb = 1024
+compact_input_max_mb = 1024
+
+# 热列白名单（PAX 列块 + colstore 派生共用）：排序键 k/amount/ts/score 与
+# 高频枚举过滤列 status/region 走列存；其余（note/title/txt_* 等大列）留行式主。
+hot_fields = ["k", "amount", "ts", "status", "region", "score"]
+
+# 热列列存旁路开关：true = 惰性派生内存列存（默认 false = 关闭，零回归）。
+colstore_enabled = true
+
+[hotcache]
+max_memory_mb = 1024            # 热数据缓存上限
+initial_capacity_mb = 128
+
+[blockcache]
+max_memory_mb = 512             # 块缓存上限（读多调大）
+
+[inverted]
+engine = "fst"
+inverted_fields = []            # 无全文/词元倒排需求可留空
+fulltext_fields = []
+max_term_len = 16
+max_memory_bytes = 268435456
+bitmap_fields = ["status", "region"]   # 低基数枚举走位图（COUNT/AND 快速路径）
+
+[memtable]
+max_size_mb = 256               # 跳表上限
+
+[watchdog]
+cpu_query_limit = 256           # 看门狗（长查询熔断阈值）

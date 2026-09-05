@@ -97,6 +97,12 @@ pub struct Engine {
     pub cost_based_enabled: bool,
     /// P4-C：代价模型参数。
     pub cost_params: crate::optimizer::CostParams,
+    /// P94（热列旁路双轨）：colstore 开关（= cfg.storage.colstore_enabled）。
+    pub(crate) colstore_enabled: bool,
+    /// P94：colstore 热列名单（= cfg.storage.hot_fields；空 = 无法派生）。
+    pub(crate) colstore_hot: Vec<String>,
+    /// P94：colstore 状态（惰性派生：cs + 水位 + 派生后写入的脏 docid）。
+    pub(crate) colstore_state: std::sync::Mutex<crate::engine::colstore::ColstoreState>,
     /// P 项：事件驱动自动 Compaction（`storage.auto_compact`）——写入路径自触发：
     /// 写前 L0 达硬顶（l0_stall_max）先合并（背压），写后 L0 超阈值（段数/大小）合并收敛。
     pub(crate) auto_compact: bool,

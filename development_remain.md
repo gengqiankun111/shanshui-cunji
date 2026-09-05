@@ -136,8 +136,13 @@ Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09
 > 列组块编解码原语验证（docid 数组 + 每列独立区域 + footer 偏移；缺列/JSON null → None 保行序对齐；
 > 删除行不入 colstore 与最新视图一致；top-K 与整行解析结果一致）。60k 宽行证据：只解 k/amount 体积
 > = 1.13MB vs 整行 19.9MB（体积比 0.057，列 IO -94%）；解码+topK = 55.9ms vs 整行 JSON 2452ms（44×，
-> debug 宽样本）。**M3（kernel 整合）待开发**：flush 派生 .cs 文件族（复用 flush 内 PAX 热列提取点）+
-> engine.scan_colstore_cols 原语 + topk 稠密路由 + EXPLAIN/回退开关 + 10/30/110 万 Task-005 三档回填。
+> debug 宽样本）。**✅ M3 kernel 整合（2026-09-05，P124）**：内存 colstore 惰性派生（默认
+> colstore_enabled=false 零回归）——engine/colstore.rs（ColArena 列区域 + docids/watermark/dirty 状态，
+> write 三处记脏）+ select.rs topk 稠密路由 + All 分支 cs.docids 位图直供（免 full_docids 整行物化）
+> + 排序键原字节快路径 + 派生 light_top_fields 字节级抽取；路由遵循二元 ⊆ 规则（用户确认）。单测 753 绿；
+> 10/30/110 万三档 #29 稳态 p50 = 18/56/231ms（110 万 ≤1.5s 达标，反超 MySQL ~0.53s）。阶段② 留后续：
+> EXPLAIN 标注 TableScan: Columnar/RowStore、回退开关一键行式、flush 派生 .cs 落盘/增量派生（现为
+> 内存常驻、重启重建）。
 
 > ✅ 阶段①（2026-09-05，P99）：GROUP BY 全扫 #14/#27 子集一次构建（sql/executor/eval.rs
 > `subset_doc_bytes` 单遍只收 needed + group_by.rs 全扫回调接线，免逐字段整行 parse×N）；回归 698

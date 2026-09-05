@@ -141,6 +141,8 @@ impl Engine {
 
     /// put_nosync 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
     fn put_nosync_inner(&mut self, docid: u64, value: Vec<u8>, terms: &[&str]) -> Result<()> {
+        // P94：colstore 派生后对旧行写 → 记脏（命中脏区间整查询回退行式）
+        self.colstore_note_write(docid);
         // ① 失效 HotCache 该 docid（批量导入模式跳过：只写不读，避免缓存膨胀挤爆内存，P40）
         if !self.skip_hotcache {
             self.hotcache.invalidate(docid);
@@ -331,6 +333,8 @@ impl Engine {
 
     /// delete 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
     fn delete_inner(&mut self, docid: u64) -> Result<()> {
+        // P94：colstore 派生后删除旧行 → 记脏（删除位图路径本会跳过，但 tombstone 路径需回退行式）
+        self.colstore_note_write(docid);
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
         self.hotcache.invalidate(docid);
         match &self.deletion_bitmap {
@@ -398,6 +402,7 @@ impl Engine {
         let mut n = 0u64;
         for docid in docids {
             self.hotcache.invalidate(docid);
+            self.colstore_note_write(docid); // P94：批量删同样记脏
             match &self.deletion_bitmap {
                 Some(bm) => {
                     // Ex-8.7：新置位才计入删除密度净置位数（重复删除幂等）

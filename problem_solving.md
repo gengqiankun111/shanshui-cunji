@@ -1531,6 +1531,38 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 免整块解压，PAX 才真正减 IO）。内存判定参考：4G 块缓存配置稳态 RSS≈5.2G（hotcache512+bcache4G
 +inv256+mem128+开销），爬升到 6G 是缓存填充过程非泄漏。
 
+**P124（P94 M3 kernel 整合闭环）热列旁路双轨：内存 colstore 惰性派生 + topk 稠密路由 → #29 110 万达线**
+落地（2026-09-05，分支 develop；设计档 research/dual_track_colstore.md）：
+- 引擎层 `src/engine/colstore.rs`（新模块）：ColArena（ends 游标+present 位+blob 列区域）、
+  `Colstore{docids,names,cols}`、`ColstoreState{cs,watermark,dirty}`；`colstore_ensure` 首次需要时
+  惰性全表派生（行序与最新视图对齐，null/缺列 → None），write.rs put/delete/delete_batch 三处
+  `colstore_note_write` 记脏；`colstore_field_indices`/`colstore_try_scan_cols`/`colstore_all_bitmap`
+  原语 + 保守回退（未派生/超水位/脏 → 整查询行式主）。默认 `colstore_enabled=false` 零回归。
+- 路由决策（用户确认二元 ⊆ 规则）：排序键列 ⊆ hot_fields 且窗口大、区间干净 → Columnar（只解
+  热列，胜出行整行回行式主）；任一排序键非热列/窗口小/含脏/超水位 → RowStore（结果逐字节一致）。
+  已按此补充 SQL 级正反例对照测试（含字符串键、非热列 note 回退）。
+- 过程中修的三个性能/正确性点：① topk 稠密 colstore 回调漏 bitmap 候选过滤（稠密区间内的洞
+  曾会多产出非候选行）→ 补 `bitmap.contains`；② 排序键解析每字段整 `serde_json::from_slice`
+  （~0.5µs/列）→ `field_bytes_to_sort_key` 原字节快路径（数字直解 f64/无转义字符串去引号，
+  畸形/转义回退 serde，语义不变）；③ All 分支 `full_docids` primary 全扫物化整行（110 万 ~GB 级）
+  → `colstore_all_bitmap` cs.docids 直供（守卫：派生、无脏、无 > 水位新行，单点窥视），否则回退；
+  ④ 派生整行 serde parse（110 万一次性 ~27s）→ `light_top_fields` 字节级顶层抽取（转义/嵌套/重复
+  键语义对齐 serde，畸形回退全 parse）。
+- 验证：全量 lib 回归 **753 绿**（colstore 引擎 7 测 + SQL 级 `sql_orderby_colstore_matches_row_path`
+  正反例 + light 抽取语义）；Task-005 三档（colstore 配置：hot_fields=k,amount,ts,status,region,score）：
+  | 档 | #29 orderby_multi p50 | 同批 排序族 p50（om500/om3000/os10k） |
+  |---|---|---|
+  | 10 万 | 18ms | 20/31/53ms |
+  | 30 万 | 56ms | 56/69/83ms |
+  | 110 万 | 231ms | 201/214/232ms |
+  **验收结论：#29 110 万 9.46s（行式/PAX 旧线）→ 稳态 p50 0.23s，≤1.5s 达标（≈6.5× 余量，
+  并反超 MySQL ~0.53s）**。冷启动一次性派生 ~24s（全表读取成本，解析已近下限），派生后常驻；
+  sqlrun 收尾 44k 清理（P123）属派生后写 → 之后查询正确回退行式（护栏，非回归）。
+- 文档/配置：storage.rs 字段注释、user_guide/README.md §7.1（热列与列存旁路说明 + 路由表 +
+  取舍/护栏/冷启动）、user_guide/config-example/config.colstore.toml（可复用模板）。
+- 阶段②（EXPLAIN 标注 TableScan: Columnar/RowStore、回退开关一键、flush 派生 .cs 落盘/增量）
+  留排期后续。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

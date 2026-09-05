@@ -310,6 +310,63 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         assert!(parse_select("SELECT * FROM t WHERE city IN ('a'").is_err());
     }
 
+    /// P94 对照引擎：同 engine_with_docs 数据，但开启 colstore（amount/status 热列）。
+    fn engine_with_docs_cs() -> Engine {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let mut cfg = Config::default();
+        cfg.storage.hot_fields = vec!["amount".into(), "status".into()];
+        cfg.storage.colstore_enabled = true;
+        let mut e = Engine::open(&path, &cfg).unwrap();
+        let cities = ["beijing", "shanghai", "shenzhen"];
+        for i in 0..100u64 {
+            let city = cities[(i % 3) as usize];
+            let doc = serde_json::json!({
+                "docid": i,
+                "status": if i % 3 == 0 { "active" } else { "inactive" },
+                "city": city,
+                "amount": i * 10,
+                "note": format!("note-{i}"),
+            });
+            let terms: Vec<String> = crate::server::extract_terms(&doc);
+            let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &refs).unwrap();
+        }
+        e
+    }
+
+    #[test]
+    fn sql_orderby_colstore_matches_row_path() {
+        // P94：开启 colstore 后 ORDER BY 结果与默认行式主完全一致——
+        // ① 全表排序（All → 稠密无洞）② WHERE 收敛 + 排序（候选稀疏、区间有洞 → 位图过滤）。
+        // 热列 amount/status；排序键取 amount。
+        let mut plain = engine_with_docs();
+        let mut cs = engine_with_docs_cs();
+        let qs = [
+            "SELECT * FROM t ORDER BY amount LIMIT 5",
+            "SELECT * FROM t ORDER BY amount DESC LIMIT 5",
+            "SELECT * FROM t WHERE status='active' ORDER BY amount LIMIT 5",
+            "SELECT * FROM t WHERE status='active' ORDER BY amount DESC LIMIT 5",
+            "SELECT * FROM t WHERE city='beijing' AND amount<500 ORDER BY amount LIMIT 10",
+            "SELECT * FROM t ORDER BY amount LIMIT 5 OFFSET 90",
+            // P94②：字符串键快路径（去引号直比）与行式一致
+            "SELECT * FROM t ORDER BY status, amount LIMIT 5",
+            "SELECT * FROM t ORDER BY status DESC, amount DESC LIMIT 5",
+            // P94④：排序键非热列（note）→ 二元 ⊆ 规则判 RowStore，回退行式主且结果一致
+            "SELECT * FROM t ORDER BY note LIMIT 5",
+            "SELECT * FROM t WHERE status='active' ORDER BY note, amount DESC LIMIT 5",
+        ];
+        for q in qs {
+            let a = execute(&mut plain, q, 1000).unwrap();
+            let b = execute(&mut cs, q, 1000).unwrap();
+            let ids_a: Vec<u64> = a.iter().map(|r| r.0).collect();
+            let ids_b: Vec<u64> = b.iter().map(|r| r.0).collect();
+            assert_eq!(ids_a, ids_b, "colstore 与行式 ORDER BY 结果一致: {q}");
+            // 结果非空且顺序正确（amount 语义：i*10 → docid 单调）
+            assert!(!ids_a.is_empty(), "探针应有结果: {q}");
+        }
+    }
+
     #[test]
     fn group_by_fast_inverted_matches_scan() {
         // Ex-9.3 ④b：无 WHERE 单字段 GROUP BY 倒排快路径结果与全扫一致（含 NULL 组；

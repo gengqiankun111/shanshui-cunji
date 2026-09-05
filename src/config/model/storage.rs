@@ -34,6 +34,10 @@ pub struct StorageConfig {
     pub inverted_dir: Option<String>,
     /// 热字段白名单（阶段 1.5 PAX 列式块）：高频查询字段进热列组（块头），其余进冷列组（块尾）。
     pub hot_fields: Vec<String>,
+    /// P94（热列旁路双轨）：colstore 派生列存开关——true 且 hot_fields 非空时，惰性派生
+    /// “docid 数组 + 每热列独立区域”的内存列存（排序/投影扫描只解目标列）；false = 关闭（零回归）。
+    /// 正确性：colstore 仅服务 ≤ 派生水位（watermark）且未被删除/未再写的行；越界走行式主覆盖合并。
+    pub colstore_enabled: bool,
     /// TTL 时间分桶粒度：`day`（MVP）/ `hour`（预留，阶段 1.5 仅 day）。
     pub time_bucket: String,
     /// TTL 时间字段名（文档 JSON 内，数值秒级时间戳）。
@@ -139,6 +143,7 @@ impl Default for StorageConfig {
             sst_dir: None,
             inverted_dir: None,
             hot_fields: Vec::new(),
+            colstore_enabled: false, // P94：默认关闭（零回归）；按需在基准配置开启
             time_bucket: "day".into(),
             ttl_field: "timestamp".into(),
             io_rate_limit_mb: 0,

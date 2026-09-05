@@ -304,6 +304,12 @@ impl Engine {
                 scan_row_factor: 1.5,
                 inverted_fallback_threshold: cfg.optimizer.inverted_fallback_threshold,
             },
+            // P94：colstore 状态（惰性派生；默认关闭零回归）
+            colstore_enabled: cfg.storage.colstore_enabled,
+            colstore_hot: cfg.storage.hot_fields.clone(),
+            colstore_state: std::sync::Mutex::new(
+                crate::engine::colstore::ColstoreState::default(),
+            ),
             auto_compact: cfg.storage.auto_compact,
             compact_pending: Arc::new(AtomicBool::new(false)),
             compact_worker: Arc::new(AtomicBool::new(false)),

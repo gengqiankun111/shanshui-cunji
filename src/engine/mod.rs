@@ -21,6 +21,7 @@
 
 mod compact;
 mod engine;
+mod colstore;
 mod mvcc;
 mod open;
 pub(crate) mod percpu_wal;
