@@ -171,19 +171,32 @@ impl<'a> SstRangeIter<'a> {
                     break; // 索引按 key 有序，后续块更大
                 }
             }
-            // P1-E：字段级 Zone Map 剪枝——块级 min/max 与谓词比较，不相交则跳过整块
+            // P1-E / Task-025 方案 A：字段级 Zone Map 剪枝——块级 min/max 与谓词比较，不相交则跳过整块。
+            // 数值安全：zone 边界与查询边界均可解析为 f64 时按**数值**比较（变长小数/跨位数字节序
+            // ≠ 数值序，如 `"10" < "9.0"` 会误剪）——任一侧非数值 → 回退字节序（字符串列语义）。
             if let Some(ref zp) = self.zone_pred {
                 if let Some(zone) = e.zones.iter().find(|z| z.field == zp.field) {
+                    let parse = |b: &[u8]| -> Option<f64> {
+                        std::str::from_utf8(b).ok().and_then(|s| s.parse::<f64>().ok())
+                    };
                     // 若查询下界 > 块上界 → 整块不命中（跳过）
                     if let Some(ref min) = zp.min {
-                        if min.as_slice() > zone.max.as_slice() {
+                        let skip = match (parse(min), parse(&zone.max)) {
+                            (Some(pmin), Some(zmax)) => pmin > zmax,
+                            _ => min.as_slice() > zone.max.as_slice(),
+                        };
+                        if skip {
                             bidx += 1;
                             continue;
                         }
                     }
                     // 若查询上界 < 块下界 → 整块不命中（跳过）
                     if let Some(ref max) = zp.max {
-                        if max.as_slice() < zone.min.as_slice() {
+                        let skip = match (parse(max), parse(&zone.min)) {
+                            (Some(pmax), Some(zmin)) => pmax < zmin,
+                            _ => max.as_slice() < zone.min.as_slice(),
+                        };
+                        if skip {
                             bidx += 1;
                             continue;
                         }

@@ -1598,6 +1598,49 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         }
     }
 
+    #[test]
+    fn task025_numeric_zone_between_no_false_skip() {
+        // Task-025 方案 A：数值 zone 剪枝不得误剪。amount 1.0..31.0 跨 "10" 文本陷阱——
+        // 旧字节序剪枝把查询上界 "10" 与块内 "9.x" 按字节比较（"10"<"9.3"）会把含 9.x 的
+        // 有效块误跳过；数值安全比较（f64）应保留。行式（无 zone 行）作为无剪枝参照。
+        fn build(hot: bool) -> (Engine, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            if hot {
+                cfg.storage.hot_fields = vec!["amount".into(), "note".into()];
+            }
+            let mut e = Engine::open(dir.path(), &cfg).unwrap();
+            let pad = "x".repeat(3000); // 撑小块 → amount 列 zone 行随小块增多
+            for i in 0..300u64 {
+                let amount = 1.0 + i as f64 * 0.1;
+                let doc = serde_json::json!({
+                    "amount": amount,
+                    "note": format!("{pad}{i}"),
+                });
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+            }
+            e.flush_primary().unwrap();
+            (e, dir)
+        }
+        fn matched_ids(e: &mut Engine) -> Vec<u64> {
+            let mut ids: Vec<u64> = execute(e, "SELECT * FROM t WHERE amount BETWEEN 1 AND 10", 10_000)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.0)
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+        let (mut row_e, _d1) = build(false);
+        let (mut pax_e, _d2) = build(true);
+        let row_ids = matched_ids(&mut row_e);
+        let pax_ids = matched_ids(&mut pax_e);
+        // 地面真值：amount = 1.0 + i*0.1 ≤ 10.0 → i ≤ 90（含 10.0 边界）
+        let expect: Vec<u64> = (0..=90).collect();
+        assert_eq!(row_ids, expect, "行式（无 zone）命中应为 0..=90");
+        assert_eq!(pax_ids, expect, "PAX 数值 zone 剪枝不得误剪 9.x/10 边界块（方案 A）");
+    }
+
     // ---------- Task-021：COUNT 全包窗口直通 O(1) ----------
 
     #[test]
