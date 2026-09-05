@@ -186,6 +186,9 @@ pub struct ColumnFamily {
     /// L0 ≤1 段、点查 O(1) 段；多表单批 flush 每表 1 文件场景防"每写必全量 L0 合并"，
     /// 单表库零回归）。
     pub(crate) per_table_l0_trigger: usize,
+    /// P129（2026-09-05 补充监控）：per-table 压实**已执行次数**（多表分支每次成功合并
+    /// +1）——观测 per-table 压实频率 = 多表写放大间接量（对比 sst_written_bytes）。
+    pub(crate) per_table_compact_runs: AtomicU64,
     /// Ex-8.6：文件级**最小 put seq** 惰性记忆（path → min seq of put rows）。
     /// 快照读（get_bytes_at / scan_stream_at，snapshot<MAX）整段剪枝用：文件所有 put
     /// 行的 seq 均 > 快照点 → 该段对快照贡献为空，O(1) 跳过（免建迭代器/免读块）。

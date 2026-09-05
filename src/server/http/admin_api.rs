@@ -62,5 +62,7 @@ pub(crate) fn handle_metrics(engine: &mut Engine) -> (u16, String) {
             ));
         }
     }
+    // P129：per-table L0 段数 label 化指标 + per-table 压实 counter（面板/告警聚合友好）
+    out.push_str(&engine.l0_table_metrics_prom());
     (200, out)
 }

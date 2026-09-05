@@ -415,13 +415,33 @@ impl Engine {
         ]
     }
 
-    /// 2026-09-05（P0 观测 ③）：**L0 层按表段数** gauge——主列族（split_by_table，
+    /// 2026-09-05（P0 观测 ③ + P129 补充）：**L0 层按表段数** gauge——主列族（split_by_table，
     /// 每段单表）每表 L0 段数。多表热点场景观测"全局 L0 未满但单表 L0 堆积"
     /// （该表点查读放大 O(段数)），为 per-table L0 优先压实调度提供输入。
     /// 名称 = `shanshui_l0_sst_count_table_{tid}`；行数随活跃表数增长。
+    /// **P129 补充汇总行**（监控/告警单点可读，不必解析 N 行动态名）：
+    ///   `shanshui_l0_tables_active`（L0 有段表数）/ `shanshui_l0_sst_count_over_trigger`
+    ///   （段数 ≥ per_table_l0_trigger 的表数 = 待压实压力）/ `shanshui_l0_sst_count_max`
+    ///   （最大段数）/ `shanshui_l0_sst_hottest_table`（段数最多表 id）/
+    ///   `shanshui_per_table_compact_runs`（P129 压实执行次数，counter）。
     pub fn l0_table_report(&self) -> Vec<(String, String, u64)> {
-        self.primary
-            .l0_table_counts()
+        let counts = self.primary.l0_table_counts();
+        let active = counts.len();
+        let max_n = counts.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        let trigger = self.primary.per_table_l0_trigger;
+        let (hot_tid, over) = if active == 0 {
+            (0u16, 0usize)
+        } else {
+            (
+                counts.iter().max_by_key(|(_, n)| *n).unwrap().0,
+                if trigger > 0 {
+                    counts.iter().filter(|(_, n)| *n >= trigger).count()
+                } else {
+                    0
+                },
+            )
+        };
+        let mut out: Vec<(String, String, u64)> = counts
             .into_iter()
             .map(|(tid, n)| {
                 (
@@ -430,7 +450,72 @@ impl Engine {
                     n as u64,
                 )
             })
-            .collect()
+            .collect();
+        out.push((
+            "shanshui_l0_tables_active".into(),
+            "主列族 L0 层有段的表数".into(),
+            active as u64,
+        ));
+        out.push((
+            "shanshui_l0_sst_count_over_trigger".into(),
+            format!("L0 段数 ≥ per_table_l0_trigger({trigger}) 的表数（待压实压力）"),
+            over as u64,
+        ));
+        out.push((
+            "shanshui_l0_sst_count_max".into(),
+            "各表 L0 段数最大值（稳态应 ≤1）".into(),
+            max_n as u64,
+        ));
+        out.push((
+            "shanshui_l0_sst_hottest_table".into(),
+            "L0 段数最多的表 id".into(),
+            hot_tid as u64,
+        ));
+        out.push((
+            "shanshui_per_table_compact_runs".into(),
+            "per-table L0 压实执行次数（多表写放大间接量，counter）".into(),
+            self.primary.per_table_compact_runs(),
+        ));
+        out
+    }
+
+    /// 2026-09-05（P129 补充监控）：/metrics **label 化** per-table 文本（Prometheus 面板/
+    /// 告警聚合友好，替代动态名行的不可聚合问题）：
+    ///   `shanshui_l0_sst_count{table="<tid>"}`（gauge，每表 L0 段数）
+    ///   `shanshui_l0_sst_over_trigger{table="<tid>",trigger="<T>"}`（1 = 该表待压实）
+    ///   `shanshui_per_table_compact_runs_total`（counter）
+    pub fn l0_table_metrics_prom(&self) -> String {
+        let mut out = String::new();
+        let counts = self.primary.l0_table_counts();
+        out.push_str(
+            "# HELP shanshui_l0_sst_count 主列族 L0 层每表段数（split_by_table 每段单表）\n\
+             # TYPE shanshui_l0_sst_count gauge\n",
+        );
+        for (tid, n) in &counts {
+            out.push_str(&format!("shanshui_l0_sst_count{{table=\"{tid}\"}} {n}\n"));
+        }
+        let trigger = self.primary.per_table_l0_trigger;
+        if trigger > 0 {
+            out.push_str(
+                "# HELP shanshui_l0_sst_over_trigger 表 L0 段数 ≥ per_table_l0_trigger（1=该表待压实）\n\
+                 # TYPE shanshui_l0_sst_over_trigger gauge\n",
+            );
+            for (tid, n) in &counts {
+                let v = if *n >= trigger { 1u64 } else { 0u64 };
+                out.push_str(&format!(
+                    "shanshui_l0_sst_over_trigger{{table=\"{tid}\",trigger=\"{trigger}\"}} {v}\n"
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP shanshui_per_table_compact_runs_total per-table L0 压实执行次数（多表写放大间接量）\n\
+             # TYPE shanshui_per_table_compact_runs_total counter\n",
+        );
+        out.push_str(&format!(
+            "shanshui_per_table_compact_runs_total {}\n",
+            self.primary.per_table_compact_runs()
+        ));
+        out
     }
 
     /// 引擎状态指标（design 20 / development 5.25，供 `admin status`）。

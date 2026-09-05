@@ -206,6 +206,7 @@ impl ColumnFamily {
             l2_trigger_files: cfg.storage.l2_trigger_files,
             // P129：多表 per-table L0 压实触发阈值（0 = 关闭；单表库由多表门控自动不启用）
             per_table_l0_trigger: cfg.storage.per_table_l0_trigger,
+            per_table_compact_runs: AtomicU64::new(0),
             seq_min: RwLock::new(std::collections::HashMap::new()),
             compaction_cooldown: cfg.storage.compaction_cooldown,
             merge_round: AtomicU64::new(0),

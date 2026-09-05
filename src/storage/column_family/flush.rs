@@ -102,6 +102,12 @@ impl ColumnFamily {
         m.into_iter().collect()
     }
 
+    /// P129（补充监控）：per-table 压实已执行次数（多表分支每次成功合并 +1）——
+    /// 观测压实频率 = 多表写放大间接量。
+    pub fn per_table_compact_runs(&self) -> u64 {
+        self.per_table_compact_runs.load(Ordering::Relaxed)
+    }
+
     /// 从 docid 编码 key 中提取 table_id（高 16 位）。
     /// key 为 encode_docid 的 8 字节大端编码，前 2 字节 = table_id。
     pub(crate) fn table_id_from_key(key: &[u8]) -> Option<u16> {

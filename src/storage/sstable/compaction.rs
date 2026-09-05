@@ -91,10 +91,14 @@ impl ColumnFamily {
         // P129：多表 per-table 压实（目标表 L0→L1，输出合并去重；同表段天然无跨表重叠）
         if self.per_table_active(&snap) {
             if let Some(sel) = self.table_l0_subset(&snap) {
-                if let Some(rep) = self.try_meta_only_compact(&sel, 1)? {
-                    return Ok(rep);
-                }
-                return self.compact_merge(&sel, 1, &|_| false);
+                let rep = if let Some(r) = self.try_meta_only_compact(&sel, 1)? {
+                    r
+                } else {
+                    self.compact_merge(&sel, 1, &|_| false)?
+                };
+                // P129 监控：per-table 压实执行计数（写放大间接量）
+                self.per_table_compact_runs.fetch_add(1, Ordering::Relaxed);
+                return Ok(rep);
             }
             // 多表模式无目标表（各表 ≤1 段 = 按表收敛态）：每表 L0 ≤1 段读放大 O(1)，
             // 不触发全量合并（全局计数在多表模式不作为触发——每表段数受控 ⇒ 全局有界）

@@ -1693,8 +1693,20 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   out L1）且 t7 单段留 L0 不参与，第 3/4 批 flush 后 L0 t1=2 再合并、L1 旧段不并入 + 跨批
   覆盖读正确（8 行）；②20 表 × L0 1 段 needs_compact=false、compact no-op、20 文件不变、读回）；
   全量 lib **774 通过 + 3 ignored**。
-- 待办（观测接续）：rr sqlrun 多表负载压测采集 `shanshui_l0_sst_count_table_*` 验证稳态
-  每表 ≤1 段 + `sst_written_bytes` 写放大 ≈2× 回填。
+- 监控指标补充（2026-09-05，用户要求）：
+  - CF `per_table_compact_runs` 原子计数（P129 分支每次成功合并 +1）+ accessor；
+  - engine `l0_table_report` 增 5 条汇总行（`shanshui_l0_tables_active` 活跃表数 /
+    `shanshui_l0_sst_count_over_trigger` 段数 ≥ trigger 待压实表数 /
+    `shanshui_l0_sst_count_max` 最大段数（稳态应 ≤1）/ `shanshui_l0_sst_hottest_table`
+    热点表 id / `shanshui_per_table_compact_runs` counter）→ /metrics gauges 与 SHOW MEMORY；
+  - `/metrics` 增 **label 化**文本（engine `l0_table_metrics_prom`）：
+    `shanshui_l0_sst_count{table="<tid>"}` + `shanshui_l0_sst_over_trigger{table=,trigger=}`（1=该表待压实）
+    + `shanshui_per_table_compact_runs_total` counter —— Prometheus 面板/告警可聚合
+    （动态名行无法做阈值告警/聚合查询）。
+  - 单测更新：l0 测试断言汇总行 + label 文本；P129 测试断言 per_table_compact_runs 随压实 +1；
+    全量 lib 774 通过 + 3 ignored。
+- 待办（压测采集）：rr sqlrun 多表负载压测采集 `shanshui_l0_sst_count{table=}` 验证稳态
+  每表 ≤1 段 + `shanshui_per_table_compact_runs_total`/`sst_written_bytes` 写放大 ≈2× 回填。
 
 ## 环境备忘（不入库）
 

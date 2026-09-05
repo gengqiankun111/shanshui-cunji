@@ -1651,6 +1651,7 @@
         let rep = cf.compact().unwrap();
         assert_eq!(rep.merged_ssts, 2, "应只合并表 1 的 2 段，实际 {}", rep.merged_ssts);
         assert_eq!(rep.out_level, 1, "输出下沉 L1");
+        assert_eq!(cf.per_table_compact_runs(), 1, "per-table 压实计数 +1");
         let snap = cf.ssts.load();
         assert_eq!(snap.ssts.len(), 2, "合并后 2 文件（t1→L1 1 段 + t7→L0 1 段）");
         let mut lv_of: Vec<(u16, u32)> = snap
@@ -1683,6 +1684,7 @@
         let rep2 = cf.compact().unwrap();
         assert!(rep2.merged_ssts >= 2, "L0 t1 两段应合并下沉");
         assert_eq!(rep2.out_level, 1);
+        assert_eq!(cf.per_table_compact_runs(), 2, "第二次 per-table 压实计数 +1");
         let snap2 = cf.ssts.load();
         assert_eq!(snap2.ssts.len(), 3, "t1 L1×2（旧+新）+ t7 L0×1");
         let t1_l0_left = snap2

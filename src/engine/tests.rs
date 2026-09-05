@@ -3661,8 +3661,18 @@ use crate::optimizer::QuerySpec;
         }
         let sum: usize = counts.iter().map(|(_, n)| n).sum();
         assert!(sum >= tids.len(), "总 L0 段数 ≥ 表数: {counts:?}");
-        // engine 动态名报告
+        // engine 动态名报告（逐表行 + P129 汇总行 5 条：active/over_trigger/max/hottest/counter）
         let rep = e.l0_table_report();
-        assert_eq!(rep.len(), counts.len());
+        assert_eq!(rep.len(), counts.len() + 5, "逐表 + 汇总行");
         assert!(rep.iter().any(|(n, _, _)| n.contains("table_5")), "含表 5 动态行");
+        let get = |name: &str| rep.iter().find(|(n, _, _)| n == name).map(|(_, _, v)| *v);
+        assert_eq!(get("shanshui_l0_tables_active"), Some(3), "活跃表数");
+        assert_eq!(get("shanshui_l0_sst_count_over_trigger"), Some(0), "每表 1 段 < trigger(2)");
+        assert_eq!(get("shanshui_l0_sst_count_max"), Some(1), "最大段数 1");
+        assert_eq!(get("shanshui_per_table_compact_runs"), Some(0), "未压实 counter=0");
+        // label 化 /metrics 文本：含 label 行与 counter 头
+        let prom = e.l0_table_metrics_prom();
+        assert!(prom.contains("shanshui_l0_sst_count{table=\"5\"}"), "label 行");
+        assert!(prom.contains("shanshui_l0_sst_over_trigger{table=\"5\",trigger=\"2\"} 0"));
+        assert!(prom.contains("shanshui_per_table_compact_runs_total 0"));
     }
