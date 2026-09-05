@@ -125,6 +125,19 @@ Task-024：全扫/排序残余 IO 收口（#29 + #14/#27/#11 合并项，2026-09
 > ⚠️ 新开发缺口（PAX 复测暴露，非纯复测可补）：
 > ① 点查/IN 投影下推：server/sql 点查仍走 engine.get 整行解码（PAX 行不解列）→ 需 engine 投影
 >   点查（get_fields 按需列）接线 #2/#3/#4（目标 #2≤0.25、#4≤0.8，P101 后复测）。
+>    ✅ 已完成（2026-09-05，P106）：select.rs `projection_pushdown_fields` 判定（纯顶层简单字段、
+>    无 doc/嵌套）→ 点查 engine.batch_get_fields / id IN Engine::get_many_pk_in_fields（稠密
+>    scan_stream_fields / 稀疏 batch_get_fields + assemble_subset_json 子集组装）接线；PAX 块任意
+>    字段单列解码、cell/列类型与整行路径逐值一致；+2 单测（引擎行式/PAX×稠密稀疏 + 协议层
+>    端到端 = 整行参考路径逐字节），全量 711（707 通过 + seqlock 偶发独立绿 + 3 ignored）。
+>    ✅ 复测回填（2026-09-05，PAX 10万既有库 cjserver 侧，results-pax-gap1b-scc-100k，P105 同库对照）：
+>    #1 0.24→0.22（SELECT* 零提取地板）、#2 0.45→0.41、#5 3.11→2.82、#3 0.40→0.41、#4 1.73→1.75
+>    持平——**接线生效无回退**。绝对值 #2≤0.25/#4≤0.8 未达：10万库全部行写路径直写 hotcache
+>    （Task-027 put 直写）且 ~100MB≪1024MB，点查基本热命中整行；且单查询固定开销 floor = #1
+>    0.22ms（协议/parse/响应组装），投影提取+类型组装仅 ~0.19ms 增量、PAX 列解码只占其中小头
+>    → 推下收益被 floor 淹没。**修复复测暴露的 hotcache 命中二次 parse 退化**（热行改直通整行、
+>    仅冷行走列解码）。缺口① 收口：冷读受益方向正确、数值验收按 floor 语义（#2 ≈ #1 + 小余量）
+>    或待 110 万超缓存轮（宽行回表冷读）验证。
 > ② #12 COUNT(*) O(1)：fresh-load 多 L0 快照不 eligible → 回退 43ms 全扫；放宽为活跃 docid
 >   rank 计数（不依赖单层快照形态）。
 > ③ #29/#5 残余 = 行读+块 IO/跨文件扇出 → Task-025b 阶段④。

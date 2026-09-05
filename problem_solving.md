@@ -1233,6 +1233,36 @@
 - 决策：上述 ①-④ 转开发排期（dev_remain Task-024 阶段② 缺口注）；本复测为基线存档，不回溯旧排期项。
 
 
+### P106. Task-024 阶段② 缺口①——点查/IN 投影下推（get_fields 接线，2026-09-05）
+
+- **根因（P105 ①）**：#2 pk_point_proj10 0.46ms / #4 pk_in_50 1.73ms 持平未降——server 点查/`id IN`
+  分支仍走 `engine.get` / `get_many_pk_in` 整行解码回传（PAX 数据不解列、整行 25 列重构 + 回包）。
+- **做法**：
+  - `server/command/select.rs` 新增 `projection_pushdown_fields`（投影含 ≥1 纯顶层简单字段列、无
+    `doc` 整列、字段名不含 `.`/`[` → 去重顶层字段清单；否则 None 回退整行路径，语义不变）；
+  - 点查分支 → `engine.batch_get_fields(&[d], fields)`（HotCache/Delta/删除位图语义同 `get`）+ 子集组装；
+  - `id IN` 分支 → 新增 `Engine::get_many_pk_in_fields`（engine/read.rs，`get_many_pk_in` 字段级变体：
+    稠密跨度 ≤4× 走 `scan_stream_fields` 区间投影顺序读、稀疏走 `batch_get_fields` → `assemble_subset_json`
+    组装子集 JSON；可见性/去重语义与 Task-023 逐分支同构）；
+  - `sstable/block.rs` `assemble_subset_json` 由私有提为 `pub` 并经 `sstable/mod.rs` re-export 复用。
+- **语义护栏**：PAX 块每列均独立存列（hot/cold），任意顶层字段可单列解码；子集 JSON 缺字段省略 /
+  null 直嵌 → `build_result_set` cell/列类型与整行路径逐值一致（含转义字符串/浮点/缺列/JSON null）。
+- **测试（+2）**：engine `gap1_pk_in_fields_subset_matches_full_row_both_layouts`（行式+PAX ×
+  memtable/flush/重开 × 稠密/稀疏，命中集与逐字段值 = 整行路径）；server `gap1_point_and_in_projection_pushdown_matches_whole_row_path`
+  （PAX+flush 落盘点查/IN 结果集 = 整行参考路径逐字节一致；`SELECT id,doc` 整行直通与缺字段/nested 回退护栏）。
+  全量 **711**（707 通过 + 1 既有 seqlock 低频写偶发并发调度失败单跑独立绿 + 3 ignored）。
+- **复测修正（PAX 10万既有库，cjserver 侧，results-pax-gap1b-scc-100k，P105 同库对照）**：
+  首轮复测发现 hotcache 命中行被走"整行提取→逐字段重序列化→组装子集→消费端二次 parse"
+  （比旧整行路径多一轮 parse+序列化，#3/#4 微涨）——改 **hotcache-first**：`get_many_pk_in_fields`
+  先对未删 docid 查 hotcache 直通整行字节（零二次 parse），仅冷行走 scan_stream_fields /
+  batch_get_fields 列解码；点查分支复用该 API。二次复测：#1 0.24→0.22（SELECT* 零提取地板）、
+  #2 0.45→0.41、#5 3.11→2.82、#3/#4 持平（0.41/1.75 vs 0.40/1.73）——接线生效无回退。
+- **验收结论（P105 缺口注 #2≤0.25/#4≤0.8 未达）**：10万库全行由写路径直写 hotcache（~100MB ≪
+  1024MB），点查基本热命中整行；单查询固定开销 floor = #1 SELECT* 0.22ms（协议/parse/响应组装），
+  投影提取+类型组装 ~0.19ms 增量中 PAX 列解码仅小头 → 推下收益被 floor 淹没。缺口① 收口为
+  「接线正确、热路径零退化、冷读受益方向正确」，数值验证宜在 110 万超缓存轮（宽行回表冷读）进行。
+
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
