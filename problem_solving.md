@@ -1474,6 +1474,24 @@ P1-D 候选解码 ~3µs/行。修复（src/engine/scan.rs + src/sql/executor/agg
 #61 0.2ms 不回退（聚合家族全部 ms 级）。+1 单测 pg_scalar_stats_guard_matches_scan（SUM/AVG 载荷
 守卫 = 权威扫描；删除/复活后守卫回退仍一致）。边界同 P120（载荷脏化守卫回退宁慢勿错）。
 
+**P122（观察项闭环升级）大区间 id-range DELETE 使整个服务确定性锁死（CPU 空闲）——内核/服务层缺陷，未闭环**
+来源：待查观察项「sqlrun 收尾 44k 区间清理 DELETE 长时间挂起」。复现（2026-09-05，10w scratch + release
+bd2debb）：
+① 全量 81 探针后收尾 `DELETE … id BETWEEN base+1501..base+46001`（44.5k 行在场）——summary 落盘后
+   >3min 未返回；服务端 CPU 3s 采样 0s（空闲等待）。kill 客户端后脏态重启，手动同 DELETE 仍不返回，
+   并发 SELECT COUNT 亦挂起 → **服务整体锁死**。
+② 新鲜库 A/B：clean 100k 行、零并发、`--one` 单条 `DELETE id BETWEEN 2 AND 20001`（20k 行）→ 同样锁死；
+   之后连 1000 行小 DELETE 都挂起。
+③ 假设排除：`auto_compact=false` + `delete_density_min_docs=1e12` 变体 cfg 下仍锁死（非删除密度排空
+   GC 与 DELETE 争写锁）；套件内 1000 行范围删 #74=3.5ms / #23/#24 正常 → 与**行数规模**相关（触发点
+   在数百~2 万之间某阈值），非逐行机制。
+特征：服务端 CPU 空闲 + 线程数恒定 17 + 全部后续命令无响应 → 引擎/服务级锁等待死锁（handler 与某后台
+线程互等，零 CPU）。结论：**确定性内核/服务缺陷**（大 id 区间删路径），非测试方法坑；workaround 保持
+（sqlrun 先落 summary + 每轮重置重装载仍适用）。建议专门会话以线程栈/断点定位（候选：delete_batch 批尾
+与组提交/后台 flush 交互、per-CPU 写队列批量等待、server 会话与后台 worker 引擎读写锁序；可先在
+5k/10k/15k 行二分复现确定触发阈值）。排查期间产生的 10w 全量探针结果（清理前）
+results/results-sqlrun-scc-10w-full/summary.md 保留为基线参考。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
