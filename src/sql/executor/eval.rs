@@ -698,11 +698,12 @@ fn post_filter(
         }
         chunk.push(docid);
         if chunk.len() == CHUNK && consume(&mut chunk, &mut out)? {
+            chunk.clear(); // limit 已满：清空避免尾部二次消费同一块
             break;
         }
     }
-    if !chunk.is_empty() && consume(&mut chunk, &mut out)? {
-        // limit 已满
+    if !chunk.is_empty() {
+        consume(&mut chunk, &mut out)?;
     }
     Ok(out)
 }

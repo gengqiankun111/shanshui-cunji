@@ -1351,6 +1351,41 @@
   2. **事件恰落 advance 目标点未处理 + 天轮候选命中"已过去的当天"**：跳到 target 即 break 不执行 `process_at` → 恰好整点/到期在 target 的任务漏触发（1 年 TTL 最后一秒不触发）；天轮桶槽号 = 日序 %365，若与当前日同余会给出已过去的当天整点（stale）→ 级联永不发生。修复：`t == target` 时处理后再结束；候选激活严格 `> now`（同余取下一周期）。
 - **提交**：见 Task-007 提交（本会话）。
 
+## 阶段 4 · 10 万轮修复（2026-09-05，Task-028/029/031/030/032）
+
+**P112（Task-028）cidx 重启/后加配置丢键 → 组合索引查询静默空**
+复现：composite_indexes 声明在、重启后 `status='active' AND ts=`（真实 ~1e4 命中）返回 0 行/0.37ms
+（cidx 仅内存/队列态，open 不回扫存量）；nocidx 声明下同库返回 10000 行。修复：`Engine::
+ensure_composite_index_backfill`（open 期调用）——primary 非空且 `cidx.sig` 标记签名不符或 cidx 空时，
+从 primary 全量回扫重建复合键（`ColumnFamily::memtable_put_nolog` 无 WAL 直入 + `switch_and_flush`
+落 SST + 写签名标记；崩溃丢标记幂等重做）；正常会话零开销。单测 task028（后加配置/签名变更/重开三态）。
+
+**P113（Task-029）AND(等值,等值) 后过滤逐 docid get → 块级批量取数**
+复现：无 cidx 下 `status='active' AND ts=` 走 eval `post_filter` 逐候选 `engine.get`（0 命中全遍历
+2322ms≈77µs/候选冷态 / 报告热态 24ms≈1.2µs）；`SUM(amount) WHERE active`（P1-D 批量）同候选仅
+~3.5µs/docid。修复：post_filter 顶层简单字段叶按 512/块 `engine.get_many_pk_in_fields` 批量取子集 +
+块内字节级判定（HotCache 直通/稠密区间流/稀疏批量），嵌套点路径叶保持逐点回退（语义不变）。
+单测 task029（跨块候选/删除隐藏/0 命中全遍历/LIKE 组合）。
+
+**P114（Task-031）结果集行输出 ~25µs/行固定常数**
+复现：同窗引擎 COUNT(20k) 94ms≈5µs/行 vs `SELECT id` keys-only 20k 606ms≈30µs/行（列数无关）→
+响应逐包 write（每包 2 次 syscall）。修复：`server.rs frame_response` 多包合并单帧一次 write_all
+（同步+异步连接同接线；字节流与逐包完全一致）。单测 task031（帧=逐包序列、seq 回绕、按包还原）。
+
+**P115（Task-030）COUNT(DISTINCT col) 与 GROUP BY … ORDER BY <聚合> 解析/执行缺口**
+复现：两探针 SQL 1064（parser 不支持 DISTINCT 参数 / ORDER BY 内聚合头）。修复：parser 聚合参数
+支持 `COUNT(DISTINCT f)`（Select.agg_distinct；GROUP BY 内 DISTINCT 拒绝防静默）、ORDER BY 项支持
+聚合列头规范串（`COUNT(*)`/`SUM(f)`）；execute_aggregate 新增去重计数分支（窗口扫描非 null 去重值，
+数值按 f64 规范化、缺字段/NULL 不计）；execute_group_by 排序项支持聚合下标（数值比较、NULL 升序最前）
+且倒排快路径遇聚合排序自动交主路径。单测 task030。
+
+**P116（Task-032）主键 IN 稀疏大批次逐键点查残余**
+复现：pk_in 随机 id 稀疏（跨度 ≫4×计数）→ `get_many_pk_in*` 逐 docid 点查（~31µs/键 warm，
+pk_in_5000 174ms）。修复：稠密判定 4×→64×（区间顺序读 ~0.5µs/行，span≤64×n 时优于逐键点查；
+超限自动回退 batch_get 不劣化），整行/投影两变体对齐。单测 task032（4×~64× 窗口 = 逐条 get）。
+> 数值验收随 Task-005 10w 基准回填；Task-033（锁等待超时 1205）需先实测 run_lock_wait 副会话
+> outcome（SCC waiter-ok vs MySQL waiter-1205）再定等待/超时接线，暂不盲改。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

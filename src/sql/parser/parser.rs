@@ -65,6 +65,7 @@ impl Parser {
         let mut columns = Vec::new();
         let mut plain: Vec<String> = Vec::new();
         let mut aggs: Vec<(String, Option<String>)> = Vec::new();
+        let mut distincts: Vec<bool> = Vec::new();
         let mut star_seen = false;
         loop {
             let item = self.next()?;
@@ -75,10 +76,18 @@ impl Parser {
                 }
                 Tok::Ident(i) => {
                     // 7.95 聚合函数列：COUNT(*) / COUNT(f) / SUM(f) / AVG(f) / MIN(f) / MAX(f)
+                    // Task-030：COUNT(DISTINCT f)（去重计数；DISTINCT 仅 COUNT 支持）
                     if matches!(self.peek()?, Tok::LParen) {
                         let upper = i.to_uppercase();
                         if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
                             self.next()?; // LParen
+                            let mut distinct = false;
+                            if let Tok::Ident(k) = self.peek()? {
+                                if k.eq_ignore_ascii_case("distinct") {
+                                    self.next()?; // distinct
+                                    distinct = true;
+                                }
+                            }
                             let arg = match self.next()? {
                                 Tok::Star => None,
                                 Tok::Ident(f) => Some(f),
@@ -90,8 +99,21 @@ impl Parser {
                                 Tok::RParen => {}
                                 t => return Err(format!("聚合期望右括号，实际 {t:?}")),
                             }
+                            if distinct && upper != "COUNT" {
+                                return Err(format!(
+                                    "仅 COUNT(DISTINCT f) 受支持（{upper}(DISTINCT) 未支持）"
+                                ));
+                            }
+                            if distinct && arg.is_none() {
+                                return Err("DISTINCT 需字段参数（COUNT(DISTINCT f)）".into());
+                            }
+                            columns.push(if distinct {
+                                format!("COUNT(DISTINCT {})", arg.as_deref().unwrap())
+                            } else {
+                                upper.clone()
+                            });
                             aggs.push((upper.to_lowercase(), arg));
-                            columns.push(upper);
+                            distincts.push(distinct);
                         } else {
                             return Err(format!("不支持的函数列: {i}"));
                         }
@@ -202,13 +224,39 @@ impl Parser {
                 }
                 Tok::Ident(k) if k.eq_ignore_ascii_case("order") => {
                     // ORDER BY f1 [ASC|DESC], f2 [ASC|DESC], ...
+                    // Task-030：排序项可为聚合列头（GROUP BY 后按聚合值排序，
+                    // 如 `ORDER BY COUNT(*) DESC`/`SUM(amount)`）——解析为规范头串
+                    // （`COUNT(*)`/`SUM(amount)`），分组执行器按聚合值排序。
                     self.next()?; // 消费 order
                     match self.next()? {
                         Tok::Ident(k) if k.eq_ignore_ascii_case("by") => {}
                         t => return Err(format!("ORDER 后期望 BY，实际 {t:?}")),
                     }
                     loop {
-                        let f = self.ident()?;
+                        let id = self.ident()?;
+                        let f = if matches!(self.peek()?, Tok::LParen) {
+                            let up = id.to_uppercase();
+                            if !matches!(up.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                                return Err(format!("ORDER BY 不支持函数: {id}"));
+                            }
+                            self.next()?; // (
+                            let a = match self.next()? {
+                                Tok::Star => "*".to_string(),
+                                Tok::Ident(x) => x,
+                                t => {
+                                    return Err(format!(
+                                        "ORDER BY 聚合参数期望 * 或字段名，实际 {t:?}"
+                                    ))
+                                }
+                            };
+                            match self.next()? {
+                                Tok::RParen => {}
+                                t => return Err(format!("ORDER BY 聚合期望右括号，实际 {t:?}")),
+                            }
+                            format!("{up}({a})")
+                        } else {
+                            id
+                        };
                         let mut desc = false;
                         if let Tok::Ident(d) = self.peek()? {
                             if d.eq_ignore_ascii_case("desc") {
@@ -248,6 +296,7 @@ impl Parser {
         }
         // 组装：无 GROUP BY → 单标量聚合（7.95 兼容）；有 GROUP BY → 组聚合列清单。
         let mut agg = None;
+        let mut agg_distinct = false;
         let group_aggs = aggs.clone();
         if !group_by.is_empty() {
             if star_seen {
@@ -261,7 +310,7 @@ impl Parser {
                     ));
                 }
             }
-            for (n, f) in &aggs {
+            for (i, (n, f)) in aggs.iter().enumerate() {
                 let up = n.to_uppercase();
                 if !matches!(up.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
                     return Err(format!("GROUP BY 不支持的聚合: {n}"));
@@ -269,11 +318,16 @@ impl Parser {
                 if f.is_none() && up != "COUNT" {
                     return Err(format!("{n}(*) 不支持（仅 COUNT(*)）"));
                 }
+                if distincts[i] {
+                    // Task-030：分组内 DISTINCT 聚合暂不支持（防静默忽略）
+                    return Err("GROUP BY 内 DISTINCT 聚合暂不支持（仅标量 COUNT(DISTINCT f)）".into());
+                }
             }
         } else if aggs.len() > 1 {
             return Err("暂不支持多列/多聚合（无 GROUP BY）".into());
         } else {
             agg = aggs.into_iter().next();
+            agg_distinct = distincts.into_iter().next().unwrap_or(false);
         }
         if having.is_some() && group_by.is_empty() {
             return Err("HAVING 需配合 GROUP BY（本期不支持无分组的 HAVING）".into());
@@ -285,6 +339,7 @@ impl Parser {
             limit,
             offset,
             agg,
+            agg_distinct,
             order_by,
             group_by,
             group_aggs,

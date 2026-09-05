@@ -400,6 +400,158 @@ tick()：推进指针，执行到期任务
 
 重启后任务不丢失（检查点恢复）
 
+Task-028：组合索引（cidx）持久化 / 启动重建——重启丢键静默空结果（10w 轮 #1 复合索引异常根因 A，正确性 P0）
+> 实测（2026-09-05，scc-sqlrun-100k 副本 + 当前 release 二进制）：`composite_indexes` 声明在场时，
+> 同一查询在**关闭前/重启后**结果不同——重启后 `WHERE status='active' AND ts=…`（数据中确定存在 ~1e4 命中）
+> 返回 **0 行 / 0.37ms**（cidx 内存条目全丢 → 前缀扫描空集直接返回，不回退 eval）；同库同查询在无 cidx
+> 声明配置下（fallback）返回 10000 行。即：**重启后声明了组合索引的等值/范围查询静默丢行（错误结果）**。
+> 既有 P92 v5 备注「cidx nosync 未刷盘重启丢键（v5 首测 #31=0 行即此）」为已知边界，本项正式修复。
+> 存储侧：cidx/ 目录仅 wal.log（0 字节），无 checkpoint/段文件；engine.open（open.rs L293）仅把
+> `composite_indexes` 声明载入内存，**不对存量 primary 数据回扫建索引**。
+属性	内容
+优先级	P0（正确性：重启后组合索引查询静默丢行，比性能劣化严重）
+工作量	1~1.5 天
+依赖	engine/open.rs 打开流程、cidx 写路径（engine/write.rs L185）、keys.rs 复合键编解码
+风险	中（重建耗时与打开期/后台并发、删除/覆盖 stale 键清理；与 write.rs stale 复筛语义一致）
+具体工作：
+□ 方案 A（首选，成本可控）：open 时检测 cidx 声明非空且内存索引空 + primary 非空 → **启动期/后台一次性
+  存量回扫重建**（scan_stream 全量，按字段组逐 doc 提取复合键 → add；与倒排 GC worker 同生命周期管理，
+  看门狗分片熔断；期间查询走既有 eval fallback 保证正确不丢行）；重建完成后置就绪标记
+□ 方案 B（可选叠加，后续）：cidx 增量持久化（段/checkpoint 或复用 cidx/wal.log 落盘键条目），免重启重建
+□ 验收：重启前插入 status/ts 数据 → 重启后 composite_idx_point / composite_idx_multi_eq 结果 = 关闭前
+  （≥1 行，非 0）；重启后首查即 <5ms（重建后走 cidx）；无声明配置行为不变；回归全绿
+> ✅ 已完成（2026-09-05，P112）：Engine::ensure_composite_index_backfill（open 期：primary 非空且
+> `cidx.sig` 签名不符或 cidx 空 → primary 全量回扫重建复合键 → memtable_put_nolog 直入 + flush 落 SST +
+> 写签名标记，崩溃幂等重做；正常会话零开销）+ CF memtable_put_nolog + 单测 task028（后加配置/签名
+> 变更/正常重开三态）。全量 740 绿。
+> 收益锚点：报告 composite_idx_point 24ms/p99 148ms（实为 nocidx 声明缺失的 eval fallback——见 Task-029）；
+> 本项修的是「声明在、重启丢」的静默错误（正确性），两任务互为补充。
+
+Task-029：AND(等值,等值) 等值后过滤批量取数——eval post_filter 逐 docid get 改块级 batch（10w 轮 #1 根因 B）
+> 根因：`status='active' AND ts=V`（ts 为数值/未索引等值）→ eval And 分支把 ts 等值当扫描叶在 status
+> 位图（~2e4~3e4 候选）上 **post_filter 逐 docid `engine.get`**（eval.rs L637-660），无 LIMIT/0 命中须遍历
+> 全候选，成本 = O(候选) × 点查常数；无 cidx 配置下实测（scc-sqlrun-100k 副本）：ts=1730000000 0 命中
+> 2322ms（≈77µs/候选，重启后 hotcache 空 + memtable 读）、ts=1700000000 1e4 命中 919ms（cap 截断 1e4 行）；
+> 报告 10w 热缓存会话同路径 24ms（≈1.2µs/候选）。对照：SUM(amount) WHERE active（P1-D/P91 候选块级
+> batch_get_fields）同候选 ~71ms ≈ 3.5µs/docid——批量即收敛。
+属性	内容
+优先级	P0（#1 性能面：cidx 不可用/未声明/未命中时一切等值 AND 组合都吃此路径；p99 抖动来自候选全遍历）
+工作量	0.5~1 天
+依赖	eval.rs post_filter、engine.batch_get_fields / get_many_pk_in_fields、P85 collect_limited_rows 消费模式
+风险	低（行序/offset/limit/墓碑可见性语义与现逐 docid 一致；仅候选获取方式分批）
+具体工作：
+□ post_filter/leaf_passes 批量改造：候选 bitmap 按 512 分块 → batch_get_fields（needed = 叶字段集合，P86②
+  字节级提取）+ scan_row_matches 块内判定 → 命中入 out；看门狗逐块熔断；offset/limit 占位语义不变
+□ 单测：批量后过滤 = 逐 docid 逐行一致（墓碑/缺失/转义护栏、0 命中全遍历、limit 早停）；AND(倒排×倒排) 快路径不回退
+□ 验收：nocidx 配置 10w：ts= 无匹配 2322ms → ≤60ms（≈1e4 候选 ×6µs）；报告 24ms → ≤5ms 量级；回归全绿
+> ✅ 已完成（2026-09-05，P113）：post_filter 改块级批量——顶层简单字段叶（无点路径）候选按 512/块
+> `engine.get_many_pk_in_fields`（HotCache 直通/稠密区间流/稀疏 batch_get_fields 子集）+ 块内字节级判定；
+> 嵌套点路径叶保持逐 docid leaf_passes。+单测 task029（跨块候选/删除隐藏/0 命中全遍历/LIKE 组合）。
+> 全量 740 绿；数值收益随基准轮回填。
+> 收益锚点：报告 #1/#2 高风险项中「组合索引点查 24ms、p99 148ms」在无声明配置下的实际成因。
+
+Task-030：MySQL 语法面补齐——COUNT(DISTINCT col) 与 GROUP BY … ORDER BY <聚合表达式>（探针 SQL 报错根因）
+> 实测 1064：`SELECT COUNT(DISTINCT status)` → 「聚合期望右括号，实际 Ident("status")」（parser 不支持
+> DISTINCT 参数）；`SELECT region,COUNT(*) … GROUP BY region ORDER BY COUNT(*) DESC LIMIT 20` → 「意外
+> token LParen」（ORDER BY 不允许聚合表达式）。MySQL 8.0 双侧同 SQL 可跑 → 该两探针仅 SCC 报错。
+> 语义锚点：COUNT(DISTINCT) = 组去重计数；GROUP BY 后 ORDER BY 聚合 = 组结果按聚合值排序后 LIMIT。
+属性	内容
+优先级	P1（测量阻塞：2 个扩展探针无法跑，distinct 能力未知；语法面 MySQL 兼容缺口）
+工作量	1 天
+依赖	parser ast（agg 参数扩展 + order_by 项支持聚合头）、aggregate/group_by 执行（DistinctSet/HashSet 去重；
+      位图/倒排字段可走 term 词典 distinct 快路径，高基数回退扫描）
+风险	中（COUNT(DISTINCT) 语义：NULL 不计入（对齐 MySQL）、非数值列类型；ORDER BY 聚合需组结果物化排序，防
+      超大组数内存——LIMIT 守卫）
+具体工作：
+□ 解析：COUNT/SUM 等聚合参数支持 `DISTINCT <field>`（ast 标记 distinct）；GROUP BY 查询的 ORDER BY 项允许
+  聚合头引用（与 HAVING 同款聚合解析）；LIMIT 随组排序生效
+□ 执行：COUNT(DISTINCT f) 无 GROUP BY = 单值列 HashSet 去重计数（位图/倒排声明字段走词典枚举快路径：
+  inverted_group_stats/term 数；status 5 组毫秒级）；GROUP BY + ORDER BY COUNT(*) = 组行按聚合值排序切片
+□ 单测：NULL 不计、浮点/字符串去重语义、混合 GROUP BY+ORDER BY 聚合+LIMIT、bitmap 字段快路径 = 扫描口径
+□ 验收：两个探针 SQL（原样）在 SCC 端可跑且行集 = MySQL；10w 下 COUNT(DISTINCT status) ≤10ms、
+   COUNT(DISTINCT user_id)（高基数回退扫描）≤ 全扫量级；回归全绿
+> ✅ 已完成（2026-09-05，P115）：parser 聚合参数支持 `COUNT(DISTINCT f)`（Select.agg_distinct；
+> GROUP BY 内 DISTINCT 解析期拒绝防静默）+ ORDER BY 项支持聚合列头规范串（`COUNT(*)`/`SUM(f)`）；
+> execute_aggregate 新增去重计数分支（窗口扫描非 null 去重值：数值 f64 规范化、缺字段/NULL 不计、
+> WHERE 过滤生效）；execute_group_by 排序支持聚合下标（数值比较、NULL 升序最前）且倒排快路径遇
+> 聚合排序自动交主路径。+单测 task030。全量 740 绿。注：COUNT(DISTINCT) 走权威窗口扫描
+> （status 等低基数字段 10w ~数十 ms，非倒排快路径；验收数值随基准轮回填）。
+
+Task-031：结果集行输出批量化（~25µs/行输出常数，10w 轮 ②⑤④ 行输出类探针共同瓶颈）
+> 实测（scc-sqlrun-100k 副本）：引擎侧同窗 COUNT(20k 行) 94ms ≈ **5µs/行**；SELECT id keys-only 20k 行
+> 606ms ≈ **30µs/行**；3 列 662ms、11 列 679ms —— 行输出成本 ~25µs/行且与列数/payload 几乎无关
+> （每行固定，逐包协议/分配为主）。报告全部行返回探针（pk_between_10000 293ms / enum_sel_limit10000
+> 337ms / IN 5000 174ms / 深分页 / 长只读 10 万行 3.2s）的每行常数均落此量级；同窗 COUNT 侧证引擎非瓶颈。
+属性	内容
+优先级	P1（系统性：所有行输出查询的固定行常数，10w→110w 线性放大）
+工作量	0.5~1 天（demo 定策 0.5 + 接线 0.5）
+依赖	server/protocol/response.rs（query_response_packets/write_query_response，逐包 write_packet）、nodelay 已开
+风险	低（协议语义不变；仅合并写批/减少每行包系统调用与分配；先 demo 分离 server 端输出与 client 读包开销
+      ——用同窗 COUNT/聚合侧证 server 引擎耗时占比后接线）
+具体工作：
+□ demo（src/demo/rowout-batch 或复用 rr-conformance --one）：server 端输出耗时 vs client 读包分摊分离
+  （引擎同窗聚合计时对照 + SHOW 状态）
+□ 接线：若 server 端主导 → write_query_response 合并大缓冲（一次 write_all 或多行包连写），减少逐包
+  syscall/分配；SELECT 结果集流式分批发包（分批 limit 语义不变）防峰值内存
+□ 单测：分批发送行集 = 全量逐包（列结构/行序/EOF/错误码）；回归全绿
+□ 验收：20000 行 keys-only 606ms → ≤150ms（对齐引擎 ~5µs/行 + 小余量）；#pk_between_10000 293ms /
+  enum_sel_limit10000 337ms / 长只读等行输出探针同比例受益；回归全绿
+> ✅ 已完成（2026-09-05，P114）：server.rs 增 `frame_response`——多包响应合并单帧一次 `write_all`
+> （同步 handle_connection 与异步 handle_connection_async 同接线；字节流与逐包 write_packet 完全一致，
+> 包边界/seq 保留）；协议单元测试 task031（帧 = 逐包序列、seq 回绕、按长度前缀还原）。全量 740 绿；
+> 行输出常数数值收益随基准轮（rr-conformance --one 大窗 keys-only 前后对照）回填。
+> 收益锚点：报告风险 ②⑤④（IN 大批量、大 limit、长事务 3s+、深分页）的行输出部分。
+
+Task-032：主键 IN 稀疏大批次批量定位（pk_in_1000/5000 逐键点查残余）
+> 根因：pk_in 随机 id 稀疏（跨度 ≫ 4×计数）→ get_many_pk_in_fields 稀疏分支逐 docid 点查（server/command/
+> select.rs L237+），成本 = Σ点查常数（报告 ~31µs/键 warm；本副本冷态 ~50µs/键）+ 行输出常数（Task-031 共享）。
+> 实测本副本 IN5 边际 ≈0.06ms/键。报告 5000 键 174ms。
+属性	内容
+优先级	P2（随 Task-031 共享收益后残余；业务已要求接口限 IN 数量，属吞吐优化）
+工作量	1 天
+依赖	P109 跨文件并行/窗口聚集读、Task-023 get_many_pk_in（稠密已走 scan_range）、Task-031 行输出
+风险	中（稀疏大列表乱序 → 排序聚集后需保 IN 列顺序语义；可见性/墓碑/去重同 get）
+具体工作：
+□ 稀疏路径排序后**窗口聚集**：相邻键间隔 ≤ W（如 4096）归并为窗口 → scan_stream_fields 一次区间读 +
+  集合过滤（对齐 P92 稠密判定的局部化扩展），替代逐键随机点查；分散键保持分块 batch_get
+□ 行序保持 IN 列表序（现语义）；与 Task-031 输出批量化叠加评估
+□ 单测：稀疏窗口聚集 = 逐键 get（墓碑/去重/offset）；混合聚集/分散边界
+□ 验收：10w warm：pk_in_1000 31ms → ≤12ms；pk_in_5000 174ms → ≤60ms；pk_in_5/50 不回退；回归全绿
+> ✅ 已完成（2026-09-05，P116）：`get_many_pk_in` / `get_many_pk_in_fields` 稠密判定 4×→64×
+> （区间顺序读 ~0.5µs/行 vs 逐键点查 ~30µs/键：随机稀疏列表局部密度高，span≤64×n 即优于逐键；
+> 超限自动回退 batch_get 不劣化），整行/投影两变体对齐。+单测 task032（4×~64× 窗口 =
+> 逐条 get、删除隐藏、投影子集等值）。全量 740 绿；pk_in_1000/5000 数值验收随基准轮回填。
+> 收益锚点：报告风险 ②（主键 IN 列表），Task-031 先行后残余再收敛。
+
+Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或明示差异
+> 实测/根因：txn_lock_wait / txn_lock_mid_contend 探针（run_lock_wait）**主会话 FOR UPDATE 持锁后 sleep 4s**
+> 再 COMMIT —— 测量 4s 是探针设计的持锁时长（非引擎卡死）；副会话 UPDATE：MySQL（innodb_lock_wait_timeout=3）
+> 第 3s 报 1205；SCC txn/lock.rs 为「等待即失败」模型（acquire 冲突即 TxnConflict 由调用方重试），
+> 无超时参数 → waiter 阻塞至主会话提交后成功（无 1205 语义）。风险清单 #3「锁冲突 4s 卡死」系探针语义，
+> 应改判为**语义一致性项**：长持锁期间 SCC 无超时上限与 MySQL 行为不一致。
+属性	内容
+优先级	P2（一致性/运维可预期性；并发 for update 长持锁的确定性）
+工作量	0.5~1 天
+依赖	server/command/transaction.rs 或 txn_dml FOR UPDATE 重试循环、txn/lock.rs
+风险	中（1205 语义需重试次数×退避换算锁等待超时；RR 当前读重试路径不得误伤已持锁成功场景）
+具体工作：
+□ 事务级锁等待超时（读会话变量 innodb_lock_wait_timeout，默认 50s）：FOR UPDATE/写重试累计等待 > 阈值 →
+  返回 1205（ER_LOCK_WAIT_TIMEOUT）；死锁环保持 1213
+□ 探针 outcome 收敛：SCC 副会话应报 waiter-1205 与 MySQL 一致（探针已设 3s）
+□ 单测：持锁 > 阈值 waiter 1205 / 阈值内成功 / 死锁 1213 不回退
+□ 验收：txn_lock_wait 两库 outcome 一致（waiter-1205）；延迟行从风险清单改判；回归全绿
+
+测量处置说明（2026-09-05，10w 轮报告逐项复核，不改码）：
+- count_all 0.2ms ✅（Task-021 P96 O(1) 已生效；首调用基线扫描为 P107 已修 fresh-load 语义，此处为后次调用）；
+- txn_lock_wait/txn_lock_mid_contend "4s" = 探针持锁 sleep 4s 设计（见 Task-033）；
+- txn_long_read 3.2s ≈ 10 万行窗 × ~30µs 行输出常数（Task-031 收益对象），非事务机制开销；
+- sum_where_enum（#13，n=3）与 sum_where_idx（扩展组，n=10）**同一条 SQL**（sql_sumwhere）先后跑，均值差
+  系库状态漂移（中间大量写探针），非聚合算子缺陷；两者绝对值同为 O(active 候选)×取数，由 Task-029 批量改造收敛；
+- update_in50 8.68ms / hotrow p99 6.77ms：批量 update 走 P88/P89 管道（已具备），残余为逐行 WAL/索引同步常数，
+  归入远期 Per-CPU WAL 触发链（Task-026 后评估），不单独立项；
+- group by / 多字段 order by / biz 列表 200ms 级：引擎全扫 ~5µs/行 + 候选取数 + 行输出常数（Task-031/029 受益），
+  在线接口语义限制（仅后台）维持。
+
 插队完成
 ----------
 ## 一、进行中（P0/P1 已立项，2026-09-03）

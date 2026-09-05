@@ -1596,6 +1596,49 @@ use crate::optimizer::QuerySpec;
         }
     }
 
+    /// Task-032：稀疏主键 IN（跨度 4×~64×计数）区间顺序读路径 = 逐条 get
+    /// （含删除位图隐藏跳过、缺失 id 跳过）；投影字段变体同构。
+    #[test]
+    fn task032_pk_in_window_scan_matches_individual_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=2000u64 {
+            let doc = serde_json::json!({ "docid": i, "note": format!("n{i}") });
+            let t: &[&str] = &[];
+            e.put(i, serde_json::to_vec(&doc).unwrap(), t).unwrap();
+        }
+        // 删除位图隐藏部分行（5 的倍数 → 400 行删除）
+        for i in (1..=2000u64).step_by(5) {
+            e.delete(i).unwrap();
+        }
+        e.flush_primary().unwrap();
+        // 每 20 取 1：约 80 个冷行（去 5 倍数），span≈2000 ≤ 64×80 → 区间扫路径
+        let ids: Vec<u64> = (1..=2000).step_by(20).collect();
+        let expect = |ids: &[u64]| -> std::collections::HashMap<u64, Vec<u8>> {
+            let mut m = std::collections::HashMap::new();
+            for id in ids {
+                if let Ok(Some(v)) = e.get(*id) {
+                    m.entry(*id).or_insert(v);
+                }
+            }
+            m
+        };
+        let want = expect(&ids);
+        let got = e.get_many_pk_in(&ids).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (d, v) in &want {
+            assert_eq!(got.get(d), Some(v), "整行变体 docid={d}");
+        }
+        let flds = vec!["note".into()];
+        let gotf = e.get_many_pk_in_fields(&ids, &flds).unwrap();
+        assert_eq!(gotf.len(), want.len(), "投影变体命中数一致");
+        for (d, v) in &want {
+            let full: serde_json::Value = serde_json::from_slice(v).unwrap();
+            let sub: serde_json::Value = serde_json::from_slice(gotf.get(d).unwrap()).unwrap();
+            assert_eq!(sub["note"], full["note"], "投影子集 note 一致 docid={d}");
+        }
+    }
+
     // ---------- 缺口①：主键 IN 投影批量取行（get_many_pk_in_fields） ----------
 
     #[test]

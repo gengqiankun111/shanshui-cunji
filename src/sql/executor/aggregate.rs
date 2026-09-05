@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::sql::parser::{parse_select, CmpOp, WhereExpr};
 use roaring::treemap::RoaringTreemap as RoaringBitmap;
 use serde_json::Value;
+use std::collections::HashSet;
 
 use super::eval::{field_of, light_top_field, light_where_matches, LightVal};
 use super::select::extract_eq_conds;
@@ -72,6 +73,46 @@ pub fn execute_aggregate_window(
     };
     if field.is_none() && name != "count" {
         return Err(Error::Config(format!("{name}(*) 不支持（仅 COUNT(*)）")));
+    }
+    // Task-030：`COUNT(DISTINCT f)` 去重计数——独立分支先行（不经过 COUNT 各类快路径，
+    // 语义 = 窗口内 WHERE 过滤后字段非 null 去重值数；数值按规范化 f64、字符串原样）。
+    if sel.agg_distinct {
+        let f = field.clone().ok_or_else(|| {
+            Error::Config("COUNT(DISTINCT) 需字段参数".into())
+        })?;
+        let header = format!("COUNT(DISTINCT {f})");
+        let guard = engine.query_guard();
+        let needed = aggregate_needed_fields(sel.where_expr.as_ref(), Some(&f));
+        let mut seen: HashSet<(u8, String)> = HashSet::with_capacity(1024);
+        let mut scanned = 0u64;
+        engine.scan_stream_fields(start, end, needed, |_docid, doc| {
+            scanned += 1;
+            if scanned % 4096 == 0 && guard.is_expired() {
+                return Err(Error::QueryTooExpensive(
+                    "COUNT(DISTINCT) 全量扫描超时（熔断中止）".into(),
+                ));
+            }
+            if let Some(wh) = &sel.where_expr {
+                let hit = match light_where_matches(doc, wh) {
+                    Some(r) => r,
+                    None => serde_json::from_slice::<Value>(doc)
+                        .map(|v| wh.matches_doc(&v))
+                        .unwrap_or(false),
+                };
+                if !hit {
+                    return Ok(true);
+                }
+            }
+            if let Some(k) = distinct_key_of(doc, &f) {
+                seen.insert(k);
+            }
+            Ok(true)
+        })?;
+        return Ok(Some(AggScalar {
+            header,
+            is_null: false,
+            text: seen.len().to_string(),
+        }));
     }
     if field.is_none() && sel.where_expr.is_none() {
         // Task-021：整表 docid 窗口（覆盖某表全区间）COUNT(*) 无 WHERE → 引擎活跃 docid
@@ -539,6 +580,42 @@ pub(crate) fn fmt_num(x: f64) -> String {
     } else {
         x.to_string()
     }
+}
+
+/// Task-030：`COUNT(DISTINCT f)` 去重键——(类型标签, 规范化文本)：
+/// 数值按 f64 规范化（1 与 1.0/1e0 同值，对齐 MySQL 数值去重）、字符串原样、
+/// 布尔 "true"/"false"；缺字段 / JSON null / 嵌套对象数组 → None（不计 DISTINCT，
+/// 对齐 SQL「NULL 不计入 COUNT(DISTINCT)」）。仅字段值语义判定，不依赖倒排。
+fn distinct_key_of(doc: &[u8], f: &str) -> Option<(u8, String)> {
+    if !f.contains('.') {
+        if let Some(lv) = light_top_field(doc, f) {
+            match lv {
+                LightVal::Num(b) => {
+                    return std::str::from_utf8(b)
+                        .ok()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|x| (0u8, fmt_num(if x == 0.0 { 0.0 } else { x })))
+                }
+                LightVal::Str(b) => {
+                    return std::str::from_utf8(b).ok().map(|s| (1u8, s.to_string()))
+                }
+                LightVal::Bool(t) => return Some((2u8, t.to_string())),
+                LightVal::Absent | LightVal::Null => return None,
+                // 嵌套对象/数组：无可比标量 → 落下方 serde 按原值语义（极少见）
+                LightVal::Complex => {}
+            }
+        }
+    }
+    serde_json::from_slice::<Value>(doc)
+        .ok()
+        .and_then(|v| match field_of(&v, f) {
+            Some(Value::Number(n)) => {
+                n.as_f64().map(|x| (0u8, fmt_num(if x == 0.0 { 0.0 } else { x })))
+            }
+            Some(Value::String(s)) => Some((1u8, s.clone())),
+            Some(Value::Bool(t)) => Some((2u8, t.to_string())),
+            _ => None,
+        })
 }
 
 /// P1-D（2026-09-04）：聚合候选收敛——WHERE 为 AND 组合且含**可倒排等值**子条件时，

@@ -137,6 +137,21 @@ fn cmp_group_key(a: &GroupKey, b: &GroupKey) -> std::cmp::Ordering {
     }
 }
 
+/// Task-030：聚合值文本比较（ORDER BY 聚合列头）——两可解析为数值 → f64 比较；
+/// 否则字典序；`None`（SQL NULL）升序最小（对齐 MySQL NULL 排序）。
+fn cmp_agg_text(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => match (x.parse::<f64>().ok(), y.parse::<f64>().ok()) {
+            (Some(p), Some(q)) => p.partial_cmp(&q).unwrap_or(Ordering::Equal),
+            _ => x.cmp(y),
+        },
+    }
+}
+
 /// 单聚合列累积器（每组每列一份，下标与 specs 对齐——杜绝多聚合串扰）。
 #[derive(Debug, Clone)]
 struct AggState {
@@ -375,9 +390,13 @@ fn group_by_fast_inverted(
         let fields = [g.to_string()];
         list.retain(|(k, sts)| having_matches(h, &fields, k, specs, sts));
     }
-    // 排序：ORDER BY 仅限分组字段（= g）；DESC 反转（NULL 组随之移末）
+    // 排序：ORDER BY 仅限分组字段（= g）；含聚合列头（Task-030，如 COUNT(*)/SUM(f)）→
+    // 交主路径（主路径支持聚合值排序，本快路径不实现）；其余字段 → 明确报错。
     for (f, _) in &sel.order_by {
         if f != g {
+            if specs.iter().any(|(n, fl)| spec_header(n, fl) == *f) {
+                return Ok(None);
+            }
             return Err(Error::Config(format!(
                 "GROUP BY 结果排序字段 {f} 须属于分组字段（{g}）"
             )));
@@ -666,28 +685,43 @@ pub fn execute_group_by_window(
     if let Some(h) = &sel.having {
         list.retain(|(k, sts)| having_matches(h, &fields, k, &specs, sts));
     }
-    // 组行排序：优先级 = ORDER BY 序列（每项须为分组字段）→ 剩余分组 level 升序补尾。
-    // DESC 反转该 level（Null 随之移末，对齐 MySQL DESC）。
-    let mut order_seq: Vec<(usize, bool)> = Vec::new();
+    // 组行排序：优先级 = ORDER BY 序列——每项可为分组字段（`Field`）或聚合列头
+    // （Task-030：`Agg`，按该聚合值数值比较，NULL 组升序最前）；剩余分组 level 升序补尾。
+    // DESC 反转该级（Null 随之移末，对齐 MySQL DESC）。
+    // 表示：('f', 分组 level 下标) / ('a', specs 下标)。
+    let mut order_seq: Vec<(char, usize, bool)> = Vec::new();
     for (f, desc) in &sel.order_by {
-        let Some(idx) = fields.iter().position(|x| x == f) else {
+        let rf = if let Some(idx) = fields.iter().position(|x| x == f) {
+            ('f', idx)
+        } else if let Some(idx) = specs.iter().position(|(n, fl)| spec_header(n, fl) == *f) {
+            ('a', idx)
+        } else {
+            let heads: Vec<String> = specs.iter().map(|(n, fl)| spec_header(n, fl)).collect();
             return Err(Error::Config(format!(
-                "GROUP BY 结果排序字段 {f} 须属于分组字段（{}）",
-                fields.join(", ")
+                "GROUP BY 结果排序目标 {f} 须为分组字段（{}）或聚合列（{}）",
+                fields.join(", "),
+                heads.join(", ")
             )));
         };
-        if !order_seq.iter().any(|(i, _)| i == &idx) {
-            order_seq.push((idx, *desc));
+        if !order_seq.iter().any(|(k, i, _)| k == &rf.0 && i == &rf.1) {
+            order_seq.push((rf.0, rf.1, *desc));
         }
     }
     for (i, _) in fields.iter().enumerate() {
-        if !order_seq.iter().any(|(j, _)| j == &i) {
-            order_seq.push((i, false));
+        if !order_seq.iter().any(|(k, j, _)| *k == 'f' && *j == i) {
+            order_seq.push(('f', i, false));
         }
     }
     list.sort_by(|a, b| {
-        for (idx, desc) in &order_seq {
-            let mut ord = cmp_group_key(&a.0[*idx], &b.0[*idx]);
+        for (k, idx, desc) in &order_seq {
+            let mut ord = if *k == 'f' {
+                cmp_group_key(&a.0[*idx], &b.0[*idx])
+            } else {
+                // 聚合值排序：数值比较；NULL（无数值聚合）升序最小
+                let av = agg_cell(&specs[*idx].0, &a.1[*idx]);
+                let bv = agg_cell(&specs[*idx].0, &b.1[*idx]);
+                cmp_agg_text(av.as_deref(), bv.as_deref())
+            };
             if *desc {
                 ord = ord.reverse();
             }

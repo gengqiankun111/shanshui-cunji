@@ -6,6 +6,8 @@
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+#[allow(unused_imports)]
+use std::io::Write as _; // Task-031：单帧 write_all（frame_response 落 socket）
 
 use crate::engine::Engine;
 use crate::error::{Error, Result};
@@ -444,12 +446,32 @@ pub(crate) fn handle_connection(
         let Some(packets) = packets else {
             return Ok(()); // COM_QUIT / EOF
         };
-        let mut seq = cmd_seq;
-        for p in packets {
-            write_packet(stream, seq, &p)?;
-            seq = seq.wrapping_add(1);
+        // Task-031：多包响应合并单帧一次写出（见 frame_response）——逐包 write_all 每包
+        // 2 次 syscall（header+payload），nodelay 下大结果集 ~25µs/行固定开销主因。
+        let frame = frame_response(packets, cmd_seq);
+        if !frame.is_empty() {
+            stream.write_all(&frame)?;
         }
     }
+}
+
+/// Task-031：把一组响应包编码为**单帧**字节流（每包 3 字节小端长 + seq + payload 顺序
+/// 拼接）——单次 `write_all` 落 socket，替代逐包 2 次系统调用；字节流与逐包
+/// `write_packet` 完全一致（协议包边界由长度前缀保留，客户端逐包读取不受影响）。
+pub(crate) fn frame_response(packets: Vec<Vec<u8>>, mut seq: u8) -> Vec<u8> {
+    let mut frame = Vec::new();
+    for p in packets {
+        let len = p.len() as u32;
+        frame.extend_from_slice(&[
+            (len & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            ((len >> 16) & 0xff) as u8,
+            seq,
+        ]);
+        frame.extend_from_slice(&p);
+        seq = seq.wrapping_add(1);
+    }
+    frame
 }
 /// 异步单连接处理：握手 → 认证 → 命令循环。
 /// **连接 idle 不占 OS 线程**（tokio task）；查询经 `spawn_blocking` 复用同步引擎
@@ -507,10 +529,11 @@ pub(crate) async fn handle_connection_async(
         let Some(pkts) = r.1 else {
             return Ok(()); // COM_QUIT
         };
-        let mut seq = cmd_seq;
-        for p in pkts {
-            write_packet_async(stream, seq, &p).await?;
-            seq = seq.wrapping_add(1);
+        // Task-031：同同步路径——多包合并单帧一次异步写出（每包 2 次 syscall → 1 次）
+        let frame = frame_response(pkts, cmd_seq);
+        if !frame.is_empty() {
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&frame).await?;
         }
     }
 }

@@ -116,6 +116,52 @@ fn main() {
         std::process::exit(rc);
     }
 
+    // 单条 SQL 定时诊断（--one "<sql>" [--one-n 次数] [--url ...]）：按次执行同一 SQL，
+    // 打印 mean/p50/p99/max/err/行数（口径同 sqlrun 客户端计时）。诊断用，非基准套件。
+    if let Some(one_sql) = args.iter().position(|a| a == "--one").map(|i| args.get(i + 1)) {
+        let url = arg(&args, "--url", "mysql://root@127.0.0.1:3317");
+        let n: usize = arg(&args, "--one-n", "20").parse().unwrap_or(20);
+        let sql = one_sql.cloned().unwrap_or_default();
+        let mut conn = match mysql::Conn::new(url.as_str()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[one] 连接失败 {url}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let mut ms: Vec<f64> = Vec::new();
+        let mut err_txt = String::new();
+        let mut ok = 0usize;
+        let mut last_rows = 0usize;
+        let mut last_aff = 0u64;
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let r = tx::exec_stmt(&mut conn, &sql);
+            let dt = t0.elapsed().as_secs_f64() * 1000.0;
+            last_rows = r.rows.len();
+            last_aff = r.affected;
+            match r.err {
+                None => {
+                    ms.push(dt);
+                    ok += 1;
+                }
+                Some(e) => {
+                    err_txt = format!("{e}");
+                    break;
+                }
+            }
+        }
+        if !ms.is_empty() {
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |f: f64| ms[((ms.len() as f64 * f).floor() as usize).min(ms.len() - 1)];
+            let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+            println!("[one] {ok}/{n} rows={last_rows} aff={last_aff} mean={mean:.2}ms p50={:.2} p99={:.2} max={:.2}", q(0.5), q(0.99), ms[ms.len() - 1]);
+        } else {
+            println!("[one] 0/{n} 错误: {err_txt}");
+        }
+        std::process::exit(0);
+    }
+
     // SQL 性能探针（--sql-run --url <mysql://...> --out <dir>）：对单端宽表跑典型负载。
     // --table：默认 t；SCC 位图倒排仅兼容默认表 documents，SCC 侧请传 documents。
     if has(&args, "--sql-run") {

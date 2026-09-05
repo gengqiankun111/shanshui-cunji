@@ -23,6 +23,46 @@ use crate::multitable::drop_table_range;
         Engine::open(dir.path(), &cfg).unwrap()
     }
 
+    /// Task-031：`frame_response` 单帧编码 = 逐包 `write_packet` 字节流（含 seq 回绕）——
+    /// 批量写不改变协议包边界/序号，客户端逐包读取语义不变。
+    #[test]
+    fn task031_frame_response_equals_sequential_packets() {
+        let payloads: Vec<Vec<u8>> = vec![
+            vec![1u8; 5],
+            vec![2u8; 300],
+            vec![3u8; 0x100],
+            vec![4u8; 0x1_0000],
+        ];
+        for cmd_seq in [0u8, 250, 254] {
+            let frame = frame_response(payloads.clone(), cmd_seq);
+            let mut expect: Vec<u8> = Vec::new();
+            let mut seq = cmd_seq;
+            for p in &payloads {
+                let len = p.len() as u32;
+                expect.extend_from_slice(&[
+                    (len & 0xff) as u8,
+                    ((len >> 8) & 0xff) as u8,
+                    ((len >> 16) & 0xff) as u8,
+                    seq,
+                ]);
+                expect.extend_from_slice(p);
+                seq = seq.wrapping_add(1);
+            }
+            assert_eq!(frame, expect, "cmd_seq={cmd_seq} 单帧字节流应与逐包一致");
+            // 按长度前缀逐包还原，验证包边界/序号保持
+            let mut i = 0usize;
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            while i + 4 <= frame.len() {
+                let len = (frame[i] as usize)
+                    | ((frame[i + 1] as usize) << 8)
+                    | ((frame[i + 2] as usize) << 16);
+                got.push(frame[i + 4..i + 4 + len].to_vec());
+                i += 4 + len;
+            }
+            assert_eq!(got, payloads, "cmd_seq={cmd_seq} 还原包序列一致");
+        }
+    }
+
     // ---------- 单元：>16MB 命令多包拼接（P 项：超大单语句 INSERT 分包） ----------
 
     #[test]

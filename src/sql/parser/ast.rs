@@ -64,6 +64,9 @@ pub struct Select {
     /// 聚合（7.95）：`(函数名小写, 参数字段)`——`COUNT(*)` 字段为 None；
     /// `COUNT(f)/SUM(f)/AVG(f)/MIN(f)/MAX(f)` 字段 Some。普通 SELECT 为 None。
     pub agg: Option<(String, Option<String>)>,
+    /// Task-030：标量聚合 `COUNT(DISTINCT f)` 去重标记（仅 `agg` 单聚合场景；
+    /// 与 name="count" 组合生效；GROUP BY 内 DISTINCT 暂不支持 → 解析期拒绝）。
+    pub agg_distinct: bool,
     /// ORDER BY 排序项（开发顺序 #1/#3）：`(字段, 是否 DESC)`。
     pub order_by: Vec<(String, bool)>,
     /// GROUP BY 分组字段（AF#2 单字段 → AF#4 多字段；空 = 无分组）。聚合列见

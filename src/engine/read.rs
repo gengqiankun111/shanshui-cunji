@@ -199,9 +199,12 @@ impl Engine {
         }
         let first = sorted[0];
         let last = *sorted.last().unwrap();
-        // 跨度 = last-first+1（防溢出回退稀疏）
+        // 跨度 = last-first+1（防溢出回退稀疏）。Task-032：稠密判定从 4× 放宽到 64×
+        // （批量点查常数 ~30µs/键 vs 区间顺序读 ~0.5µs/行：随机稀疏列表的局部密度
+        // 远高于全表跨度，span≤64×n 时区间扫已优于逐键点查——pk_in_5000 174ms→~60ms 级；
+        // span 上限仍显著低于 110w 冷库全跨度，超限自动回退 batch_get 不劣化）
         if let Some(span) = last.checked_sub(first).and_then(|d| d.checked_add(1)) {
-            if span <= (4 * sorted.len()) as u64 {
+            if span <= (64 * sorted.len()) as u64 {
                 let want: std::collections::HashSet<u64> = sorted.iter().copied().collect();
                 for (d, v) in self.scan_range(Some(first), Some(last))? {
                     if want.contains(&d) {
@@ -260,9 +263,10 @@ impl Engine {
         }
         let first = cold[0];
         let last = *cold.last().unwrap();
-        // ② 稠密冷行：投影流式区间顺序读（跨度 ≤ 4×计数，对齐 get_many_pk_in / P92 判定）
+        // ② 稠密冷行：投影流式区间顺序读（Task-032：跨度判定 4× 放宽至 64×，
+        // 对齐 get_many_pk_in / P92 判定——随机稀疏列表局部密度高，区间扫优于逐键点查）
         if let Some(span) = last.checked_sub(first).and_then(|d| d.checked_add(1)) {
-            if span <= (4 * cold.len()) as u64 {
+            if span <= (64 * cold.len()) as u64 {
                 let want: std::collections::HashSet<u64> = cold.iter().copied().collect();
                 self.scan_stream_fields(
                     Some(first),
