@@ -446,12 +446,16 @@ fn group_by_fast_inverted(
     }))
 }
 
-/// P-GB（2026-09-05）：窗口白名单位图分组快路径（server 整表窗口下 #14/#27/#59/#81 收敛）。
+/// P-GB（2026-09-05）：窗口白名单位图分组快路径（server 整表窗口下 #14/#27/#59/#60/#81 收敛；
+/// P-GB2 数值扩展：同思路接 SUM/AVG/MIN/MAX 统计载荷窗口化，#15/#28 类收敛）。
 /// 语义 = 权威扫描：组计数经「窗口∩活跃集（∩WHERE 单等值候选 posting）」精确（删除/复活；
 /// 候选=WHERE 命中集内分组，等价行级过滤）；单字段可补 NULL 组（Σ<live）；两字段要求
 /// Σ==live（无缺字段/NULL 组）否则回退扫描；Σ>live（陈旧值变更交叉放大）亦回退扫描保精确。
-/// 支持单列 `COUNT(*)` 聚合（含 HAVING/组字段或该聚合列头排序/LIMIT）；WHERE 为非单等值、
-/// SUM/AVG 等 stats 聚合、多聚合 → None（回退主路径）。
+/// 聚合形态：单 `COUNT(*)`（纯计数），或 `COUNT(*)` + 单个 `SUM/AVG/MIN/MAX(<stats_field>)`——
+/// 数值聚合经 term 统计载荷填充（须 `[inverted] stats_fields` 声明 + 写路径 add_stats 积累；
+/// 段级 v5 载荷落盘后可跨重启读），守卫：每组分组的载荷 `n == 位图活跃计数`（删除/复活/换值/
+/// 跨表/缺 amount 使载荷 n 与活跃计数不一致 → 回退权威扫描保精确）；数值聚合仅单字段分组
+/// （载荷按单 term 聚合，两字段组合无法拆分）。WHERE 非单等值、多聚合 → None（回退主路径）。
 fn group_by_fast_bitmap_window(
     engine: &Engine,
     sel: &Select,
@@ -461,8 +465,39 @@ fn group_by_fast_bitmap_window(
     end: Option<u64>,
 ) -> Result<Option<GroupResult>> {
     let specs = &sel.group_aggs;
-    if specs.len() != 1 || !(specs[0].0 == "count" && specs[0].1.is_none()) {
+    // 聚合形态解析：单 COUNT(*)（纯计数），或 COUNT(*) + 单个数值聚合（SUM/AVG/MIN/MAX over stats_field）
+    let mut count_idx: Option<usize> = None;
+    let mut num: Option<(usize, String, String)> = None; // (spec 下标, 聚合名, stats 字段)
+    for (i, (n, f)) in specs.iter().enumerate() {
+        match n.as_str() {
+            "count" if f.is_none() => {
+                if count_idx.replace(i).is_some() {
+                    return Ok(None);
+                }
+            }
+            "sum" | "avg" | "min" | "max" => {
+                let Some(ff) = f.as_deref() else { return Ok(None) };
+                if ff.is_empty() || num.is_some() {
+                    return Ok(None);
+                }
+                num = Some((i, n.clone(), ff.to_string()));
+            }
+            _ => return Ok(None),
+        }
+    }
+    if count_idx.is_none() && num.is_none() {
+        return Ok(None); // 需至少一个可快路径聚合
+    }
+    if specs.len() > 2 {
         return Ok(None);
+    }
+    if num.is_some() && fields.len() != 1 {
+        return Ok(None); // 数值聚合仅单字段分组（载荷按单 term 聚合，组合无法拆分）
+    }
+    if let Some((_, _, sf)) = &num {
+        if engine.stats_field_pos(sf).is_none() {
+            return Ok(None); // 未配置 stats_fields → 回退扫描
+        }
     }
     // WHERE：无 或 单等值 `f=value`（含数值文本；AND/OR/比较/BETWEEN/LIKE → 行级 → 扫描）
     let cand_term: Option<String> = match sel.where_expr.as_ref() {
@@ -476,22 +511,58 @@ fn group_by_fast_bitmap_window(
         Some(v) => v,
         None => return Ok(None),
     };
+    // 数值载荷（仅 numeric）：单字段 term 级聚合（组值 → 目标 stats 位序 FieldAgg）
+    let gs_map: Option<std::collections::HashMap<String, crate::inverted::FieldAgg>> = match &num {
+        Some((_, _, sf)) => {
+            let pos = engine.stats_field_pos(sf).expect("已校验声明");
+            let mut m = std::collections::HashMap::new();
+            for (v, _cnt, aggs) in engine.inverted_group_stats(&fields[0])? {
+                if let Some(a) = aggs.get(pos) {
+                    m.insert(v, a.clone());
+                }
+            }
+            Some(m)
+        }
+        None => None,
+    };
     let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = Vec::with_capacity(combos.len() + 1);
     let mut sum = 0u64;
     for (vals, cnt) in &combos {
         sum += *cnt;
-        let mut st = AggState::new();
-        st.count = *cnt;
-        list.push((vals.iter().map(|v| GroupKey::Str(v.clone())).collect(), vec![st]));
+        let mut sts: Vec<AggState> = (0..specs.len()).map(|_| AggState::new()).collect();
+        if let Some(ci) = count_idx {
+            sts[ci].count = *cnt;
+        }
+        if let Some((ni, _, _)) = &num {
+            let a = match gs_map.as_ref().and_then(|m| m.get(&vals[0])) {
+                Some(a) => a,
+                None => return Ok(None), // 组值无数值载荷（该值文档全缺 amount 或未积累）→ 扫描
+            };
+            if a.n != *cnt {
+                return Ok(None); // 载荷 n ≠ 活跃计数（删除/复活/换值/跨表/缺 amount）→ 精确守卫回退
+            }
+            let st = &mut sts[*ni];
+            st.n_num = a.n;
+            st.sum = a.sum;
+            st.min = a.min;
+            st.max = a.max;
+        }
+        list.push((vals.iter().map(|v| GroupKey::Str(v.clone())).collect(), sts));
     }
     if sum > live_total {
         return Ok(None); // 陈旧值变更交叉放大 → 回退权威扫描
     }
-    if fields.len() == 1 {
+    if num.is_some() {
         if sum < live_total {
-            let mut st = AggState::new();
-            st.count = live_total - sum;
-            list.push((vec![GroupKey::Null], vec![st]));
+            return Ok(None); // 缺分组字段行的数值贡献载荷无法给出 → 回退扫描
+        }
+    } else if fields.len() == 1 {
+        if sum < live_total {
+            let mut sts: Vec<AggState> = (0..specs.len()).map(|_| AggState::new()).collect();
+            if let Some(ci) = count_idx {
+                sts[ci].count = live_total - sum;
+            }
+            list.push((vec![GroupKey::Null], sts));
         }
     } else if sum < live_total {
         return Ok(None); // 两字段含缺字段行 → NULL 组分布词典无法精确 → 回退扫描
@@ -502,17 +573,17 @@ fn group_by_fast_bitmap_window(
             list.len()
         )));
     }
-    // HAVING（组字段 + COUNT(*) 聚合左项）
+    // HAVING（组字段 / 各聚合列头左项）
     if let Some(h) = &sel.having {
         list.retain(|(k, sts)| having_matches(h, fields, k, specs, sts));
     }
-    // 排序：ORDER BY 序列（组字段级 'f' / 唯一聚合列头 'a'=COUNT(*)，DESC 反转）+ 其余组 level 升序补尾
+    // 排序：ORDER BY 序列（组字段级 'f' / 聚合列头 'a'=对应 spec，DESC 反转）+ 其余组 level 升序补尾
     let mut order_seq: Vec<(char, usize, bool)> = Vec::new();
     for (f, desc) in &sel.order_by {
         let rf = if let Some(idx) = fields.iter().position(|x| x == f) {
             ('f', idx)
-        } else if specs.iter().any(|(n, fl)| spec_header(n, fl) == *f) {
-            ('a', 0) // specs 已限单列 COUNT(*)
+        } else if let Some(idx) = specs.iter().position(|(n, fl)| spec_header(n, fl) == *f) {
+            ('a', idx)
         } else {
             return Ok(None); // 越界 → 交主路径（正确报错/行为）
         };

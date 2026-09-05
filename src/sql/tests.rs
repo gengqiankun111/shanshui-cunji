@@ -676,6 +676,80 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         assert_eq!(fast81.len(), 2);
     }
 
+    /// P-GB2（2026-09-05）：数值统计载荷窗口化——COUNT(*)+SUM/AVG/MIN/MAX(<stats_field>)
+    /// 单字段分组经 term 载荷填充（守卫 n==位图活跃计数；删除/缺 amount/未积累 → 回退扫描），
+    /// = 权威扫描（WHERE docid>=0 逼扫描路径）。
+    #[test]
+    fn pg_windowed_bitmap_group_stats_matches_scan() {
+        let mask = (1u64 << 48) - 1;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.inverted.bitmap_fields = vec!["status".into(), "region".into()];
+        cfg.inverted.stats_fields = vec!["amount".into()];
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let put_doc = |e: &mut Engine, docid: u64, status: &str, region: &str, amount: Option<f64>| {
+            let val = match amount {
+                Some(a) => serde_json::json!({"docid": docid, "status": status, "region": region, "amount": a}),
+                None => serde_json::json!({"docid": docid, "status": status, "region": region}),
+            };
+            let bytes = serde_json::to_vec(&val).unwrap();
+            let terms = crate::server::extract_terms(&val);
+            let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            e.put(docid, bytes, &t).unwrap();
+        };
+        for i in 1..=120u64 {
+            put_doc(
+                &mut e,
+                i,
+                if i % 2 == 0 { "active" } else { "inactive" },
+                if i % 3 == 0 { "beijing" } else { "shanghai" },
+                Some((i * 10) as f64),
+            );
+        }
+        let gb = |e: &Engine, sql: &str| -> Vec<(Vec<Option<String>>, Vec<Option<String>>)> {
+            let gr = execute_group_by_window(e, sql, 100_000, Some(0), Some(mask))
+                .unwrap()
+                .unwrap();
+            gr.rows.iter().map(|r| (r.keys.clone(), r.cells.clone())).collect()
+        };
+        let scan_ref = |sql: &str| sql.replace("GROUP BY", "WHERE docid>=0 GROUP BY");
+        // ① 单字段 COUNT+SUM（载荷快路径）vs 权威扫描
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"))
+        );
+        // ② AVG / MIN / MAX 同口径
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*), AVG(amount) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*), AVG(amount) FROM t GROUP BY status"))
+        );
+        assert_eq!(
+            gb(&e, "SELECT status, MIN(amount), MAX(amount) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, MIN(amount), MAX(amount) FROM t GROUP BY status"))
+        );
+        // ③ 删除部分行 → 载荷 n≠活跃计数 → 精确守卫回退扫描，结果仍一致（删除/复活精确）
+        let del: Vec<u64> = (1..=120u64).filter(|i| i % 5 == 0).collect();
+        e.delete_batch(del.iter().copied()).unwrap();
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"))
+        );
+        // ④ 复活同 docid（载荷对复活天然重复累积 → n>活跃计数 → 守卫回退扫描，结果仍一致）
+        put_doc(&mut e, 5, "active", "beijing", Some(50.0));
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"))
+        );
+        // ⑤ 缺 amount 行加入 → 载荷 n<活跃计数（COUNT 含无 amount 行）→ 守卫回退扫描，结果一致
+        for i in 121..=126u64 {
+            put_doc(&mut e, i, if i % 2 == 0 { "active" } else { "inactive" }, "beijing", None);
+        }
+        assert_eq!(
+            gb(&e, "SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"),
+            gb(&e, &scan_ref("SELECT status, COUNT(*), SUM(amount) FROM t GROUP BY status"))
+        );
+    }
+
     #[test]
     fn sql_comparison_pushdown_single_pass_early_stop() {
         // 7.93：裸比较/BETWEEN 下推——单遍流式扫描 + LIMIT 早停，结果与旧 eval 路径一致

@@ -1444,6 +1444,24 @@ LIMIT = 权威扫描等值；既有 ①~⑦ 覆盖单/双字段/删除/复活/�
 Σcounts≤匹配数 守卫回退扫描保精确；字段不在 bitmap_fields 时快路径不可用（回退扫描，见 #60 配置注）。
 残余（记录不开发）：#15/#28 SUM/AVG+HAVING ~1.5-1.7×（数值聚合需行级/载荷窗口化，触发候选）。
 
+**P120（P-GB2）数值统计载荷窗口化——GROUP BY + SUM/AVG/MIN/MAX（stats_fields）**
+根因：#15 group_by_sum_having 271ms / #28 having_avg_gt 286ms（1.5~1.7× MySQL）——数值聚合须逐行解码
+amount 求和（P-GB 位图路径仅覆盖 COUNT）。方案（复用 P-GB 基建，src/sql/executor/group_by.rs）：
+- `group_by_fast_bitmap_window` 聚合形态扩展：`COUNT(*)` 与 单个 `SUM/AVG/MIN/MAX(<stats_field>)`
+  （可只数值，无 COUNT）；ORDER BY 聚合头映射到对应 spec；
+- 数值经 `engine.inverted_group_stats(field)` term 载荷按 stats 位序取 FieldAgg（n/sum/min/max）填组状态；
+- **精确守卫**：每组分组的载荷 `n == 位图活跃计数` 才可用（删除/复活/换值/跨表/缺 amount 使 n≠活跃计数
+  → 回退权威扫描，宁慢勿错）；数值聚合限单字段分组（载荷按单 term 聚合，组合无法拆分）；缺分组字段行
+  存在（Σ<live）回退；
+- 前置：`[inverted] stats_fields` 声明 + 写路径 add_stats 积累（段 v5 载荷跨重启可读）——基准 cfg
+  tmp-cfg-wide-2g.toml 增 `stats_fields=["amount"]`（tmp 不入库，复用需自行补）。
+10w 实测（干净轮，#15 位于删除探针前 → 快路径全程生效）：#15 271→**4.0ms**（MySQL 161.7）、#28
+285.8→**3.8ms**（181.5，--only 隔离态）；#14/#27/#61/#81 维持 0.15~7.9ms 不回退。
+**时序注**：完整 81 探针顺序下 #28 位于删除类探针之后，预留区删除使活跃计数<载荷 n → 守卫回退扫描
+（精确兜底，不再 285ms 档内漂移）；#15 在删除前 → 快路径。纯读/只读会话与聚合型仪表盘全程 ms 级。
++1 单测 pg_windowed_bitmap_group_stats_matches_scan ①~⑤（SUM/AVG/MIN/MAX=权威扫描等值；删除/复活/
+缺 amount → 守卫回退后仍一致）。边界同 P118/P119（值变更陈旧 → 守卫回退；非白名单/未配 stats_fields → 扫描）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
