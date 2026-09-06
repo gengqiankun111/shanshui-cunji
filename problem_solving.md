@@ -1829,6 +1829,31 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   缺陷（既有回归 tests.rs 391-407 同文本点查 1 行即证）。**教训：TCP 结果集解析须按 columns
   数自适应头偏移**（col_count 包 + columns×列定义包 + EOF 包），测试沿用 SELECT *（2 列）规避。
 
+**P135（batch_get_at 内核 + txn 谓词倒排 superset 接线 + 其余端复核决策，2026-09-06）**
+- demo-first（src/demo/p135-batch-get-at，gitignored）：get_at 语义矩阵 20/20（位图关/开 ×
+  快照后删/前删/换值/复活/多版本/跨表/不存在）；批量潜力 A/B（debug warm 4000 docid）逐 get_at
+  乱序 4.69 / 升序 4.44 / latest batch_get 2.92 µs-op（batch ~1.6×）——支撑 CF 级批量收益。
+- 内核：`Engine::batch_get_at(docids, S)`（src/engine/read.rs）——语义 = 逐 `get_at`：跳过删除
+  位图、tombstone seq ≤S→None/>S→旧版、Delta ≤S 折叠；结构 = primary.get_bytes_at 逐键（≤S
+  跨 memtable+全层最大 seq，sst_min_seq 整段剪枝）+ **Delta 单次 [min..max] ≤S 窗口折叠**
+  （摊薄 get_at 逐调用各自 Delta 窗口扫）。不入 HotCache（快照视图≠最新态）。输入升序无重复
+  （对齐 batch_get 契约）。单测 p135_batch_get_at_matches_get_at（位图关/开×删/换值/patch 跨
+  快照/空集/跨表，批量==逐 get_at）。
+- 接线①（txn 谓词 superset，server/command/transaction.rs）：`txn_select_by_predicate_snapshot`
+  先试 **inverted_eq_superset**（WHERE 纯倒排等值 AND 链 → posting 交集；只加不删 = ever-match
+  superset；任一叶非 Eq/空 posting/OR/Ne → None 保守回退）→ ∩默认表窗口 → `batch_get_at(S)`
+  复核 + `doc_matches_where`——**恢复索引加速**（替代 P134 的全窗分块扫描）且 RR 正确（快照后
+  删/换值行仍在 posting → ≤S 版本/值裁决）；含未提交写 → 全窗扫兜底（自写合并复杂）。抽出
+  finish_predicate_rows 共用收尾。测试：p135_inverted_eq_superset_gating（判定/回退）、
+  txn_predicate_snapshot_inverted_superset_rr（端到端 delete/update/SUM，倒排声明字段）。
+- 复核决策（其余端不改）：非事务倒排消费端全链已是 latest 批量（P2-D batch_get / P85
+  collect_limited_rows，eval_cond/topk/聚合/区间均 batch_get，无逐 engine.get 残留）；autocommit
+  无 RR 义务（语句在引擎读锁内执行、写需写锁 → 语句内无并发提交，S=语句开始≡latest）→ 改
+  `batch_get_at(S=now)` 为纯退化（≤S 归并 + 冷段 sst_min_seq 首触全键扫）→ **选型 = 保留
+  latest 批量位图快路径**；区间/组合同理（autocommit 保持，RR 端已由 scan_range_txn 窗口/
+  superset 覆盖）。batch_get_at 消费点 = RR 快照语义端（txn superset）+ 未来混合库残余。
+- 全量 lib **787 通过 + 4 ignored**（seqlock 概率型 flaky 单跑复绿）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
