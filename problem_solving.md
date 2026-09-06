@@ -2087,7 +2087,4 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 本机 origin/develop = 81d4f45，与上表一致；原 HEAD 停在 master（d2d1972，2026-09-02 的 10 亿库阶段 A~D 合并线，其 problem_solving.md 无 §阶段 4）。本次已建本地 develop 跟踪 origin/develop 续作；master 上 10 亿库阶段 A~D 内容若需并入 develop 排期线，先 merge-base 核对（a8c4e17 已在 develop 祖先中）。
 - P143 口径已统一 = **32KB**（development_remain.md P143 行 + commit 41f7147；本文件 §P143 正文已同步回填）。
 
-## 环境备忘（不入库）
-
-- **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
-- **PowerShell 传参陷阱**：原生命令（cargo/curl/plink）的内嵌双引号会被 PS 5.1 剥离——JSON 参数用反斜杠转义 `{\"k\":1}`；远程 `$()`/`\n` 用 PowerShell 单引号字符串避免被展开。
+> 环境/远端访问备忘（阿里云 hostkey、plink/pscp、PowerShell 传参陷阱）原为本文件「## 环境备忘（不入库）」节——但本文件入库，hostkey 实际进入 git 历史。2026-09-06 已迁至 **`tmp/env-notes.md`**（gitignore，不入库）。历史提交中仍含旧内容，如需彻底清除须 git 历史改写（hostkey 为指纹非私钥，建议不处理）。
