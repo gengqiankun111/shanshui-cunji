@@ -2739,6 +2739,51 @@ use crate::optimizer::QuerySpec;
         );
     }
 
+    #[test]
+    fn p145_batch_get_at_grouped_matches_get_at() {
+        // P145：Engine::batch_get_at 改走 CF `get_many_at`（按块分组批量 ≤S 点查）——
+        // 语义与逐 docid `get_at`（=逐 get_bytes_at + Delta ≤S 折叠）完全一致：
+        // SST 落盘态 × 快照在 patch/delete 前后（旧值/新值/删除隐藏）逐行等价。
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.storage.deletion_bitmap_enabled = true;
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        for i in 1..=2000u64 {
+            let doc = serde_json::json!({"k": i, "note": format!("n{i}")});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        e.flush_primary().unwrap(); // 落 SST（批量分组读路径生效）
+        let ids: Vec<u64> = (1..=2000).collect();
+        let s0 = e.begin_snapshot(); // patch/delete 前快照
+        // 快照后并发 patch（5/6 换值）+ delete（7 → 位图/墓碑）
+        e.patch(5, &[("k", json!(555))]).unwrap();
+        e.patch(6, &[("note", json!("patched6"))]).unwrap();
+        e.delete(7).unwrap();
+        let s1 = e.begin_snapshot(); // 当前视图
+        // 逐 docid get_at 参考（含未写 docid 2500 → None）
+        let mut ids2 = ids.clone();
+        ids2.push(2500);
+        for (s_tag, s) in [("S0(旧视图)", s0), ("S1(当前)", s1)] {
+            let got: Vec<Option<Vec<u8>>> = ids2
+                .iter()
+                .map(|&d| e.get_at(d, s).unwrap())
+                .collect();
+            let batched = e.batch_get_at(&ids2, s).unwrap();
+            assert_eq!(batched.len(), got.len());
+            for (d, (g, b)) in ids2.iter().zip(got.iter().zip(batched.iter())) {
+                assert_eq!(g, b, "docid {d} @{s_tag} 批量分组==逐 get_at");
+            }
+        }
+        // 视图差异抽查：S0 见旧值（doc5 k=5 / doc7 存活）；S1 见新值（555 / doc7 隐藏）
+        let m = |s: u64, d: u64| -> serde_json::Value {
+            serde_json::from_slice(&e.get_at(d, s).unwrap().unwrap()).unwrap()
+        };
+        assert_eq!(m(s0, 5)["k"], 5, "S0 旧值");
+        assert_eq!(m(s1, 5)["k"], 555, "S1 新值");
+        assert!(e.get_at(7, s0).unwrap().is_some(), "S0 doc7 存活");
+        assert!(e.get_at(7, s1).unwrap().is_none(), "S1 doc7 已删");
+    }
+
     /// R4：无活跃快照时 compact 收敛丢旧版本（现状语义）——旧 seq 快照读返回 None。
     #[test]
     fn rr_no_active_snapshot_compaction_drops_old_versions() {

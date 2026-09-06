@@ -250,12 +250,10 @@ impl Engine {
         self.metrics.read_ops.fetch_add(n as u64, Ordering::Relaxed);
         // P137：快照读监控计数（batch_get_at 处理 docid 累计）
         self.snapshot_batch_rows.fetch_add(n as u64, Ordering::Relaxed);
-        // ① 主数据 ≤S（逐 docid 快照版本；不入 HotCache）
-        for (i, &d) in docids.iter().enumerate() {
-            if let Some((bv, _)) = self
-                .primary
-                .get_bytes_at(&encode_docid(d), snapshot_seq)?
-            {
+        // ① 主数据 ≤S（P145：批量按块分组点查，语义 = 逐 get_bytes_at；不入 HotCache）
+        let found = self.primary.get_many_at(docids, snapshot_seq)?;
+        for (i, f) in found.into_iter().enumerate() {
+            if let Some((bv, _)) = f {
                 out[i] = Some(bv);
             }
         }

@@ -182,6 +182,86 @@ impl ColumnFamily {
         Ok(out)
     }
 
+    /// P145（2026-09-06）：**批量快照取行**——语义与 `get_bytes_at` 逐条完全一致
+    /// （MemTable 多版本 ≤S 最新 + 全层取 seq ≤ snapshot_seq 的最大版本；≤S Tombstone → None），
+    /// 但跨 docid **批量化**：逐 SST 文件按块分组、每块只读/解码一次（块缓存复用）——
+    /// 把 `Engine::batch_get_at` 的逐键 `get_bytes_at` 点查（SST 冷库 ~39µs/docid，
+    /// P135/P138 触发项）降为块级顺序读量级。Tombstone 候选（seq>0, value=None）短路下沉
+    /// （memtable 最新 → 其 ≤S 版本必为全局 ≤S 最大，低层不可能有更大 seq 复活）。
+    /// 返回与输入 docids 对齐 `Vec<Option<(value, seq)>>`。
+    pub fn get_many_at(
+        &self,
+        docids: &[u64],
+        snapshot_seq: u64,
+    ) -> Result<Vec<Option<(Vec<u8>, u64)>>> {
+        let keys: Vec<Vec<u8>> = docids.iter().map(|d| encode_docid(*d).to_vec()).collect();
+        let n = keys.len();
+        let mut best: Vec<(u64, Option<Vec<u8>>)> = vec![(0, None); n]; // (best seq ≤ S, value)
+        // ① MemTable 多版本快照（≤S 最新；Tombstone 计候选 → 短路，不再查低层）
+        for (i, k) in keys.iter().enumerate() {
+            if let Some(e) = self.memtable.get_at(k, snapshot_seq) {
+                if e.seq > best[i].0 {
+                    best[i] = (e.seq, e.value);
+                }
+            }
+        }
+        let mut remain: Vec<usize> = best
+            .iter()
+            .enumerate()
+            .filter(|(_, (seq, _))| *seq == 0)
+            .map(|(i, _)| i)
+            .collect();
+        if remain.is_empty() {
+            return Ok(finish_get_many_at(best));
+        }
+        // ② 逐层（顺序无关——取全部层 ≤S 最大版本）；层范围/整段 min_seq 剪枝同 get_bytes_at
+        let cache = Arc::clone(&self.block_cache);
+        let snap = self.ssts.load();
+        for (lv, idxs) in snap.layer_indices.iter().enumerate() {
+            if remain.is_empty() {
+                break;
+            }
+            if let Some((lmin, lmax)) = &snap.layer_ranges[lv] {
+                if remain
+                    .iter()
+                    .all(|&i| keys[i].as_slice() < lmin.as_slice() || keys[i].as_slice() > lmax.as_slice())
+                {
+                    continue;
+                }
+            }
+            for &i in idxs {
+                if remain.is_empty() {
+                    break;
+                }
+                // Ex-8.6：文件最小行 seq > 快照 → 整段剪枝（段内无 ≤ 快照版本）
+                if snapshot_seq != u64::MAX && self.sst_min_seq(&snap.ssts[i])? > snapshot_seq {
+                    continue;
+                }
+                let hits = get_many_from_sst_at(
+                    &snap.ssts[i],
+                    &cache,
+                    &keys,
+                    &remain,
+                    self.bloom.layer(lv),
+                    snapshot_seq,
+                )?;
+                let mut next = Vec::with_capacity(remain.len());
+                for (j, &idx) in remain.iter().enumerate() {
+                    match &hits[j] {
+                        Some((value, seq)) => {
+                            if *seq > best[idx].0 {
+                                best[idx] = (*seq, value.clone());
+                            }
+                        }
+                        None => next.push(idx),
+                    }
+                }
+                remain = next;
+            }
+        }
+        Ok(finish_get_many_at(best))
+    }
+
     /// P87②：投影字段批量点查——语义与 `get_many` 一致（MemTable 优先 + SST 层
     /// 新→旧首个命中终结 / Tombstone 终止），但只返回每个 docid 的**请求字段值**：
     /// - MemTable / 行式块行：整行 JSON 按需字段提取（P86② 语义）；
@@ -568,6 +648,134 @@ fn get_many_from_sst(
                 }
             }
             // P2：误报估计——分区布隆放行的 key 读块后该段未命中（Tombstone 计入 Some 不算）
+            if pruned {
+                for &i in &targets {
+                    if let Some(&slot) = slot_of.get(&i) {
+                        if out[slot].is_none() {
+                            layer.fp_est.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        pos = end;
+    }
+    Ok(out)
+}
+
+/// P145：批量快照 `best[(seq, value)]` → 输出——(0,..)=未见→None；(seq,None)=≤S 最新
+/// Tombstone→None；(seq,Some(v))=可见→Some((v,seq))。语义对齐 `get_bytes_at` 收尾。
+fn finish_get_many_at(
+    best: Vec<(u64, Option<Vec<u8>>)>,
+) -> Vec<Option<(Vec<u8>, u64)>> {
+    best.into_iter()
+        .map(|(seq, v)| match (seq, v) {
+            (0, _) => None,
+            (_, Some(v)) => Some((v, seq)),
+            (_, None) => None, // ≤S 最新为删除
+        })
+        .collect()
+}
+
+/// P145：单 SST **批量快照**等值查询——定位/按块分组/块缓存读一次与 `get_many_from_sst`
+/// 一致，块内逐目标 key 走 `scan_block_for_key_at(≤snapshot)`（同 `get_from_sst_at` 逐键
+/// 语义：文件内取 ≤S 最大版本；该文件无 ≤S 版本 → None，调用方继续查其它文件）。
+/// 返回与 `idxs` 对齐：`Some((value, seq))`（value=None = ≤S Tombstone 候选）/
+/// `None`（该文件无 ≤S 版本，调用方保留待查）。
+fn get_many_from_sst_at(
+    sst: &SstReader,
+    cache: &BlockCache,
+    keys: &[Vec<u8>],
+    idxs: &[usize],
+    layer: &BloomLayerCounters,
+    snapshot_seq: u64,
+) -> Result<Vec<Option<(Option<Vec<u8>>, u64)>>> {
+    let mut out: Vec<Option<(Option<Vec<u8>>, u64)>> = vec![None; idxs.len()];
+    if idxs.is_empty() {
+        return Ok(out);
+    }
+    let legacy = sst.legacy_bloom();
+    let seg_range = sst.key_range();
+    let mut located: Vec<(usize, usize, IndexEntry)> = Vec::new();
+    for &i in idxs {
+        let k = &keys[i];
+        if let Some((min, max)) = seg_range {
+            if k.as_slice() < min || k.as_slice() > max {
+                layer.minmax_skip.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        if let Some(b) = legacy {
+            if !b.maybe_contains(k) {
+                layer.legacy_skip.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        if let Some((block_idx, entry)) = sst.locate_indexed_block(k)? {
+            located.push((i, block_idx, entry));
+        }
+    }
+    if located.is_empty() {
+        return Ok(out);
+    }
+    located.sort_by_key(|&(_, bi, _)| bi);
+    let slot_of: std::collections::HashMap<usize, usize> = idxs
+        .iter()
+        .enumerate()
+        .map(|(slot, &i)| (i, slot))
+        .collect();
+    let mut pos = 0usize;
+    while pos < located.len() {
+        let block_idx = located[pos].1;
+        let mut end = pos;
+        while end < located.len() && located[end].1 == block_idx {
+            end += 1;
+        }
+        let mut targets: Vec<usize> = Vec::new();
+        let mut pruned = false;
+        if let Some(pb) = sst.partition_blooms() {
+            if let Some(bytes) = pb.get(block_idx) {
+                if let Some(b) = BloomFilter::from_bytes(bytes) {
+                    for &(i, _, _) in &located[pos..end] {
+                        layer.part_probe.fetch_add(1, Ordering::Relaxed);
+                        if b.maybe_contains(&keys[i]) {
+                            layer.part_pass.fetch_add(1, Ordering::Relaxed);
+                            targets.push(i);
+                        } else {
+                            layer.part_skip.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    pruned = true;
+                }
+            }
+        }
+        if !pruned {
+            targets.extend(located[pos..end].iter().map(|&(i, _, _)| i));
+        }
+        if !targets.is_empty() {
+            sst.touch();
+            let entry = located[pos].2.clone();
+            let tid = sst.table_id().unwrap_or(0);
+            let ck = BlockCacheKey::new(sst.path().to_path_buf(), entry.offset, tid);
+            let block = if let Some(b) = cache.get(&ck) {
+                b
+            } else {
+                let b = sst.read_block(&entry)?;
+                cache.put(ck, b.clone());
+                b
+            };
+            // 块只读一次；逐目标 ≤S 解析（块已缓存，纯解码成本）
+            for &i in &targets {
+                if let Some(&slot) = slot_of.get(&i) {
+                    if out[slot].is_none() {
+                        if let Some(cand) =
+                            sst.scan_block_for_key_at(&block, &keys[i], snapshot_seq)?
+                        {
+                            out[slot] = Some(cand);
+                        }
+                    }
+                }
+            }
             if pruned {
                 for &i in &targets {
                     if let Some(&slot) = slot_of.get(&i) {
