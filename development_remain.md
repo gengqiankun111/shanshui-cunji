@@ -829,6 +829,12 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 | **P141 事务内聚合 MVCC 权威版（A1）** | 缺口：RR 显式事务内 `COUNT(*)`/`COUNT(WHERE)`/`COUNT(DISTINCT)`/`GROUP BY` 聚合目前**受限（无 WHERE 1064）或最新口径**，与 RR 快照视图不自洽 = 语义缺陷。补齐（复用 P134/P135 基建）：`COUNT(*)` = 快照 ≤S 可见行数（scan_range_txn/scan_range_at 计数、不物化整行；**无 O(1) 捷径**——并发删需 ≤S 判定，正确但 O(窗) 为预期非缺陷）；`COUNT(WHERE)/DISTINCT/GROUP BY` = 候选 superset（倒排 posting 只增不删 = ever-match）+ `batch_get_at(S)` 逐行判活复核（P135 superset/P136 prune 现成）。附带：FOR QUICK 落点 = **默认权威、加词降级 O(1) 近似**的对照基线 | 立项（2026-09-06）。待办：接线点盘点（现 COUNT 路径/1064 守卫位置）+ demo/内核 + 探针 |
 | **P142 Estimate 数量级接口（A2）** | **独立非 SQL 入口**（HTTP `?estimate=true` / 独立命令 / /stats），契约 = "约 N 行（approx）"（当前已提交视图数量级），明确标注近似——与 MySQL 语义天然脱钩，**不进 SQL 关键字**。实现：引擎读锁内一次 `Engine::count_all_docs()`（全库）/`Engine::count_docs_range(start,end)`（表窗口 = docid 高 16 位表号；**单 Mutex 内 rank 差值已现成**，零 MVCC/锁/LSM 改动），返回标 approx；带条件估计（≈ COUNT WHERE f='v'）= bitmap_fields 内存位图或倒排 posting∩live（仍当前视图；换值旧值残留可接受——近似语义不修）。边界：live 懒建首调全键 keys-only 尖刺（open 后**后台预热**或接口标注首次慢）；两次调用数值不同是特性非 bug | 立项（2026-09-06）。待办：入口接线 + approx 标注 + 预热 + 量级验证 |
 
+### 冷首触 IO 立项（2026-09-06，#77 复测触发）
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| **P143 冷首触 IO 收敛（#77 离群）** | **触发**：#77 复测 mean 2459ms 未达 ≤1.5s 验收——n=5 中 1 次**冷首触 7-10s 离群**（100k/≈100MB 窗首次读：页/块缓存全冷 + 装载后 compaction 抖动；warm 迭代 p50 750ms 已达标 = P140 投影收益），IO-bound 与投影无关（服务日志 compaction 恰在探针期）。**目标**：#77 clean n=5 **mean ≤1.5s 且无 >3s 离群**。**第一步 = 归因 demo**（clean 110 万冷库，100k 窗首读计时拆解）：① 块 IO（页缓存清空前后 / 命中块数×大小）② engine 逐行机制（范围扫 vs 点查、文件数/重叠）③ compaction 抖动（settle 前后）→ 定主因再选方案。**候选方案**（按归因挑）：A. 范围读块**预取/顺序化**（scan_stream_at 块级 readahead；PAX 列块按列顺序读）B. 装载后**compaction 收敛 + open 后台预热**（含 live_ensure 懒建尖刺后台化，与 P142 同源）C. colstore #79-80（热列只读列块，行式大列不进窗读）D. Windows 页/块缓存预热接口。**验收**：#77 mean ≤1.5s 无 >3s 离群；同族大窗冷读探针（pk_between_10000 / cmp_between_nolimit / enum_sel_limit10000）首读同步收敛 | 立项（2026-09-06）。待办：归因 demo → 方案 → 内核 + 探针复测 |
+
 ### SQL 语法面收尾审计（2026-09-05，用户目标：MySQL 语法对齐 + 既定数据结构性能对比）
 
 - ✅ 已同步 user_guide/README.md §4.1/§4.2：JOIN（单 INNER/LEFT）、GROUP BY…ORDER BY 聚合列、
