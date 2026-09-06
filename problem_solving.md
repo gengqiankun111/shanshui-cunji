@@ -2001,6 +2001,12 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   - 结论：#77 离群（冷首触 ~7.5s）不随组读大小变化；剩真杠杆 = **块尺寸 4KB→64KB（写侧，
      新 SST，需 clean 重装单变体对照）** / colstore #79-80（瘦行块）/ WAL checkpoint 缺陷
      前置修复（P144 候选）。**待办：块尺寸变体验证（或用户改向）**。
+- **块尺寸变体验证 ✅（2026-09-06）**：tmp-cfg-p140-b64（`[blockcache] block_size_kb=64`，单旋钮
+  同驱动写侧块布局 + 缓存粒度；clean 重装 110 万）：#77 cold 首跑 **1612.9/452/4692**
+  （4KB 基线 2523.8/951/7212）；warm 稳态 **296.9/186/594**（4KB 稳态 750-950 + 9.7s 离群 →
+  64KB 无 >600ms 离群）；回归探针全健康（pk_point 0.18-0.22ms、pk_between_10000 170→112、
+  enum_sel_limit10000 58→39.6、pk_in_50 2.17）。**定论：块尺寸 4KB→64KB 是冷首触有效杠杆**
+  （块数 /30）；采纳为宽表基准配置（wide/OLAP 建议 block_size_kb=64）。P143 收口。
 
 **P144（per-CPU WAL checkpoint 推进，2026-09-06 立项修复，局部完成）**
 - 根因（诊断实证：enq=[1.1M,0,1.1M,0] wm=[1.1M,0,0,∞] cp=0）：① cp 持久化只在 flush_all
