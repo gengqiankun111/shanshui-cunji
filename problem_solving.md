@@ -1928,6 +1928,16 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   0.5×**）**。单测 p139b_batch_alive_latest_matches_get（位图开/关 × 与逐 get 一致 × 复活）+
   p139 路径⑤（id-only `{}` 输出/行集一致/墓碑剔除）；lib **792 通过 + 4 ignored**。
 
+**P140（快照投影流 #77 前置核对 + 干净基线，2026-09-06 立项 demo-first）**
+- 前置核对：#77 `txn_long_read` SQL = `SELECT id,k,amount … WHERE id BETWEEN a AND a+100000`
+  （3 列投影，非 SELECT *）→ 快照侧列下推价值成立（25 列快照归并整行 → 3 列）。
+- 干净基线（db-wide-scc-p140 wide-load 74s 立即跑，P139-c binary）：#77 mean **3316ms** /
+  p50 1848 / p99 8069；MySQL 147/145/160 → **≈22.5×**。较 P137 clean（5486/1933/20767）
+  已收敛（p99 20s→8s）。
+- 方案（待做 demo/内核）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`（≤S 归并仅
+  解目标列，复用 P131/P134 版本归并 + P86②/P91 列提取）→ 事务长读窗输出接线。验收：#77
+  clean ≤1.5s（≥2.2×）且 p99 收敛。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
