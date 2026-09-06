@@ -1975,6 +1975,23 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   （≤S 归并仅解目标列，复用 P131/P134 版本归并 + P86②/P91 列提取）→ 事务长读窗输出接线；
   验收 #77 clean ≤1.5s（≥2.2×）未全达——warm 2-2.5× 达标、冷首触 IO 离群另归 IO/read-amp 族。
 
+**P143（冷首触 IO 归因，2026-09-06 立项；demo 归因完成）**
+- **归因 demo**（src/demo/p143-cold-io，gitignored，直连 db-wide-scc-p140 真实库，
+  与探针同配置同数据，release）：RR `scan_range_txn_fields([k,amount])` 100k 窗逐窗：
+  - 每窗首读**块缓存 miss ≈ 50002 块**（100k 行 / ~2 行每 4KB 块，默认 block_size_kb=4）
+    ——100k 窗 ≈ **50k 次 4KB 随机小盘读（读放大 ≈200MB）**；
+  - OS 页缓存热区掩蔽（a=450k/650k/850k 冷首读 1.3-1.5s）、冷区暴露（a=50k 17.2s /
+    a=250k 9.9s）——**#77 7-10s 离群 = 窗落在页缓存冷区**（每次探针 a 随机漂移）；
+  - **warm（块缓存命中二次读）0.24-0.30s（2.4-3µs/row）**——引擎机制/解码非主成本；
+  - 整行对照（同窗已 warm）1.38s vs fields 0.28s → P140 投影**省解码 ~5×，不省块数**
+    （fields/整行 miss 同为 ~50k——行块整体读入，投影不缩 IO）；
+  - 非 compaction 主导（无后台抖动下冷热差纯缓存所致；compaction 仅放大项）。
+- **定论/方案修正**：主因 = 4KB 小块随机读放大；首选 **B 读路径预取/顺序化 + 块尺寸杠杆**
+  （4KB→64KB 块数 /16 ≈ 3k 次读；或块序 readahead / 命中块相邻预读入缓存）；C colstore
+  #79-80（热列瘦行块 → 行/块↑ → 随机读块数↓）次选；A compaction 收敛仅放大项。
+  验收：#77 clean mean ≤1.5s 无 >3s 离群；同族大窗冷读探针首读同步收敛。
+- 待办：方案内核（预取/块尺寸）+ 探针复测。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
