@@ -805,6 +805,19 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 | **P1 MVCC 快照生命周期管控（2026-09-05 立项）** | 现状：`active_snapshots` 原为 `BTreeSet<seq>`（无时间），长 RR 事务可无限阻塞 compaction（txn_long_read 19.1× 相关）。**已落地**：①注册表改 `BTreeMap<seq, 注册ms>`，新增 `active_snapshot_count / oldest_snapshot_age_ms / snapshot_evict_older_than(受控逐出)`；②观测接入：`EngineStats.active_snapshots / snapshot_oldest_ms`（status）、`/metrics` gauge `shanshui_snapshots_active / shanshui_snapshot_oldest_ms`、`SHOW MEMORY` 行集；③3 个新单测（mvcc.rs cfg(test)），lib 全量 764 通过。**仍待排**：会话层空闲事务自动回滚（等价 MySQL wait_timeout：空闲超时 → rollback → 注销快照 → 放行 compaction；引擎不主动逐出以保 RR 语义，需上层策略调用 `snapshot_evict_older_than`） | 引擎层 ✅；会话 idle 回滚待排 |
 | **P2 容量规划文档（Windows WS ≠ 引擎堆）** | 口径确认（2026-09-05）：主列族 SST **走 read_at 位置读（非 mmap）**；mmap 仅用于**倒排段/词典**（mmap_file）；Windows WorkingSet 会把已触达的 file-backed/mmap 页计入 → 相对 Linux private RSS 虚高，方向认可。**跨平台对比以 Linux private RSS 为准，Windows WS 仅参考**；文档需区分：稳态常驻（cache 填满即停）/负载瞬时尖峰（并行扫描超淘汰）/系统预留策略（×1.4~1.8）。待产出 research 容量规划文档（与内存观测行联动） | 待排（与内存三组观测合并） |
 
+### 倒排 MVCC/RR 专项排期（2026-09-06，用户确定：倒排索引走版本号）
+
+> 设计依据：research/inverted-versioning-rr.md。目标 = posting 版本化（add/remove seq）使倒排
+> 独立服务 RR 快照读（免全候选回表复核），配合 live_docids 版本化与倒排监控。**范围：P134
+> 正确性小项先行；P135 版本化大项 demo 先行立项；B 排序不做独立项；C/D 随阶段。**
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| **P134 事务读快照语义收口（正确性，先行）** | 两缺口：① `txn_select_by_predicate` 字段谓词候选来自最新态（回表位图剔除快照后删行 → 事务内重复读消失，与点查 get_at 见旧值不自洽）；② `scan_range_txn` 快照扫描仍按删除位图剔行（位图无 seq）。修法：候选/扫描不做"最新态删除"预过滤（posting 只加不删 ⇒ 候选含历史 docid），可见性统一交快照裁决（txn_get / scan_range_at tombstone seq）；顺带 mem `Vec<u64>` flush 前排序（闭合 merge_distinct 升序前提） | 待排（1~1.5 天） |
+| **P135 倒排 posting 版本化（主线，用户确定走版本号）** | 每 (term,docid) add/remove seq → view(term,S) 快照视图；形态 demo（甲 位图+旁路 seq 数组 / 乙 版本化双位图 / 丙 段粒度 seq 窗口）→ 段 v7 + mem(docid,seq) + term diff 写路径（含 docid→terms 反查） + gc 版本归并收敛；接线 §4 | 待排（demo 先行） |
+| **P136 版本化活跃集（C，live_docids v2 + 共享原语）** | live 升级 docid 级 add/del seq → snapshot_live(S)；与 posting 统一"版本化 docid 集合"原语；守卫/计数快路径改快照口径 | 待排（依赖 P135 形态） |
+| **P137 倒排专项监控（D）** | shanshui_inv_* gauge（段数/GC 积压/delta fst/mem 深度/posting_cache 命中/段 seq 窗口/长快照窗）+ SHOW 行集 + 诊断 demo | 待排（随阶段埋点） |
+
 ### SQL 语法面收尾审计（2026-09-05，用户目标：MySQL 语法对齐 + 既定数据结构性能对比）
 
 - ✅ 已同步 user_guide/README.md §4.1/§4.2：JOIN（单 INNER/LEFT）、GROUP BY…ORDER BY 聚合列、
