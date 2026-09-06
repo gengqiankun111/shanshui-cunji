@@ -89,6 +89,11 @@ fn in_sql(rng: &mut StdRng, c: &Ctx, size: usize) -> String {
     format!("SELECT id,k,status FROM {tb} WHERE id IN ({})", ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
 }
 
+/// P141 A1-1：txn_agg 探针 body 占位（脚本由 run_txn_agg 按 name 分发，body 无实义）。
+fn txn_agg_mk(_r: &mut StdRng, _c: &Ctx, _i: usize) -> String {
+    String::new()
+}
+
 pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
     let _ = TAB.set(table.to_string());
     // --only 过滤：空 = 全量；支持逗号分隔（如 "txn_lock_wait,txn_lock_mid_contend"）
@@ -516,6 +521,12 @@ pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
         Probe { cat: "混合", name: "biz_list_query", kind: Kind::Rows, n: 10, sql: sql_biz500, note: "倒排过滤+时间排序 limit 500" },
         Probe { cat: "混合", name: "biz_page_offset", kind: Kind::Rows, n: 10, sql: sql_bizpage, note: "where+order by offset 2000 limit 100" },
         Probe { cat: "混合", name: "biz_agg_filter", kind: Kind::Rows, n: 5, sql: sql_bizagg, note: "where+group by+order by 聚合 limit 20" },
+        // ---- P141 A1-1（2026-09-07）：事务内聚合权威探针（与 MySQL 双端对拍；块内 ROLLBACK 零污染） ----
+        Probe { cat: "事务聚合", name: "txn_agg_cnt_all", kind: Kind::Block, n: 5, sql: txn_agg_mk, note: "BEGIN→自插→COUNT(*) 全表→ROLLBACK（快照含自插）" },
+        Probe { cat: "事务聚合", name: "txn_agg_scalar", kind: Kind::Block, n: 10, sql: txn_agg_mk, note: "BEGIN→同事务改 k/status→标量多函数窗口→ROLLBACK" },
+        Probe { cat: "事务聚合", name: "txn_agg_avg", kind: Kind::Block, n: 10, sql: txn_agg_mk, note: "BEGIN→同事务改 k/amount→AVG 数值语义→ROLLBACK" },
+        Probe { cat: "事务聚合", name: "txn_agg_group", kind: Kind::Block, n: 10, sql: txn_agg_mk, note: "BEGIN→改分布→GROUP BY/HAVING→自删全窗→空集 SUM NULL→ROLLBACK" },
+        Probe { cat: "事务聚合", name: "txn_agg_fu", kind: Kind::Block, n: 8, sql: txn_agg_mk, note: "BEGIN→FOR UPDATE 聚合（当前读锁定/自写/空集）→ROLLBACK" },
     ];
 
     let env_note = if url.contains("3316") {
@@ -615,6 +626,9 @@ fn run_block(conn: &mut mysql::Conn, url: &str, body: &str, name: &'static str, 
     if name == "txn_multi_stat" {
         return run_multi_stat(conn, upd_lo);
     }
+    if name.starts_with("txn_agg") {
+        return run_txn_agg(conn, name, upd_lo);
+    }
     if name == "txn_rr_readwrite" {
         let _ = exec_stmt(conn, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ");
     } else if name == "txn_serializable" {
@@ -669,6 +683,156 @@ fn run_multi_stat(conn: &mut mysql::Conn, upd_lo: u64) -> Result<(usize, String)
         return Err(format!("COMMIT: {}", rc.err.unwrap()));
     }
     Ok((affected, "multi-dml".to_string()))
+}
+
+/// P141 A1-1（2026-09-07）：事务内聚合探针执行族。每个 txn_agg_* 执行**确定性脚本**
+/// （BEGIN → 同事务写覆盖/自插/自删 + 聚合读 → ROLLBACK，零持久污染、逐轮可重放），
+/// 每步 SELECT 行集与**硬编码期望真值**比对（`compare::rows_to_keys` 数值规范化键——
+/// 屏蔽 MySQL DECIMAL 尾零 / 整浮同值文本差异）。**本端断言通过（exp-ok）⇔ 结果符合
+/// 权威真值；MySQL 与 SCC 各自 exp-ok 即行集数值语义等值。**
+/// 覆盖三态：FOR UPDATE 当前读 / 同事务写自见（插·改·删）/ 空集数值聚合 SQL NULL；
+/// 标量 COUNT/SUM/MIN/MAX/COUNT(DISTINCT)/AVG 与 GROUP BY/HAVING、无 WHERE 全表 COUNT。
+fn run_txn_agg(conn: &mut mysql::Conn, name: &str, upd_lo: u64) -> Result<(usize, String), String> {
+    let tb = t();
+    let lo = upd_lo;
+    let hi = lo + 4; // 窗 = upd 预留 5 行（预插值 k=1 / amount=1.00 / score=0.5 / status='active'）
+    let w = format!("id BETWEEN {lo} AND {hi}");
+    let x = lo + 200; // 自插空闲 id = upd_hi+1（upd 200 行之外，永不被其它探针占用）
+    let steps: Vec<(&str, String, Option<&str>)> = match name {
+        // 无 WHERE 全表 COUNT + 同事务自插可见（COUNT(*) 期望 = 加载 N+1，两侧同基线；
+        // 自插局部断言恒 1）
+        "txn_agg_cnt_all" => vec![
+            ("ins", format!("INSERT INTO {tb} ({COLS_FULL}) VALUES {}", ins_vals(x, "txnagg")), None),
+            ("cnt_all", format!("SELECT COUNT(*) FROM {tb}"), None),
+            ("cnt_self", format!("SELECT COUNT(*) FROM {tb} WHERE id={x}"), Some("1")),
+        ],
+        // 同事务改 k（1→2 整窗）与 status 分布 → 整型标量多函数（单语句单聚合，逐条断言）
+        "txn_agg_scalar" => vec![
+            ("upd_k", format!("UPDATE {tb} SET k=2 WHERE {w}"), None),
+            (
+                "upd_s",
+                format!("UPDATE {tb} SET status='b' WHERE id IN ({lo},{},{hi})", lo + 2),
+                None,
+            ),
+            ("cnt", format!("SELECT COUNT(*) FROM {tb} WHERE {w}"), Some("5")),
+            ("sum", format!("SELECT SUM(k) FROM {tb} WHERE {w}"), Some("10")),
+            ("min", format!("SELECT MIN(k) FROM {tb} WHERE {w}"), Some("2")),
+            ("max", format!("SELECT MAX(k) FROM {tb} WHERE {w}"), Some("2")),
+            ("cdk", format!("SELECT COUNT(DISTINCT k) FROM {tb} WHERE {w}"), Some("1")),
+            (
+                "cds",
+                format!("SELECT COUNT(DISTINCT status) FROM {tb} WHERE {w}"),
+                Some("2"),
+            ),
+        ],
+        // AVG 浮点数值语义（MySQL DECIMAL 尾零 vs SCC DOUBLE 文本经 value_key 归一；单聚合逐条）。
+        // 注：SET 拆两条单列——单语句复合 SET（SET k=2, amount=2.50）超出 SCC 事务 UPDATE 单字段
+        // 解析（M-7 已知缺口，非 P141 事务聚合面）；分步单列赋值两侧语义一致。
+        "txn_agg_avg" => vec![
+            ("upd_k", format!("UPDATE {tb} SET k=2 WHERE {w}"), None),
+            ("upd_a", format!("UPDATE {tb} SET amount=2.50 WHERE {w}"), None),
+            ("avg_k", format!("SELECT AVG(k) FROM {tb} WHERE {w}"), Some("2")),
+            (
+                "avg_amt",
+                format!("SELECT AVG(amount) FROM {tb} WHERE {w}"),
+                Some("2.5"),
+            ),
+            (
+                "avg_score",
+                format!("SELECT AVG(score) FROM {tb} WHERE {w}"),
+                Some("0.5"),
+            ),
+        ],
+        // 同事务改 status 分布 + k 分布 → GROUP BY(COUNT+SUM 双聚合)/HAVING → 自删整窗 →
+        // 空集 SUM/AVG = SQL NULL
+        "txn_agg_group" => vec![
+            ("upd_b", format!("UPDATE {tb} SET status='b' WHERE id IN ({lo},{})", lo + 2), None),
+            ("upd_c", format!("UPDATE {tb} SET status='c' WHERE id={hi}"), None),
+            (
+                "upd_ksum",
+                format!("UPDATE {tb} SET k=2 WHERE id IN ({lo},{})", lo + 1),
+                None,
+            ),
+            (
+                "gb",
+                format!(
+                    "SELECT status, COUNT(*), SUM(k) FROM {tb} WHERE {w} GROUP BY status ORDER BY status"
+                ),
+                // active(lo+1 k2, lo+3 k1)=count2 sum3；b(lo k2, lo+2 k1)=count2 sum3；c(lo+4 k1)
+                Some("active|2|3\nb|2|3\nc|1|1"),
+            ),
+            (
+                "having",
+                format!(
+                    "SELECT status, COUNT(*) FROM {tb} WHERE {w} GROUP BY status HAVING COUNT(*) >= 2 ORDER BY status"
+                ),
+                Some("active|2\nb|2"),
+            ),
+            ("del_all", format!("DELETE FROM {tb} WHERE {w}"), None),
+            (
+                "empty_sum",
+                format!("SELECT SUM(k) FROM {tb} WHERE {w}"),
+                Some("NULL"),
+            ),
+            (
+                "empty_avg",
+                format!("SELECT AVG(k) FROM {tb} WHERE {w}"),
+                Some("NULL"),
+            ),
+        ],
+        // FOR UPDATE 当前读聚合：窗口锁定 → 同事务自改（当前读见自写）→ 自删行空集 NULL
+        "txn_agg_fu" => vec![
+            ("fu5", format!("SELECT SUM(k) FROM {tb} WHERE {w} FOR UPDATE"), Some("5")),
+            ("upd9", format!("UPDATE {tb} SET k=9 WHERE id={lo}"), None),
+            ("fu13", format!("SELECT SUM(k) FROM {tb} WHERE {w} FOR UPDATE"), Some("13")),
+            ("del1", format!("DELETE FROM {tb} WHERE id={}", lo + 1), None),
+            (
+                "fu_lo",
+                format!("SELECT SUM(k) FROM {tb} WHERE id BETWEEN {lo} AND {lo} FOR UPDATE"),
+                Some("9"),
+            ),
+            (
+                "fu_null",
+                format!("SELECT SUM(k) FROM {tb} WHERE id BETWEEN {} AND {} FOR UPDATE", lo + 1, lo + 1),
+                Some("NULL"),
+            ),
+        ],
+        _ => return Err(format!("未知 txn_agg 探针: {name}")),
+    };
+
+    let r0 = exec_stmt(conn, "BEGIN");
+    if r0.err.is_some() {
+        return Err(format!("BEGIN: {}", r0.err.unwrap()));
+    }
+    let rollback = |conn: &mut mysql::Conn| {
+        let _ = exec_stmt(conn, "ROLLBACK");
+    };
+    let mut sig = String::new();
+    let mut last_rows = 0usize;
+    for (label, sql, exp) in steps {
+        let r = exec_stmt(conn, &sql);
+        if let Some(e) = &r.err {
+            rollback(conn);
+            return Err(format!("{label}: {e}"));
+        }
+        // 聚合读步骤：记录规范化行集签名（有期望则断言）
+        if !r.rows.is_empty() {
+            let keys = crate::compare::rows_to_keys(&r.rows);
+            sig.push_str(&format!("{label}=[{}];", keys.join(";")));
+            last_rows = r.rows.len();
+            if let Some(expk) = exp {
+                let got = keys.join("\n");
+                if got != expk {
+                    rollback(conn);
+                    return Err(format!(
+                        "{label} 行集 != 期望真值\n期望:\n{expk}\n实际:\n{got}"
+                    ));
+                }
+            }
+        }
+    }
+    rollback(conn);
+    Ok((last_rows, format!("txn-agg exp-ok {sig}")))
 }
 
 /// 锁等待探针：主连接 BEGIN + SELECT..FOR UPDATE 持锁 → 副连接对同 id UPDATE 等锁

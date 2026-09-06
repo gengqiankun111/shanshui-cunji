@@ -146,7 +146,8 @@ pub(crate) fn txn_insert(engine: &mut Engine, session: &mut Session, sql: &str) 
     }
 }
 
-/// 事务内单行字段更新（id 已解析）：整体替换（field=doc）/ 自增 / 字符串赋值。
+/// 事务内单行字段更新（id 已解析）：整体替换（field=doc）/ 自增 / 类型化赋值
+/// （数字/布尔/对象按 JSON 类型，其余字符串）。
 /// 读事务视图（`txn_get`：快照 + 同事务写可见）；不存在 → 空文档（与单 id 旧语义一致）。
 pub(crate) fn txn_apply_update_one(
     engine: &Engine,
@@ -175,8 +176,13 @@ pub(crate) fn txn_apply_update_one(
         let cur = obj.get(field).and_then(|v| v.as_i64()).unwrap_or(0);
         obj.insert(field.to_string(), serde_json::Value::from(cur + inc));
     } else {
-        // 字符串赋值：c='value'
-        obj.insert(field.to_string(), serde_json::Value::String(unquote(expr)));
+        // 类型化赋值（对齐 ODKU / 非事务 P131）：数字/布尔/对象按 JSON 类型，其余字符串——
+        // 修复：旧实现无条件写字符串（`SET k=2` → doc.k "2"）→ SUM/AVG 数值聚合（numeric_field
+        // 仅认 JSON number）读到 NULL，事务内改后数值聚合与 MySQL 不一致（A1-1 对拍暴露）。
+        let raw = unquote(expr);
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw));
+        obj.insert(field.to_string(), v);
     }
     let new_doc = serde_json::to_string(&doc)
         .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
@@ -184,6 +190,11 @@ pub(crate) fn txn_apply_update_one(
 }
 
 /// 事务内 WHERE 段 → 作用 docid 集合（d 的 txn 路径扩展，对齐非事务 `resolve_where_ids`）：
+/// - `id BETWEEN A AND B` / `docid BETWEEN ...`（可后接 `AND <字段条件>`）：主键闭窗口直解
+///   ——窗口内**事务视图存在**的 docid（含同事务自插 Put；空洞/已删行排除，affected 对齐
+///   MySQL），再对剩余字段条件逐行 `doc_matches_where` 复检。修复：BETWEEN 误走字段候选
+///   路径 + doc 复检（doc JSON 无 `id` 字段 → 主键谓词恒假 → UPDATE/DELETE 窗口恒 0 行），
+///   对齐事务 SELECT BETWEEN 窗口读路径（A1-1 探针对拍暴露）。
 /// - `id IN (..)` / `docid IN (..)`：目标即 docid（直解，不检查存在性——与单 id 语义一致）
 /// - 其余（字段条件 / 复合 and/or）：候选 = 引擎当前视图命中（sqlish）∪ 同事务 write_set，
 ///   逐候选 `txn_get` 取**事务视图**值 + `doc_matches_where` 谓词复检（快照不可见/已删行
@@ -192,9 +203,65 @@ pub(crate) fn txn_resolve_where_ids(
     engine: &Engine,
     txn: &mut crate::txn::Transaction,
     where_part: &str,
+    tid: u16,
 ) -> Result<Vec<u64>> {
     let w = where_part.trim().trim_end_matches(';').trim();
     let lower = w.to_lowercase();
+    // 主键闭窗口直解（前缀判定：`id between` / `docid between` 均为 ASCII 前缀，
+    // lower 前段与原文等长安全；边界在数字/关键字上，无引号字符串错位风险）
+    let bpre = if lower.starts_with("id between") {
+        Some("id between".len())
+    } else if lower.starts_with("docid between") {
+        Some("docid between".len())
+    } else {
+        None
+    };
+    if let Some(plen) = bpre {
+        let mut tail = w[plen..].trim_start();
+        let a_digits: usize = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+        if a_digits == 0 {
+            return Err(Error::Cluster("BETWEEN 缺下界数值".into()));
+        }
+        let a: u64 = tail[..a_digits].parse().map_err(|_| Error::Cluster("BETWEEN 下界非法".into()))?;
+        tail = tail[a_digits..].trim_start();
+        if !tail.to_lowercase().starts_with("and") {
+            return Err(Error::Cluster("BETWEEN 缺 AND".into()));
+        }
+        tail = tail[3..].trim_start();
+        let b_digits: usize = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+        if b_digits == 0 {
+            return Err(Error::Cluster("BETWEEN 缺上界数值".into()));
+        }
+        let b: u64 = tail[..b_digits].parse().map_err(|_| Error::Cluster("BETWEEN 上界非法".into()))?;
+        // 剩余字段条件（`AND <cond>` 链；引用值原样保真——w 为原文）
+        let rest = tail[b_digits..].trim_start();
+        let rem = if rest.is_empty() {
+            None
+        } else if rest.to_lowercase().starts_with("and") {
+            Some(rest[3..].trim_start())
+        } else {
+            // BETWEEN + OR/括号等复杂组合暂不拆解 → 回退字段候选路径（sqlish 引擎当前视图）
+            return txn_resolve_where_field(engine, txn, w);
+        };
+        // 窗口过宽防御（事务内逐 id 事务视图取行）
+        if b.saturating_sub(a) > 1_000_000 {
+            return Err(Error::Cluster("BETWEEN 窗口过大（上限 100 万行）".into()));
+        }
+        let cond_sql = rem.map(|r| format!("SELECT docid FROM t WHERE {r}"));
+        let mut out = Vec::new();
+        for r in a..=b {
+            let d = docid_for(tid, r);
+            // 事务视图存在性：自删/快照不可见 → None（空洞/已删行不计 affected）
+            let Some(v) = engine.txn_get(txn, d)? else { continue };
+            if let Some(cs) = &cond_sql {
+                if !crate::sqlish::doc_matches_where(cs, &v) {
+                    continue;
+                }
+            }
+            out.push(d);
+        }
+        return Ok(out);
+    }
     if lower.starts_with("id in") || lower.starts_with("docid in") {
         let open = w
             .find('(')
@@ -207,6 +274,15 @@ pub(crate) fn txn_resolve_where_ids(
         }
         return Ok(ids);
     }
+    txn_resolve_where_field(engine, txn, w)
+}
+
+/// 字段条件 / 复合候选解析（引擎当前视图命中 ∪ 同事务写集 → 事务视图 + 谓词复检）。
+fn txn_resolve_where_field(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    w: &str,
+) -> Result<Vec<u64>> {
     // 字段条件 / 复合：引擎视图命中 ∪ 同事务写集 → 事务视图 + 谓词复检
     let cond_sql = format!("SELECT docid FROM t WHERE {w}");
     let base = crate::sqlish::execute(engine, &cond_sql, 200_000)?;
@@ -243,7 +319,7 @@ pub(crate) fn txn_update(engine: &mut Engine, session: &mut Session, sql: &str) 
             };
             // §26 M1b：非默认表字段条件 UPDATE 放开——候选限定本表区间（防跨表写）
             let txn = session.txn.as_mut().unwrap();
-            let mut ids = match txn_resolve_where_ids(engine, txn, &wp) {
+            let mut ids = match txn_resolve_where_ids(engine, txn, &wp, tid) {
                 Ok(v) => v,
                 Err(err) => return QueryResponse::Err(1064, format!("update where: {err}")),
             };
@@ -297,7 +373,7 @@ pub(crate) fn txn_delete(engine: &mut Engine, session: &mut Session, sql: &str) 
             };
             // §26 M1b：非默认表字段条件 DELETE 放开——候选限定本表区间（防跨表删）
             let txn = session.txn.as_mut().unwrap();
-            let mut ids = match txn_resolve_where_ids(engine, txn, &wp) {
+            let mut ids = match txn_resolve_where_ids(engine, txn, &wp, tid) {
                 Ok(v) => v,
                 Err(e) => return QueryResponse::Err(1064, format!("delete where: {e}")),
             };

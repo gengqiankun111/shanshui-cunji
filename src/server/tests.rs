@@ -3147,6 +3147,119 @@ use crate::multitable::drop_table_range;
         );
     }
 
+    #[test]
+    fn txn_update_delete_between_window() {
+        // A1-1（2026-09-07）：事务内 UPDATE/DELETE … WHERE id BETWEEN 主键闭窗口直解——
+        // 修复：BETWEEN 误走字段候选 + doc 复检（doc JSON 无 id 字段 → 主键谓词恒假 → 窗口恒
+        // 0 行），对齐事务 SELECT BETWEEN 读路径；窗口空洞/已删行不计 affected（MySQL 语义）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        let auto = std::sync::Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(std::sync::Arc::clone(&auto));
+        let mut q = |e: &mut Engine, sql: &str| super::dispatch_query(e, sql, &mut s);
+        let rows_of = |r: QueryResponse| -> Vec<Vec<String>> {
+            match r {
+                QueryResponse::Set { rows, .. } => rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|c| {
+                                if c == vec![MYSQL_NULL_CELL] {
+                                    "NULL".to_string()
+                                } else {
+                                    String::from_utf8_lossy(&c).into_owned()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                _ => panic!("应返回结果集响应"),
+            }
+        };
+        let affected_of = |r: QueryResponse| -> u64 {
+            match r {
+                QueryResponse::Ok(a, _) => a,
+                _ => panic!("应返回 OK"),
+            }
+        };
+        // 基线 1..5（k=id，s=a/b/a/b/c）
+        for (id, k, sval) in [(1, 1, "a"), (2, 2, "b"), (3, 3, "a"), (4, 4, "b"), (5, 5, "c")] {
+            let doc = format!("{{\"k\":{k},\"s\":\"{sval}\"}}");
+            let sql = format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')");
+            assert!(matches!(q(&mut e, &sql), QueryResponse::Ok(..)));
+        }
+        assert!(matches!(q(&mut e, "BEGIN"), QueryResponse::Ok(..)));
+        // UPDATE 主键闭窗口（修复前 affected=0）→ 窗口内 4 行改 k=2
+        assert_eq!(
+            affected_of(q(&mut e, "UPDATE documents SET k=2 WHERE id BETWEEN 1 AND 4")),
+            4,
+            "BETWEEN 窗口 UPDATE 应命中 4 行"
+        );
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT id, k FROM documents WHERE id BETWEEN 1 AND 5 ORDER BY id"
+            )),
+            vec![
+                vec!["1", "2"],
+                vec!["2", "2"],
+                vec!["3", "2"],
+                vec!["4", "2"],
+                vec!["5", "5"],
+            ],
+            "窗口行 k 明细应为更新后值"
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT COUNT(*) FROM documents WHERE id BETWEEN 1 AND 5")),
+            vec![vec!["5"]],
+            "窗口 COUNT 应含全部 5 行"
+        );
+        eprintln!("DEBUG k 明细过,COUNT=5, SUM 待查");
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 5")),
+            vec![vec!["13"]], // 2+2+2+2+5
+        );
+        // BETWEEN + AND 字段条件（剩余谓词复检）：s='a' 的 id1/3 → k=9（id5 s='c' 不命中）
+        assert_eq!(
+            affected_of(q(
+                &mut e,
+                "UPDATE documents SET k=9 WHERE id BETWEEN 1 AND 5 AND s='a'"
+            )),
+            2,
+            "BETWEEN + 字段条件 UPDATE 应命中 2 行"
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 5")),
+            vec![vec!["27"]], // 9+2+9+2+5
+        );
+        // DELETE 主键闭窗口（含空洞：id2/3 删后 SUM 只计剩余）
+        assert_eq!(
+            affected_of(q(&mut e, "DELETE FROM documents WHERE id BETWEEN 2 AND 3")),
+            2
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 5")),
+            vec![vec!["16"]], // 9+2+5
+        );
+        // 全窗 DELETE → 空集数值聚合 SQL NULL
+        assert_eq!(
+            affected_of(q(&mut e, "DELETE FROM documents WHERE id BETWEEN 1 AND 5")),
+            3
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 5")),
+            vec![vec!["NULL"]],
+            "空集 SUM 应 NULL"
+        );
+        // ROLLBACK 原子：窗口 5 行原值恢复
+        assert!(matches!(q(&mut e, "ROLLBACK"), QueryResponse::Ok(..)));
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 5")),
+            vec![vec!["15"]],
+            "回滚后窗口原值 SUM=15"
+        );
+    }
+
     // ---------- H-5：预处理语句 ----------
 
     #[test]
