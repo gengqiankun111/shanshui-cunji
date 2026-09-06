@@ -165,12 +165,15 @@ fn main() {
     // SQL 性能探针（--sql-run --url <mysql://...> --out <dir>）：对单端宽表跑典型负载。
     // --table：默认 t；SCC 位图倒排仅兼容默认表 documents，SCC 侧请传 documents。
     // --only <name|a,b,c>：只跑指定探针（诊断/验收用；空 = 全量）。
+    // --reps <N>：增量验证——每条命令只跑 N 次（覆盖探针自带次数，原库不重建即可快速看慢/差异；
+    //   完整复测/验收不加该参数用自带次数全量跑）。
     if has(&args, "--sql-run") {
         let url = arg(&args, "--url", "mysql://root@127.0.0.1:3308");
         let out = arg(&args, "--out", "results-sqlrun");
         let table = arg(&args, "--table", "t");
         let only = arg(&args, "--only", "");
-        std::process::exit(sqlrun::run(&url, &out, &table, &only));
+        let reps: usize = arg(&args, "--reps", "0").parse().unwrap_or(0);
+        std::process::exit(sqlrun::run(&url, &out, &table, &only, reps));
     }
 
     // 宽表数据集装载（--wide-load --url <mysql://...> --rows N --procs P [--table T]）：

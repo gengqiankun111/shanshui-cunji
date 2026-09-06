@@ -94,7 +94,7 @@ fn txn_agg_mk(_r: &mut StdRng, _c: &Ctx, _i: usize) -> String {
     String::new()
 }
 
-pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
+pub fn run(url: &str, out: &str, table: &str, only: &str, reps: usize) -> i32 {
     let _ = TAB.set(table.to_string());
     // --only 过滤：空 = 全量；支持逗号分隔（如 "txn_lock_wait,txn_lock_mid_contend"）
     let want: Vec<&str> = only.split(',').filter(|s| !s.is_empty()).collect();
@@ -552,7 +552,9 @@ pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
         let mut rows = 0usize;
         let mut detail = String::new();
         let mut err_txt = String::new();
-        for i in 0..p.n {
+        // --reps 增量模式：每条命令只跑 N 次（≤ 探针自带 n），原库不重建快速看慢/差异
+        let n_run = if reps > 0 { reps.min(p.n) } else { p.n };
+        for i in 0..n_run {
             let sql = (p.sql)(&mut rng, &ctx, i);
             let t0 = Instant::now();
             let r = match p.kind {
@@ -597,9 +599,9 @@ pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
             format!("  ❌ {err_txt}")
         };
         let note = format!("| {} | {} | {} | {} | {}/{} | {} | {:.2} | {:.2} | {:.2} | {:.2} |{}",
-                           idx + 1, p.cat, p.name, p.note, ok, p.n, rows, mean, p50, p99, mx, tail);
+                           idx + 1, p.cat, p.name, p.note, ok, n_run, rows, mean, p50, p99, mx, tail);
         println!("[{:02}] {} {:<22} ok={}/{} rows={} mean={:.2}ms p50={:.2} p99={:.2} max={:.2}{}",
-                 idx + 1, p.cat, p.name, ok, p.n, rows, mean, p50, p99, mx, tail);
+                 idx + 1, p.cat, p.name, ok, n_run, rows, mean, p50, p99, mx, tail);
         md.push_str(&note);
         md.push('\n');
     }
