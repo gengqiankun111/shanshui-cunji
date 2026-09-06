@@ -1772,6 +1772,25 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   - 单测：p131_live_window_ids_matches_keys_only_scan（live 窗口 == keys-only 现存：删行/limit/
     复活/边缘）+ p131 既有 4 项；全量 lib **783 通过 + 3 ignored**（+4）。
 
+**P133（Ex-8.9 交变负载 A/B 验收收口：忙窗读 p99 探针补全 + 4/4 复验，2026-09-06）**
+- 背景：Ex-8.9 切片 2A（server 层 3 worker 负载感知三档 tick + idle_run）2026-09-04 已落地，但
+  development_remain 状态「交变验收待做」与设计文档 §6「3/3 已验（24.75s）」不一致——跟踪未回填，
+  且 §6 的「前台 busy 耗时 ≈4.0s/轮 持平」是整轮 burst 耗时代理（写锁内测量），**无前台并发读的
+  逐操作 p99 探针**（后台维护是否侵蚀忙窗读延迟未直接测）。
+- 补测试（server/tests.rs `ex89_ab_busy_read_p99_no_degradation`，`#[ignore]` 真实时钟）：
+  无信号 L0 积压（auto_compact 关，8000×1KB 再 flush → L0 5）→ A（aware）≥5s 空闲 idle_run 收敛
+  vs B（旧固定节奏）滞留 → 忙窗点读探针（命中散布 + 区间外 miss 混合，miss 逐段布隆校验 → 延迟对
+  L0 段数敏感）逐操作计时取 p50/p99；final 测前 400 次 warmup（避 compaction/flush 换新段首触冷
+  IO 抬 p99——首版 19.3µs 尖峰即此，warmup 后 2.4µs）。
+- 实测（debug，2026-09-06）：B l0 1→5→5（滞留），A l0 1→5→0（5.2s idle_run 收敛）；
+  忙窗读 p50/p99：A **2.0/4.6µs** vs B **2.2/17.1µs**（A 收敛态不劣于自身干净基态 5.8µs p99，
+  p99 明显优于滞留积压的 B——收敛后单段读 vs 5 段逐段布隆）。断言：A l0_final≤2、A p99_final ≤
+  干净基态 ×1.8（后台维护不使忙窗读退化）、A p50/p99 ≤ B ×1.2。
+- 复验：4/4 A/B 测试（倒排落盘 mem 跨窗归零 vs 240k 滞留 / compaction idle_run 5.2s 收敛 vs 滞留 /
+  GC 12→1 vs 12 / busy 读 p99 4.6 vs 17.1µs）23.5s 全过；全量 lib **783 通过 + 3 ignored** 无回归
+  （新测试计入 ignored，非编译/运行态）。
+- 收口：development_remain Ex-8.9 行状态 → ✅（引用本条目）；设计文档 §6 增第 4 行 + 复验注。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

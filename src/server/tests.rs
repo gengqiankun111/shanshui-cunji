@@ -2043,6 +2043,119 @@ use crate::multitable::drop_table_range;
         }
     }
 
+    /// 交变负载 A/B（忙窗读 p99）：无信号 L0 积压（auto_compact 关）→ 前台**忙窗点读探针**
+    /// （命中 + 区间外 miss 混合，miss 逐段布隆校验 → 延迟对 L0 段数敏感）逐操作计时。
+    /// A（idle_aware）：≥5s 空闲 idle_run 收敛 L0 → 忙窗读 p50/p99 不劣化（≈ 收敛前干净态）；
+    /// B（旧固定节奏）：无信号不收敛 → 同探针在更多 L0 段上读，p50/p99 显著更差。
+    /// 验收判据：A 收敛态 p99 ≤ 自身干净基线 ×1.8（后台维护不使忙窗读退化）且 ≤ B 积压态 p99
+    /// （同数据集同探针下 A 收敛段数少 → 忙窗读不劣于滞留积压的旧节奏）。
+    #[test]
+    #[ignore = "Ex-8.9 交变负载 A/B 验收（真实时钟，--ignored 手动跑）"]
+    fn ex89_ab_busy_read_p99_no_degradation() {
+        // 忙窗点读探针：命中散布 + 区间外 miss 穿插；返回 (p50, p99) µs
+        fn probe(server: &DbServer, n: usize) -> (f64, f64) {
+            let span = 8_000u64;
+            let mut lat: Vec<f64> = Vec::with_capacity(n);
+            for i in 0..n as u64 {
+                // miss 集中在 [span, span+8190)（全部超过 docid 9999 → 必 miss，逐段布隆校验）
+                let id = if i % 2 == 1 { span + (i % 4096) * 2 } else { (i * 2654435761) % span };
+                let t0 = std::time::Instant::now();
+                let _ = server.engine.read().unwrap().get(id).unwrap();
+                lat.push(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p = |q: f64| lat[(q * (lat.len() - 1) as f64) as usize];
+            (p(0.50), p(0.99))
+        }
+
+        let mut a_final: Option<(f64, f64)> = None;
+        let mut b_final: Option<(f64, f64)> = None;
+        for (label, aware) in [("B 旧固定节奏(aware=off)", false), ("A 空闲感知(aware=on)", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = crate::config::Config::default();
+            cfg.storage.auto_compact = false; // 积压仅靠 idle_run 收敛（无写路径信号路径）
+            cfg.storage.l0_stall_min = 2;
+            cfg.storage.l0_stall_max = 64;
+            cfg.storage.l0_stall_threshold = 2;
+            cfg.memtable.max_size_mb = 2;
+            cfg.storage.group_commit_us = 2000;
+            let engine = Engine::open(dir.path(), &cfg).unwrap();
+            let mut server = DbServer::new(engine, "root", "");
+            // 干净基线态：2MB（2000 × 1KB）→ flush → 单段附近
+            {
+                let mut g = server.engine.write().unwrap();
+                for i in 0..2_000u64 {
+                    g.put_nosync(i, vec![b'x'; 1024], &[]).unwrap();
+                }
+                g.flush_primary().unwrap();
+                g.flush_wal().unwrap();
+            }
+            let l0_base = server.engine.read().unwrap().primary_l0_count();
+            let (p50_base, p99_base) = probe(&server, 1500);
+            // 积压：再 8MB（8000 × 1KB）→ 写中多次 flush → L0 增 ~4~5
+            {
+                let mut g = server.engine.write().unwrap();
+                for i in 2_000..10_000u64 {
+                    g.put_nosync(i, vec![b'x'; 1024], &[]).unwrap();
+                }
+                g.flush_primary().unwrap();
+                g.flush_wal().unwrap();
+            }
+            let l0_back = server.engine.read().unwrap().primary_l0_count();
+            assert!(l0_back >= 4, "{label}: 积压应使 L0≥4（实际 {l0_back}）");
+            server.set_idle_aware(aware);
+            server.spawn_compaction_worker();
+            server.spawn_inverted_gc_worker();
+            server.spawn_inverted_flush_worker();
+            if aware {
+                // A：≥5s 连续空闲 idle_run → targets.run 收敛 L0；20s 上限
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                loop {
+                    if !server.engine.read().unwrap().needs_compact() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "A：idle_run 未能在时限内收敛 L0 积压"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            } else {
+                // B：无 idle_run → 积压滞留（等 6s，对齐其它 A/B 测试口径）
+                std::thread::sleep(std::time::Duration::from_secs(6));
+                assert!(
+                    server.engine.read().unwrap().needs_compact(),
+                    "B：旧固定节奏无信号不应收敛"
+                );
+            }
+            // 忙窗读探针（同一混合形态：命中 + miss；先 warmup 预热收敛后新文件的元数据/块缓存，
+            // 避免 compaction/flush 换新段后的首触冷 IO 抬 p99——测的是稳态忙窗延迟而非冷缓存）
+            let _ = probe(&server, 400);
+            let (p50_final, p99_final) = probe(&server, 1500);
+            let l0_final = server.engine.read().unwrap().primary_l0_count();
+            eprintln!(
+                "[{label}] l0={l0_base}→{l0_back}→{l0_final} p50={p50_base:.1}→{p50_final:.1}µs p99={p99_base:.1}→{p99_final:.1}µs"
+            );
+            if aware {
+                assert!(l0_final <= 2, "A：idle_run 应收敛 L0（{l0_back} → {l0_final}）");
+                assert!(
+                    p99_final <= p99_base * 1.8,
+                    "A：后台维护不应使忙窗读 p99 退化（干净基态 {p99_base:.1} → {p99_final:.1}µs）"
+                );
+                a_final = Some((p50_final, p99_final));
+            } else {
+                assert!(l0_final >= 4, "B：L0 积压应滞留（实际 {l0_final}）");
+                b_final = Some((p50_final, p99_final));
+            }
+        }
+        // 同数据集同探针：A（idle_run 收敛段数少）忙窗读不劣于 B（积压滞留）
+        let (a50, a99) = a_final.unwrap();
+        let (b50, b99) = b_final.unwrap();
+        eprintln!("A 忙窗读 p50={a50:.1}µs p99={a99:.1}µs vs B p50={b50:.1}µs p99={b99:.1}µs");
+        assert!(a50 <= b50 * 1.2, "A 忙窗读 p50 不应劣于 B（A {a50:.1} vs B {b50:.1}µs）");
+        assert!(a99 <= b99 * 1.2, "A 忙窗读 p99 不应劣于 B（A {a99:.1} vs B {b99:.1}µs）");
+    }
+
     // ---------- 集成：协议往返 ----------
 
     /// 测试客户端：连接 → 握手 → 认证 → 查询。
