@@ -230,6 +230,21 @@ impl Engine {
         if let Some(bm) = &self.deletion_bitmap {
             out.retain(|(d, _)| !bm.is_deleted(*d));
         }
+        // P131（2026-09-06）：Delta Merge-on-Read 接入快照扫描——RR/SERIALIZABLE 只合成
+        // `patch_seq ≤ snapshot` 的增量（§11 统一版本规则：倒排/任意 RR 查询读到的行值 =
+        // 快照点 base + 可见增量）；RC 合成当前视图。置于 read_own 覆盖之前（后者整值替换）。
+        let overrides = if snapshot == u64::MAX {
+            self.delta_overrides_range(start, end)?
+        } else {
+            self.delta_overrides_range_at(start, end, snapshot)?
+        };
+        if !overrides.is_empty() {
+            for row in out.iter_mut() {
+                if let Some(ov) = overrides.get(&row.0) {
+                    row.1 = crate::engine::read::fold_with_overrides(&row.1, Some(ov))?;
+                }
+            }
+        }
         // 同事务写覆盖：write_set 中的 docid 用 read_own 值替换/排除
         for row in out.iter_mut() {
             if let Some(own) = txn.read_own(row.0) {

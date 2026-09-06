@@ -1725,6 +1725,30 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 待办（压测采集）：rr sqlrun 多表负载压测采集 `shanshui_l0_sst_count{table=}` 验证稳态
   每表 ≤1 段 + `shanshui_per_table_compact_runs_total`/`sst_written_bytes` 写放大 ≈2× 回填。
 
+**P132（P131 增量 UPDATE 落地：Delta CF 路线 + 快照 Delta 多版本坍缩修复 + 扫描 Merge-on-Read 补全，2026-09-06）**
+- 背景/决策：P131 初案「value 内嵌 wrapper（`__sp_base/__sp_p`）」demo 通过但 base+p 字节 ≥ 整 doc
+  （写字节不减）暂缓；用户 2026-09-06 选定**复用既有 Delta CF**（`Engine::patch` 字段级增量，
+  docid++field 键、每 patch 自带全局 seq）实现「非索引列 UPDATE 免整行重写」，并要求**统一增量 MVCC
+  版本规则**：倒排索引与一切 RR 查询都必须 MVCC——增量只对 ≥ 其 seq 的快照可见（设计 research/delta-patch.md §10/§11）。
+- 落地（内核）：
+  1. 写：dml `update_response` 单字段字面量 SET——**声明配置下**（`term_inc.is_some()`）且列 ∉
+     term 声明 ∪ 组合索引 ∪ {id/docid/doc}、非自增表达式、base 行存在 → `Engine::patch_batch`
+     （新增，批尾单次 flush_wal；`patch` 重构为 nosync+组提交，与 put 同构）；索引列 / 整 doc /
+     表达式 / 无声明配置（legacy 全字段 term，避免陈旧 posting）→ 全量路径不变。
+  2. 读（Merge-on-Read 补全缺口）：新增 `delta_overrides_range(_at)`（底层 Delta CF `scan_stream_at`
+     snapshot 语义）+ `fold_with_overrides(_fields)` 折叠 helpers；接入 scan_range / scan_range_paged /
+     scan_after / scan_stream / scan_stream_fields / scan_stream_with_zonepred / scan_stream_parallel
+     （project 白名单合成）+ txn `scan_range_txn`（RR 快照按 seq 门控）；无增量时 `data_empty()` 短路
+     = 干净库零开销。
+  3. **修复既有隐患（get_at Delta 多版本坍缩）**：旧路径 `scan_raw_range_with_seq` 先按每键最新坍缩
+     再按 snapshot 过滤 → 同一字段键两次 patch（补丁1 < 快照 < 补丁2）时快照读丢补丁1（误读 base 旧值）；
+     改走 `delta_overrides_range_at`（CF scan_stream_at 各源归并后取 ≤ snapshot 最大 seq）→ 快照读见补丁1。
+- 一致性边界（沿用「最新态候选 + 行级复核」索引模型 §11.5）：term/posting 只加不删，陈旧 docid 由
+  行级 WHERE 重算兜底；增量列恒非索引 ⇒ posting 形态零扰动；声明列变更走全量重写维持模型。
+- 验证：4 新增单测（patch_batch 扫描/快照可见 + 不坍缩、scan_range_txn RR 门控、SQL UPDATE 非索引列
+  落 Delta CF 且 posting 不扰动/同值 affected 0/声明列全量）；全量 lib **782 通过 + 3 ignored**（+3）。
+- 待办：值变形态 #75 压测回填（目标：非索引列 UPDATE 写链 ~1ms 增量级；#75 mean 10.5 → ~6-7ms）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

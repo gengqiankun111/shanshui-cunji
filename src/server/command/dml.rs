@@ -320,14 +320,33 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
             // put_batch 攒批提交（倒排/组合索引/位图随 put_nosync 同步，批尾单次 flush_wal），
             // 替代旧逐行 engine.get + engine.put（每行独立 WAL 提交/看门狗/热缓存开销）。
             // P131b：term 声明白名单（None=无声明保持全字段现行为）——只生成声明字段 term。
+            // P131：非索引列单字段字面量赋值 → Delta CF 字段增量（免整行重写/免全量解码，
+            // 读现值只取目标列比较；同值跳过对齐 affected=0）。
             let term_inc = engine.term_index_fields();
+            // 索引/保留列集合 = term 声明（倒排/fulltext/stats/bitmap）∪ 组合索引字段 ∪ {id/docid/doc}。
+            // P131 一致性守卫：仅当存在索引声明（term_inc.is_some()，写路径 term = 声明字段
+            // 白名单）时，未声明列才可走 Delta——无声明（legacy 全字段 term）时任何列都有 posting，
+            // 增量会留陈旧 term → 一律全量重写维持索引一致。
+            let mut non_delta: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let delta_enabled = term_inc.is_some();
+            if let Some(s) = &term_inc {
+                non_delta.extend(s.iter().cloned());
+            }
+            for fg in &engine.composite_indexes {
+                non_delta.extend(fg.iter().cloned());
+            }
+            non_delta.insert("id".into());
+            non_delta.insert("docid".into());
+            non_delta.insert("doc".into());
             let mut n = 0u64;
             for chunk in ids.chunks(1000) {
                 let cur = match engine.batch_get(chunk) {
                     Ok(v) => v,
                     Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                 };
-                let mut items: Vec<(u64, Vec<u8>, Vec<String>)> = Vec::with_capacity(chunk.len());
+                let mut items_full: Vec<(u64, Vec<u8>, Vec<String>)> = Vec::with_capacity(chunk.len());
+                let mut items_delta: Vec<(u64, Vec<(String, serde_json::Value)>)> = Vec::new();
+                let inc = parse_increment_expr(&field, &expr);
                 for (&id, cur_opt) in chunk.iter().zip(cur.into_iter()) {
                     let old_bytes: Option<&[u8]> = cur_opt.as_deref();
                     // 整体替换（field=doc）
@@ -341,10 +360,29 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                             Ok(t) => t,
                             Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                         };
-                        items.push((id, raw.into_bytes(), terms));
+                        items_full.push((id, raw.into_bytes(), terms));
                         continue;
                     }
-                    // 读当前文档 → 字段级修改 → 覆盖写回（缺失/删除 id 视为空文档：与旧单 id 语义一致）
+                    // P131 delta：声明配置下非索引列 + 纯字面量赋值（不依赖旧值）→ Delta CF 字段增量
+                    if delta_enabled && inc.is_none() && !non_delta.contains(&field.to_lowercase()) {
+                        if let Some(ob) = old_bytes {
+                            let new_val = serde_json::Value::String(unquote(&expr));
+                            // 同值跳过（affected=0）：现值折叠读后目标列已 == 新值 → 不写增量
+                            if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(ob) {
+                                let same = doc
+                                    .get(&field)
+                                    .map(|v| v == &new_val)
+                                    .unwrap_or(false);
+                                if same {
+                                    continue;
+                                }
+                            }
+                            items_delta.push((id, vec![(field.clone(), new_val)]));
+                            continue;
+                        }
+                        // base 行缺失（孤例）→ 回落下方全量路径（以空文档构建）
+                    }
+                    // 全量路径：读当前文档 → 字段级修改 → 覆盖写回（缺失/删除 id 视为空文档）
                     let mut doc: serde_json::Value = match old_bytes {
                         Some(v) => serde_json::from_slice(v)
                             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
@@ -362,7 +400,6 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                     }
                     let new_doc = serde_json::to_string(&doc).unwrap_or_default();
                     // MySQL affected 对齐：字段变换后文档未变（赋值同值）→ 跳过写
-                    // （免无条件读-改-写整文档 + 倒排重索引 → 同键多版本堆积 + 多轮基准漂移）
                     if old_bytes == Some(new_doc.as_bytes()) {
                         continue;
                     }
@@ -370,12 +407,21 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                         Ok(t) => t,
                         Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                     };
-                    items.push((id, new_doc.into_bytes(), terms));
+                    items_full.push((id, new_doc.into_bytes(), terms));
                 }
-                match engine.put_batch(&items) {
-                    Ok(()) => n += items.len() as u64,
-                    Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                if !items_full.is_empty() {
+                    match engine.put_batch(&items_full) {
+                        Ok(()) => {}
+                        Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                    }
                 }
+                if !items_delta.is_empty() {
+                    match engine.patch_batch(&items_delta) {
+                        Ok(()) => {}
+                        Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
+                    }
+                }
+                n += (items_full.len() + items_delta.len()) as u64;
             }
             QueryResponse::Ok(n, 0)
         }

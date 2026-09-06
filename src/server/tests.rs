@@ -1370,6 +1370,105 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn p131_sql_update_nonindexed_col_uses_delta_cf_and_index_stays_consistent() {
+        // P131 集成（2026-09-06）：声明配置（bitmap status）下 SQL UPDATE 非索引列 note
+        // → 走 Delta CF（增量写几十字节，0 索引动作）；倒排 posting 不变、SQL 后过滤可见新值；
+        // 同值第二次 → affected 0；声明列（status）更新仍全量重写（posting 精确变更）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.bitmap_fields = vec!["status".into()];
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        for i in 1..=200u64 {
+            // 偶数 active（status posting 100 行）、奇数 closed —— WHERE active 候选 = 偶数集
+            let (status, term): (&str, &str) = if i % 2 == 0 {
+                ("active", "status=active")
+            } else {
+                ("closed", "status=closed")
+            };
+            let doc = serde_json::json!({"status": status, "note": format!("n{i}")});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[term]).unwrap();
+        }
+        e.flush_wal().unwrap();
+        assert!(e.delta.data_empty(), "起始无增量");
+        let before = e.inverted_posting("status=active").unwrap().len();
+        assert_eq!(before, 100, "posting 基线 100（仅偶数 active）");
+        // ① 非索引列 UPDATE（LIMIT 50，升序 active 2..=100）
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET note='x9' WHERE id BETWEEN 1 AND 100 AND status='active' LIMIT 50",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 50, "note 值变应影响 50"),
+            super::QueryResponse::Err(c, m) => panic!("update note 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        assert!(!e.delta.data_empty(), "非索引列 UPDATE 应落 Delta CF（增量非空）");
+        // ② 倒排一致性：status posting 精确不变（note 无 term 动作）
+        assert_eq!(
+            e.inverted_posting("status=active").unwrap().len(),
+            100,
+            "note 增量不得扰动 status posting"
+        );
+        // ③ 行值已折叠（点读 + 扫描）：偶数 2..=100 note=x9
+        for i in 1..=100u64 {
+            if i % 2 == 0 {
+                let obj: serde_json::Value =
+                    serde_json::from_slice(&e.get(i).unwrap().unwrap()).unwrap();
+                assert_eq!(obj["note"], "x9", "doc{i} note 应折叠为 x9");
+            }
+        }
+        let mut n_x9 = 0u64;
+        e.scan_stream(Some(1), Some(100), |_, v| {
+            let obj: serde_json::Value = serde_json::from_slice(v).unwrap();
+            if obj["note"] == "x9" {
+                n_x9 += 1;
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(n_x9, 50, "窗口扫描折叠后 x9 命中 50");
+        // ④ SQL 后过滤（server 读路径）可见增量列
+        let rows = crate::sqlish::execute_with_tid(
+            &e,
+            "SELECT id,note FROM documents WHERE note='x9' LIMIT 200",
+            10_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 50, "SQL WHERE note='x9' 扫描后过滤应命中 50");
+        // ⑤ 同值第二次 → 0（增量跳过，不堆积版本）
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET note='x9' WHERE id BETWEEN 1 AND 100 AND status='active' LIMIT 50",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 0, "同值再更新影响 0"),
+            super::QueryResponse::Err(c, m) => panic!("update note2 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        // ⑥ 声明列（status）更新 → 全量重写（非增量）：行值精确更新；
+        // posting 为「最新态候选 + 行级复核」模型（§11.5）——原始 posting 只加不删，
+        // 精确性由行级 WHERE 重算兜底（下述 SELECT 应排除 doc2）。
+        match super::update_response(
+            &mut e,
+            "UPDATE documents SET status='closed' WHERE id=2",
+        ) {
+            super::QueryResponse::Ok(n, _) => assert_eq!(n, 1),
+            super::QueryResponse::Err(c, m) => panic!("update status 失败: {c} {m}"),
+            super::QueryResponse::Set { .. } => panic!("DML 不应返回 Set"),
+        }
+        let obj2: serde_json::Value =
+            serde_json::from_slice(&e.get(2).unwrap().unwrap()).unwrap();
+        assert_eq!(obj2["status"], "closed", "doc2 status 全量写回后为 closed");
+        let r_active2 = crate::sqlish::execute_with_tid(
+            &e,
+            "SELECT id FROM documents WHERE status='active' AND id=2",
+            10_000,
+            0,
+        )
+        .unwrap();
+        assert!(r_active2.is_empty(), "doc2 已 closed → active 查询行级重算排除");
+    }
+
+    #[test]
     fn p127_b_select_combo_pk_range_no_id_field_in_doc() {
         // P127 分支 B（真实形态）：cjserver INSERT 的 id 列提取为主键、**文档 JSON 无 id 字段**
         // → 组合 `id BETWEEN ∩ status=` 此前 executor 字段语义求值恒 0 行慢查（110 万验收实测

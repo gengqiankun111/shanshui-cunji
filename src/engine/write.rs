@@ -452,12 +452,24 @@ impl Engine {
     /// 部分更新（阶段 1.5，design 4.7）：仅写入变更字段到 Delta CF（几十字节小记录），
     /// 读取时 Merge-on-Read 覆盖 Base；`null` 值表示删除该字段。替代全量 PUT，写入 IO 放大趋近 1。
     /// Task-026：per-CPU 启用时整次 patch 单 gseq 组。
+    /// P131（2026-09-06）：组提交时机对齐 `put`（nosync 入组 → 组提交窗口统一 fsync）。
     pub fn patch(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
-        percpu_write!(self, self.patch_inner(docid, fields))
+        self.patch_nosync(docid, fields)?;
+        self.maybe_group_commit()
     }
 
-    /// patch 主体（语义不变，被 per-CPU 写批次 scope 包裹）。
-    fn patch_inner(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
+    /// patch_nosync：不入组提交的字段增量（批量调用方攒批后自行 flush_wal，见 patch_batch）。
+    /// Task-026：per-CPU 启用时以单 gseq 组包裹（跨 CF 条目同组 → 崩溃回放原子）。
+    fn patch_nosync(&mut self, docid: u64, fields: &[(&str, serde_json::Value)]) -> Result<()> {
+        percpu_write!(self, self.patch_nosync_inner(docid, fields))
+    }
+
+    /// patch_nosync 主体（语义不变，被 per-CPU 写批次 scope 包裹；不触发组提交）。
+    fn patch_nosync_inner(
+        &mut self,
+        docid: u64,
+        fields: &[(&str, serde_json::Value)],
+    ) -> Result<()> {
         self.hotcache.invalidate(docid);
         for (f, v) in fields {
             let mut key = encode_docid(docid).to_vec();
@@ -466,7 +478,25 @@ impl Engine {
                 serde_json::to_vec(v).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
             self.delta.put_bytes_nosync(key, val)?;
         }
-        self.maybe_group_commit()
+        Ok(())
+    }
+
+    /// P131（2026-09-06）：批量字段增量（原子批次，语义对齐 `put_batch`）——多个 docid 的
+    /// 字段 patch 攒批写入，批尾单次 `flush_wal` 统一提交（免逐行组提交等待；per-CPU 下
+    /// 整批经 nosync 单 gseq 组 + 批尾 drain）。SQL 单列 UPDATE（非索引列）落此路径。
+    pub fn patch_batch(
+        &mut self,
+        items: &[(u64, Vec<(String, serde_json::Value)>)],
+    ) -> Result<()> {
+        self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
+        for (docid, fields) in items {
+            let refs: Vec<(&str, serde_json::Value)> = fields
+                .iter()
+                .map(|(f, v)| (f.as_str(), v.clone()))
+                .collect();
+            self.patch_nosync(*docid, &refs)?;
+        }
+        self.flush_wal()
     }
 
     /// 入队 outbox 消息（Ex-1.1）：docid + 全局 seq 幂等键，与业务写共享 fsync 点

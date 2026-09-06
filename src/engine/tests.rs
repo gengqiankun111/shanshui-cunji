@@ -3676,3 +3676,121 @@ use crate::optimizer::QuerySpec;
         assert!(prom.contains("shanshui_l0_sst_over_trigger{table=\"5\",trigger=\"2\"} 0"));
         assert!(prom.contains("shanshui_per_table_compact_runs_total 0"));
     }
+
+    // ---------- P131（2026-09-06）：Delta CF 增量 UPDATE + 扫描/快照 Merge-on-Read ----------
+
+    #[test]
+    fn p131_patch_batch_visible_via_scans_and_snapshot() {
+        // patch_batch 字段增量 → 全部值输出路径（get/batch_get/scan_range/scan_stream/
+        // scan_stream_fields/scan_range_paged）合成；RR 快照（patch 前）仍读旧值；
+        // 同一字段两次 patch（补丁1 < 快照 < 补丁2）→ 快照读须见补丁1（不坍缩修复）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=5u64 {
+            let doc = serde_json::json!({"status": "active", "note": format!("n{i}"), "k": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        let snap_before = e.begin_snapshot(); // 全部 patch 之前
+        // 批 patch：doc3.note=x、doc4.note=y（单次提交）
+        e.patch_batch(&[
+            (3, vec![("note".into(), serde_json::json!("x"))]),
+            (4, vec![("note".into(), serde_json::json!("y"))]),
+        ])
+        .unwrap();
+        let snap_after_x = e.begin_snapshot(); // x 已提交
+        // 补丁 2：doc3.note=z（覆盖同列，版本 seq 更新）
+        e.patch(3, &[("note", serde_json::json!("z"))]).unwrap();
+
+        // ① 点读 / 批量（最新视图）
+        let v3: serde_json::Value =
+            serde_json::from_slice(&e.get(3).unwrap().unwrap()).unwrap();
+        assert_eq!(v3["note"], "z", "最新视图 note=z");
+        let got = e.batch_get(&[3, 4]).unwrap();
+        let g4: serde_json::Value = serde_json::from_slice(got[1].as_ref().unwrap()).unwrap();
+        assert_eq!(g4["note"], "y", "batch_get 合成 doc4");
+        // ② RR 快照：patch 前快照 → 旧值 n3
+        let s3: serde_json::Value =
+            serde_json::from_slice(&e.get_at(3, snap_before).unwrap().unwrap()).unwrap();
+        assert_eq!(s3["note"], "n3", "patch 前快照读旧值");
+        // ③ 不坍缩：snap_after_x（x 已提交、z 未提交时点）→ 快照读须见 x 而非 base n3
+        let m3: serde_json::Value =
+            serde_json::from_slice(&e.get_at(3, snap_after_x).unwrap().unwrap()).unwrap();
+        assert_eq!(m3["note"], "x", "多版本不坍缩：快照读见补丁1(x) 而非 base");
+        // ④ 扫描族合成
+        let rows = e.scan_range(None, None).unwrap();
+        assert_eq!(rows.len(), 5, "扫描行数不变（增量不改 docid 集）");
+        for (d, v) in &rows {
+            let obj: serde_json::Value = serde_json::from_slice(v).unwrap();
+            let expect = match *d {
+                3 => "z",
+                4 => "y",
+                _ => continue,
+            };
+            assert_eq!(obj["note"], expect, "scan_range 合成 doc{d}");
+        }
+        // scan_stream
+        let mut seen = std::collections::HashMap::new();
+        e.scan_stream(None, None, |d, v| {
+            let obj: serde_json::Value = serde_json::from_slice(v).unwrap();
+            seen.insert(d, obj["note"].as_str().unwrap().to_string());
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(seen.get(&3).unwrap(), "z");
+        assert_eq!(seen.get(&4).unwrap(), "y");
+        // scan_stream_fields（投影）
+        let mut n3 = None;
+        e.scan_stream_fields(None, None, vec!["note".into()], |d, v| {
+            if d == 3 {
+                n3 = Some(v.to_vec());
+            }
+            Ok(true)
+        })
+        .unwrap();
+        let p3: serde_json::Value = serde_json::from_slice(n3.unwrap().as_slice()).unwrap();
+        assert_eq!(p3["note"], "z", "投影扫描合成 note");
+        // scan_range_paged
+        let paged = e.scan_range_paged(None, None, Some(10), 0).unwrap();
+        for (d, v) in &paged.rows {
+            let obj: serde_json::Value = serde_json::from_slice(v).unwrap();
+            if *d == 3 {
+                assert_eq!(obj["note"], "z", "分页扫描合成");
+            }
+        }
+        // keys-only / count 不受影响
+        assert_eq!(e.count_all_docs().unwrap(), 5, "计数不受增量影响");
+    }
+
+    #[test]
+    fn p131_scan_range_txn_snapshot_merges_delta_gated() {
+        // RR 事务范围扫描（scan_range_txn）：快照在 patch 前 → 旧值；RC → 最新合成值。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=3u64 {
+            let doc = serde_json::json!({"status": "active", "note": format!("n{i}")});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        // RR 事务（快照在 patch 前）
+        let mut txn_a = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+        // 事务外 patch（模拟并发提交）
+        e.patch(2, &[("note", serde_json::json!("patched"))]).unwrap();
+        let rows = e.scan_range_txn(&mut txn_a, None, None).unwrap();
+        for (d, v) in &rows {
+            let obj: serde_json::Value = serde_json::from_slice(v).unwrap();
+            if *d == 2 {
+                assert_eq!(obj["note"], "n2", "RR 快照在 patch 前 → 旧值");
+            }
+        }
+        e.txn_commit(txn_a).unwrap();
+        // RC 事务 → 最新合成值
+        let mut txn_c = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+        let rows2 = e.scan_range_txn(&mut txn_c, None, None).unwrap();
+        for (d, v) in &rows2 {
+            let obj: serde_json::Value = serde_json::from_slice(v).unwrap();
+            if *d == 2 {
+                assert_eq!(obj["note"], "patched", "RC 扫描合成最新值");
+            }
+        }
+        e.txn_commit(txn_c).unwrap();
+    }
+

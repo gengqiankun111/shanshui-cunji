@@ -93,6 +93,8 @@ impl Engine {
         let cap = limit.unwrap_or(u64::MAX);
         let sk = start.map(|s| crate::keys::encode_docid(s).to_vec());
         let ek = end.map(|e| crate::keys::encode_docid(e).to_vec());
+        // P131：Delta Merge-on-Read（收集行折叠；无增量零开销）
+        let ovs = self.delta_overrides_range(start, end)?;
         let mut rows = Vec::new();
         let mut skipped = 0u64;
         let mut total = 0u64;
@@ -109,7 +111,13 @@ impl Engine {
                 let docid = crate::keys::decode_docid(key).map_err(|_| {
                     crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
                 })?;
-                rows.push((docid, val.to_vec()));
+                match ovs.get(&docid) {
+                    Some(ov) => {
+                        let merged = crate::engine::read::fold_with_overrides(val, Some(ov))?;
+                        rows.push((docid, merged));
+                    }
+                    None => rows.push((docid, val.to_vec())),
+                }
                 Ok(true)
             })?;
         Ok(PagedRows { total, rows })
@@ -127,6 +135,11 @@ impl Engine {
     ) -> Result<Vec<QueryRow>> {
         let start = after.map(|a| encode_docid(a.saturating_add(1)).to_vec());
         let ek = end.map(|e| encode_docid(e).to_vec());
+        // P131：Delta Merge-on-Read（收集行折叠；无增量零开销）
+        let ovs = self.delta_overrides_range(
+            after.map(|a| a.saturating_add(1)),
+            end,
+        )?;
         let mut rows = Vec::new();
         self.primary
             .scan_stream(start.as_deref(), ek.as_deref(), |key, val| {
@@ -136,24 +149,43 @@ impl Engine {
                 let docid = crate::keys::decode_docid(key).map_err(|_| {
                     crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
                 })?;
-                rows.push((docid, val.to_vec()));
+                match ovs.get(&docid) {
+                    Some(ov) => {
+                        let merged = crate::engine::read::fold_with_overrides(val, Some(ov))?;
+                        rows.push((docid, merged));
+                    }
+                    None => rows.push((docid, val.to_vec())),
+                }
                 Ok(true)
             })?;
         Ok(rows)
     }
 
     /// 主键范围扫描。
+    /// P131（2026-09-06）：Delta Merge-on-Read——窗口内字段增量一次性收集（无增量零开销），
+    /// 命中行折叠合成（覆盖 → parse+apply+serialize；无覆盖 → 原字节直通）。
     pub fn scan_range(&self, start: Option<u64>, end: Option<u64>) -> Result<Vec<QueryRow>> {
         let mut rows = self.primary.scan_range(start, end)?;
         // Ex-8.1：删除位图语义对齐（get 不可见 → scan 也不返回已删 docid）
         if let Some(bm) = &self.deletion_bitmap {
             rows.retain(|(d, _)| !bm.is_deleted(*d));
         }
+        if !rows.is_empty() {
+            let ovs = self.delta_overrides_range(start, end)?;
+            if !ovs.is_empty() {
+                for (d, v) in rows.iter_mut() {
+                    if let Some(ov) = ovs.get(d) {
+                        *v = crate::engine::read::fold_with_overrides(v, Some(ov))?;
+                    }
+                }
+            }
+        }
         Ok(rows)
     }
 
     /// 流式主键范围扫描（design 20.5 导出管道）：回调按 docid 升序收到 `(docid, value)`；
     /// 返回 `false` 提前终止（取满批/游标续扫）。内存 O(批)，不随扫描总量膨胀。
+    /// P131：Delta Merge-on-Read（命中行折叠；无增量零开销）。
     pub fn scan_stream<F: FnMut(u64, &[u8]) -> Result<bool>>(
         &self,
         start: Option<u64>,
@@ -162,6 +194,7 @@ impl Engine {
     ) -> Result<()> {
         let sk = start.map(|s| encode_docid(s).to_vec());
         let ek = end.map(|e| encode_docid(e).to_vec());
+        let ovs = self.delta_overrides_range(start, end)?;
         self.primary.scan_stream(sk.as_deref(), ek.as_deref(), |key, val| {
             let docid = decode_docid(key).map_err(|_| {
                 crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
@@ -172,13 +205,20 @@ impl Engine {
                     return Ok(true);
                 }
             }
-            f(docid, val)
+            match ovs.get(&docid) {
+                Some(ov) => {
+                    let merged = crate::engine::read::fold_with_overrides(val, Some(ov))?;
+                    f(docid, &merged)
+                }
+                None => f(docid, val),
+            }
         })
     }
 
     /// P91：投影列流式扫描（最新视图）——语义同 `scan_stream`，但 SST 端按 `fields`
     /// 投影解码（PAX 块只解所需列 → 子集 JSON；行式/内存直通原 JSON 字节）。
     /// 消费端只读 `fields` 覆盖列（须含 WHERE 引用 + 分组 + 聚合字段全集）。
+    /// P131：Delta Merge-on-Read（只对 `fields` 白名单内命中的覆盖合成；无增量零开销）。
     pub fn scan_stream_fields<F: FnMut(u64, &[u8]) -> Result<bool>>(
         &self,
         start: Option<u64>,
@@ -188,6 +228,8 @@ impl Engine {
     ) -> Result<()> {
         let sk = start.map(|s| encode_docid(s).to_vec());
         let ek = end.map(|e| encode_docid(e).to_vec());
+        let ovs = self.delta_overrides_range(start, end)?;
+        let merge_fields = fields.clone();
         self.primary
             .scan_stream_fields(sk.as_deref(), ek.as_deref(), fields, |key, val| {
                 let docid = decode_docid(key).map_err(|_| {
@@ -198,7 +240,17 @@ impl Engine {
                         return Ok(true);
                     }
                 }
-                f(docid, val)
+                match ovs.get(&docid) {
+                    Some(ov) => {
+                        let merged = crate::engine::read::fold_with_overrides_fields(
+                            val,
+                            &merge_fields,
+                            Some(ov),
+                        )?;
+                        f(docid, &merged)
+                    }
+                    None => f(docid, val),
+                }
             })
     }
 
@@ -206,6 +258,7 @@ impl Engine {
     /// 窗口命中 ≥2 SST 且 workers≥2 时 CF 逐文件线程并行（块读/解压/解码），主线程
     /// k-way 归并；否则自动回退串行 `scan_stream`（零行为/性能回归）。
     /// `project`/`zone_pred` 与 `scan_stream_fields`/`scan_stream_with_zonepred` 语义一致。
+    /// P131：Delta Merge-on-Read（主线程归并期折叠；project=Some 时按白名单合成）。
     pub fn scan_stream_parallel<F: FnMut(u64, &[u8]) -> Result<bool>>(
         &self,
         start: Option<u64>,
@@ -217,6 +270,9 @@ impl Engine {
     ) -> Result<()> {
         let sk = start.map(|s| encode_docid(s).to_vec());
         let ek = end.map(|e| encode_docid(e).to_vec());
+        let ovs = self.delta_overrides_range(start, end)?;
+        let merge_fields = project.clone().unwrap_or_default();
+        let projected = project.is_some();
         self.primary
             .scan_stream_at_parallel(u64::MAX, sk.as_deref(), ek.as_deref(), zone_pred, project, workers, |key, val| {
                 let docid = decode_docid(key).map_err(|_| {
@@ -227,13 +283,26 @@ impl Engine {
                         return Ok(true);
                     }
                 }
-                f(docid, val)
+                match ovs.get(&docid) {
+                    Some(ov) => {
+                        let merged = if projected {
+                            crate::engine::read::fold_with_overrides_fields(
+                                val, &merge_fields, Some(ov),
+                            )?
+                        } else {
+                            crate::engine::read::fold_with_overrides(val, Some(ov))?
+                        };
+                        f(docid, &merged)
+                    }
+                    None => f(docid, val),
+                }
             })
     }
 
     /// P1-E：带 Zone Map 字段级范围剪枝的流式扫描——与 `scan_stream` 语义一致，
     /// 但额外在 SST 块级检查 `zone_pred` 的 min/max，不相交块跳过（免 IO/解压）。
     /// 适用于 SQL 范围查询（`ts BETWEEN`、`amount > N`）的扫描下推路径。
+    /// P131：Delta Merge-on-Read（命中行折叠；无增量零开销）。
     pub fn scan_stream_with_zonepred<F: FnMut(u64, &[u8]) -> Result<bool>>(
         &self,
         start: Option<u64>,
@@ -243,6 +312,7 @@ impl Engine {
     ) -> Result<()> {
         let sk = start.map(|s| encode_docid(s).to_vec());
         let ek = end.map(|e| encode_docid(e).to_vec());
+        let ovs = self.delta_overrides_range(start, end)?;
         self.primary.scan_stream_with_zonepred(sk.as_deref(), ek.as_deref(), zone_pred, |key, val| {
             let docid = decode_docid(key).map_err(|_| {
                 crate::error::Error::Corrupted("scan 流式 key 非 docid 编码".into())
@@ -252,7 +322,13 @@ impl Engine {
                     return Ok(true);
                 }
             }
-            f(docid, val)
+            match ovs.get(&docid) {
+                Some(ov) => {
+                    let merged = crate::engine::read::fold_with_overrides(val, Some(ov))?;
+                    f(docid, &merged)
+                }
+                None => f(docid, val),
+            }
         })
     }
 

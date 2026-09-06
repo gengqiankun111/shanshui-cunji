@@ -390,6 +390,135 @@ impl Engine {
         self.primary
             .zone_field_aggregate(lo.as_deref(), hi.as_deref(), field)
     }
+}
 
+/// P131（2026-09-06）：单文档折叠 —— base 字节 + 该 docid 的 Delta 覆盖（`b"null"` 值 = 删字段）。
+/// 语义与 `Engine::get` 完全一致：无覆盖 → 原样返回（零 parse）；覆盖非空 → parse JSON 对象、
+/// 逐字段 apply（null → shift_remove，否则 insert）、重序列化；非 JSON / 非对象 base 原样返回。
+pub(crate) fn fold_with_overrides(
+    base: &[u8],
+    ov: Option<&[(String, serde_json::Value)]>,
+) -> crate::error::Result<Vec<u8>> {
+    let Some(ov) = ov else {
+        return Ok(base.to_vec());
+    };
+    if ov.is_empty() {
+        return Ok(base.to_vec());
+    }
+    let obj: serde_json::Value = match serde_json::from_slice(base) {
+        Ok(v) => v,
+        Err(_) => return Ok(base.to_vec()),
+    };
+    let mut map = match obj {
+        serde_json::Value::Object(m) => m,
+        _ => return Ok(base.to_vec()),
+    };
+    for (f, val) in ov {
+        if val.is_null() {
+            map.shift_remove(f);
+        } else {
+            map.insert(f.clone(), val.clone());
+        }
+    }
+    serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))
+}
 
+/// P131：投影折叠 —— 只把 `fields` 白名单内命中的覆盖应用到 base（base 可为整行或子集 JSON）。
+/// 覆盖与白名单无交集 → 原样返回（免 parse）。行布局（整行 JSON）与 PAX（子集 JSON）均适用：
+/// 只对消费端声明的字段做合成，未声明字段一律不动。
+pub(crate) fn fold_with_overrides_fields(
+    base: &[u8],
+    fields: &[String],
+    ov: Option<&[(String, serde_json::Value)]>,
+) -> crate::error::Result<Vec<u8>> {
+    let Some(ov) = ov else {
+        return Ok(base.to_vec());
+    };
+    if ov.is_empty() || fields.is_empty() {
+        return Ok(base.to_vec());
+    }
+    let hit = ov.iter().any(|(f, _)| fields.iter().any(|x| x == f));
+    if !hit {
+        return Ok(base.to_vec());
+    }
+    let obj: serde_json::Value = match serde_json::from_slice(base) {
+        Ok(v) => v,
+        Err(_) => return Ok(base.to_vec()),
+    };
+    let mut map = match obj {
+        serde_json::Value::Object(m) => m,
+        _ => return Ok(base.to_vec()),
+    };
+    for (f, val) in ov {
+        if !fields.iter().any(|x| x == f) {
+            continue;
+        }
+        if val.is_null() {
+            map.shift_remove(f);
+        } else {
+            map.insert(f.clone(), val.clone());
+        }
+    }
+    serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))
+}
+
+impl Engine {
+    /// P131：当前视图窗口 Delta 覆盖表（docid → 字段覆盖；null 值 = 删字段）。
+    /// 无增量时直接返回空表（调用方短路，干净库零开销）。底层走 Delta CF
+    /// `scan_stream_at(∞)` —— 各源归并后每键取最新版本（当前视图语义）。
+    pub(crate) fn delta_overrides_range(
+        &self,
+        lo: Option<u64>,
+        hi: Option<u64>,
+    ) -> Result<std::collections::HashMap<u64, Vec<(String, serde_json::Value)>>> {
+        self.delta_overrides_range_at(lo, hi, u64::MAX)
+    }
+
+    /// P131：快照视图窗口 Delta 覆盖表（只收 `patch_seq ≤ snapshot_seq` 的最新版本）。
+    /// 底层走 Delta CF `scan_stream_at(snapshot)` —— **各源归并后按 ≤ snapshot 取最大 seq**
+    /// （§11.2：禁止先按最新坍缩再过滤——`scan_raw_range_with_seq` 会丢"最新补丁在快照后、
+    /// 旧补丁在快照前"的旧态，RR 读旧文档必须看到旧补丁）。
+    pub(crate) fn delta_overrides_range_at(
+        &self,
+        lo: Option<u64>,
+        hi: Option<u64>,
+        snapshot_seq: u64,
+    ) -> Result<std::collections::HashMap<u64, Vec<(String, serde_json::Value)>>> {
+        let mut out: std::collections::HashMap<u64, Vec<(String, serde_json::Value)>> =
+            std::collections::HashMap::new();
+        if self.delta.data_empty() {
+            return Ok(out);
+        }
+        let start = lo.map(|s| crate::keys::encode_docid(s).to_vec());
+        let mut end = hi.map(|e| crate::keys::encode_docid(e).to_vec());
+        // 包含 docid==hi 的字段后缀键（docid 后仍有 VarLen 前缀 + 字段名）
+        if let Some(e) = end.as_mut() {
+            e.extend_from_slice(&[0xFF; 4]);
+        }
+        self.delta.scan_stream_at(
+            snapshot_seq,
+            start.as_deref(),
+            end.as_deref(),
+            None,
+            None,
+            1,
+            |k, v| {
+                if k.len() < 12 {
+                    return Ok(true);
+                }
+                let Ok(docid) = crate::keys::decode_docid(&k[..8]) else {
+                    return Ok(true);
+                };
+                let Ok(field) = String::from_utf8(k[12..].to_vec()) else {
+                    return Ok(true);
+                };
+                let Ok(val) = serde_json::from_slice::<serde_json::Value>(v) else {
+                    return Ok(true);
+                };
+                out.entry(docid).or_default().push((field, val));
+                Ok(true)
+            },
+        )?;
+        Ok(out)
+    }
 }

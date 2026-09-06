@@ -121,48 +121,17 @@ impl Engine {
         let Some((bv, _)) = found else {
             return Ok(None);
         };
-        let obj: serde_json::Value = match serde_json::from_slice(&bv) {
-            Ok(v) => v,
-            Err(_) => return Ok(Some(bv)),
-        };
-        let mut map = match obj {
-            serde_json::Value::Object(m) => m,
-            _ => return Ok(Some(bv)),
-        };
-        let start = encode_docid(docid).to_vec();
-        let mut end = start.clone();
-        end.extend_from_slice(&[0xFF; 4]);
-        let rows = self
-            .delta
-            .scan_raw_range_with_seq(Some(&start), Some(&end))?;
-        for (k, seq, v) in rows {
-            if seq > snapshot_seq {
-                continue; // 快照点之后的增量不可见
-            }
-            if !k.starts_with(&start) || k.len() < 12 {
-                continue;
-            }
-            let field = String::from_utf8(k[12..].to_vec())
-                .map_err(|_| crate::error::Error::Corrupted("Delta 字段名非法 UTF-8".into()))?;
-            match v {
-                Some(bytes) => {
-                    let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                        crate::error::Error::Corrupted(format!("Delta 值解析失败: {e}"))
-                    })?;
-                    if val.is_null() {
-                        map.shift_remove(&field);
-                    } else {
-                        map.insert(field, val);
-                    }
-                }
-                None => {
-                    map.shift_remove(&field); // 增量删除字段（Tombstone）
-                }
-            }
+        // P131（2026-09-06）：Delta 增量按快照 seq 门控合并（§11.2 不坍缩）——
+        // 统一走 delta_overrides_range_at（CF scan_stream_at 各源归并后取 ≤ snapshot 最大 seq），
+        // 替代旧 scan_raw_range_with_seq「先按最新坍缩再过滤」——同一字段键被两次 patch 时
+        // （补丁1 < 快照 < 补丁2），旧路径丢补丁1（读成 base 旧值），新路径正确读补丁1。
+        // 无覆盖 → 直通（非 JSON base 亦原样返回，语义与 get 一致）。
+        let overrides = self.delta_overrides_range_at(Some(docid), Some(docid), snapshot_seq)?;
+        if let Some(ov) = overrides.get(&docid) {
+            crate::engine::read::fold_with_overrides(&bv, Some(ov)).map(Some)
+        } else {
+            Ok(Some(bv))
         }
-        let merged =
-            serde_json::to_vec(&map).map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-        Ok(Some(merged))
     }
 
     /// R4：compact 前置 MVCC 保活水位（活跃快照低水位 → 各 CF）。

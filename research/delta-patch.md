@@ -1,9 +1,23 @@
-# P131 delta patch（单字段 UPDATE 免整行重写）设计
+# P131 增量 UPDATE（单字段免整行重写）设计
 
-> 状态：立项（2026-09-06，用户选定方案：**每列 ≤1 delta + MVCC seq 管理**）
+> 状态：**路线重定（2026-09-06，用户选定：复用既有 Delta CF + 统一 MVCC/版本规则）**
+> 历史：初案「value 内嵌 wrapper（`__sp_base/__sp_p`）」因 base+p 字节 ≥ 整 doc（写字节不减）暂缓，
+> 机制 demo 保留作参考（src/demo/delta-patch）；**2026-09-06 内核集成改走引擎既有 Delta CF**
+> （`Engine::patch` 字段级增量：docid++field 键、每 patch 自带全局 seq、`get_at` 已按 seq 过滤 = 增量天然 MVCC）。
 > 触发：Task-005 110 万干净复测 #75 = 3.5×（SCC 10.5ms vs MySQL 3.01）；拆解 = 组提交常数 ~2ms +
-> 定位/读现值 ~2-3ms + **整文档重写 + 全字段重索引 ~5-6ms**（③ 是 delta patch 消灭目标）。
+> 定位/读现值 ~2-3ms + **整文档重写 + 全字段重索引 ~5-6ms**（③ 是增量 UPDATE 消灭目标）。
 > 定位/常数不属本设计（见 P127/P89）。
+
+## 0. 集成范围（2026-09-06 定稿，对应 kernel 改动清单 §10）
+
+- **写**：dml.rs `update_response` —— `SET <单非索引列> = 字面量`（不含增量表达式、非 id/docid/doc、
+  非倒排/组合/bitmap/fulltext/stats 声明列）→ 走 `Engine::patch_batch`（新增，免逐行组提交），
+  索引列 / 整 doc 替换 / 表达式依赖旧值 → 既有全量路径（读旧值撤 posting + 整 doc 重写）。
+- **读**：全值输出路径统一 Merge-on-Read（现状缺口：扫描族不合并 Delta，HTTP patch 后 SQL 扫不到）：
+  scan_range / scan_stream / scan_stream_fields / scan_stream_with_zonepred / scan_stream_parallel /
+  scan_range_paged / scan_after + txn `scan_range_txn`（RR 快照按 seq 门控）。
+- **版本规则**：见 §11「统一增量 MVCC 版本规则」（用户 2026-09-06 约束：倒排索引与一切 RR 查询
+  都必须 MVCC——增量只对 ≥ 其 seq 的快照可见）。
 
 ## 1. 目标
 
@@ -12,7 +26,10 @@
 
 收益场景：#75 的 `note='x9'`（非索引大列）、#73/#17-19 单列 update。
 
-## 2. 存储表示（value 内嵌 patch，不动主链 docid 唯一性）
+> ⚠️ §2~§9 为**已弃用参考**（value 内嵌 wrapper 初案；2026-09-06 用户选定 Delta CF 路线后不再采用，
+> 保留供"增量折叠 vs 版本可见性"语义比对参考）。**现行设计见 §10/§11。**
+
+## 2. 存储表示（value 内嵌 patch，不动主链 docid 唯一性）【已弃用参考】
 
 ```
 存储 value（仍是单条 JSON 文档，单 seq 版本——MVCC 行版本机制零改动）：
@@ -81,10 +98,61 @@ engine 输出侧（get/get_many/scan_stream/scan_stream_keys 保持 keys-only �
 - 子集读（get_many_pk_in_fields）wrapper 下先 fold 再取列（正确性优先；性能优化留后）。
 - 同语句多列 / 索引列混改 → 全量（保守）；增量演进。
 
-## 9. Demo 验证点（src/demo/delta-patch，先行）
+## 9. Demo 验证点（src/demo/delta-patch，先行）【已弃用参考】
 
 - ① 连续 SET 非索引列 → wrapper 每列 1 条、同列覆盖链长不增、折叠结果与全量重写一致；
 - ② 多列 patch 应用顺序无关（列级覆盖）；
 - ③ 折叠窗口：seq ≤ floor 折叠输出纯 doc（字节=全量等价）；seq > floor 保留 wrapper 且读折叠结果一致；
 - ④ DELETE 后链随版本作废；复活新基；
 - ⑤ wrapper_terms == 折叠 doc terms（索引一致）。
+
+---
+
+# 现行方案（2026-09-06 定稿）：Delta CF 字段级增量
+
+## 10. 存储与写读（复用既有 Delta 子系统，零格式改动）
+
+- **写**：`Engine::patch_batch(&[(docid, [(field, JSON value)])])` —— per-docid 字段键
+  （key = 8B docid ++ VarLen 前缀 ++ 字段名）`delta.put_bytes_nosync`，批尾一次 `flush_wal`
+  （per-CPU 下整批单 gseq 组）。每个字段键一次写 = 一个独立全局 seq 版本 → 版本链天然 MVCC。
+  生效范围（dml 判定）：单字段 `SET col = 字面量`，col ∉ composite_indexes ∪ term_index_fields()
+  （inverted/fulltext/stats/bitmap）且非 id/docid/doc；`SET col = NULL` / 自增表达式 / 整 doc 替换 /
+  索引列 → 既有全量路径（读现值 → 整 doc 写回 + term/组合索引重建）。
+- **读（Merge-on-Read）**：引擎所有**值输出**路径统一先查 Delta 覆盖再折叠（只对命中行 parse+合并，
+  无覆盖直通原字节——P86① 短路同构，干净库零开销）；keys-only/计数路径不涉值不受影响。
+- **折叠语义**（与 `get`/`get_at` 同构）：base JSON 对象 + 逐字段覆盖；`b"null"` 值 = 删除字段
+  （shift_remove）；非 JSON base 原样返回。
+- **索引一致性**：delta 列恒非索引 → 倒排 term/posting/载荷/bitmap/composite/cidx 全部零动作；
+  声明列（含 bitmap_fields/stats_fields）禁止走 delta → 无"posting 陈旧"风险面。
+
+## 11. 统一增量 MVCC 版本规则（用户 2026-09-06 约束：倒排索引与一切 RR 查询都必须 MVCC）
+
+增量写入（Delta CF 字段键；语义同 wrapper 列增量的单列覆盖）服从**单一版本规则**：
+
+1. **可见性 = 写版本 seq 门控**：快照 T 合并增量只取 `patch_seq ≤ T` 的最新版本；
+   最新视图（T = ∞）取全部。倒排检索出的候选 docid 回表/后过滤一律走上述折叠读 →
+   任一 RR 查询看到的行值恒为该快照点"base + 可见增量"合成态，与快照后写入/删除无关。
+2. **多版本不坍缩**：同一字段键可跨源存在多版本（memtable 未刷 + SST 已刷）；快照读必须在
+   **各源归并后按 `≤ snapshot` 取最大 seq**（用 CF `scan_stream_at` 语义），禁止先按最新坍缩再过滤
+   （后者丢"最新补丁在快照后、旧补丁在快照前"的旧态——既有 `scan_raw_range_with_seq` 陷阱，修复于 P131）。
+3. **折叠 = 读时合成，不产生新版本**：Delta 折叠发生在读侧内存，不改写主链、不提升任何 seq；
+   因此折叠对快照可见性零影响（区别于 wrapper 案的物理折叠需保版本 seq）。
+4. **GC/压实 = mvcc_keep_floor 门控**：primary/delta 各 CF compact 只回收 `seq < floor` 的旧版本；
+   floor = 最老活跃 RR 快照（R4 既有机制）。增量旧版本与 base 旧版本同规则回收，无额外窗口。
+5. **索引结构为"最新态候选 + 行级快照复核"模型**：term/posting 反映最新已提交写；候选集可含
+   陈旧 docid（删除/复活/换值），精确性由 ① 折叠读 + WHERE 行级重算兜底（P-GB/P121 守卫同源）；
+   增量列非索引 ⇒ 不改变 posting 形态，此模型不受增量扰动。声明列变更走全量重写（§10）维持模型。
+6. **同值跳过**：SET 字面量 == 现值（折叠读比较）→ 不写增量（MySQL affected 0；免版本堆积）。
+
+## 12. Kernel 改动清单（2026-09-06，P131 集成，按序）
+
+1. engine/read.rs：`delta_overrides_range(_at)` + `fold_with_overrides(_fields)` helpers；
+   修 `get_at` 快照合并改走 `scan_stream_at`（修多版本坍缩，见 §11.2）；
+2. engine/scan.rs：scan_range / scan_range_paged / scan_after / scan_stream /
+   scan_stream_fields / scan_stream_with_zonepred / scan_stream_parallel 接入折叠（无 delta 时零开销短路）；
+3. engine/txn.rs `scan_range_txn`：RR 快照扫描增量按 snapshot 门控合并；
+4. engine/write.rs：`patch_batch`（原子批量，批尾单次 flush_wal）；
+5. server/command/dml.rs `update_response`：delta 判定分流（§10）；
+6. 单测：patch 后扫描可见 / RR 快照旧值 / 倒排检索值一致 / 同值 affected 0 / 索引列回退全量；
+7. 回归 + #75 值变形态压测回填（写链目标 ≤1ms 增量、mean 10.5 → ~6-7ms）。
+
