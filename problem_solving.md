@@ -2005,8 +2005,13 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   同驱动写侧块布局 + 缓存粒度；clean 重装 110 万）：#77 cold 首跑 **1612.9/452/4692**
   （4KB 基线 2523.8/951/7212）；warm 稳态 **296.9/186/594**（4KB 稳态 750-950 + 9.7s 离群 →
   64KB 无 >600ms 离群）；回归探针全健康（pk_point 0.18-0.22ms、pk_between_10000 170→112、
-  enum_sel_limit10000 58→39.6、pk_in_50 2.17）。**定论：块尺寸 4KB→64KB 是冷首触有效杠杆**
-  （块数 /30）；采纳为宽表基准配置（wide/OLAP 建议 block_size_kb=64）。P143 收口。
+  enum_sel_limit10000 58→39.6、pk_in_50 2.17）。
+- **32KB 变体 ✅（同法，tmp-cfg block_size_kb=32）**：#77 cold **1700.9/498/4870**、稳态
+  **301.9/179/574**、回归探针全同（pk_point 0.18、pk_in_50 1.36、pk_between_10000 115、
+  enum_sel 37.2）→ **32KB ≈ 64KB（稳态 179 vs 186ms），拐点在 4→32 之间**。
+- **定论：块尺寸 4KB→32KB 即捕获 ~全部冷首触收益（块数 /15、seek 骤降），碎片/缓存浪费
+  更小 → 采纳 block_size_kb=32 为宽表基准推荐配置**（新写 SST 生效；wide/OLAP 建议 32，
+  点查/小窗经 32/64 两档 + 4KB 基线实测均无退化）。P143 收口。
 
 **P144（per-CPU WAL checkpoint 推进，2026-09-06 立项修复，局部完成）**
 - 根因（诊断实证：enq=[1.1M,0,1.1M,0] wm=[1.1M,0,0,∞] cp=0）：① cp 持久化只在 flush_all
@@ -2057,7 +2062,7 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 
 ### 本机核对 / 遗留口径（Windows 工作区记录）
 - 本机 origin/develop = 81d4f45，与上表一致；原 HEAD 停在 master（d2d1972，2026-09-02 的 10 亿库阶段 A~D 合并线，其 problem_solving.md 无 §阶段 4）。本次已建本地 develop 跟踪 origin/develop 续作；master 上 10 亿库阶段 A~D 内容若需并入 develop 排期线，先 merge-base 核对（a8c4e17 已在 develop 祖先中）。
-- P143 最终口径 = **32KB**（development_remain.md P143 行 + commit 41f7147）；本文件 §P143 记录正文仍写"建议 64KB"，待回填统一。
+- P143 口径已统一 = **32KB**（development_remain.md P143 行 + commit 41f7147；本文件 §P143 正文已同步回填）。
 
 ## 环境备忘（不入库）
 
