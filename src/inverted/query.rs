@@ -144,11 +144,15 @@ impl InvertedIndex {
     /// K 项（7.74）：惰性游标归并**精确去重**计数（跨段/内存重复 docid 合并）——
     /// 容器级按需解码，不收集 docid 列表。
     pub fn doc_count(&self, term: &str) -> Result<u64> {
-        let mem_vals: Vec<u64> = self
+        let mut mem_vals: Vec<u64> = self
             .mem
             .get(term)
             .map(|e| e.value().clone())
             .unwrap_or_default();
+        // P134：merge_distinct 以 mem 为升序源（前提各源升序）——到达序不保证升序（如乱序
+        // 显式 id 写入），排序+去重后归并正确（原仅隐含依赖写到达序）。
+        mem_vals.sort_unstable();
+        mem_vals.dedup();
         let mut cursors: Vec<PostingCursor> = Vec::new();
         let segs = self.segments.load();
         for seg in segs.iter() {
@@ -206,12 +210,14 @@ impl InvertedIndex {
     /// （~10µs，demo posting-chunk x211）。返回 (total, 窗口 docid 升序列表，已去重)。
     /// total 为各源头部基数之和（跨段重复 docid 未去重时为上界；后台 GC 收敛后精确）。
     pub fn search_paged(&self, term: &str, offset: u64, limit: u64) -> Result<(u64, Vec<u64>)> {
-        // 内存 posting（小，升序）
-        let mem_vals: Vec<u64> = self
+        // 内存 posting（小；P134：merge_distinct 升序前提 → 排序+去重，防乱序显式 id 写入）
+        let mut mem_vals: Vec<u64> = self
             .mem
             .get(term)
             .map(|e| e.value().clone())
             .unwrap_or_default();
+        mem_vals.sort_unstable();
+        mem_vals.dedup();
         let mut total = mem_vals.len() as u64;
         // 各段：v3–v5 → 惰性游标；v2/v6 → 全量解码包游标（兼容）
         let segs = self.segments.load();

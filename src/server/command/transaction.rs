@@ -278,6 +278,21 @@ pub(crate) fn txn_select_by_predicate(
     }
     let cond_sql = format!("SELECT docid FROM t WHERE {tail}");
     let txn = session.txn.as_mut().unwrap();
+    // P134（2026-09-06）：RR/SERIALIZABLE 快照 + 非 FOR UPDATE（当前读）→ 字段谓词候选改走
+    // **快照窗口扫描**（候选 = 快照可见行全集，无"最新态删除/换值预过滤"→ 快照后被并发删/
+    // 换值的行仍可见，与点查 get_at 语义自洽；旧路径用最新态 sqlish 候选 → 漏行）。RC 无快照、
+    // FOR UPDATE 当前读均见最新已提交，旧候选路径正确，保持不变。
+    if !for_update && txn.isolation.uses_snapshot() && engine.auto_watermark() <= (1u64 << 48) {
+        return txn_select_by_predicate_snapshot(
+            engine,
+            txn,
+            &cond_sql,
+            proj,
+            limit,
+            is_sum,
+            upper,
+        );
+    }
     const CAP: u64 = 200_000;
     let base = match crate::sqlish::execute(engine, &cond_sql, CAP) {
         Ok(r) => r,
@@ -321,6 +336,98 @@ pub(crate) fn txn_select_by_predicate(
         };
     }
     build_result_set(proj, rows, upper.contains("ORDER BY"), limit)
+}
+
+/// P134：RR/SERIALIZABLE 快照下的事务内字段谓词 SELECT（非 FOR UPDATE）——
+/// 候选 = **快照可见行全集**分块窗口扫描 + 谓词复检（`scan_range_txn` 逐窗：
+/// ≤快照版本 + 同事务写覆盖 + Delta ≤S 折叠，口径 = 点查 `txn_get`）。
+/// 修复：旧路径候选 = 最新态 sqlish 命中（回表 `batch_get` 删除位图剔除已删行）→ 快照后被
+/// 并发删/换值的行不在候选 → 事务内重复谓词读消失，与点查 get_at（见旧值）不自洽。
+/// 约束：仅默认表域（调用方已校验 tid=0 且 watermark ≤ 2^48）；LIMIT 且无 ORDER BY / 聚合时
+/// 早停（结果按 docid 升序，与既有 id 集合排序一致）；RC/FOR UPDATE 走旧路径（见调用点）。
+pub(crate) fn txn_select_by_predicate_snapshot(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    cond_sql: &str,
+    proj: Option<&[ProjCol]>,
+    limit: Option<usize>,
+    is_sum: bool,
+    upper: &str,
+) -> QueryResponse {
+    // 默认表单行 docid = row id，高水位 = auto_watermark()-1（调用点已保证 ≤ 2^48-1）
+    const SPAN: u64 = 16_384;
+    let hi = engine.auto_watermark().saturating_sub(1);
+    let order = upper.contains("ORDER BY");
+    let early_stop = !order && !is_sum && limit.is_some();
+    let need = limit.unwrap_or(usize::MAX);
+    let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(need.min(4096));
+    // complete = 扫描覆盖到高水位（无早停中断）→ 才需补"超出页高水位的自写新 docid"
+    //（早停中断时自写 docid 均按升序落在已扫前缀内/需限之后，补入会破坏 LIMIT 位置）。
+    let mut complete = !early_stop;
+    let mut w = 0u64;
+    'page: loop {
+        let e = w.saturating_add(SPAN - 1).min(hi);
+        let page = match engine.scan_range_txn(txn, Some(w), Some(e)) {
+            Ok(p) => p,
+            Err(err) => return QueryResponse::Err(3500, format!("事务谓词读失败: {err}")),
+        };
+        for (d, v) in page {
+            // scan_range_txn 已滤空（自删/墓碑 ≤S）；再按谓词复检快照行值（换值陈旧排除）
+            if !crate::sqlish::doc_matches_where(cond_sql, &v) {
+                continue;
+            }
+            rows.push((d, v));
+            if early_stop && rows.len() >= need {
+                complete = false;
+                break 'page;
+            }
+        }
+        if e == hi {
+            complete = true;
+            break;
+        }
+        w = e.saturating_add(1);
+    }
+    // 同事务未提交 Put 的新 docid（完整覆盖时若未被页扫描含入）→ 补入并保序
+    if complete && !txn.ops().is_empty() {
+        let present: std::collections::HashSet<u64> = rows.iter().map(|(d, _)| *d).collect();
+        let mut added = false;
+        for op in txn.ops() {
+            if let crate::txn::Op::Put { docid, .. } = op {
+                if present.contains(docid) || *docid >= (1u64 << 48) {
+                    continue;
+                }
+                if let Some(Some(v)) = txn.read_own(*docid) {
+                    if crate::sqlish::doc_matches_where(cond_sql, &v) {
+                        rows.push((*docid, v.to_vec()));
+                        added = true;
+                    }
+                }
+            }
+        }
+        if added {
+            rows.sort_by_key(|r| r.0);
+            if early_stop {
+                rows.truncate(need);
+            }
+        }
+    }
+    if is_sum {
+        let mut sum: i64 = 0;
+        for (_, doc) in &rows {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
+                if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
+                    sum += k;
+                }
+            }
+        }
+        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
+        return QueryResponse::Set {
+            columns: vec![sum_col],
+            rows: vec![vec![sum.to_string().into_bytes()]],
+        };
+    }
+    build_result_set(proj, rows, order, limit)
 }
 
 /// 提取 `WHERE id BETWEEN A AND B` 闭区间 → (A, B)；非 id BETWEEN → None。

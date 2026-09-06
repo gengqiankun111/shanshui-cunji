@@ -1791,6 +1791,41 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   （新测试计入 ignored，非编译/运行态）。
 - 收口：development_remain Ex-8.9 行状态 → ✅（引用本条目）；设计文档 §6 增第 4 行 + 复验注。
 
+**P134（事务读快照语义收口：字段谓词 RR 漏行 + 区间位图剔行 + 快照锚定核对，2026-09-06）**
+- 背景/审计（承接倒排 MVCC/RR 专项 design research/inverted-versioning-rr.md §2；用户确定读法 =
+  posting 不加版本号，先取全局 MVCC seq 再读 term→docid，所有数据以 snap_seq 为准）：
+  ① `txn_select_by_predicate`（src/server/command/transaction.rs）字段谓词候选 = 最新态 sqlish
+    execute（回表 batch_get 删除位图剔除快照后删行、最新值过滤已换值行）→ 快照后被并发删/换值
+    行不在候选 → 事务内重复谓词读消失，与点查 get_at（见旧值）不自洽（RR 违反）；
+  ② `scan_range_txn`（src/engine/txn.rs）快照扫描仍按删除位图剔行（位图无 seq）→ 快照后删行被
+    隐藏，与 get_at 跳过位图不一致。
+- 修①：`txn_select_by_predicate_snapshot`（新增，transaction.rs）——RR/Serializable 且非
+  FOR UPDATE 的字段谓词读 = **快照窗口分块扫描**（候选 = 快照可见行全集，无最新态删除预过滤）：
+  `scan_range_txn` 按 SPAN=16384 逐窗 → `doc_matches_where` 按 ≤S 行值复检 → LIMIT 且无
+  ORDER BY/聚合时早停；同事务自写新 docid（超窗高水位）完整覆盖时补入保序。RC（无快照）与
+  FOR UPDATE（当前读）语义本就见最新已提交 → 旧候选路径正确，保持不变；仅默认表单行域
+  （auto_watermark ≤ 2^48）启用，混合表库回退旧路径（残余记录：混合库默认表 txn 谓词仍走旧
+  候选，P135 batch_get_at 后统一）。
+- 修②：`scan_range_txn` 删除位图剔除改仅 `snapshot == u64::MAX`（RC/当前视图，语义同 get 位图
+  短路）；RR/Serializable 跳过，删除后墓碑由 `scan_range_at(≤snapshot)` 裁决（tombstone ≤S 已滤、
+  >S 回旧版）——与 get_at 一致。
+- ③ 核对结论（快照锚定时机）：现实现 = **BEGIN 锚定**（`Engine::txn_begin` → `begin_snapshot` =
+  global_seq-1，src/engine/mvcc.rs L17-19）；MySQL RR = **首条一致性读锚定**。差异真实但改锚定
+  影响既有测试/语义面大（多个 RR 测试假定 BEGIN 锚定），本次不改，记录为已知边界 + 后续专项
+  核对项（rr-conformance RR 探针若存在 "BEGIN→他事务提交→首读" 形态需对照）。
+- 顺带：inverted `doc_count` / `search_paged` 的 mem Vec 在进 `merge_distinct`（k-way 升序前提）
+  前 sort_unstable + dedup（防乱序显式 id 写入破坏归并；原仅隐含依赖写到达序）。
+- 验证：2 新集成测试（server/tests.rs，TCP 双连接）——`txn_predicate_snapshot_rr_after_concurrent_
+  delete_and_update`（轮1 快照后并发 DELETE 谓词读仍见 + 点查对照；轮2 并发换值 s:a→b 谓词读
+  s='a' 仍见旧值、s='b' 为空）、`txn_between_snapshot_sees_deleted_after_snapshot`（BETWEEN SUM
+  快照后删不变；旧实现剔位图 → 0）。全量 lib **784 通过 + 4 ignored**（seqlock 低频写重试率
+  概率型 flaky 单跑 0.10s 复绿，历史多轮无关）。
+- **另发现两既有缺口（不在 P134，记录待查）**：① autocommit 纯 id 投影（`SELECT id ... WHERE
+  id=N` / BETWEEN 无 ORDER BY）返回空，而 `SELECT *` 同条件正常（row 存在，疑似 P127 家族
+  投影缺线——字段语义求值无 id 字段的形态延伸）；② 同连接快速连续多条 INSERT 后，字段全扫
+  首行不可见（scan 视图与 get 不一致嫌疑；get/SELECT* id 可见而全扫不见）。均已记录
+  development_remain P134 行，待独立排期核实。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

@@ -225,11 +225,16 @@ impl Engine {
             u64::MAX
         };
         let mut out: Vec<QueryRow> = self.primary.scan_range_at(snapshot, start, end)?;
-        // Ex-8.10：删除位图语义对齐（与 txn_get/get_at 一致）——快照视图先排除位图已删 docid。
-        // 置于 read_own 覆盖**之前**：事务内对已删 docid 的未提交写（自写复活）仍可覆盖显现。
-        // 注：位图删除为非版本化全局语义（get_at 同近似），快照不晚于删除时点亦隐藏（既有取舍）。
-        if let Some(bm) = &self.deletion_bitmap {
-            out.retain(|(d, _)| !bm.is_deleted(*d));
+        // P134（2026-09-06）：删除位图剔除仅对**当前/RC 视图**（snapshot=∞ 最新态，语义同
+        // `get` 的位图短路）。RR/SERIALIZABLE 快照读**跳过位图**——位图无 seq；删除后墓碑由
+        // `scan_range_at(≤snapshot)` 裁决（tombstone ≤ S 的行已滤除、> S 的行返回 S 前旧版本），
+        // 与 `get_at` 跳过位图一致。此前快照读也剔位图 → 快照后被并发删除的行被隐藏，与
+        // 点查 `get_at`（仍见旧值）不自洽（RR 违反）。置于 read_own 覆盖之前：事务内对已删
+        // docid 的未提交写（自写复活）仍可覆盖显现。
+        if snapshot == u64::MAX {
+            if let Some(bm) = &self.deletion_bitmap {
+                out.retain(|(d, _)| !bm.is_deleted(*d));
+            }
         }
         // P131（2026-09-06）：Delta Merge-on-Read 接入快照扫描——RR/SERIALIZABLE 只合成
         // `patch_seq ≤ snapshot` 的增量（§11 统一版本规则：倒排/任意 RR 查询读到的行值 =

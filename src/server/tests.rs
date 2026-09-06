@@ -2701,6 +2701,157 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn txn_predicate_snapshot_rr_after_concurrent_delete_and_update() {
+        // P134 缺口①：事务内**字段谓词**读（RR 快照）在快照后被并发删除/换值的行必须仍可见，
+        // 与点查 get_at（见旧值）自洽——旧路径候选 = 最新态 sqlish（回表位图剔除已删行、
+        // 最新值过滤已换值行）→ 快照后删/换值行不在候选 → 谓词读漏行（RR 违反）。
+        // 注：读行用 SELECT *（行首列 = id，避开 id 纯投影既有缺口）；单行/轮（多行快速连续
+        // 插入后全扫首行可见性为既有独立问题，不入本测试）。
+        let engine = test_engine();
+        let server = DbServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        let row_ids = |r: &Vec<Vec<u8>>| -> Vec<String> {
+            let mut out = Vec::new();
+            for row in r.iter().skip(4).take(r.len().saturating_sub(5)) {
+                let mut p = 0usize;
+                let n = read_lenenc(row, &mut p).unwrap() as usize;
+                out.push(String::from_utf8(row[p..p + n].to_vec()).unwrap());
+            }
+            out
+        };
+        let pred_a = "SELECT * FROM documents WHERE s='a' ORDER BY id";
+        let pred_b = "SELECT * FROM documents WHERE s='b' ORDER BY id";
+        let ins = |c: &mut TestClient, id: u64, s: &str| {
+            let doc = format!("{{\"s\":\"{s}\"}}");
+            assert_eq!(
+                c.query(&format!(
+                    "INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')"
+                ))[0][0],
+                OK_PACKET
+            );
+        };
+        // 轮 1：快照后并发 DELETE → 谓词读仍见该行（= 首读），点查仍见旧值
+        ins(&mut main, 900501, "a");
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        let first = row_ids(&main.query(pred_a));
+        assert_eq!(first, vec!["900501"], "首读含 900501(s=a)");
+        assert_eq!(
+            aux.query("DELETE FROM documents WHERE id=900501")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(
+            row_ids(&main.query(pred_a)),
+            first,
+            "RR：快照后并发删 900501，谓词读仍见（与点查 get_at 一致）"
+        );
+        assert_eq!(
+            row_ids(&main.query("SELECT * FROM documents WHERE id=900501")),
+            vec!["900501"],
+            "点查对照：快照仍见已删行"
+        );
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+        // 轮 2：快照后并发换值（s:a→b）→ 谓词读 s='a' 仍见旧值行
+        ins(&mut main, 900601, "a");
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        let first2 = row_ids(&main.query(pred_a));
+        assert_eq!(first2, vec!["900601"]);
+        assert_eq!(
+            aux.query("UPDATE documents SET s='b' WHERE id=900601")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(
+            row_ids(&main.query(pred_a)),
+            first2,
+            "RR：快照后并发换值，谓词读 s='a' 仍见 900601（旧值 a）"
+        );
+        assert_eq!(
+            row_ids(&main.query(pred_b)),
+            Vec::<String>::new(),
+            "快照视图下 900601 仍是 a（s='b' 应为空）"
+        );
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
+    fn txn_between_snapshot_sees_deleted_after_snapshot() {
+        // P134 缺口②：事务内 id BETWEEN 范围一致读（RR 快照）在快照后被并发删除的行必须仍可见
+        // （SUM 不变）——旧 scan_range_txn 快照扫描仍按删除位图剔行（位图无 seq），
+        // 与点查 get_at 跳过位图不一致。
+        let engine = test_engine();
+        let server = DbServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        let sum = |c: &mut TestClient, sql: &str| -> String {
+            let r = c.query(sql);
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        let doc = "{\"k\":5}";
+        assert_eq!(
+            main.query(&format!(
+                "INSERT INTO documents (id, doc) VALUES (900702, '{doc}')"
+            ))[0][0],
+            OK_PACKET
+        );
+        let sql_sum = "SELECT SUM(k) FROM documents WHERE id BETWEEN 900702 AND 900702";
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(sum(&mut main, sql_sum), "5", "首读 SUM=5");
+        assert_eq!(
+            aux.query("DELETE FROM documents WHERE id=900702")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(
+            sum(&mut main, sql_sum),
+            "5",
+            "RR：快照后并发删 900702，BETWEEN 一致读仍见（SUM 不变，旧实现剔位图 → 0）"
+        );
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
     fn txn_update_delete_where_in_and_predicate() {
         // d txn 路径：事务内 UPDATE/DELETE … WHERE id IN(...) 与字段条件——攒批可见 + 回滚原子
         let engine = test_engine();
