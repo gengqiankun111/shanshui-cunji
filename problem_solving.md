@@ -1934,7 +1934,24 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 干净基线（db-wide-scc-p140 wide-load 74s 立即跑，P139-c binary）：#77 mean **3316ms** /
   p50 1848 / p99 8069；MySQL 147/145/160 → **≈22.5×**。较 P137 clean（5486/1933/20767）
   已收敛（p99 20s→8s）。
-- 方案（待做 demo/内核）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`（≤S 归并仅
+- **demo（双态，2026-09-06，src/demo/p140-snapshot-projection，gitignored）**：100k×25 列
+  wide-pax 配置（hot_fields k/amount/…、bitmap status/region、位图+per-CPU、release）：
+  - 热态（全留 memtable）：A_snap 0.43 / A_latest 0.33 / B_fields 2.62 µs/row——
+    **≤S 归并增量 +0.09 µs/row（批量快照读全热 ≈ 免费）**；B_fields 热态贵 = 整 JSON
+    parse+重建（行是 raw 整 doc，无 PAX 可解）→ 热态无列下推空间（与 P139 收益在 SST
+    冷读侧一致）。
+  - SST 冷态（写完一次 flush_primary 落盘）：A_latest **0.38 µs/row**（get_many 按块批量
+    点查 + raw 字节直传**不解码**）；B_fields 3.00 µs/row（字段提取逐行 JSON parse 主导）→
+    **整行 vs 3 列不是解码差，"列解码"非 #77 主成本**；A_snap（`batch_get_at` 逐 docid
+    `get_bytes_at`：SST 冷段逐键 ≤S 点查、无 get_many 批量分组、无 HotCache 回填）
+    **39.2 µs/row ≈ #77 clean 33 µs/row（3316ms/100k）同量级**。
+  - 结论：#77 主成本 = **SST 上快照 ≤S 读取机制本身**（scan_range_txn/scan_range_at
+    逐行 ≤S 折叠 + 冷段读取），server 侧整 doc JSON 投影解析为次量级。
+- **P140 内核取向修正**：原方案"≤S 归并仅解目标列"（把列解码当主成本）方向修正为
+  **范围迭代复用（scan_range_at 同源一次 k-way）+ ≤S 折叠 + 目标列投影 三合一**的
+  `scan_range_txn_fields`；另产出**触发项**：`batch_get_at` 冷库逐键点查退化
+  （39.2 µs/row vs get_many 0.38），P135 superset 回表需上按块批量点查。
+- 方案（待内核）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`（≤S 归并仅
   解目标列，复用 P131/P134 版本归并 + P86②/P91 列提取）→ 事务长读窗输出接线。验收：#77
   clean ≤1.5s（≥2.2×）且 p99 收敛。
 
