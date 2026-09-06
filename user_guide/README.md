@@ -99,7 +99,12 @@
 
 ```bash
 # 构建
-cargo build --release
+sudo apt install rustup
+rustup install nightly
+rustup install nightly          # 安装最新的 nightly
+cargo +nightly build --release  # 使用 nightly 编译
+
+#cargo build --release
 
 # 原生服务（HTTP/TCP/CLI 于同一二进制）
 shanshui-cunji server --config config.toml
@@ -136,6 +141,11 @@ curl -X POST http://localhost:8080/put -H 'Content-Type: application/json' \
   -d '{"docid":1001,"fields":{"status":"active","type":"order"}}'
 curl 'http://localhost:8080/get?docid=1001'
 curl 'http://localhost:8080/search?filter=status%3Dactive'
+# P142 Estimate 数量级估计（approx 标注；条件估计 = 倒排 posting ∩ 活跃集，可能含陈旧残留）
+curl 'http://localhost:8080/estimate'                                  # 全库 ≈ 行数
+curl 'http://localhost:8080/estimate?range=1-1000'                     # 行窗口闭区间
+curl 'http://localhost:8080/estimate?field=status&value=active'        # 条件命中估计
+curl 'http://localhost:8080/estimate?field=status&value=active&range=1-100000'
 ```
 
 > 构建环境与启动参数细节见 [../compile.md](../compile.md)。
