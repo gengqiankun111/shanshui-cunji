@@ -2050,6 +2050,31 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   结论：cidx 全程随 primary 收敛（cidx_wm==cp，9→10 SST）；**旧库态（cp=0）首启一次全量回放即收敛并持久化 cp→500000，此后崩溃/非干净退出重启只回放最近刷盘后的写尾（0.5-0.6s 级）**；对照修复前"每次重启全量回放 110 万 + 45-60s"，P144-② 将启动/重启回放从全量收敛到写尾。注：open#1 pending=144171 = import（<1M 行不尾刷主）留下的写尾，属 loader 现状非缺陷（import 尾刷可进一步归 0，见杂项）。
 - 杂项：import_parquet 结尾未尾刷 primary（FLUSH_EVERY=1M，<1M 行只在结尾 flush_wal）→ 大文件导入后首次 open 需回放尾批；可考虑结尾补 flush_primary 使 import 完成即 cp=满量（未做——避免回归面扩大）。
 
+**P146（50 万库 2G 限内存 sqlrun 基线 + MariaDB 对拍，2026-09-06）**
+- 环境：VMware 专用 VM（gqkdb/123，4C/3.86G 内存）；VM 仓库 `/home/gqkdb/scc-p144`（develop @ 9d8e2cc = 本机 origin/develop 同点；cjserver + rr-conformance release 全量重编）；数据 = db-p144-500k（502000 行，P144 验证写尾 +2000）；配置 cfg-500k.toml（block 32KB / composite [[status,ts],[ts]] / bitmap status,region / per-CPU WAL）。
+- SCC 运行：`cjserver --data-dir db-p144-500k --config cfg-500k.toml --bind 127.0.0.1:3308 --watchdog-secs 300`；**进程 2G 限内存 = systemd transient scope（`sudo systemd-run --scope -p MemoryHigh=1800M -p MemoryMax=2048M`，unit=cj2g，cgroup v2）**。
+- 结果 ①（2G 是否撞墙）：sqlrun（rr-conformance --sql-run，documents 表）**82/82 全过**；cgroup **memory.peak = 1512091648B ≈ 1.41 GiB（< 2G）**、memory.max/high 事件与 oom 全程 0、swap 2.3MB、终态 current ~700MB → 该库全套负载 2G 预算内未被回收掐限。
+- 结果 ②（SCC 单端量级，mean ms）：点查 0.14-0.27 / id IN 50/1000/5000 = 5/114/504 / BETWEEN 100/3000/10000 = 1.5/35/123 / status 等值 limit 100/10000 = 22/438；**活跃集/位图/载荷快路径 count_all 0.03、count_where_enum 0.02、group_by_status 0.12、count_distinct(枚举) 0.05、enum_count 0.08**；写 0.05-0.16、INSERT 万行 254、事务块 0.2-0.5ms。**无索引短板**：ORDER BY k,amount limit100 = 7.5s、field IN 列表 = 4.9-9.5s、数值 BETWEEN 全扫 = 3.9s、高基数 COUNT(DISTINCT user_id) = 2.3s、全扫 SUM/GROUP 2.2-2.8s；combo_and（枚举 AND）p50 24ms 但偶发 5.6s 尖峰（2G 内页缓存回收冷读特征）。
+- MariaDB 对拍（同机同构）：VM 自带 mysql 服务实为 **MariaDB 10.11.14**，改 `innodb_buffer_pool_size=1G + innodb_flush_log_at_trx_commit=2`（/etc/mysql/mariadb.conf.d/zz-cj.cnf，对齐 SCC 组提交档位）；wide.t 同构 25 列 50 万行（wide_load 装载 10.5s、含索引 584MB），索引对齐 SCC 能力面（k_status/k_region/idx_ts/idx_status_ts）；sqlrun **82/82 全过（仅 74s）**。
+- 对拍结论：
+  - **SCC 占优（1-3 数量级）**：写路径与事务开销（update_id 0.05 vs 0.13ms、insert_batch_10000 254 vs 185ms、txn_multi_stat 0.47 vs 122ms）；活跃集/bitmap/统计载荷类聚合：count_all 0.03 vs 55.9（≈1900×）、count_where_enum 0.02 vs 16.9、group_by_status 0.12 vs 90、count_distinct_enum 0.05 vs 0.17ms。
+  - **MariaDB 占优**：一切走 B+tree 的过滤/排序/范围与选择性扫描——pk_in_5000 504 vs 14.8ms、BETWEEN_10000 123 vs 6.9、enum_sel_limit10000 438 vs 4.9、combo_and 尖峰 2.5s vs 0.48、field_in 9.5s vs 0.37、ORDER BY multi 7.5s vs 152ms、数值 BETWEEN 3.9s vs 118ms、sum_where_enum 2.2s vs 248、count_distinct_highcard 2.3s vs 376、group_by_multi 2.6s vs 423ms。
+  - 认知：SCC 主要短板 = **无二级索引的过滤/排序/高基数 DISTINCT/字段 IN**（JSON 全扫 + 整排序），与既有 backlog（colstore #79-80 瘦行、二级/统计扩展、SQL 执行优化）同族；MariaDB 通用 B+tree 全能。公平性注记：MariaDB 索引对齐为 SCC bitmap/composite 能力的近似映射，非完全同构；两端执行同一 sqlrun 探针 SQL。
+- 工具链与产物（均 gitignore）：`tmp/vm-2g/`（build-vm/server-2g/probe-ready/run-sqlrun*/sample-mem 脚本 + summary.md / summary-mariadb.md 全量表）；VM：`~/results-2g/summary.md`、`~/results-mariadb-2g/summary.md`、`~/sqlrun-2g.log`、`~/sqlrun-mariadb.log`；cgroup 采样文件随 scope 消失不可复读（peak 已记录）。MariaDB 配置改动残留 VM `zz-cj.cnf`（还原=删除该文件并重启服务）。
+> 更正注（见 §P147）：P146 中「field IN 4.9-9.5s、combo_and 2.5s」**主因是 db-p144-500k 倒排空心（回放+导入 schema 空白名单双重成因）的数据态问题，非引擎能力缺口**；同能力重灌对拍见 §P147，field_in/combo 族已回落到亚毫秒级并与 MariaDB 同级或占优。
+
+**P147（field_in 慢因定位 + 空心索引成因 + 干净重灌同能力对拍修正，2026-09-06）**
+- 触发：sqlrun 对拍中 `status IN (...)` 9.4s/显式 OR 同慢/每 +1 值 ≈ +3.1s；单值 eq 仅 0.15ms 的强烈反差。打点重编（eval_cond/scan_backfill_bitmap/Or 加 CJPROBE 临时探针，后 git checkout 还原）实测：`eq status=active` posting_len=44200（0ms）、`eq status=closed/pending` **posting_len=0 → scan_backfill_bitmap 全表 502200 行 ≈ 4.5-4.9s/次**、OR union 本身 0ms → 慢 = IN/OR 每缺失 posting 分支各触发一次全表等值回填；消费端早停存在（非 sort 路径 collect_limited_rows），单值 eq 快只是裸 Cond 顶层 scan_pushdown+LIMIT 早停的假象。
+- 空心索引两层成因：① db-p144-500k 是 P144 run-remote.sh 崩溃回放产物（resetcp/writetail/多次 open），per-CPU WAL `replay_external`（open.rs）**直写 CF、不重派生倒排词条**（仅增量备份 restore_incremental 派生）→「行在 term 缺」；② 且 parquet 导入 schema `inverted_fields: []` 经 `ImportSchema::term_filter()` = Some(空集) → extract 白名单判定对每字段 false → **导入零词条落盘**（v2 首灌 0 段证实；旧库 22:05+ 的 seg 实为 server 侧活写产生）。旧库磁盘 6 个 seg 逐字面 grep 均无 status=closed/pending。
+- 修复验证：`schema-v2.json`（inverted_fields=["status","region","channel"]）+ `cfg-500k-v2.toml`（data_dir=db-p144-500k-v2、bitmap_fields=[status,region,channel]）重灌 500k/23s → seg 1.18MB + 三值词条齐全 → fieldin-diagnose 重测：单值 2.95ms、**IN 三值 0.19ms（9418→0.19）**、COUNT(IN) 2034ms（COUNT 权威聚合逐行 matches_doc，未下推 posting/bitmap union，遗留）。
+- 同能力对拍（SCC db-p144-500k-v2 vs MariaDB 重载 wide.t，均 50 万行、索引对齐含新增 k_channel；82 项×2 全过）：SCC peak **1.43 GiB**（1532825600B）/ oom 0；分桶（SCC/MariaDB mean 比 ≤0.34 / 0.34-3 / >3）**13 项 SCC 明显胜 / 28 接近 / 41 MariaDB 胜**。
+  - SCC 占优代表：count_all 0.04 vs 48、count_where_enum 0.03 vs 16.2、enum_count 0.07 vs 15.6、group_by_status 6.7 vs 59、group_by_multi 39.6 vs 398、combo_three_and 0.22 vs 1.97、enum_card_high_sel100 0.09 vs 116、txn_multi_stat 1.2 vs 115、biz_agg_filter 13.7 vs 242。
+  - 反转项（P146 曾误归因「无二级索引」）：field_in 0.14 vs 0.19、field_in_limit3000 0.93 vs 1.25、combo_and 0.20 vs 0.45、combo_and_limit3000 0.97 vs 8.68 —— 倒排/位图收敛后与 MariaDB 同级或占优。
+  - 真实残余差距（公平态、非索引缺失）：行返回解码成本（enum_sel_limit10000 226 vs 4.6、pk_between_10000 108 vs 6.7、pk_in_5000 481 vs 14.6、idx_range_scan_1000 120 vs 0.35、composite_idx_range ts 非前置 36 vs 0.20）；数值范围/无索引全扫（cmp_between 3354 vs 110、cmp_gt 30-86×）；全排序 40-49×（orderby_multi 6.1-7.4s vs ~140-150ms、biz_list/page 2.2s vs 1.4/4.1ms —— ORDER BY 未借 cidx 前缀序）；过滤后聚合 3-16×（sum_where 1841 vs 122、count_distinct_highcard 2208 vs 349、having 3.4×）；update_range_idx 值变形态 8-11×；txn_long_read 1202 vs 100。均与既有 colstore/#79-80 瘦行/二级统计扩展 backlog 同族。
+- 待决策 candidate：schema 空数组语义（`[]` 应归一为「全部」或显式报错防再踩）；崩溃回放后按 schema 重建倒排；聚合下推 posting/bitmap union（消 COUNT(IN) 2s）；ORDER BY 借组合索引前缀序。
+- 产物（gitignore）：本机 `tmp/vm-2g/{cfg-500k-v2.toml,schema-v2.json,run-sqlrun-v2.sh,mariadb-refresh-rerun.sh,sqlrun-v2.log,sqlrun-mariadb-v2.log,cj2g-probe.log（打点证据）,fieldin-diagnose.out,compare.py}`；VM：`~/scc-p144-500k/{cfg-500k-v2.toml,schema-v2.json,db-p144-500k-v2}`、`~/results-v2`、`~/results-mariadb-v2`、`~/sqlrun-v2.log`、`~/sqlrun-mariadb-v2.log`（db-p144-500k 旧空心库保留供回放基线）。CJPROBE 打点已本地还原；VM cjserver 为打点版二进制（无 CJPROBE 环境变量时行为等同普通版，重编即还原）。
+
+
 ## 交接段 · 山水存迹（2026-09-06，develop @ 81d4f45）
 
 > 本段 = P134+ 问题线本会话（含 Linux 远端 A/B）收口交接快照，供换机/新会话直接续读。细记录见上文对应 P 条目与 development_remain.md 的 P 行状态表。
@@ -2059,13 +2084,15 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 排期/问题文档（一切以这两份为准）：development_remain.md（P 行状态表）、problem_solving.md（P134+ 问题闭环，= 本文件 §阶段 4）。
 - 工作流：读排期 → design → src/demo/\<功能\> 跑通 → 合入 src/ → 单测 + 全量 `cargo test --lib`（~799，唯一 flaky = seqlock retry 复绿）→ 回填两份文档 → 提交。
 
-### 本会话收口（P140–P145）
+### 本会话收口（P140–P146）
 | P | 内容 | 结论/产物 |
 |---|---|---|
 | P140 | #77 txn 快照窗投影流 | scan_range_txn_fields（快照+列投影三合一）+ BETWEEN 窗下推；warm p50 2-2.5×；#77 mean 3316→2459ms |
 | P143 | #77 冷首触 IO | 组读(SCAN_GROUP) 8/64/256 clean A/B 无差异（维持 8）；块尺寸 4→32KB 有效（cold 2524→1701、稳态 179ms，点查无损）→ 宽表推荐 block_size_kb=32（写侧新 SST 生效） |
 | P144 | WAL checkpoint 推进 | flush_checkpoint_advance（cp 前进即持久化+裁剪）+ cidx 钉死场景 P144-②（唯一钉点自动补刷，随 primary 收敛）——完成 ✅，见 §P144 记录 |
 | P145 | batch_get_at 按块分组 | CF get_many_at（≤S 语义逐 get_bytes_at 等价）；冷 39.2→12.2µs/doc；要点 = 块只解码一次 |
+| P146 | 50 万库 2G 限内存 sqlrun 基线 + MariaDB 对拍 | cgroup MemoryMax=2G 全 82 探针平稳（peak 1.41 GiB，max/high/oom 均 0）；MariaDB 同构对拍完成，快路径聚合/写 SCC 占优、无索引过滤/排序 MariaDB 占优——见 §P146 记录（field_in/combo 慢项后经 §P147 更正为空心索引数据态） |
+| P147 | field_in 慢因定位 + 空心索引成因 + 干净重灌同能力对拍 | IN 慢 = 每缺失 posting 分支全表等值回填（4.5-4.9s/次）；成因 = 回放不重建倒排 + schema `inverted_fields:[]` 零发词；schema-v2 显式白名单重灌 → IN 9418→0.19ms；同能力重拍 SCC 明显胜 13/接近 28/MariaDB 胜 41，残余差距为行解码/全扫/全排序等真实架构项——见 §P147 |
 
 ### 待办队列（development_remain 已登记，均未开发）
 - P141 事务内聚合 MVCC 权威版（RR COUNT/GROUP BY；复用 P134/P135 superset）。
