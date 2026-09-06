@@ -298,6 +298,25 @@ impl Engine {
         (used / max).clamp(0.0, 1.0)
     }
 
+    /// P131b（2026-09-06）：倒排 term **声明字段集**（server 写路径 doc_terms 白名单）——
+    /// inverted_fields(白名单) ∪ fulltext_fields ∪ stats_fields ∪ bitmap_fields。
+    /// 返回 None = 无声明（保持全字段现行为，default 零回归）；Some(非空) 时只生成这些字段
+    /// 的 term——未声明短字段/大文本不再构造 term（省 CPU/字典膨胀，声明式本意）。
+    pub fn term_index_fields(&self) -> Option<std::collections::HashSet<String>> {
+        let mut s: std::collections::HashSet<String> = match &self.inverted_include {
+            Some(v) => v.clone(),
+            None => std::collections::HashSet::new(),
+        };
+        s.extend(self.fulltext_fields.iter().cloned());
+        s.extend(self.stats_fields.iter().cloned());
+        s.extend(self.inverted.bitmap_fields());
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
     /// 2026-09-05（内存口径观测）：组件内存计量（字节/计数）——`/metrics` 实时 gauge。
     /// 覆盖：主 memtable、hotcache、blockcache、倒排内存 docid；用于 RSS 构成拆解
     /// （cache payload ≠ 进程 RSS；元数据/临时对象/mmap 页另计，容量规划乘 1.4~1.8×）。

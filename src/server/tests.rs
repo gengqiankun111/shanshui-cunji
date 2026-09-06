@@ -872,7 +872,7 @@ use crate::multitable::drop_table_range;
         let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
         let put = |e: &mut crate::engine::Engine, id: u64, status: &str| {
             let doc = format!("{{\"status\":\"{status}\",\"v\":{id}}}");
-            let terms = super::doc_terms(&doc).unwrap();
+            let terms = super::doc_terms(&doc, None).unwrap();
             let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             e.put(id, doc.as_bytes().to_vec(), &refs).unwrap();
         };
@@ -1286,6 +1286,40 @@ use crate::multitable::drop_table_range;
             super::QueryResponse::Set { rows, .. } => assert_eq!(rows.len(), 300),
             other => panic!("无 LIMIT 区间异常"),
         }
+    }
+
+    #[test]
+    fn p131b_doc_terms_declared_fields_only() {
+        // P131b：server 写路径 doc_terms 只生成倒排**声明字段** term（bitmap/inverted/
+        // fulltext/stats）——未声明字段（note/city 等）不再构造 term（省 CPU/字典膨胀）。
+        // 行为对照：None（无声明/旧调用）仍全字段；端到端 put_doc 只命中声明 posting。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.inverted.bitmap_fields = vec!["status".into()];
+        let mut e = crate::engine::Engine::open(dir.path(), &cfg).unwrap();
+        let inc = e.term_index_fields().expect("bitmap status 声明非空");
+        assert_eq!(inc.len(), 1, "声明集应仅 status 一个字段");
+        let doc = r#"{"status":"active","note":"a long note text that is not declared","city":"beijing"}"#;
+        let terms = super::doc_terms(doc, Some(&inc)).unwrap();
+        assert_eq!(terms, vec!["status=active"], "只生成声明字段 term");
+        // 全字段旧行为对照（include=None）：未声明短字段 city 也有 term
+        let all = super::doc_terms(doc, None).unwrap();
+        assert!(all.contains(&"city=beijing".to_string()));
+        assert!(all.contains(&"status=active".to_string()));
+        // 端到端：put_doc → 仅 status posting 命中；city（未声明）无 posting
+        super::put_doc(&mut e, 1, doc).unwrap();
+        e.flush_wal().unwrap();
+        let s = e.inverted_posting("status=active").unwrap();
+        assert!(!s.is_empty(), "声明字段 status posting 命中");
+        let c = e.inverted_posting("city=beijing").unwrap();
+        assert!(c.is_empty(), "未声明字段无 posting");
+        // UPDATE note（未声明列）→ 词条集不变（仅 status），倒排零净动作
+        super::update_response(
+            &mut e,
+            "UPDATE documents SET note='x9' WHERE id=1",
+        );
+        let s2 = e.inverted_posting("status=active").unwrap();
+        assert!(!s2.is_empty(), "note 变更后 status posting 仍命中");
     }
 
     #[test]

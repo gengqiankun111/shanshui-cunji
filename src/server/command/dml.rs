@@ -319,6 +319,8 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
             // P89：UPDATE 批量管道——分批 batch_get(1000) 取现值 → 逐行变换 →
             // put_batch 攒批提交（倒排/组合索引/位图随 put_nosync 同步，批尾单次 flush_wal），
             // 替代旧逐行 engine.get + engine.put（每行独立 WAL 提交/看门狗/热缓存开销）。
+            // P131b：term 声明白名单（None=无声明保持全字段现行为）——只生成声明字段 term。
+            let term_inc = engine.term_index_fields();
             let mut n = 0u64;
             for chunk in ids.chunks(1000) {
                 let cur = match engine.batch_get(chunk) {
@@ -335,7 +337,7 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                         if old_bytes == Some(raw.as_bytes()) {
                             continue;
                         }
-                        let terms = match doc_terms(&raw) {
+                        let terms = match doc_terms(&raw, term_inc.as_ref()) {
                             Ok(t) => t,
                             Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                         };
@@ -364,7 +366,7 @@ pub(crate) fn update_response(engine: &mut Engine, sql: &str) -> QueryResponse {
                     if old_bytes == Some(new_doc.as_bytes()) {
                         continue;
                     }
-                    let terms = match doc_terms(&new_doc) {
+                    let terms = match doc_terms(&new_doc, term_inc.as_ref()) {
                         Ok(t) => t,
                         Err(e) => return QueryResponse::Err(1064, format!("update error: {e}")),
                     };
@@ -517,22 +519,27 @@ pub(crate) fn delete_pk_range(engine: &mut Engine, tid: u16, lo: u64, hi: u64) -
 }
 
 /// put 文档（doc JSON → 提取倒排 term 复用 HTTP 路径语义）。
+/// P131b：include = 引擎倒排声明字段集（None = 全字段现行为）——只生成声明字段 term。
 pub(crate) fn put_doc(engine: &mut Engine, id: u64, doc: &str) -> Result<()> {
-    let terms = doc_terms(doc)?;
+    let inc = engine.term_index_fields();
+    let terms = doc_terms(doc, inc.as_ref())?;
     let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
     engine.put(id, doc.as_bytes().to_vec(), &refs)
 }
 
 /// 事务内 put：攒批到事务（H-4，commit 时原子应用）。
 pub(crate) fn put_doc_txn(txn: &mut crate::txn::Transaction, id: u64, doc: &str) -> Result<()> {
-    let terms = doc_terms(doc)?;
+    let terms = doc_terms(doc, None)?;
     txn.put(id, doc.as_bytes().to_vec(), terms);
     Ok(())
 }
 
-/// 从 JSON 文档提取倒排词条。
-pub(crate) fn doc_terms(doc: &str) -> Result<Vec<String>> {
+/// 从 JSON 文档提取倒排词条（P131b：include = 倒排声明字段白名单；None = 全字段现行为）。
+pub(crate) fn doc_terms(
+    doc: &str,
+    include: Option<&std::collections::HashSet<String>>,
+) -> Result<Vec<String>> {
     let parsed: serde_json::Value = serde_json::from_str(doc)
         .map_err(|e| crate::error::Error::Serialize(e.to_string()))?;
-    Ok(crate::server::extract_terms(&parsed))
+    Ok(crate::server::extract_terms_filtered(&parsed, include))
 }

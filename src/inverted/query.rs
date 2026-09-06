@@ -52,6 +52,11 @@ impl InvertedIndex {
         self.bitmap_fields.contains(field)
     }
 
+    /// P131b：已声明位图索引字段列表（写路径 term 白名单合并用）。
+    pub fn bitmap_fields(&self) -> Vec<String> {
+        self.bitmap_fields.iter().cloned().collect()
+    }
+
     /// 内存位图 AND（M7-2）：全部 term 命中白名单字段 → 交集位图（组合筛选快速路径）；否则 None。
     pub fn bitmap_and(&self, terms: &[&str]) -> Option<Posting> {
         let mut acc: Option<Posting> = None;
