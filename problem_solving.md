@@ -1999,8 +1999,22 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
     g64 mean 2645.9/p50 889.7/max 7526 → 无差异**（warm p50 ~0.9s、冷首触离群 ~7.5s 均
     不变）——组读合并不改变磁盘冷区总字节/随机度瓶颈 → **SCAN_GROUP 维持 8**（回退）。
   - 结论：#77 离群（冷首触 ~7.5s）不随组读大小变化；剩真杠杆 = **块尺寸 4KB→64KB（写侧，
-    新 SST，需 clean 重装单变体对照）** / colstore #79-80（瘦行块）/ WAL checkpoint 缺陷
-    前置修复（P144 候选）。**待办：块尺寸变体验证（或用户改向）**。
+     新 SST，需 clean 重装单变体对照）** / colstore #79-80（瘦行块）/ WAL checkpoint 缺陷
+     前置修复（P144 候选）。**待办：块尺寸变体验证（或用户改向）**。
+
+**P144（per-CPU WAL checkpoint 推进，2026-09-06 立项修复，局部完成）**
+- 根因（诊断实证：enq=[1.1M,0,1.1M,0] wm=[1.1M,0,0,∞] cp=0）：① cp 持久化只在 flush_all
+  （flush_wal/正常关闭）→ 强制 kill/崩溃永不落盘；② **cidx（组合索引）CF 行 value 为空 →
+  approx_bytes≈0 → 永不达刷盘阈值 → 其水位恒 0 → cp=min(各 CF)=0 钉死** → 每次重启全量回放
+  ~110 万条 + 重刷 SST（+40-60s；cidx 回放 2.2M 条后 memtable_bytes=0 佐证 value 空）。
+- 已落：`WalRuntime::flush_checkpoint_advance`（CF 刷盘使 cp 前进即原子持久化 + 段裁剪，
+  open.rs 四 CF 回调接线）→ 无 composite / cidx 达阈负载下运行期安全点收敛，非干净退出
+  重启回放≈0。单测 p144_checkpoint_persists_after_flush_without_close（写+flush_primary 后
+  未 close 即 checkpoint>0）；lib 794 过（seqlock flaky 复绿）。
+- 待设计（cidx 钉死场景）：① memtable 刷盘判据含条目数（cidx 2.2M 条即刷）② composite cidx
+  可重建（task028 open 期重建语义）→ 不钉 cp、随 primary 收敛裁段 ③ approx_bytes 计入 key
+  （注意：会破坏现有 approx==Σvalue 测试契约，需同步改测）。现状：110 万 composite 库仍
+  全量回放，测量卫生 = clean 重装。
 
 ## 环境备忘（不入库）
 

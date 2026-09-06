@@ -415,11 +415,14 @@ impl Engine {
         if outbox.is_none() {
             rt.mark_cf_absent(CF_OUTBOX);
         }
-        // CF 切 external + 刷盘水位回调
+        // CF 切 external + 刷盘水位回调（P144：水位前进即持久化 checkpoint）
         {
             let cb: Arc<dyn Fn(u64) + Send + Sync> = {
                 let rt = Arc::clone(&rt);
-                Arc::new(move |m| rt.note_flush(CF_PRIMARY, m))
+                Arc::new(move |m| {
+                    rt.note_flush(CF_PRIMARY, m);
+                    rt.flush_checkpoint_advance();
+                })
             };
             Arc::get_mut(primary)
                 .ok_or_else(|| crate::error::Error::Unsupported("primary Arc 非唯一".into()))?
@@ -428,7 +431,10 @@ impl Engine {
         {
             let cb: Arc<dyn Fn(u64) + Send + Sync> = {
                 let rt = Arc::clone(&rt);
-                Arc::new(move |m| rt.note_flush(CF_DELTA, m))
+                Arc::new(move |m| {
+                    rt.note_flush(CF_DELTA, m);
+                    rt.flush_checkpoint_advance();
+                })
             };
             Arc::get_mut(delta)
                 .ok_or_else(|| crate::error::Error::Unsupported("delta Arc 非唯一".into()))?
@@ -437,7 +443,10 @@ impl Engine {
         if let Some(c) = cidx.as_mut() {
             let cb: Arc<dyn Fn(u64) + Send + Sync> = {
                 let rt = Arc::clone(&rt);
-                Arc::new(move |m| rt.note_flush(CF_CIDX, m))
+                Arc::new(move |m| {
+                    rt.note_flush(CF_CIDX, m);
+                    rt.flush_checkpoint_advance();
+                })
             };
             Arc::get_mut(c)
                 .ok_or_else(|| crate::error::Error::Unsupported("cidx Arc 非唯一".into()))?
@@ -446,7 +455,10 @@ impl Engine {
         if let Some(ob) = outbox.as_mut() {
             let cb: Arc<dyn Fn(u64) + Send + Sync> = {
                 let rt = Arc::clone(&rt);
-                Arc::new(move |m| rt.note_flush(CF_OUTBOX, m))
+                Arc::new(move |m| {
+                    rt.note_flush(CF_OUTBOX, m);
+                    rt.flush_checkpoint_advance();
+                })
             };
             ob.set_external_wal(CF_OUTBOX, cb);
         }
@@ -495,6 +507,10 @@ impl Engine {
                     rt.note_enqueued(cf, last.gseq);
                 }
             }
+            // P144（局部，保留 flush_checkpoint_advance 钩子于 runtime）：此处不强刷——
+            // composite 场景 cidx 回放后 memtable_bytes=0（组合索引行不在该 CF 可刷缓冲，
+            // 语义待设计澄清，见 P144 记录），强刷仅徒增启动耗时；cidx 水位 0 钉死 cp 的
+            // composite 场景留待设计后再解。
         }
         // global_seq 起点：checkpoint+1 / 队列 max+1 / 旧 WAL next_seq 取大
         let next = cp

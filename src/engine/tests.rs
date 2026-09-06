@@ -2713,6 +2713,32 @@ use crate::optimizer::QuerySpec;
         }
     }
 
+    #[test]
+    fn p144_checkpoint_persists_after_flush_without_close() {
+        // P144：CF memtable 刷盘（水位前进）即**持久化 checkpoint**——此前仅 flush_all
+        // （flush_wal/正常关闭）落盘 → 非干净退出重启反复回放全量 WAL（110 万条 ×
+        // ~45-60s × 叠加 SST）。本测：写入触发/显式刷盘后、**未调 flush_wal/未关闭**，
+        // checkpoint 文件即已推进（证明 flush 回调钩子生效）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.storage.per_cpu_enabled = true;
+        c.memtable.max_size_mb = 1; // 写路径自动刷盘 → note_flush → P144 即时持久化
+        let mut e = Engine::open(dir.path(), &c).unwrap();
+        for i in 1..=200_000u64 {
+            let doc = serde_json::json!({"k": i});
+            e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50)); // 等 per-CPU 消费线程落 memtable
+        e.flush_primary().unwrap(); // 至少一次确定性刷盘（若写入期已自动刷则水位更高）
+        let ckpt = dir.path().join("percpu-wal").join("checkpoint.json");
+        let text = std::fs::read_to_string(&ckpt).unwrap_or_default();
+        let cp: u64 = text.trim().parse().unwrap_or(0);
+        assert!(
+            cp > 0,
+            "flush 后 checkpoint 应已持久化（未调 flush_wal/close，仅 flush 回调钩子）: '{text}'"
+        );
+    }
+
     /// R4：无活跃快照时 compact 收敛丢旧版本（现状语义）——旧 seq 快照读返回 None。
     #[test]
     fn rr_no_active_snapshot_compaction_drops_old_versions() {

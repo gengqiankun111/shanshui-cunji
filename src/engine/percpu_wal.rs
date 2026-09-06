@@ -573,6 +573,20 @@ impl WalRuntime {
         self.recompute_cp();
     }
 
+    /// P144（2026-09-06）：CF flush 水位前进后**即时持久化 checkpoint + 裁剪**——
+    /// 此前 cp 只在 `flush_all`（flush_wal/正常关闭）落盘：非干净退出（强制 kill/崩溃）
+    /// 时安全点不推进 → 重启反复回放全量 WAL 并重刷 SST（110 万条 × ~45-60s × 叠加文件，
+    /// P143 测量污染源）。本方法使每轮 memtable 刷盘（≥ 水位前进）即原子持久化，
+    /// 崩溃恢复回放量 ≤ 最近一次刷盘后的写尾（通常为空/极小）。
+    pub(crate) fn flush_checkpoint_advance(&self) {
+        let cp = self.cp.load(Ordering::Relaxed);
+        if cp > self.persisted_cp.load(Ordering::Relaxed) {
+            if self.persist_checkpoint().is_ok() {
+                self.trim_segments();
+            }
+        }
+    }
+
     /// 播种"该 CF 曾入队最大 gseq"（submit 自动维护；恢复回放后调用 → 已回放未刷条目
     /// 参与 cp 约束，防裁剪越过未刷数据）。从未入队的 CF 保持 0（不约束 cp）。
     pub fn note_enqueued(&self, cf: u8, gseq: u64) {

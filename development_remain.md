@@ -835,7 +835,18 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 |---|---|---|
 | **P143 冷首触 IO 收敛（#77 离群）** | **触发**：#77 复测 mean 2459ms 未达 ≤1.5s 验收——n=5 中 1 次**冷首触 7-10s 离群**（100k/≈100MB 窗首次读：页/块缓存全冷 + 装载后 compaction 抖动；warm 迭代 p50 750ms 已达标 = P140 投影收益），IO-bound 与投影无关（服务日志 compaction 恰在探针期）。**目标**：#77 clean n=5 **mean ≤1.5s 且无 >3s 离群**。**归因 demo ✅（2026-09-06，src/demo/p143-cold-io，gitignored，直连 db-wide-scc-p140 真实库 release）**：100k 窗 `scan_range_txn_fields[k,amount]` 各窗首读 **cold_miss ≈ 50002 块**（≈每 2 行 1 个 4KB 块）——**主因 = ~50k 次 4KB 随机盘读（读放大 ≈200MB/100k 行，块缓存全 miss）**；OS 页缓存热区掩蔽（450k+ 窗 1.3-1.5s）冷区暴露（50k 窗 17.2s、250k 窗 9.9s——#77 离群同源）；**warm（块缓存命中）0.24-0.30s**（2.4-3µs/row）；整行对照 warm 1.38s vs fields 0.28s → **P140 投影省解码 ~5×，不省块数**（fields/整行 miss 同为 ~50k）。非 compaction 主导（无后台抖动下冷热差纯缓存所致）。**方案优先级修正**：B 首选——**读路径预取/顺序化 + 块尺寸杠杆**（4KB→64KB 块数 /16 → ~3k 次读；或块序 readahead / 相邻块预读入缓存）；C colstore #79-80 次选（热列瘦行块 → 行/块↑ → 随机读块数↓）；A compaction 收敛仅放大项。**验收**：#77 clean mean ≤1.5s 无 >3s 离群；同族大窗冷读探针首读同步收敛 | 立项（2026-09-06）。**内核 A/B（组读）✅ 否定（2026-09-06）**：SCAN_GROUP 8→64→256 组读放大**无效甚至反效**（污染态下 g256 mean 8.1s/p99 34.6s、compact 后 15.6s/66s——实为 **WAL checkpoint 不推进→重启反复回放 110 万条+重刷叠加 SST** 的污染产物，非杠杆效应）；**干净重装对照**：g8 2523.8/951/7212 vs g64 2645.9/889.7/7526 → **无差异**（warm p50 ~0.9s、冷首触离群 ~7.5s 均不变）——组读合并不改变磁盘冷区总字节/随机度瓶颈 → **SCAN_GROUP 维持 8**。**真候选重排**：① **块尺寸 4KB→64KB（写侧，新 SST）**（~50k 随机小块 → ~1.6k 大块，冷读字节/随机度双减）需 clean 全量重装单变体对照；② colstore #79-80（瘦行块）；③ **前置：WAL checkpoint 推进缺陷（新发现，另登记 P144 候选）**——测量必须先干净重装。**待办：块尺寸变体验证（或用户改向）** |
 
-- **P144 候选（未立项）：per-CPU WAL checkpoint 推进缺陷**（2026-09-06 P143 实验发现）——非干净退出（强制 Stop/崩溃）后**重启反复回放 ~110 万条 WAL 并重刷 SST**（每次启动 ~45-60s + 叠加冗余文件），是 P143 g256/compact 实验 8-66s 失真的**污染源**；修复方向：正常关闭/周期 checkpoint 持久化截断推进（启动回放后立即 checkpoint），顺带启动期可做 live/页缓存后台预热（与 P142 同源）。
+- **P144（立项修复 2026-09-06，局部完成 ✅/composite 场景待设计）：per-CPU WAL checkpoint 推进缺陷**。
+  根因链：① cp 持久化只在 `flush_all`（flush_wal/正常关闭）→ 非干净退出（强制 kill/崩溃）永不落盘；
+  ② 更本质——**cidx（组合索引）CF 行 value 为空 → memtable approx_bytes≈0 → 永不达 256MB 刷盘阈值
+  → 其水位恒 0 → cp=min(各 CF)=0 被钉死** → 每次重启（含干净关闭后）都全量回放 ~110 万条 + 重刷
+  SST（+40-60s，P143 测量污染源；诊断实证 enq=[1.1M,0,1.1M,0] wm=[1.1M,0,0,∞] cp=0，cidx 回放
+  2.2M 条后 memtable_bytes=0）。**已落**：`WalRuntime::flush_checkpoint_advance`——CF 刷盘使 cp 前进即
+  原子持久化 + 段裁剪（open.rs 四 CF 回调接线；运行期安全点收敛，无 composite 或 cidx 达阈负载下
+  重启回放≈0、非干净退出丢失 ≤ 最近刷盘尾）；单测 p144_checkpoint_persists_after_flush_without_close
+  （写 + flush_primary 后未 close 即 checkpoint>0）；lib 794 过。**待设计（cidx 钉死）**：候选 ①
+  memtable 刷盘判据含条目数（cidx 2.2M 条即刷）② composite cidx 可重建（task028 open 期重建语义）→
+  不钉 cp、随 primary 收敛裁段 ③ approx_bytes 计入 key。**现状**：110 万 composite 库仍全量回放，
+  基准测量卫生 = clean 重装（既有做法）。
 
 ### SQL 语法面收尾审计（2026-09-05，用户目标：MySQL 语法对齐 + 既定数据结构性能对比）
 
