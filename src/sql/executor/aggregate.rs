@@ -607,7 +607,8 @@ pub(crate) fn fmt_num(x: f64) -> String {
 /// 数值按 f64 规范化（1 与 1.0/1e0 同值，对齐 MySQL 数值去重）、字符串原样、
 /// 布尔 "true"/"false"；缺字段 / JSON null / 嵌套对象数组 → None（不计 DISTINCT，
 /// 对齐 SQL「NULL 不计入 COUNT(DISTINCT)」）。仅字段值语义判定，不依赖倒排。
-fn distinct_key_of(doc: &[u8], f: &str) -> Option<(u8, String)> {
+/// P141（2026-09-06）：pub(crate)——事务内标量 COUNT(DISTINCT) 逐行复用（语义对齐权威）。
+pub(crate) fn distinct_key_of(doc: &[u8], f: &str) -> Option<(u8, String)> {
     if !f.contains('.') {
         if let Some(lv) = light_top_field(doc, f) {
             match lv {

@@ -7,6 +7,7 @@ use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::sql::parser::{parse_select, CmpOp, HavingExpr, Select, WhereExpr};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use super::aggregate::{aggregate_needed_fields, fmt_num};
 use super::eval::{
@@ -68,8 +69,9 @@ pub struct GroupRow {
 }
 
 /// 组键（自定义 Eq/Hash：`-0.0` 与 `0.0` 归并为同组，数值按位等价）。
+/// P141（2026-09-06）：pub(crate)——事务内分组的行级累积与权威同款键（txn_agg.rs 复用）。
 #[derive(Debug, Clone)]
-enum GroupKey {
+pub(crate) enum GroupKey {
     Null,
     Num(f64),
     Str(String),
@@ -153,19 +155,20 @@ fn cmp_agg_text(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
 }
 
 /// 单聚合列累积器（每组每列一份，下标与 specs 对齐——杜绝多聚合串扰）。
+/// P141（2026-09-06）：pub(crate)——事务内分组逐行累积同款状态（字段直改，语义与权威一致）。
 #[derive(Debug, Clone)]
-struct AggState {
+pub(crate) struct AggState {
     /// COUNT(*) / COUNT(f) 计入行数（非 null 任意类型都计入 COUNT(f)）。
-    count: u64,
+    pub(crate) count: u64,
     /// 数值行数（SUM/AVG/MIN/MAX 的存在性与均值分母；0 → 数值聚合 NULL）。
-    n_num: u64,
-    sum: f64,
-    min: f64,
-    max: f64,
+    pub(crate) n_num: u64,
+    pub(crate) sum: f64,
+    pub(crate) min: f64,
+    pub(crate) max: f64,
 }
 
 impl AggState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             count: 0,
             n_num: 0,
@@ -179,7 +182,8 @@ impl AggState {
 /// 从文档取组键：顶层字段优先字节级取值（免整文档反序列化）；点路径/其余值
 /// serde 回退——Number → Num、String → Str，其余（缺省/null/布尔/嵌套）→ NULL 组
 /// （与 SQL「NULL 分一组」语义一致）。
-fn group_key_of(doc: &[u8], field: &str) -> GroupKey {
+/// P141（2026-09-06）：pub(crate)——事务内分组逐行组键同款提取。
+pub(crate) fn group_key_of(doc: &[u8], field: &str) -> GroupKey {
     if !field.contains('.') {
         match light_top_field(doc, field) {
             Some(LightVal::Num(b)) => {
@@ -206,7 +210,8 @@ fn group_key_of(doc: &[u8], field: &str) -> GroupKey {
 }
 
 /// 字段是否「存在且非 JSON null」（COUNT(f) 语义，任意类型非 null 计入）。
-fn field_non_null(doc: &[u8], f: &str) -> bool {
+/// P141（2026-09-06）：pub(crate)——事务内分组/标量 COUNT(f) 同款判据。
+pub(crate) fn field_non_null(doc: &[u8], f: &str) -> bool {
     if !f.contains('.') {
         if let Some(r) = light_top_field(doc, f) {
             return !matches!(r, LightVal::Absent | LightVal::Null);
@@ -223,7 +228,8 @@ fn field_non_null(doc: &[u8], f: &str) -> bool {
 }
 
 /// 取数值字段（SUM/AVG/MIN/MAX 只统计 JSON number；非数值/缺省 → None）。
-fn numeric_field(doc: &[u8], f: &str) -> Option<f64> {
+/// P141（2026-09-06）：pub(crate)——事务内分组/标量数值聚合同款提取。
+pub(crate) fn numeric_field(doc: &[u8], f: &str) -> Option<f64> {
     if !f.contains('.') {
         if let Some(LightVal::Num(b)) = light_top_field(doc, f) {
             if let Some(x) = std::str::from_utf8(b).ok().and_then(|s| s.parse::<f64>().ok()) {
@@ -893,6 +899,23 @@ pub fn execute_group_by_window(
             Ok(true)
         })?;
     }
+    // P141（2026-09-06）：收尾（HAVING/组排序/切片/组装 GroupResult）抽至 finalize_groups
+    // ——事务内分组（txn_agg.rs）复用同款权威收尾，结果与非事务分组逐字节一致。
+    finalize_groups(&sel, fields, specs, groups, cap).map(Some)
+}
+
+/// P141（2026-09-06）：GROUP BY 收尾（原 execute_group_by_window 尾段）——对已完成的
+/// 「组键 → 累积器」表执行 HAVING 过滤 / ORDER BY 组排序（分组字段 + 聚合列头，DESC 反转、
+/// 剩余 level 升序补尾）/ LIMIT-OFFSET 组行切片，组装 `GroupResult`（组键文本 + 数值标记 +
+/// 聚合值单元格；组键序 Null < Num < Str）。`cap` = 分组数上限（扫描段已校验，此处兼
+/// LIMIT 缺省值）。供**权威扫描路径与事务行流路径（txn_agg.rs）共用**（同输入 → 同输出）。
+pub(crate) fn finalize_groups(
+    sel: &Select,
+    fields: Vec<String>,
+    specs: Vec<(String, Option<String>)>,
+    groups: HashMap<Vec<GroupKey>, Vec<AggState>>,
+    cap: u64,
+) -> Result<GroupResult> {
     let mut list: Vec<(Vec<GroupKey>, Vec<AggState>)> = groups.into_iter().collect();
     // HAVING（AF#5）：分组完成后、排序/切片前过滤组行。
     if let Some(h) = &sel.having {
@@ -977,12 +1000,12 @@ pub fn execute_group_by_window(
         .iter()
         .map(|(n, f)| spec_header(n, f))
         .collect();
-    Ok(Some(GroupResult {
+    Ok(GroupResult {
         group_fields: fields,
         group_cols,
         headers,
         rows,
-    }))
+    })
 }
 
 /// 全库 GROUP BY（兼容入口 = 无窗口）。

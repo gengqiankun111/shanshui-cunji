@@ -2571,15 +2571,12 @@ use crate::multitable::drop_table_range;
         assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
         assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900300"), "5");
         assert_eq!(aux.query("DELETE FROM documents WHERE id=900300")[0][0], OK_PACKET);
-        // 快照仍见已删行；FOR UPDATE 当前读行已删 → 聚合为 0
+        // 快照仍见已删行；FOR UPDATE 当前读行已删 → 聚合空集（P141 权威语义 = SQL NULL，
+        // 对齐非事务聚合/MySQL；旧手写 SUM 曾返回 "0"）
         assert_eq!(sum(&mut main, "SELECT SUM(k) FROM documents WHERE id=900300"), "5");
-        assert_eq!(
-            sum(
-                &mut main,
-                "SELECT SUM(k) FROM documents WHERE id=900300 FOR UPDATE"
-            ),
-            "0"
-        );
+        let r = main.query("SELECT SUM(k) FROM documents WHERE id=900300 FOR UPDATE");
+        let row = &r[r.len() - 2];
+        assert_eq!(row.first(), Some(&MYSQL_NULL_CELL), "FOR UPDATE 空集 SUM 应为 NULL");
         assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
     }
 
@@ -3004,12 +3001,14 @@ use crate::multitable::drop_table_range;
         );
         assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='b'"), "3"); // 仅 doc2
         assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='a'"), "5"); // 仅 doc3
-        // 字段条件 DELETE：s='b' 剩余 → doc2 删除
+        // 字段条件 DELETE：s='b' 剩余 → doc2 删除 → 空集（P141 权威语义 = SQL NULL）
         assert_eq!(
             c.query("DELETE FROM documents WHERE s='b'")[0][0],
             OK_PACKET
         );
-        assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='b'"), "0");
+        let r = c.query("SELECT SUM(k) FROM documents WHERE s='b'");
+        let row = &r[r.len() - 2];
+        assert_eq!(row.first(), Some(&MYSQL_NULL_CELL), "空集 SUM 应为 NULL");
         assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
         // 回滚原子：全部恢复原值
         assert_eq!(sum(&mut c, "SELECT SUM(k) FROM documents WHERE s='a'"), "4");
@@ -3032,6 +3031,120 @@ use crate::multitable::drop_table_range;
         let r2 = c.query("BEGIN");
         assert_eq!(r2[0][0], ERR_PACKET);
         assert_eq!(c.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
+    fn p141_txn_aggregate_authoritative() {
+        // P141（2026-09-06）：事务内聚合/分组 MVCC 权威版——快照视图 + 同事务写（自插/自改/自删）
+        // 逐字节对齐非事务权威聚合：标量 COUNT/SUM/AVG/MIN/MAX/COUNT(DISTINCT)（id 窗口 / 点查 /
+        // 字段谓词 / 无 WHERE 全表四源）+ GROUP BY/HAVING 收尾（finalize_groups 共用）。
+        // 走 dispatch_query 会话直路（免 wire 编解码，直接断言 QueryResponse 单元格）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        let auto = std::sync::Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(std::sync::Arc::clone(&auto));
+        let mut q = |e: &mut Engine, sql: &str| super::dispatch_query(e, sql, &mut s);
+        let rows_of = |r: QueryResponse| -> Vec<Vec<String>> {
+            match r {
+                QueryResponse::Set { rows, .. } => rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|c| {
+                                if c == vec![MYSQL_NULL_CELL] {
+                                    "NULL".to_string()
+                                } else {
+                                    String::from_utf8_lossy(&c).into_owned()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                _ => panic!("应返回结果集响应"),
+            }
+        };
+        // 基线行 1..5（k 1..5，s=a/b/a/b/c），全 autocommit
+        let base: [(u64, i64, &str); 5] =
+            [(1, 1, "a"), (2, 2, "b"), (3, 3, "a"), (4, 4, "b"), (5, 5, "c")];
+        for (id, k, sval) in base {
+            let doc = format!("{{\"k\":{k},\"s\":\"{sval}\"}}");
+            let sql = format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')");
+            assert!(
+                matches!(q(&mut e, &sql), QueryResponse::Ok(..)),
+                "INSERT 未返回 OK"
+            );
+        }
+        assert!(matches!(q(&mut e, "BEGIN"), QueryResponse::Ok(..)));
+        // 同事务自插 doc6 (k=6, s=a)——引擎水位不动（自插 docid 在水位之上）
+        assert!(
+            matches!(
+                q(
+                    &mut e,
+                    "INSERT INTO documents (id, doc) VALUES (6, '{\"k\":6,\"s\":\"a\"}')"
+                ),
+                QueryResponse::Ok(..)
+            ),
+            "txn INSERT 未返回 OK"
+        );
+        // 无 WHERE 全表 COUNT(*)（窗口上界须抬至自插 docid——hi-raise 路径）
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT COUNT(*) FROM documents")),
+            vec![vec!["6"]],
+            "全表 COUNT 含同事务自插"
+        );
+        // 字段谓词标量
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT SUM(k) FROM documents WHERE s='a'")),
+            vec![vec!["10"]],
+            "s=a: 1+3+6"
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT COUNT(*) FROM documents WHERE s='b'")),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT COUNT(DISTINCT k) FROM documents")),
+            vec![vec!["6"]]
+        );
+        // id 窗口标量（BETWEEN / 点查源）
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT AVG(k) FROM documents WHERE id BETWEEN 1 AND 2")),
+            vec![vec!["1.5"]]
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT MIN(k) FROM documents WHERE id IN (2, 4)")),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT MAX(k) FROM documents WHERE id=6")),
+            vec![vec!["6"]],
+            "点查源见同事务自插行"
+        );
+        // GROUP BY（同事务自插 doc6 并入 a 组）+ HAVING
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*), SUM(k) FROM documents GROUP BY s"
+            )),
+            vec![
+                vec!["a", "3", "10"],
+                vec!["b", "2", "6"],
+                vec!["c", "1", "5"],
+            ]
+        );
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*) FROM documents GROUP BY s HAVING COUNT(*) >= 2"
+            )),
+            vec![vec!["a", "3"], vec!["b", "2"]]
+        );
+        // ROLLBACK 原子：自插行消失，全表 COUNT 回 5
+        assert!(matches!(q(&mut e, "ROLLBACK"), QueryResponse::Ok(..)));
+        assert_eq!(
+            rows_of(q(&mut e, "SELECT COUNT(*) FROM documents")),
+            vec![vec!["5"]]
+        );
     }
 
     // ---------- H-5：预处理语句 ----------

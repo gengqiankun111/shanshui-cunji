@@ -6,6 +6,7 @@
 //! select.rs      select_response / COUNT 快路径（单文件 ~370 行）
 //! dml.rs         非事务 INSERT/REPLACE/UPDATE/DELETE 响应 + 写定位
 //! transaction.rs 事务内 SELECT / parse_isolation_level / extract_* 窗口解析
+//! txn_agg.rs     事务内聚合/分组（P141：COUNT/SUM/AVG/MIN/MAX [DISTINCT] + GROUP BY/HAVING，快照/RC/当前读行源）
 //! txn_dml.rs     事务内 INSERT/UPDATE/DELETE/REPLACE
 //! stmt.rs        COM_STMT_PREPARE / COM_STMT_EXECUTE
 //! ```
@@ -15,6 +16,7 @@ mod query;
 mod select;
 mod stmt;
 mod transaction;
+mod txn_agg;
 mod txn_dml;
 
 pub(crate) use dml::*;
@@ -22,4 +24,5 @@ pub(crate) use query::*;
 pub(crate) use select::*;
 pub(crate) use stmt::*;
 pub(crate) use transaction::*;
+pub(crate) use txn_agg::*;
 pub(crate) use txn_dml::*;

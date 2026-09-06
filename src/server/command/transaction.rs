@@ -6,6 +6,7 @@
 
 use crate::engine::Engine;
 use crate::server::*;
+use crate::sql::parser::parse_select;
 
 
 /// 解析 `SET [SESSION] TRANSACTION ISOLATION LEVEL <level>`（会话级，大写输入）。
@@ -149,7 +150,9 @@ pub(crate) fn plain_field_projection(proj: Option<&[ProjCol]>) -> Option<Vec<Str
 
 /// 事务内 SELECT：快照查询（含同事务未提交写可见）。
 /// sysbench 兼容（H-6 扩展）：`WHERE id=N` 点查 / `id BETWEEN A AND B` 范围 /
-/// `id IN (...)` 多点 / `SUM(k)` 聚合 / `ORDER BY ... LIMIT N`（简化为排序截断）。
+/// `id IN (...)` 多点 / `ORDER BY ... LIMIT N`（简化为排序截断）。
+/// P141（2026-09-06）：聚合/分组（COUNT/SUM/AVG/MIN/MAX [DISTINCT]、GROUP BY/HAVING）已在
+/// 顶部经 parse_select 检测 → 转 txn_agg（txn_aggregate）权威事务行流执行（见函数头注）。
 /// P140（2026-09-06）：纯字段投影范围查询走 `scan_range_txn_fields`（见 plain_field_projection）。
 /// M 项优化（P0）：BETWEEN 范围走一次快照扫描（`scan_range_txn`），替代逐 id `txn_get`；
 /// 点查 / IN 保持逐 id（目标少，逐 id 更快）。
@@ -172,11 +175,18 @@ pub(crate) fn txn_select(
     } else {
         sql
     };
+    // P141（2026-09-06）：事务内聚合/分组（COUNT/SUM/AVG/MIN/MAX [DISTINCT] /
+    // GROUP BY [HAVING/ORDER BY/LIMIT]）→ txn_agg 权威事务行流执行（快照/RC 视图 + FOR UPDATE
+    // 当前读，同事务未提交写可见；语义对齐非事务权威聚合）。仅当 parse_select 成功**且**命中
+    // 聚合/分组形态才转入（防扩面：parser 不支持或普通查询维持既有事务读路径）。
+    if let Ok(sel) = parse_select(core) {
+        if sel.agg.is_some() || !sel.group_by.is_empty() {
+            return txn_aggregate(engine, session, core, for_update);
+        }
+    }
     let proj = parse_projection(core);
     let limit = extract_limit(core);
     let upper = core.to_uppercase();
-    // 聚合：`SELECT SUM(k) FROM ... WHERE id BETWEEN A AND B` → 单行单列数值
-    let is_sum = upper.contains("SUM(");
     let txn = session.txn.as_mut().unwrap();
     // 范围查询（BETWEEN）：快照扫描（M 项 P0，逐 id txn_get → scan_range_txn）；
     // FOR UPDATE → 当前读（最新已提交扫描 + 同事务写覆盖）
@@ -202,22 +212,6 @@ pub(crate) fn txn_select(
                 Err(e) => return QueryResponse::Err(3500, format!("事务范围读失败: {e}")),
             }
         };
-        if is_sum {
-            // 聚合：扫描结果逐行解析 JSON 累加 k 字段（缺失视为 0）；返回单行单列
-            let mut sum: i64 = 0;
-            for (_, doc) in &rows {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
-                    if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
-                        sum += k;
-                    }
-                }
-            }
-            let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
-            return QueryResponse::Set {
-                columns: vec![sum_col],
-                rows: vec![vec![sum.to_string().into_bytes()]],
-            };
-        }
         // 普通范围查询：按投影裁剪（字段列类型推断）+ ORDER BY / LIMIT
         return build_result_set(proj.as_deref(), rows, upper.contains("ORDER BY"), limit);
     }
@@ -233,33 +227,10 @@ pub(crate) fn txn_select(
                 );
             }
             return txn_select_by_predicate(
-                engine, session, core, proj.as_deref(), limit, is_sum, &upper, for_update,
+                engine, session, core, proj.as_deref(), limit, &upper, for_update,
             );
         }
     };
-    if is_sum {
-        // 聚合：逐 id 取 doc，解析 JSON 累加 k 字段（缺失视为 0）；返回单行单列
-        let mut sum: i64 = 0;
-        for id in &ids {
-            let r = if for_update {
-                txn_read_current(engine, txn, *id)
-            } else {
-                engine.txn_get(txn, *id)
-            };
-            if let Ok(Some(v)) = r {
-                if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&v) {
-                    if let Some(k) = doc.get("k").and_then(|x| x.as_i64()) {
-                        sum += k;
-                    }
-                }
-            }
-        }
-        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
-        return QueryResponse::Set {
-            columns: vec![sum_col],
-            rows: vec![vec![sum.to_string().into_bytes()]],
-        };
-    }
     // 普通点查 / IN：逐 id 快照 get（同事务写可见）/ 当前读，按投影裁剪
     let mut raw: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len());
     for id in &ids {
@@ -277,7 +248,7 @@ pub(crate) fn txn_select(
     build_result_set(proj.as_deref(), raw, upper.contains("ORDER BY"), limit)
 }
 
-/// b：事务内**非主键列谓词** SELECT（普通 / SUM(k) 聚合）：
+/// b：事务内**非主键列谓词** SELECT（普通投影查询；聚合已由 txn_select 顶部 P141 拦截）：
 /// 候选 = 主库当前视图命中（sqlish，事务持引擎写锁 → 视图稳定）∪ 同事务写集；
 /// 逐候选 `txn_get` 覆盖取值 + `sqlish::doc_matches_where` 谓词复检 → 结果与
 /// 快照+同事务写一致（自增后自见、删除即不可见、新增被收录）。
@@ -287,7 +258,6 @@ pub(crate) fn txn_select_by_predicate(
     sql: &str,
     proj: Option<&[ProjCol]>,
     limit: Option<usize>,
-    is_sum: bool,
     upper: &str,
     for_update: bool,
 ) -> QueryResponse {
@@ -319,7 +289,7 @@ pub(crate) fn txn_select_by_predicate(
     // 换值的行仍可见，与点查 get_at 语义自洽；旧路径用最新态 sqlish 候选 → 漏行）。RC 无快照、
     // FOR UPDATE 当前读均见最新已提交，旧候选路径正确，保持不变。
     if !for_update && txn.isolation.uses_snapshot() && engine.auto_watermark() <= (1u64 << 48) {
-        return txn_select_by_predicate_snapshot(engine, txn, &cond_sql, tail, proj, limit, is_sum, upper);
+        return txn_select_by_predicate_snapshot(engine, txn, &cond_sql, tail, proj, limit, upper);
     }
     const CAP: u64 = 200_000;
     let base = match crate::sqlish::execute(engine, &cond_sql, CAP) {
@@ -348,21 +318,6 @@ pub(crate) fn txn_select_by_predicate(
             Err(e) => return QueryResponse::Err(3500, format!("事务读失败: {e}")),
         }
     }
-    if is_sum {
-        let mut sum: i64 = 0;
-        for (_, doc) in &rows {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
-                if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
-                    sum += k;
-                }
-            }
-        }
-        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
-        return QueryResponse::Set {
-            columns: vec![sum_col],
-            rows: vec![vec![sum.to_string().into_bytes()]],
-        };
-    }
     build_result_set(proj, rows, upper.contains("ORDER BY"), limit)
 }
 
@@ -380,7 +335,6 @@ pub(crate) fn txn_select_by_predicate_snapshot(
     tail: &str,
     proj: Option<&[ProjCol]>,
     limit: Option<usize>,
-    is_sum: bool,
     upper: &str,
 ) -> QueryResponse {
     // 默认表单行 docid = row id，高水位 = auto_watermark()-1（调用点已保证 ≤ 2^48-1）
@@ -393,10 +347,10 @@ pub(crate) fn txn_select_by_predicate_snapshot(
     // 值裁决）。复杂谓词/空 posting/本事务含未提交写（自写合并复杂）→ 全窗扫描兜底。
     if txn.ops().is_empty() {
         if let Some(sup) = inverted_eq_superset(engine, tail) {
-            return finish_predicate_superset(engine, txn, cond_sql, sup, hi, is_sum, proj, limit, order);
+            return finish_predicate_superset(engine, txn, cond_sql, sup, hi, proj, limit, order);
         }
     }
-    let early_stop = !order && !is_sum && limit.is_some();
+    let early_stop = !order && limit.is_some();
     let need = limit.unwrap_or(usize::MAX);
     let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(need.min(4096));
     // complete = 扫描覆盖到高水位（无早停中断）→ 才需补"超出页高水位的自写新 docid"
@@ -450,32 +404,16 @@ pub(crate) fn txn_select_by_predicate_snapshot(
             }
         }
     }
-    finish_predicate_rows(rows, proj, is_sum, order, limit)
+    finish_predicate_rows(rows, proj, order, limit)
 }
 
-/// P135：谓词结果收尾（SUM 聚合 / build_result_set）——窗口扫描与 superset 快路径共用。
+/// P135：谓词结果收尾（build_result_set）——窗口扫描与 superset 快路径共用。
 fn finish_predicate_rows(
     rows: Vec<(u64, Vec<u8>)>,
     proj: Option<&[ProjCol]>,
-    is_sum: bool,
     order: bool,
     limit: Option<usize>,
 ) -> QueryResponse {
-    if is_sum {
-        let mut sum: i64 = 0;
-        for (_, doc) in &rows {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(doc) {
-                if let Some(k) = v.get("k").and_then(|x| x.as_i64()) {
-                    sum += k;
-                }
-            }
-        }
-        let sum_col = column_payload("SUM(k)", MYSQL_TYPE_LONGLONG, 63);
-        return QueryResponse::Set {
-            columns: vec![sum_col],
-            rows: vec![vec![sum.to_string().into_bytes()]],
-        };
-    }
     build_result_set(proj, rows, order, limit)
 }
 
@@ -519,12 +457,11 @@ fn finish_predicate_superset(
     cond_sql: &str,
     sup: roaring::treemap::RoaringTreemap,
     hi: u64,
-    is_sum: bool,
     proj: Option<&[ProjCol]>,
     limit: Option<usize>,
     order: bool,
 ) -> QueryResponse {
-    let early_stop = !order && !is_sum && limit.is_some();
+    let early_stop = !order && limit.is_some();
     let need = limit.unwrap_or(usize::MAX);
     // 候选收口两条件：默认表单行域（docid 低位域 <2^48）∧ 调用方窗口上界 hi——
     // 单表库（watermark≤2^48）两条件等价于 d≤hi；混合库（watermark 被高 tid 表顶高）时
@@ -548,7 +485,7 @@ fn finish_predicate_superset(
             break;
         }
     }
-    finish_predicate_rows(rows, proj, is_sum, order, limit)
+    finish_predicate_rows(rows, proj, order, limit)
 }
 
 /// 提取 `WHERE id BETWEEN A AND B` 闭区间 → (A, B)；非 id BETWEEN → None。
