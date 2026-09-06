@@ -490,7 +490,11 @@ fn finish_predicate_superset(
 ) -> QueryResponse {
     let early_stop = !order && !is_sum && limit.is_some();
     let need = limit.unwrap_or(usize::MAX);
-    let mut ids: Vec<u64> = sup.iter().filter(|d| *d <= hi).collect();
+    // 候选收口两条件：默认表单行域（docid 低位域 <2^48）∧ 调用方窗口上界 hi——
+    // 单表库（watermark≤2^48）两条件等价于 d≤hi；混合库（watermark 被高 tid 表顶高）时
+    // 低位域过滤防跨表高位 docid 混入候选（潜在串行），P134 残余防御（服务端默认表恒低位，
+    // 仅引擎直连多命名空间才可达该形态）。
+    let mut ids: Vec<u64> = sup.iter().filter(|d| *d < (1u64 << 48) && *d <= hi).collect();
     // P136：批量取行前集合级剔除"S 前已删且未复活"候选（免空回表；漏剔由 batch None 兜底）
     engine.prune_deleted_before_snapshot(&mut ids, txn.snapshot());
     let vals = match engine.batch_get_at(&ids, txn.snapshot()) {

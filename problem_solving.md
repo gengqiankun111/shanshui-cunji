@@ -1852,6 +1852,10 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   `batch_get_at(S=now)` 为纯退化（≤S 归并 + 冷段 sst_min_seq 首触全键扫）→ **选型 = 保留
   latest 批量位图快路径**；区间/组合同理（autocommit 保持，RR 端已由 scan_range_txn 窗口/
   superset 覆盖）。batch_get_at 消费点 = RR 快照语义端（txn superset）+ 未来混合库残余。
+- 复核补充（2026-09-06）：混合库残余（watermark>2^48 旧逐候选路径）**服务端不可达**（cjserver
+  默认表恒 tid0 低位 docid → SQL 层 watermark 恒 ≤2^48；仅引擎 API 直连多命名空间才可能）→ 不
+  接线；低成本防御已落——`finish_predicate_superset` 候选 filter 改 `d<2^48 ∧ d≤hi`（单表库与
+  原 d≤hi 严格等价；混合库防跨表高位 docid 混入候选串行）。回归 790 绿。
 - 全量 lib **787 通过 + 4 ignored**（seqlock 概率型 flaky 单跑复绿）。
 
 **P136（快照活跃预过滤：snapshot_dels 删除事件表 + prune 接线，2026-09-06）**
