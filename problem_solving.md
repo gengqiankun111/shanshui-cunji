@@ -64,6 +64,7 @@
 - **根因**：源码打包时带上了本机 `.cargo/config.toml`（含 Windows target-dir/linker），Linux cargo 误用。
 - **修复**：删除服务器项目内 `.cargo/`；本机该目录属本机配置、不入库。
 - **提交**：`9dc0a10`
+- **根治（入库配置跨平台化）**：后续发现 `.cargo/config.toml` 仍被跟踪入库，Linux 克隆构建再度复现；已将入库配置中的 `[build] target-dir = "D:\\shanshui-cunji-target"` 移除（仅余 windows-gnu linker，target 限定、Linux 不生效）。Windows 产物目录改由 `CARGO_TARGET_DIR` 环境变量或 `--target-dir` 指定。
 
 ### P10. PAX：`get_from_sst` 块内扫描未适配 v4 kind 字节
 - **现象**：`flush_then_read_back` 失败（flush 后 SST 内 get 全 None，但直接 `SstReader::iterate` 正常）。
@@ -2102,7 +2103,7 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 杂项：seqlock flaky 阈值；WAL 回放 checkpoint——110 万 composite 旧库首次升级重启回放一次完成收敛，此后非干净退出重启回放≈0（P144-②）。
 
 ### 换机 / 远端注意
-- Linux 编译：仓库内 `.cargo/config.toml` 为 Windows 专用（target-dir/linker）——Linux 须删除或用 CARGO_TARGET_DIR 覆盖；`~/.cargo/config.toml` 用 rsproxy.cn 镜像；构建加 `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`（否则 cgu1+LTO 2 核极慢）。
+- Linux 编译：仓库 `.cargo/config.toml` 已不含 `[build] target-dir`（曾含 `D:\shanshui-cunji-target`，Linux 误用报 `path segment contains separator ':'`），仅余 windows-gnu linker、Linux 构建不受影响；Windows 本机产物目录用 `CARGO_TARGET_DIR=D:\shanshui-cunji-target` 或 `--target-dir` 指定；`~/.cargo/config.toml` 用 rsproxy.cn 镜像；构建加 `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`（否则 cgu1+LTO 2 核极慢）。
 - Engine.iou 已改 pub(crate)（Linux E0451，Windows 不可见，81d4f45）→ 远端需拉 81d4f45 后重编 cjserver + rr-conformance。
 - 阿里云 A/B（a4 vs b32，50 万行 / 1G 预算）：root@106.14.68.116（Debian12 / 2C / 1.6GB），/root/scc-p143（已删仓库 .cargo）、/root/cfg-linux-a4.toml / cfg-linux-b32.toml、/root/bench-remote.sh 就绪；mariadb 已停（编完记得 `service mariadb start`）。本地 plink/pscp 在 C:\putty。
 - PowerShell 陷阱：原生命令内嵌引号被剥离；pkill -f 会自匹配远程 shell（用 pkill -x 或分两次调用）。

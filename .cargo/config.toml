@@ -1,5 +1,10 @@
+# 注意：本文件为入库配置，必须保持跨平台安全，禁止写盘符/机器级路径。
+# 曾误设 `[build] target-dir = "D:\\shanshui-cunji-target"`（Windows 本机专用），
+# Linux/macOS 构建会将其当相对目录拼成含 `:` 的路径并写入 $LD_LIBRARY_PATH，
+# rustc 报 "error: failed to join paths from `$LD_LIBRARY_PATH` together
+# / path segment contains separator `:`"，故已移除。
+# Windows 产物目录属机器级偏好，请用环境变量 CARGO_TARGET_DIR=D:\shanshui-cunji-target
+# 或命令行 `--target-dir` 指定（user_guide 下脚本已按此写法）。
+
 [target.x86_64-pc-windows-gnu]
 linker = "D:\\w64devkit\\bin\\gcc.exe"
-
-[build]
-target-dir = "D:\\shanshui-cunji-target"
