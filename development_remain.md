@@ -115,7 +115,17 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
     - txn_dml `WHERE id BETWEEN` 主键闭窗口直解——误走字段候选 + doc 无 id 复检 → 事务内窗口 UPDATE/DELETE 恒 0 行；
     - txn 单字段赋值 JSON 类型化——`SET k=2` 旧落 doc.k 字符串 → 事务内 SUM/AVG 数值聚合读 NULL（对齐非事务 P131/ODKU）。
   - 边界注：单语句复合 SET（SET k=2, amount=2.50）超出 txn UPDATE 单字段解析 → avg 探针 SET 拆两条单列（M-7 已知缺口，非 P141 面）；组态同款不阻塞。
-- [ ] A1-2 "FOR QUICK 落点"对照基线（评估项）：默认权威 vs 加词降级 O(1) 近似——盘点可加词近似的聚合形态（enum/bitmap 字段 COUNT 族），产出定位 + 探针对照基线，不强制接 code
+- [x] A1-2 "FOR QUICK 落点"对照基线（评估项）：默认权威 vs 加词降级 O(1) 近似——盘点可加词近似的聚合形态（enum/bitmap 字段 COUNT 族），产出定位 + 探针对照基线，不强制接 code
+  - ✅ 2026-09-07：同一 500k 库（guest db-p144-500k-v2，documents，无并发）权威 vs 加词快路对照（tmp/vm-a11/a13.out，探针非 txn SQL 直连 3308）：
+    - txn-RR 权威全扫（MVCC 快照逐行判活，a12-base/a13 双测）：COUNT WHERE status='active' 5.2-5.6s→101149；region='beijing' 5.2-6.1s→63707；GROUP BY/COUNT DISTINCT 同量级 ~5.1s
+    - 加词 O(1) 快路：COUNT(WHERE) 0.1-0.3ms（~10⁴×）；COUNT(DISTINCT status) 0.1-0.2ms→5；GROUP BY status 7.4-7.5ms→101149（~700×；首调 4.9s = 懒建/攒批 flush，非稳态）
+  - 可加词近似形态与定位（白名单族 = cfg inverted.bitmap_fields/倒排字段）：
+    - COUNT(WHERE 单等值)：非 txn Ex-9.1 → `inverted_doc_count`（engine/query.rs，server count 快路；段 TermMeta 载荷/doc_count_fast）——**口径无 live∩**：含墓碑/换值残留 → 本库高估恒定 +53288（active 154437 vs 权威 101149；region 116995 vs 63707；两字段差同 = 同墓碑残留集），相对 +52.7%@active
+    - GROUP BY <白名单 1..=2 字段>：`group_by_bitmap_window`（engine/query.rs，live∩ + cand_term 收敛）→ 7.5ms 且与权威一致
+    - COUNT(DISTINCT 低基数)：`count_distinct_fast`（engine/query.rs，live∩ 判活）→ 亚毫秒且与权威一致（5）
+    - /estimate 条件估计（P142/A2）：posting∩live → 与权威一致（101149）
+    - SUM/AVG/MIN/MAX 与 COUNT(f)：无位图等价（须逐行取值/数值）→ 不可加词近似，恒权威全扫（~5s）
+  - 结论（FOR QUICK 落点）：加词降级 O(1) 语义安全前提 = 白名单字段 + **live∩ 判活路径**（group_by_bitmap_window/count_distinct_fast/estimate 族，与权威一致）；Ex-9.1 `inverted_doc_count` 单等值快路缺 live∩ → 删除/换值库上近似高估墓碑残留——FOR QUICK 若走该路须标注近似语义或先补 live∩（留作后续，本项未接 code）
 - [ ] A1-3 demo/内核确认：release 下事务聚合路径正确性/耗时 sanity（可选 src/demo/，与 txn_agg 单测互补；确认 sqlish 候选兜底路径 + 混合库 wm>2^48 分支实际可达性）
 - 销项：development_0907.md P141 行「待办：demo/内核 + 探针 + FOR QUICK 对照基线」→ 全部完成后标 ✅
 
