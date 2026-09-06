@@ -2636,6 +2636,83 @@ use crate::optimizer::QuerySpec;
         e.txn_commit(txn_c).unwrap();
     }
 
+    #[test]
+    fn p140_scan_range_txn_fields_projection_matches_full() {
+        // P140：scan_range_txn_fields(fields) 与 scan_range_txn 逐行语义一致——
+        // 行集 + 目标列值在 RR（快照 ≤S）/ RC（最新合成）/ 自写覆盖 / 本事务删除 /
+        // 新 docid 并入下完全对齐；memtable 与落盘(SST)双态。
+        for flush in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = cfg();
+            c.storage.deletion_bitmap_enabled = true; // P134 位图分支（RR 跳过/RC 剔除）
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            for i in 1..=5u64 {
+                let doc = serde_json::json!({"k": i * 10, "amount": i * 100, "note": format!("n{i}")});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+            }
+            if flush {
+                e.flush_primary().unwrap(); // 落 SST（快照/最新多版本语义分支）
+            }
+            let fields = vec!["k".to_string(), "amount".to_string()];
+            // (1) RR：快照在外部 patch 前 → 目标列值 = 快照旧值；自写覆盖/删除/新插入生效
+            let mut txn = e.txn_begin(crate::txn::Isolation::RepeatableRead);
+            e.patch(2, &[("k", json!(999)), ("amount", json!(888))]).unwrap();
+            txn.put(
+                2,
+                serde_json::to_vec(&json!({"k": 22, "amount": 222, "note": "own2"})).unwrap(),
+                vec![],
+            );
+            txn.delete(3);
+            txn.put(
+                9,
+                serde_json::to_vec(&json!({"k": 90, "amount": 900})).unwrap(),
+                vec![],
+            );
+            let full = e.scan_range_txn(&mut txn, Some(1), Some(9)).unwrap();
+            let sub = e
+                .scan_range_txn_fields(&mut txn, Some(1), Some(9), fields.clone())
+                .unwrap();
+            assert_eq!(
+                full.iter().map(|r| r.0).collect::<Vec<_>>(),
+                sub.iter().map(|r| r.0).collect::<Vec<_>>(),
+                "flush={flush} 行集一致（1,2,4,5 + 自写 9）"
+            );
+            let msub: std::collections::HashMap<u64, Vec<u8>> =
+                sub.into_iter().collect();
+            assert_eq!(msub.len(), 5, "flush={flush} 事务内删除 docid 3 应排除");
+            for (d, fv) in &full {
+                let so = msub.get(d).unwrap();
+                let fo: serde_json::Value = serde_json::from_slice(fv).unwrap();
+                let so: serde_json::Value = serde_json::from_slice(so).unwrap();
+                assert_eq!(fo["k"], so["k"], "flush={flush} docid {d} k");
+                assert_eq!(fo["amount"], so["amount"], "flush={flush} docid {d} amount");
+            }
+            // 自写覆盖值可见（docid 2 = 22/222 整行）；新 docid 9 并入；事务内删除 docid 3 排除
+            let own2: serde_json::Value = serde_json::from_slice(msub.get(&2).unwrap()).unwrap();
+            assert_eq!(own2["k"], 22, "自写覆盖可见");
+            assert_eq!(own2["amount"], 222);
+            let o9: serde_json::Value = serde_json::from_slice(&msub[&9]).unwrap();
+            assert_eq!(o9["k"], 90);
+            assert_eq!(o9["amount"], 900);
+            assert!(!msub.contains_key(&3));
+            e.txn_rollback(txn);
+            // (2) RC：无快照 → 目标列 = 最新合成值（外部 patch 可见）
+            let mut txn_c = e.txn_begin(crate::txn::Isolation::ReadCommitted);
+            let full_c = e.scan_range_txn(&mut txn_c, Some(2), Some(2)).unwrap();
+            let sub_c = e
+                .scan_range_txn_fields(&mut txn_c, Some(2), Some(2), fields)
+                .unwrap();
+            assert_eq!(full_c.len(), 1);
+            assert_eq!(sub_c.len(), 1);
+            let fc: serde_json::Value = serde_json::from_slice(&full_c[0].1).unwrap();
+            let sc: serde_json::Value = serde_json::from_slice(&sub_c[0].1).unwrap();
+            assert_eq!(fc["k"], 999, "RC 最新合成（patch 可见）");
+            assert_eq!(sc["k"], 999);
+            assert_eq!(sc["amount"], 888);
+            e.txn_rollback(txn_c);
+        }
+    }
+
     /// R4：无活跃快照时 compact 收敛丢旧版本（现状语义）——旧 seq 快照读返回 None。
     #[test]
     fn rr_no_active_snapshot_compaction_drops_old_versions() {

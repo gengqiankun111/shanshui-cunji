@@ -6,7 +6,7 @@
 
 use crate::engine::{Engine, QueryRow};
 use crate::error::Result;
-use crate::keys::encode_docid;
+use crate::keys::{decode_docid, encode_docid};
 
 impl Engine {
     /// 批量写入（原子批次，用户端批量语义）：一次性提交一组 `(docid, value, terms)`——
@@ -263,6 +263,117 @@ impl Engine {
         out.retain(|(_, v)| !v.is_empty());
         // Ex-8.10：事务内未提交 Put 的**新 docid / 已删复活**（基表扫描不含该行）并入窗口——
         // read_own 仅覆盖"已出现"的行（上循环）；此处对 write_set 中未见 docid 补入最新自写值。
+        if !txn.ops().is_empty() {
+            let mut own_ids: Vec<u64> = txn
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    crate::txn::Op::Put { docid, .. } => Some(*docid),
+                    crate::txn::Op::Delete { .. } => None,
+                })
+                .collect();
+            own_ids.sort_unstable();
+            own_ids.dedup();
+            let present: std::collections::HashSet<u64> = out.iter().map(|(d, _)| *d).collect();
+            let mut added = false;
+            for d in own_ids {
+                if present.contains(&d) {
+                    continue;
+                }
+                let in_win = start.map_or(true, |s| d >= s) && end.map_or(true, |e| d <= e);
+                if in_win {
+                    if let Some(Some(v)) = txn.read_own(d) {
+                        out.push((d, v.to_vec()));
+                        added = true;
+                    }
+                }
+            }
+            if added {
+                out.sort_by_key(|r| r.0); // 保持升序（自写并入后重排；事务窗口通常小）
+            }
+        }
+        Ok(out)
+    }
+
+    /// P140（2026-09-06）：事务范围扫描 + **目标列投影**（#77 txn 长快照窗）——`scan_range_txn`
+    /// 的字段变体：基表用 `primary.scan_stream_at(S, project=Some(fields))`（一次 k-way 归并，
+    /// SST 端 PAX 只解目标列 → 子集 JSON；行式/内存直通整 JSON 字节），Delta 覆盖按 `fields`
+    /// 白名单合成（`fold_with_overrides_fields`，无命中免 parse），尾部同事务写覆盖/新 docid
+    /// 并入与 `scan_range_txn` 完全一致（语义逐条对齐）。
+    /// 返回行 = JSON 文档，**保证含 `fields` 各列**（内存/自写/行式行可能带整行多余字节），
+    /// 消费端只读 `fields` 覆盖列（契约同 `scan_stream_fields`）。
+    pub fn scan_range_txn_fields(
+        &self,
+        txn: &mut crate::txn::Transaction,
+        start: Option<u64>,
+        end: Option<u64>,
+        fields: Vec<String>,
+    ) -> Result<Vec<QueryRow>> {
+        if txn.is_finished() {
+            return Err(crate::error::Error::TxnAborted(format!(
+                "txn#{} 已结束",
+                txn.id
+            )));
+        }
+        // 扫描快照视图（RC 语义 = 最新视图；RR/SERIALIZABLE = 快照过滤）
+        let snapshot = if txn.isolation.uses_snapshot() {
+            txn.snapshot()
+        } else {
+            u64::MAX
+        };
+        let start_key = start.map(|s| encode_docid(s).to_vec());
+        let end_key = end.map(|e| encode_docid(e).to_vec());
+        // ① 基表 ≤S + 目标列投影（一次 k-way merge；PAX 只解 fields；SST 段级/块级剪枝照常）
+        let mut out: Vec<QueryRow> = Vec::new();
+        self.primary.scan_stream_at(
+            snapshot,
+            start_key.as_deref(),
+            end_key.as_deref(),
+            None,
+            Some(fields.clone()),
+            1,
+            |key, val| {
+                let docid = decode_docid(key).map_err(|_| {
+                    crate::error::Error::Corrupted("scan_at key 非 docid 编码".into())
+                })?;
+                out.push((docid, val.to_vec()));
+                Ok(true)
+            },
+        )?;
+        // ② 删除位图剔除仅对**当前/RC 视图**（snapshot=∞ 最新态，语义同 `scan_range_txn` 的
+        // 位图短路）；RR/SERIALIZABLE 快照读跳过位图——tombstone ≤ S 由 scan_stream_at 裁决。
+        if snapshot == u64::MAX {
+            if let Some(bm) = &self.deletion_bitmap {
+                out.retain(|(d, _)| !bm.is_deleted(*d));
+            }
+        }
+        // ③ Delta ≤S 折叠（只对 fields 白名单命中合成——P131 投影折叠；无增量短路零开销）
+        let overrides = if snapshot == u64::MAX {
+            self.delta_overrides_range(start, end)?
+        } else {
+            self.delta_overrides_range_at(start, end, snapshot)?
+        };
+        if !overrides.is_empty() {
+            for row in out.iter_mut() {
+                if let Some(ov) = overrides.get(&row.0) {
+                    row.1 = crate::engine::read::fold_with_overrides_fields(
+                        &row.1,
+                        &fields,
+                        Some(ov),
+                    )?;
+                }
+            }
+        }
+        // ④ 同事务写覆盖 / 新 docid 并入（与 scan_range_txn 尾部逐条一致）
+        for row in out.iter_mut() {
+            if let Some(own) = txn.read_own(row.0) {
+                match own {
+                    Some(v) => row.1 = v.to_vec(), // 自写整行（含 fields 列；消费端只取投影列）
+                    None => row.1.clear(),         // 事务内已删除：标记为空（下方过滤）
+                }
+            }
+        }
+        out.retain(|(_, v)| !v.is_empty());
         if !txn.ops().is_empty() {
             let mut own_ids: Vec<u64> = txn
                 .ops()

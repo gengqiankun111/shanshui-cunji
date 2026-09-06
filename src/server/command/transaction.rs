@@ -119,9 +119,38 @@ pub(crate) fn txn_scan_current(
     Ok(out)
 }
 
+/// P140（2026-09-06）：事务 SELECT 投影可否下推为目标列——列清单仅 `id/docid + 简单顶层
+/// 字段名`（无 `doc`/`*`/嵌套路径/表达式，且至少一个字段列）→ 返回字段名集合（不含 id）。
+/// 不可下推返回 None（调用方维持整行 `scan_range_txn`，语义不变）。
+pub(crate) fn plain_field_projection(proj: Option<&[ProjCol]>) -> Option<Vec<String>> {
+    let cols = proj?;
+    if cols.is_empty() {
+        return None;
+    }
+    let mut fields = Vec::new();
+    for c in cols {
+        match c {
+            ProjCol::Id => {}
+            ProjCol::Doc => return None, // 需整行
+            ProjCol::Field(f) => {
+                // 嵌套路径（addr.city / arr[0]）须整行深查 → 回退
+                if f.contains('.') || f.contains('[') {
+                    return None;
+                }
+                fields.push(f.clone());
+            }
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(fields)
+}
+
 /// 事务内 SELECT：快照查询（含同事务未提交写可见）。
 /// sysbench 兼容（H-6 扩展）：`WHERE id=N` 点查 / `id BETWEEN A AND B` 范围 /
 /// `id IN (...)` 多点 / `SUM(k)` 聚合 / `ORDER BY ... LIMIT N`（简化为排序截断）。
+/// P140（2026-09-06）：纯字段投影范围查询走 `scan_range_txn_fields`（见 plain_field_projection）。
 /// M 项优化（P0）：BETWEEN 范围走一次快照扫描（`scan_range_txn`），替代逐 id `txn_get`；
 /// 点查 / IN 保持逐 id（目标少，逐 id 更快）。
 /// 缺陷 A：`FOR UPDATE` 尾部修饰 → **当前读**（`txn_read_current` / `txn_scan_current`，
@@ -155,10 +184,17 @@ pub(crate) fn txn_select(
     if let Some((a, b)) = extract_between_range(core) {
         // §26 M1：SQL row_id 窗口 → 本表 docid 窗口
         let (da, db) = (docid_for(tid, a), docid_for(tid, b));
+        // P140：纯字段投影（非 FOR UPDATE/SUM，且无 doc/嵌套列）→ 快照范围扫 + 目标列下推
+        let proj_fields = plain_field_projection(proj.as_deref());
         let rows = if for_update {
             match txn_scan_current(engine, txn, Some(da), Some(db)) {
                 Ok(r) => r,
                 Err(e) => return QueryResponse::Err(3500, format!("事务范围当前读失败: {e}")),
+            }
+        } else if let Some(fs) = proj_fields {
+            match engine.scan_range_txn_fields(txn, Some(da), Some(db), fs) {
+                Ok(r) => r,
+                Err(e) => return QueryResponse::Err(3500, format!("事务范围读失败: {e}")),
             }
         } else {
             match engine.scan_range_txn(txn, Some(da), Some(db)) {

@@ -1951,7 +1951,21 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   **范围迭代复用（scan_range_at 同源一次 k-way）+ ≤S 折叠 + 目标列投影 三合一**的
   `scan_range_txn_fields`；另产出**触发项**：`batch_get_at` 冷库逐键点查退化
   （39.2 µs/row vs get_many 0.38），P135 superset 回表需上按块批量点查。
-- 方案（待内核）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`（≤S 归并仅
+- **内核完成（2026-09-06）**：`Engine::scan_range_txn_fields(start,end,txn,fields)`：
+  基表 `primary.scan_stream_at(S, project=Some(fields))`（一次 k-way，PAX 只解目标列 →
+  子集 JSON；内存/行式直通整 JSON——消费端只读 fields 覆盖列）+ Delta ≤S 白名单折叠
+  `fold_with_overrides_fields`（无命中免 parse）+ 位图仅 RC/当前视图剔除（RR 跳过由 ≤S
+  裁决，与 scan_range_txn 一致）+ 自写覆盖 / 事务删除 / 新 docid 并入（尾部逐条同
+  scan_range_txn）。接线：事务 BETWEEN 窗先 `plain_field_projection(proj)` 判定（仅
+  id + 简单顶层字段、无 doc/`*`/嵌套路径/表达式且 ≥1 字段列）→ 下推
+  `scan_range_txn_fields`；否则整行 `scan_range_txn` 回退（FOR UPDATE/SUM/含 doc 保持
+  原路径不变）。#77 形态 `SELECT id,k,amount WHERE id BETWEEN` 已免整行 25 列解码。
+- 单测 `p140_scan_range_txn_fields_projection_matches_full`（mem/SST 双态 × RR ≤S 旧值 /
+  RC 合成最新 / 自写覆盖整行可见 / 事务删除排除 / 窗口外新 docid 并入，行集+目标列值
+  == scan_range_txn 全量解析）；lib 793 全绿（seqlock flaky 复绿）。
+- 待办：探针复测 #77 clean（基线 3316ms → 验收 ≤1.5s）；以及 `batch_get_at` 按块批量
+  点查触发项（可并入 superset 冷库回表优化）。
+- 方案（内核已落，探针复测中）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`（≤S 归并仅
   解目标列，复用 P131/P134 版本归并 + P86②/P91 列提取）→ 事务长读窗输出接线。验收：#77
   clean ≤1.5s（≥2.2×）且 p99 收敛。
 
