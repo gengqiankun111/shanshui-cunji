@@ -2022,6 +2022,43 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   （注意：会破坏现有 approx==Σvalue 测试契约，需同步改测）。现状：110 万 composite 库仍
   全量回放，测量卫生 = clean 重装。
 
+## 交接段 · 山水存迹（2026-09-06，develop @ 81d4f45）
+
+> 本段 = P134+ 问题线本会话（含 Linux 远端 A/B）收口交接快照，供换机/新会话直接续读。细记录见上文对应 P 条目与 development_remain.md 的 P 行状态表。
+
+### 仓库与状态
+- 分支 develop，已推送 gitee（geng_qiankun/shanshui-cunji）；src/demo/*、tmp/ 均 gitignore。
+- 排期/问题文档（一切以这两份为准）：development_remain.md（P 行状态表）、problem_solving.md（P134+ 问题闭环，= 本文件 §阶段 4）。
+- 工作流：读排期 → design → src/demo/\<功能\> 跑通 → 合入 src/ → 单测 + 全量 `cargo test --lib`（~799，唯一 flaky = seqlock retry 复绿）→ 回填两份文档 → 提交。
+
+### 本会话收口（P140–P145）
+| P | 内容 | 结论/产物 |
+|---|---|---|
+| P140 | #77 txn 快照窗投影流 | scan_range_txn_fields（快照+列投影三合一）+ BETWEEN 窗下推；warm p50 2-2.5×；#77 mean 3316→2459ms |
+| P143 | #77 冷首触 IO | 组读(SCAN_GROUP) 8/64/256 clean A/B 无差异（维持 8）；块尺寸 4→32KB 有效（cold 2524→1701、稳态 179ms，点查无损）→ 宽表推荐 block_size_kb=32（写侧新 SST 生效） |
+| P144 | WAL checkpoint 推进 | 局部修复 flush_checkpoint_advance（cp 前进即持久化+裁剪）+ 单测 p144_checkpoint_persists_after_flush_without_close；composite cidx 钉死 cp 场景待设计 |
+| P145 | batch_get_at 按块分组 | CF get_many_at（≤S 语义逐 get_bytes_at 等价）；冷 39.2→12.2µs/doc；要点 = 块只解码一次 |
+
+### 待办队列（development_remain 已登记，均未开发）
+- P141 事务内聚合 MVCC 权威版（RR COUNT/GROUP BY；复用 P134/P135 superset）。
+- P142 Estimate 数量级接口（count_all_docs / count_docs_range 单锁 rank，零 MVCC，标 approx）。
+- P144 残余：cidx 钉死 cp 设计（候选① memtable 刷盘判据含条目数 ② composite cidx 可重建（task028 open 期语义）→ 不钉 cp、随 primary 收敛裁段 ③ approx_bytes 计 key——③ 会破坏 approx==Σvalue 测试契约需同步改测）。
+- #77 验收残余：cold 首跑 mean 1613ms 距 ≤1.5s 一步（32KB 档）；block_size_kb 代码默认 4→32 待 Linux A/B 定。
+- 杂项：seqlock flaky 阈值；WAL 回放 checkpoint——新库 110 万 composite 仍全量回放（测量卫生 = clean 重装）。
+
+### 换机 / 远端注意
+- Linux 编译：仓库内 `.cargo/config.toml` 为 Windows 专用（target-dir/linker）——Linux 须删除或用 CARGO_TARGET_DIR 覆盖；`~/.cargo/config.toml` 用 rsproxy.cn 镜像；构建加 `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`（否则 cgu1+LTO 2 核极慢）。
+- Engine.iou 已改 pub(crate)（Linux E0451，Windows 不可见，81d4f45）→ 远端需拉 81d4f45 后重编 cjserver + rr-conformance。
+- 阿里云 A/B（a4 vs b32，50 万行 / 1G 预算）：root@106.14.68.116（Debian12 / 2C / 1.6GB），/root/scc-p143（已删仓库 .cargo）、/root/cfg-linux-a4.toml / cfg-linux-b32.toml、/root/bench-remote.sh 就绪；mariadb 已停（编完记得 `service mariadb start`）。本地 plink/pscp 在 C:\putty。
+- PowerShell 陷阱：原生命令内嵌引号被剥离；pkill -f 会自匹配远程 shell（用 pkill -x 或分两次调用）。
+
+### 新机器上继续的第一步
+`git pull develop` → 重编远端（含 81d4f45）→ 跑 a4/b32 → 依结果决定 block_size_kb 默认是否改 32。
+
+### 本机核对 / 遗留口径（Windows 工作区记录）
+- 本机 origin/develop = 81d4f45，与上表一致；原 HEAD 停在 master（d2d1972，2026-09-02 的 10 亿库阶段 A~D 合并线，其 problem_solving.md 无 §阶段 4）。本次已建本地 develop 跟踪 origin/develop 续作；master 上 10 亿库阶段 A~D 内容若需并入 develop 排期线，先 merge-base 核对（a8c4e17 已在 develop 祖先中）。
+- P143 最终口径 = **32KB**（development_remain.md P143 行 + commit 41f7147）；本文件 §P143 记录正文仍写"建议 64KB"，待回填统一。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
