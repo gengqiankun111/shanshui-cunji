@@ -1882,6 +1882,18 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 验证：单测 p137_inverted_report_rows_and_snapshot_counters（9 行齐全 + 首查 miss→二查 hit +
   prune 剔 2/批量 3 计数前进）；全量 lib **790 通过 + 4 ignored**。
 
+**P138（autocommit S 选型 demo：非事务端 S 路径定量 A/B，2026-09-06）**
+- 背景：P135 复核结论"非事务端不改（latest 批量位图快路径）"系定性（S=语句开始≡latest）。
+  P138 定量：`Engine::batch_get_at(S=当前全局 seq)` vs `batch_get`（latest）直连引擎全矩阵
+  （src/demo/p138-autocommit-s，gitignored）。
+- 实验：60k 行、s=a 候选 30k，位图开/关 × memtable 热（留 mem）/冷（已 flush SST）× 窗
+  30000/4096/512，先各自 warm（latest 侧 HotCache 回填）再计时（固定处理 180k docid 每单元）。
+- 结果（debug 相对口径 µs/docid）：**batch_get_at(S) 全 8 单元均慢于 latest 1.6–2.4×**
+  （latest 1.07–2.30 vs S 2.56–2.96；位图开/关与热/冷均成立；冷段无 sst_min_seq keys-only
+  首触放大——批量 ≤S 归并开销与 mem/SST 状态弱相关，HotCache 旁路是 warm 后主要差源）。
+- 结论：**维持"非事务端不改"**（S 路径为 RR 专属：txn superset + 未来混合库残余），无触发项。
+  batch_get_at 的 ≤S 归并 + 不入 HotCache 在 latest 语义下无收益且纯增成本（实证）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。
