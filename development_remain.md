@@ -126,8 +126,13 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
     - /estimate 条件估计（P142/A2）：posting∩live → 与权威一致（101149）
     - SUM/AVG/MIN/MAX 与 COUNT(f)：无位图等价（须逐行取值/数值）→ 不可加词近似，恒权威全扫（~5s）
   - 结论（FOR QUICK 落点）：加词降级 O(1) 语义安全前提 = 白名单字段 + **live∩ 判活路径**（group_by_bitmap_window/count_distinct_fast/estimate 族，与权威一致）；Ex-9.1 `inverted_doc_count` 单等值快路缺 live∩ → 删除/换值库上近似高估墓碑残留——FOR QUICK 若走该路须标注近似语义或先补 live∩（留作后续，本项未接 code）
-- [ ] A1-3 demo/内核确认：release 下事务聚合路径正确性/耗时 sanity（可选 src/demo/，与 txn_agg 单测互补；确认 sqlish 候选兜底路径 + 混合库 wm>2^48 分支实际可达性）
-- 销项：development_0907.md P141 行「待办：demo/内核 + 探针 + FOR QUICK 对照基线」→ 全部完成后标 ✅
+- [x] A1-3 demo/内核确认：release 下事务聚合路径正确性/耗时 sanity（可选 src/demo/，与 txn_agg 单测互补；确认 sqlish 候选兜底路径 + 混合库 wm>2^48 分支实际可达性）
+  - ✅ 2026-09-07：补 p141_txn_agg_sqlish_fallback_fu_and_mixed_wm 可达性单测（两条兜底分支 + 修复）：
+    - ① sqlish 候选兜底（单表单行库 + FOR UPDATE 字段谓词）：候选=当前视图 sqlish ∪ 写集 → txn_read_current 取值 + doc_matches_where 复检——自改离开谓词行被剔除、仍命中行当前读见新值（SUM 4→100 断言）；
+    - ② wm>2^48 混合库分支（t_a 高位 docid 推水位）：快照字段谓词标量/分组走 sqlish 兜底，限定默认表（t_a 无 s 不命中），与 nontxn 权威对照一致；
+    - **发现并修复缺陷（commit 917171c）**：txn_agg drive sqlish 兜底构造 cond_sql 时尾截断只含 ORDER BY/LIMIT → 字段谓词 + GROUP BY（混合库/FOR UPDATE）cond 误带 "GROUP BY s" → parse "非分组列 docid" 失败；现截断含 GROUP BY/HAVING（分组累积仍在 txn_group 行流）。41 项 txn 回归全绿。
+  - release sanity：复用 A1-1 SCC 500k release 探针双端全绿 + 本单测 debug 通过（耗时基线见 A1-2/A1-1，权威 ~5.2s/条）。
+- 销项 ✅：development_0907.md P141 行已完成（A1-1~A1-3 全 [x]，development_0907.md P141 行已标 ✅）
 
 **A2 P142 Estimate 数量级接口（独立非 SQL，零 MVCC 改动）**
 - [x] A2-1 契约与入口：HTTP `GET /estimate`（无参 = 全库；`field=&value=` = 条件估计；`range=` 可选窗口）→ 响应 JSON 显式 `approx: true` 与数量级标注；复用 route_request（src/server/http/mod.rs），doc_api 新 handle_estimate
@@ -135,6 +140,6 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 - [x] A2-3 live 懒建首调尖刺：open 后台预热（live_ensure 懒建 → open 收尾触发）或接口标注首次慢 —— **选标注**（`/estimate` 全库响应 note 已注明首次懒建基线、大库秒级，后续 O(1)）；后台预热开放留触发式（若生产首调尖刺成问题再上）
 - [x] A2-4 单测 + 量级验证 + 文档：全库/表窗/条件×位图/posting 单测；与权威 COUNT 数量级对照；HTTP 面文档（user_guide/README）回填
   - ✅ 2026-09-07：http 端到端测试覆盖 all/window/field/field+window/400（commit 5716dcb）；量级验证（VM 50 万 SCC 库，est2）：all=501200 精确（权威 COUNT(*) 501200，首调 5.7s 懒建基线）、window 1-1000=1000、field status=active=101149（权威 154437，同 1e5 量级——差值 = 重启后倒排 term 未达内存落盘阈值丢段/陈旧残留，属近似语义 + P144 空心索引已知面，接口 approx 标注兜底）。A2 接线 commit 37fe410，文档 93938cc
-- 销项：development_0907.md P142 行「待办：入口接线 + approx 标注 + 预热 + 量级验证」→ 完成后标 ✅
+- 销项 ✅：development_0907.md P142 行已完成（A2-1~A2-4 全 [x]，development_0907.md P142 行已标 ✅）
 
 > 执行顺序建议：A1-1（探针对拍，闭环正确性）→ A2-1~A2-4（独立接口）→ A1-2/A1-3（评估/确认）。
