@@ -110,7 +110,11 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 ### A 批任务拆解（用户 2026-09-07 选定先行；批次表 A1/A2 标记 ⏳ 进行中）
 
 **A1 P141 收尾（txn 聚合权威面闭环）**
-- [ ] A1-1 rr/sqlrun 探针对拍：新增事务内聚合探针（txn COUNT/SUM/AVG/MIN/MAX [DISTINCT]、GROUP BY/HAVING、COUNT(*) 无 WHERE 全表），与 MySQL 双端对拍——覆盖三态：FOR UPDATE 当前读 / 同事务自插·自改·自删 / 空集数值聚合 NULL（两库行集等值，纳入既有复测闭环）
+- [x] A1-1 rr/sqlrun 探针对拍：新增事务内聚合探针（txn COUNT/SUM/AVG/MIN/MAX [DISTINCT]、GROUP BY/HAVING、COUNT(*) 无 WHERE 全表），与 MySQL 双端对拍——覆盖三态：FOR UPDATE 当前读 / 同事务自插·自改·自删 / 空集数值聚合 NULL（两库行集等值，纳入既有复测闭环）
+  - ✅ 2026-09-07：txn_agg_{cnt_all,scalar,avg,group,fu} 双端全 exp-ok（MariaDB a11g / SCC a11f，同 sqlrun 版本，行集数值语义等值）。附带修复 2 个 SCC 缺陷（commit 32ed256）：
+    - txn_dml `WHERE id BETWEEN` 主键闭窗口直解——误走字段候选 + doc 无 id 复检 → 事务内窗口 UPDATE/DELETE 恒 0 行；
+    - txn 单字段赋值 JSON 类型化——`SET k=2` 旧落 doc.k 字符串 → 事务内 SUM/AVG 数值聚合读 NULL（对齐非事务 P131/ODKU）。
+  - 边界注：单语句复合 SET（SET k=2, amount=2.50）超出 txn UPDATE 单字段解析 → avg 探针 SET 拆两条单列（M-7 已知缺口，非 P141 面）；组态同款不阻塞。
 - [ ] A1-2 "FOR QUICK 落点"对照基线（评估项）：默认权威 vs 加词降级 O(1) 近似——盘点可加词近似的聚合形态（enum/bitmap 字段 COUNT 族），产出定位 + 探针对照基线，不强制接 code
 - [ ] A1-3 demo/内核确认：release 下事务聚合路径正确性/耗时 sanity（可选 src/demo/，与 txn_agg 单测互补；确认 sqlish 候选兜底路径 + 混合库 wm>2^48 分支实际可达性）
 - 销项：development_0907.md P141 行「待办：demo/内核 + 探针 + FOR QUICK 对照基线」→ 全部完成后标 ✅
