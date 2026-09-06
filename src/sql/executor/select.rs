@@ -705,9 +705,10 @@ pub(crate) fn topk_sort(
         return Ok(Vec::new());
     }
     // P87③ + P139：仅对胜出行回表——SELECT 纯字段列集 → 投影子集解码（batch_get_fields），
-    // 免 25 列整行；`*`/表达式/id-only 保持整行（SELECT * 消费端需完整文档）
+    // 纯 id → batch_alive_latest 免整行；`*`/表达式保持整行（SELECT * 消费端需完整文档）
     let proj = select_projection_fields(columns);
-    let got = batch_fetch_rows(engine, &win, proj.as_deref())?;
+    let alive_only = proj.is_none() && id_only_columns(columns);
+    let got = batch_fetch_rows(engine, &win, proj.as_deref(), alive_only)?;
     let mut out = Vec::new();
     for (d, v_opt) in win.into_iter().zip(got.into_iter()) {
         let Some(v) = v_opt else { continue };
@@ -993,13 +994,27 @@ fn subset_doc_bytes(fields: &[String], vals: &[Option<Vec<u8>>]) -> Vec<u8> {
     serde_json::to_vec(&Value::Object(obj)).unwrap_or_else(|_| b"{}".to_vec())
 }
 
-/// P139：批量取行（fields Some 且非空 → 投影子集解码 `batch_get_fields`；否则整行
-/// `batch_get`）→ Vec<Option<doc bytes>>（删除位图/墓碑剔除语义与整行一致）。
+/// P139：SELECT 列恰为纯 id（`id`/`docid` 单列）——输出无需行值，仅需活跃判定。
+fn id_only_columns(columns: &[String]) -> bool {
+    columns.len() == 1 && (columns[0] == "id" || columns[0] == "docid")
+}
+
+/// P139：批量取行（fields Some 且非空 → 投影子集解码 `batch_get_fields`；alive_only →
+/// `batch_alive_latest` 免整行活跃判定输出 `{}`；否则整行 `batch_get`）→ Vec<Option<doc bytes>>。
+/// 删除位图/墓碑剔除语义与整行一致（alive 仅代表"当前存在未删"）。
 fn batch_fetch_rows(
     engine: &Engine,
     docids: &[u64],
     fields: Option<&[String]>,
+    alive_only: bool,
 ) -> Result<Vec<Option<Vec<u8>>>> {
+    if alive_only {
+        return Ok(engine
+            .batch_alive_latest(docids)
+            .into_iter()
+            .map(|alive| if alive { Some(b"{}".to_vec()) } else { None })
+            .collect());
+    }
     match fields {
         Some(fs) => {
             let got = engine.batch_get_fields(docids, fs)?;
@@ -1072,7 +1087,8 @@ fn pk_range_select(
     // 同态 A/B（2026-09-06 3317 实测，pk_between_10000）：fields 333ms vs 整行 541ms
     // （~1.6×，整行 25 列解码 > fields 逐键开销）→ 主键区间同样受益，保留投影。
     let fields = select_projection_fields(&sel.columns);
-    let got = batch_fetch_rows(engine, &out_ids, fields.as_deref())?;
+    let alive_only = fields.is_none() && id_only_columns(&sel.columns);
+    let got = batch_fetch_rows(engine, &out_ids, fields.as_deref(), alive_only)?;
     let mut out = Vec::new();
     for (d, v_opt) in out_ids.into_iter().zip(got.into_iter()) {
         if let Some(doc) = v_opt {
@@ -1327,8 +1343,9 @@ pub fn execute_with_tid(
             other => other.iter(),
         };
         let fields = select_projection_fields(&sel.columns);
+        let alive_only = fields.is_none() && id_only_columns(&sel.columns);
         rows = collect_limited_rows(
-            |chunk| batch_fetch_rows(engine, chunk, fields.as_deref()),
+            |chunk| batch_fetch_rows(engine, chunk, fields.as_deref(), alive_only),
             it,
             sel.offset,
             limit,

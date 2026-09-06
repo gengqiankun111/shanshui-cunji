@@ -201,6 +201,35 @@ impl Engine {
         removed
     }
 
+    /// P139-b（2026-09-06）：id-only 输出活跃判定——批量"最新态存在/未删"检查（免整行解码）。
+    /// 删除位图开 → O(1) `is_deleted`；位图关（Tombstone 模式）→ 主数据 `get_bytes` 存在性
+    /// （读块不解析 JSON，成本 ≈ 点查块 IO < 整行 serde）。输出与输入对齐的 Vec<bool>。
+    /// **前置契约**：候选 docid 必源自"现存集派生"（倒排 posting / live 窗口 / 区间 keys-only
+    /// 迭代——均为曾写入的 docid）；位图模式下对**从未写入**的 docid 返回 true（无删除标记
+    /// 无法区分"从未存在"与"活跃"，O(1) 代价上限使然）。调用方（id-only 输出）候选恒满足前置。
+    pub(crate) fn batch_alive_latest(&self, docids: &[u64]) -> Vec<bool> {
+        let mut out = Vec::with_capacity(docids.len());
+        match &self.deletion_bitmap {
+            Some(bm) => {
+                for &d in docids {
+                    out.push(!bm.is_deleted(d));
+                }
+            }
+            None => {
+                for &d in docids {
+                    let k = crate::keys::encode_docid(d).to_vec();
+                    let alive = self
+                        .primary
+                        .get_bytes(&k)
+                        .map(|r| r.is_some())
+                        .unwrap_or(false);
+                    out.push(alive);
+                }
+            }
+        }
+        out
+    }
+
     /// P135（2026-09-06）：**批量快照取行**——语义与 `get_at` 逐条完全一致
     /// （≤ snapshot_seq 版本：跳过删除位图、tombstone seq ≤ S → None / > S → 取 S 前旧版、
     /// Delta 增量 ≤ S 折叠不坍缩），但一次处理多个 docid：

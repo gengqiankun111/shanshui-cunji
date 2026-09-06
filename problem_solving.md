@@ -1916,13 +1916,17 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   出现 + 墓碑剔除一致）；lib **791 通过 + 4 ignored**。
 - 下一片候选：sort 输出期 top-k 整行回表投影、#77 txn 长快照窗快照侧投影流、混合 #79/80 排序列
   子集、id-only 安全投影（需墓碑剔除保真方案）。
-- **下一片落地（2026-09-06，P139-b sort/top-k 输出期投影）**：`topk_sort` 增 `columns` 参，输出
-  期（P87③ 胜出行整行回表）改 `select_projection_fields` 投影子集解码；无 LIMIT 全排序路径
-  取行集 = 排序键 ∪ SELECT 纯字段投影（`*`/表达式仍整行）；`select_projection_fields` 改列切片
-  入参；sql/tests 直调补 `&[]`。单测扩展路径③④（topk/full 子集==SELECT* 基线 status 等值 +
-  note 不出现 + docid 集一致）。实测（P139 clean 110 万同库）：enum_sel_limit3000 稳定 18.5-18.7ms
-  无回归；#16/#66/#79/#80 波动在状态/噪声内（输出行 ≤ LIMIT 小 → 投影收益受限；排序族主成本 =
-  候选全扫解码，不属本片）。lib **791 通过 + 4 ignored**。
+- **下一片落地 A（2026-09-06，P139-b sort/top-k 输出期投影）**：`topk_sort` 增 `columns` 参，
+  输出期（P87③ 胜出行整行回表）改投影子集解码；无 LIMIT 全排序取行集 = 排序键 ∪ SELECT 纯字段
+  投影（`*`/表达式仍整行）；实测无回归（enum3000 稳定），排序族主成本 = 候选全扫解码（不属本片）。
+- **下一片落地 B（2026-09-06，P139-c id-only 活跃判定）**：`Engine::batch_alive_latest`（位图开
+  → O(1) `is_deleted`；位图关 → 主数据 `get_bytes` 存在性点查；**前置契约：候选必源自现存集
+  派生（posting/live 窗口/keys-only 区间），位图模式对"从未写入"docid 返回 true（无法区分，
+  O(1) 上限使然）**）+ `batch_fetch_rows` 增 alive_only 分支输出 `{}` + `id_only_columns` 判定；
+  接线三输出端（pk 区间 / 非 sort 通用 / topk 胜出）。实测（P139 同库同态）：**#47 combo_and_
+  limit500 1.18→0.68ms、#48 combo_and_limit3000 7.39→1.58ms（4.7×，对 MySQL 3.11ms **反超
+  0.5×**）**。单测 p139b_batch_alive_latest_matches_get（位图开/关 × 与逐 get 一致 × 复活）+
+  p139 路径⑤（id-only `{}` 输出/行集一致/墓碑剔除）；lib **792 通过 + 4 ignored**。
 
 ## 环境备忘（不入库）
 

@@ -3926,6 +3926,58 @@ use crate::optimizer::QuerySpec;
         }
         // docid 集与全排序基线一致（排序由内部 needed 含 k 保证，输出多余 k 无碍 server 投影）
         assert!(full4.iter().all(|(x, _)| sub4.iter().any(|(d, _)| d == x)));
+        // 路径⑤：id-only 活跃判定（SELECT id）——免整行解码输出 {}，行集/墓碑剔除与基线一致
+        let full5 = crate::sqlish::execute(
+            &e,
+            "SELECT * FROM t WHERE status='a' LIMIT 1000",
+            1000,
+        )
+        .unwrap();
+        let sub5 = crate::sqlish::execute(
+            &e,
+            "SELECT id FROM t WHERE status='a' LIMIT 1000",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(sub5.len(), 1000);
+        assert_eq!(full5.len(), 1000);
+        assert!(sub5.iter().all(|(_, v)| v.as_slice() == b"{}"), "id-only 输出空 doc");
+        assert!(sub5.iter().all(|(d, _)| full5.iter().any(|(x, _)| x == d)), "行集一致");
+        assert!(sub5.iter().all(|(d, _)| *d != 1234), "墓碑剔除");
+        let sub5b = crate::sqlish::execute(
+            &e,
+            "SELECT id FROM t WHERE id BETWEEN 1 AND 2000",
+            4000,
+        )
+        .unwrap();
+        assert_eq!(sub5b.len(), 1999);
+        assert!(sub5b.iter().all(|(_, v)| v.as_slice() == b"{}"));
+        assert!(sub5b.iter().all(|(d, _)| *d != 1234));
+    }
+
+    /// P139-b：id-only 活跃判定引擎原语——位图开/关两态下 `batch_alive_latest` 与逐 `get`
+    /// 存在性一致（含墓碑删除/复活后）。
+    #[test]
+    fn p139b_batch_alive_latest_matches_get() {
+        for bm in [true, false] {
+            let dir = tmp();
+            let mut cfg = Config::default();
+            cfg.storage.deletion_bitmap_enabled = bm;
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            for i in 1..=5u64 {
+                e.put(i, mkdoc_kg(i, "n"), &[]).unwrap();
+            }
+            e.delete(2).unwrap();
+            let alive = e.batch_alive_latest(&[1, 2, 3, 4, 5]);
+            assert_eq!(alive, vec![true, false, true, true, true], "[bm={bm}]");
+            // 与逐 get 存在性一致（候选均为曾写入 docid —— 前置契约内）
+            for (i, &d) in [1u64, 2, 3, 4, 5].iter().enumerate() {
+                let g = e.get(d).unwrap().is_some();
+                assert_eq!(alive[i], g, "[bm={bm}] docid={d}");
+            }
+            e.put(2, mkdoc_kg(2, "r"), &[]).unwrap(); // 复活
+            assert_eq!(e.batch_alive_latest(&[2]), vec![true], "[bm={bm}] 复活后存活");
+        }
     }
 
     #[test]
