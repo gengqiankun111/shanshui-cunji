@@ -11,6 +11,10 @@ use crate::engine::{Engine, PagedRows, QueryRow};
 use crate::error::Result;
 use crate::keys::{decode_docid, encode_docid};
 
+/// P131 定位 v2：live 位图窗口 and 的最大跨度（>此跨度回退 keys-only 扫，避免一次性
+/// 构造百万级窗口位图；覆盖 #75 20000 / pk_between 10000 等基准窗口形态）。
+const LIVE_WINDOW_SPAN_MAX: u64 = 200_000;
+
 
 impl Engine {
     /// Task-025b 阶段③：条带并行全扫（导出/条带消费端构建块）——把 [lo..hi] 按核等分子窗，
@@ -404,6 +408,55 @@ impl Engine {
                 bm.insert(docid);
             }
         }
+    }
+
+    /// P131 定位 v2（2026-09-06）：窗口现存候选 = `live ∩ [lo,hi]` 纯内存升序——
+    /// 替代组合主键定位（P127 `locate_pk_range_converged` / `pk_range_select`）的
+    /// **keys-only 磁盘扫 20000 键**（实测 ~4ms/语句），把窗口扫描降为位图 and（内存）。
+    /// 口径与 keys-only 现存扫描完全一致（live 由 put/delete/delete_batch/purge 增量维护，
+    /// 懒建全键扫一次 = count_docs_range 同源）；`limit` 截断（None = 全取）。
+    /// 小跨度：窗口位图 and；大跨度（>LIVE_WINDOW_SPAN_MAX，如超大纯区间无 LIMIT）回退
+    /// keys-only 扫描保持行为不劣化（避免一次性构造百万级窗口位图）。
+    pub(crate) fn live_window_ids(
+        &self,
+        lo: u64,
+        hi: u64,
+        limit: Option<u64>,
+    ) -> Result<Vec<u64>> {
+        if lo > hi {
+            return Ok(Vec::new());
+        }
+        self.live_ensure()?;
+        let live = self.live_docids.lock().unwrap().clone().unwrap_or_default();
+        let span = hi - lo + 1;
+        if span <= LIVE_WINDOW_SPAN_MAX {
+            let win: RoaringTreemap = (lo..=hi).collect();
+            let mut out: Vec<u64> = Vec::new();
+            for d in (live & win).iter() {
+                out.push(d);
+                if let Some(l) = limit {
+                    if out.len() as u64 >= l {
+                        break;
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // 大跨度回退：keys-only 扫（与旧定位同行为，span 超限场景不劣化）
+        let mut out: Vec<u64> = Vec::new();
+        self.scan_stream_ids(Some(lo), Some(hi), |d| {
+            if d < lo || d > hi {
+                return Ok(true);
+            }
+            out.push(d);
+            if let Some(l) = limit {
+                if out.len() as u64 >= l {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(out)
     }
 
     /// P1-C：活跃集剔除（delete 路径）——幂等（删不存在 / 重复删为 no-op）。

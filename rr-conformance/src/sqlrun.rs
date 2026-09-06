@@ -409,6 +409,12 @@ pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
     let sql_upd_range = |_r: &mut StdRng, _c: &Ctx, _i: usize| {
         format!("UPDATE {tb} SET note='x9' WHERE id BETWEEN 1 AND 20000 AND status='active' LIMIT 200", tb = t())
     };
+    // P131（2026-09-06）：值变形态 #75 —— note 每次赋不同字面量（p131c{i}），保证每轮
+    // affected=200（官方探针 note='x9' 因 loader 同值恒 rows=0 = 读现值路径，测不出写链）。
+    // 声明配置（bitmap status/region）下 note 非索引列 → SCC 走 Delta CF patch_batch。
+    let sql_upd_range_chg = |_r: &mut StdRng, _c: &Ctx, i: usize| {
+        format!("UPDATE {tb} SET note='p131c{i}' WHERE id BETWEEN 1 AND 20000 AND status='active' LIMIT 200", tb = t())
+    };
     let sql_longread = |_r: &mut StdRng, c: &Ctx, _i: usize| {
         // 窗宽 100k：干净 100k 库上 n-100000=0 → 采 [1..=1]（整表窗），避免空区间 panic
         let lo = c.n.saturating_sub(100_000).max(1);
@@ -503,6 +509,7 @@ pub fn run(url: &str, out: &str, table: &str, only: &str) -> i32 {
         Probe { cat: "写", name: "update_hotrow_single", kind: Kind::Exec, n: 200, sql: sql_hotupd, note: "热点同一主键反复 update" },
         Probe { cat: "写", name: "delete_range_1000", kind: Kind::Exec, n: 1, sql: sql_delc, note: "范围删除 1000 行" },
         Probe { cat: "写", name: "update_range_idx", kind: Kind::Exec, n: 20, sql: sql_upd_range, note: "索引条件批量 update 200 行" },
+        Probe { cat: "写", name: "update_range_idx_chg", kind: Kind::Exec, n: 20, sql: sql_upd_range_chg, note: "索引条件批量 update 200 行（值变形态，P131 delta 写链）" },
         Probe { cat: "事务", name: "txn_lock_mid_contend", kind: Kind::Block, n: 5, sql: sql_lock, note: "中等并发 for update 部分锁冲突（双连接）" },
         Probe { cat: "事务", name: "txn_long_read", kind: Kind::Block, n: 5, sql: sql_longread, note: "长只读快照事务（读 10 万行窗）" },
         Probe { cat: "事务", name: "txn_multi_stat", kind: Kind::Block, n: 20, sql: sql_multi, note: "事务内多条 DML 混合" },

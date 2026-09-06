@@ -10,8 +10,9 @@ use crate::keys::encode_docid;
 
 impl Engine {
     /// 批量写入（原子批次，用户端批量语义）：一次性提交一组 `(docid, value, terms)`——
-    /// put_nosync 攒批 + 一次 `flush_wal` 统一提交（整批落盘或崩溃后按 WAL 批次整体重放，
-    /// 无中间态；与组提交正交——显式批次边界，延迟可预期）。
+    /// put_nosync 攒批 + 批尾统一提交（整批落盘或崩溃后按 WAL 批次整体重放，无中间态；
+    /// 提交语义 = `commit_batch`：档位 1 显式 flush_wal 强安全；档位 0/2 组提交窗口，
+    /// 见 P131 2026-09-06——批量 UPDATE 不再每语句双 WAL 同步 fsync）。
     /// 为 D 项（LSM 事务阶段一 WriteBatch 原子写）的前置基础；单条语义同 `put`。
     pub fn put_batch(&mut self, items: &[(u64, Vec<u8>, Vec<String>)]) -> Result<()> {
         self.watchdog.check_all(self.mem_ratio, &self.data_dir)?;
@@ -19,7 +20,7 @@ impl Engine {
             let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             self.put_nosync(*docid, value.clone(), &refs)?;
         }
-        self.flush_wal()
+        self.commit_batch()
     }
 
     // ===== D/E/F 事务三阶段 =====

@@ -993,10 +993,9 @@ fn pk_range_select(
     };
     let need = limit.saturating_add(offset_u).max(1);
     let mut ids: Vec<u64> = Vec::new();
-    engine.scan_stream_ids(Some(lo), Some(hi), |d| {
-        if d < lo || d > hi {
-            return Ok(true);
-        }
+    // P131 定位 v2（2026-09-06）：窗口现存改走 live_window_ids（live 位图 ∩ 区间，
+    // 纯内存，替代 keys-only 磁盘扫）；口径与 keys-only 现存一致（已删行排除、升序）。
+    for d in engine.live_window_ids(lo, hi, None)? {
         let hit = match &rest_set {
             Some(s) => docset_contains(s, d),
             None => true,
@@ -1004,11 +1003,10 @@ fn pk_range_select(
         if hit {
             ids.push(d);
             if ids.len() as u64 >= need {
-                return Ok(false); // LIMIT+OFFSET 上限达标：终止扫描（早停）
+                break; // LIMIT+OFFSET 上限达标：终止（早停）
             }
         }
-        Ok(true)
-    })?;
+    }
     let out_ids: Vec<u64> = ids.into_iter().skip(sel.offset as usize).collect();
     if out_ids.is_empty() {
         return Ok(Some(Vec::new()));

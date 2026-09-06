@@ -481,9 +481,24 @@ impl Engine {
         Ok(())
     }
 
+    /// P131（2026-09-06）：批量写/批量增量的统一提交语义——按事务落盘档位：
+    /// 档位 1 = 显式 `flush_wal`（强安全批边界，语义不变）；档位 0/2 = 走组提交窗口
+    /// （`maybe_group_commit`：无后台窗口时兜底 flush_wal，有则 ack 后 ≤窗口落盘）。
+    /// 此前批量路径恒 `flush_wal` → UPDATE 每语句对 primary/delta WAL 各做一次同步 fsync
+    /// （单连接下组提交窗口空转，fsync 常数不可摊薄），成为 UPDATE 相对 INSERT/MySQL
+    /// （innodb_flush_log_at_trx_commit=2 不逐提交 fsync）的 p50 差主源之一。
+    pub(crate) fn commit_batch(&mut self) -> Result<()> {
+        if self.flush_log_at_trx_commit == 1 {
+            self.flush_wal()
+        } else {
+            self.maybe_group_commit()
+        }
+    }
+
     /// P131（2026-09-06）：批量字段增量（原子批次，语义对齐 `put_batch`）——多个 docid 的
-    /// 字段 patch 攒批写入，批尾单次 `flush_wal` 统一提交（免逐行组提交等待；per-CPU 下
-    /// 整批经 nosync 单 gseq 组 + 批尾 drain）。SQL 单列 UPDATE（非索引列）落此路径。
+    /// 字段 patch 攒批写入，批尾按 `commit_batch` 统一提交（档位 1 = 单次 flush_wal；
+    /// 档位 0/2 = 组提交窗口；per-CPU 下整批经 nosync 单 gseq 组 + 批尾 drain）。
+    /// SQL 单列 UPDATE（非索引列）落此路径。
     pub fn patch_batch(
         &mut self,
         items: &[(u64, Vec<(String, serde_json::Value)>)],
@@ -496,7 +511,7 @@ impl Engine {
                 .collect();
             self.patch_nosync(*docid, &refs)?;
         }
-        self.flush_wal()
+        self.commit_batch()
     }
 
     /// 入队 outbox 消息（Ex-1.1）：docid + 全局 seq 幂等键，与业务写共享 fsync 点

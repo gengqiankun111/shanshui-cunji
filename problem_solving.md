@@ -1747,7 +1747,30 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   行级 WHERE 重算兜底；增量列恒非索引 ⇒ posting 形态零扰动；声明列变更走全量重写维持模型。
 - 验证：4 新增单测（patch_batch 扫描/快照可见 + 不坍缩、scan_range_txn RR 门控、SQL UPDATE 非索引列
   落 Delta CF 且 posting 不扰动/同值 affected 0/声明列全量）；全量 lib **782 通过 + 3 ignored**（+3）。
-- 待办：值变形态 #75 压测回填（目标：非索引列 UPDATE 写链 ~1ms 增量级；#75 mean 10.5 → ~6-7ms）。
+- **值变形态 #75 压测回填（2026-09-06，clean 110 万 pax 库 db-wide-scc-pax；rr-conformance 新增探针
+  update_range_idx_chg：note 逐轮异值保证每轮 affected=200，官方同值探针恒 rows=0 测不出写链）**：
+  SCC Delta 稳态 **p50 21.3ms / mean 21.1~22.1 / p99 ≤27**（三连稳定）；
+  同库 nodelta（bitmap 声明移除 → term_inc=None → delta 关闭走全量重写）**p50 35.3ms / p99 77** →
+  **Delta 省 ~40%（p50 1.66×；p99 尾收敛 3.4×，重写/词条脉冲消除）**；
+  MySQL 8.0 同探针 p50 2.96ms → 值变 p50 ≈7.2×（P131 前同形态历史 p50 46ms ≈13.7× → 减半）；
+  官方同值 rows=0 读现值 SCC p50 6.35 vs MySQL 3.57 ≈1.8×。
+  写链残余 = 定位（locate ~6ms）+ 200 行折叠读 + 组提交 fsync 常数（≈21ms 总量），未达 update_id ≤2×
+  触发线 → 维持触发式（后续候选：定位 keys-only 早停已 P127、组提交/提交常数对齐 INSERT 路径）。
+- **P131 定位 v2 + 批量提交组提交化（2026-09-06 追加，承接上面残余分析）**：
+  - 根因拆分（引擎级 demo src/demo/p131-writechain-prof）：①UPDATE 定位 keys-only 磁盘扫 20000 键
+    ≈4ms/语句（demo A1）；②批量提交路径 `put_batch/patch_batch` 批尾无条件 `flush_wal()`（双 WAL
+    同步 fsync ≈8ms/语句，单连接下组提交窗口空转），而 INSERT 走 put→组提交 → UPDATE 相对
+    INSERT/MySQL（innodb_flush_log_at_trx_commit=2）的 p50 差主源。
+  - 落地：①`Engine::commit_batch`——批量写/批量增量按事务档位提交（档1 = 显式 flush_wal 强安全
+    不变；档0/2 = 组提交窗口 ack）；put_batch/patch_batch 改走 commit_batch。②定位 v2——
+    `Engine::live_window_ids`（live 位图 ∩ [lo,hi] 纯内存，小跨度位图 and，>200k 跨度回退 keys-only
+    不劣化）+ locate_pk_range_converged / pk_range_select 两处组合定位改用它（语义与 keys-only
+    现存完全一致：已删行排除、升序、limit 早停），消除 20000 键磁盘扫。
+  - 干净 110 万 PAX 库端到端复测（results/p131-final-scc|scc2）：**#75 官方 rows=0 p50 6.35→1.3ms**
+    （反超 MySQL 3.57 ≈0.36×）；**值变 rows=200 p50 21.3→7.6ms**（≈2.6× MySQL，写链增量 ~15→6ms）。
+    残余 ≈ 服务层每语句常数 + 组提交窗口排队（≤2ms），未达 ≤2× 但已大幅收敛。
+  - 单测：p131_live_window_ids_matches_keys_only_scan（live 窗口 == keys-only 现存：删行/limit/
+    复活/边缘）+ p131 既有 4 项；全量 lib **783 通过 + 3 ignored**（+4）。
 
 ## 环境备忘（不入库）
 

@@ -3680,6 +3680,54 @@ use crate::optimizer::QuerySpec;
     // ---------- P131（2026-09-06）：Delta CF 增量 UPDATE + 扫描/快照 Merge-on-Read ----------
 
     #[test]
+    fn p131_live_window_ids_matches_keys_only_scan() {
+        // P131 定位 v2：live_window_ids（live 位图 ∩ 窗口，纯内存）必须与 keys-only 现存扫描
+        // 口径一致——含已删行排除、limit 截断、复活恢复、窗口边缘；否则组合定位会漏行/错行。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &cfg()).unwrap();
+        for i in 1..=5000u64 {
+            e.put_nosync(i, format!("v{i}").into_bytes(), &[]).unwrap();
+        }
+        e.flush_wal().unwrap();
+        for d in [3u64, 2500, 2600, 4999] {
+            e.delete(d).unwrap();
+        }
+        let collect = |lo: u64, hi: u64| {
+            let mut v = Vec::new();
+            e.scan_stream_ids(Some(lo), Some(hi), |d| {
+                v.push(d);
+                Ok(true)
+            })
+            .unwrap();
+            v
+        };
+        for (lo, hi) in [
+            (1u64, 5000),
+            (1, 100),
+            (2450, 2650),
+            (4990, 5000),
+            (5000, 5000),
+        ] {
+            let all = e.live_window_ids(lo, hi, None).unwrap();
+            assert_eq!(all, collect(lo, hi), "live 窗口 {lo}..{hi} 全取 == keys-only");
+            assert!(!all.contains(&3), "已删行须排除");
+            if hi - lo + 1 > 100 {
+                let lim = e.live_window_ids(lo, hi, Some(50)).unwrap();
+                let expect = collect(lo, hi);
+                assert_eq!(
+                    lim,
+                    expect[..lim.len()],
+                    "limit 截断须为 keys-only 升序前缀"
+                );
+                assert!(lim.len() <= 50, "limit 上限");
+            }
+        }
+        // 复活：删后同 docid put → live 恢复（与 keys-only 现存在复活后一致）
+        e.put(3, b"v3x".to_vec(), &[]).unwrap();
+        assert!(e.live_window_ids(1, 10, None).unwrap().contains(&3));
+    }
+
+    #[test]
     fn p131_patch_batch_visible_via_scans_and_snapshot() {
         // patch_batch 字段增量 → 全部值输出路径（get/batch_get/scan_range/scan_stream/
         // scan_stream_fields/scan_range_paged）合成；RR 快照（patch 前）仍读旧值；

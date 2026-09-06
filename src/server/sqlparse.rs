@@ -542,10 +542,11 @@ fn docset_contains(s: &DocIdSet, d: u64) -> bool {
     }
 }
 
-/// P127：组合主键区间写定位——主键闭区间 [lo, hi]（row → docid 区间）**keys-only 扫描**
-/// 现存 docid（升序）∩ 其余条件集（DocIdSet contains）→ 消费；`limit` 命中即停
-/// （UPDATE/DELETE ... LIMIT 语义对齐 MySQL，免全候选遍历/全量写）。
-/// 其余条件空 → 区间现存全集（与 `delete_pk_range` 语义一致）。
+/// P127：组合主键区间写定位——主键闭区间 [lo, hi]（row → docid 区间）∩ 其余条件集
+/// （DocIdSet contains）→ 消费；`limit` 命中即停（UPDATE/DELETE ... LIMIT 语义对齐 MySQL，
+/// 免全候选遍历/全量写）。其余条件空 → 区间现存全集（与 `delete_pk_range` 语义一致）。
+/// P131 定位 v2（2026-09-06）：窗口现存改走 `live_window_ids`（live 位图 ∩ 区间，纯内存，
+/// 替代 keys-only 磁盘扫 ~4ms/语句）；口径与 keys-only 现存一致（已删行排除、升序）。
 pub(crate) fn locate_pk_range_converged(
     engine: &mut Engine,
     tid: u16,
@@ -569,10 +570,7 @@ pub(crate) fn locate_pk_range_converged(
     let start = docid_for(tid, lo);
     let end = docid_for(tid, hi);
     let mut ids: Vec<u64> = Vec::new();
-    engine.scan_stream_ids(Some(start), Some(end), |d| {
-        if d < start || d > end {
-            return Ok(true); // 防御：区间外跳过
-        }
+    for d in engine.live_window_ids(start, end, None)? {
         let hit = match &rest_set {
             Some(s) => docset_contains(s, d),
             None => true,
@@ -581,12 +579,11 @@ pub(crate) fn locate_pk_range_converged(
             ids.push(d);
             if let Some(l) = limit {
                 if ids.len() as u64 >= l {
-                    return Ok(false); // LIMIT 达标：终止扫描（早停）
+                    break; // LIMIT 达标：终止（早停）
                 }
             }
         }
-        Ok(true)
-    })?;
+    }
     Ok(ids)
 }
 
