@@ -1963,11 +1963,17 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 单测 `p140_scan_range_txn_fields_projection_matches_full`（mem/SST 双态 × RR ≤S 旧值 /
   RC 合成最新 / 自写覆盖整行可见 / 事务删除排除 / 窗口外新 docid 并入，行集+目标列值
   == scan_range_txn 全量解析）；lib 793 全绿（seqlock flaky 复绿）。
-- 待办：探针复测 #77 clean（基线 3316ms → 验收 ≤1.5s）；以及 `batch_get_at` 按块批量
-  点查触发项（可并入 superset 冷库回表优化）。
-- 方案（内核已落，探针复测中）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`（≤S 归并仅
-  解目标列，复用 P131/P134 版本归并 + P86②/P91 列提取）→ 事务长读窗输出接线。验收：#77
-  clean ≤1.5s（≥2.2×）且 p99 收敛。
+- **探针复测（2026-09-06，同库 clean 重装 110 万，P140 binary）**：`#77 txn_long_read`
+  n=5：r1 mean **2500.9ms** / p50 924 / p99 7049；r2 mean **2459ms** / p50 750 / p99 9674。
+  基线（P139-c clean）3316/1848/8069 → **warm 迭代 p50 减半以上（2-2.5×）**——投影下推
+  收益实锤（100k 窗只解 k/amount 子集，免整行 25 列解码）；mean 1.35×。**离群 7-10s =
+  冷首触 100MB 随机窗 IO + 装载后 L0/compaction 抖动**（服务日志 compaction 恰在探针期；
+  基线同型 p99 8s，非投影作用域）。验收 mean ≤1.5s 未达标 → 残余归 **IO/read-amp 族**
+  （冷窗 IO 预取 / colstore #79-80 / compaction 收敛），另 `batch_get_at` 按块批量触发项
+  仍挂 superset 冷库回表。P140 收口（内核价值 = warm 窗 2-2.5×；冷首触另行立项）。
+- 方案（内核已落，探针复测完成）：引擎/CF 原语 `scan_range_txn_fields(start,end,S,fields)`
+  （≤S 归并仅解目标列，复用 P131/P134 版本归并 + P86②/P91 列提取）→ 事务长读窗输出接线；
+  验收 #77 clean ≤1.5s（≥2.2×）未全达——warm 2-2.5× 达标、冷首触 IO 离群另归 IO/read-amp 族。
 
 ## 环境备忘（不入库）
 
