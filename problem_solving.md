@@ -2013,19 +2013,29 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   更小 → 采纳 block_size_kb=32 为宽表基准推荐配置**（新写 SST 生效；wide/OLAP 建议 32，
   点查/小窗经 32/64 两档 + 4KB 基线实测均无退化）。P143 收口。
 
-**P144（per-CPU WAL checkpoint 推进，2026-09-06 立项修复，局部完成）**
+**P144（per-CPU WAL checkpoint 推进，2026-09-06 立项修复，完成 ✅）**
 - 根因（诊断实证：enq=[1.1M,0,1.1M,0] wm=[1.1M,0,0,∞] cp=0）：① cp 持久化只在 flush_all
   （flush_wal/正常关闭）→ 强制 kill/崩溃永不落盘；② **cidx（组合索引）CF 行 value 为空 →
   approx_bytes≈0 → 永不达刷盘阈值 → 其水位恒 0 → cp=min(各 CF)=0 钉死** → 每次重启全量回放
   ~110 万条 + 重刷 SST（+40-60s；cidx 回放 2.2M 条后 memtable_bytes=0 佐证 value 空）。
-- 已落：`WalRuntime::flush_checkpoint_advance`（CF 刷盘使 cp 前进即原子持久化 + 段裁剪，
+- 已落 ①：`WalRuntime::flush_checkpoint_advance`（CF 刷盘使 cp 前进即原子持久化 + 段裁剪，
   open.rs 四 CF 回调接线）→ 无 composite / cidx 达阈负载下运行期安全点收敛，非干净退出
   重启回放≈0。单测 p144_checkpoint_persists_after_flush_without_close（写+flush_primary 后
-  未 close 即 checkpoint>0）；lib 794 过（seqlock flaky 复绿）。
-- 待设计（cidx 钉死场景）：① memtable 刷盘判据含条目数（cidx 2.2M 条即刷）② composite cidx
-  可重建（task028 open 期重建语义）→ 不钉 cp、随 primary 收敛裁段 ③ approx_bytes 计入 key
-  （注意：会破坏现有 approx==Σvalue 测试契约，需同步改测）。现状：110 万 composite 库仍
-  全量回放，测量卫生 = clean 重装。
+  未 close 即 checkpoint>0）。
+- 已落 ②（cidx 钉死场景，2026-09-06 选型方向 ② 落地）：cidx 字节判据失效的根子是"没有任何
+  事件驱动它刷盘"。新增 `WalRuntime::maybe_cidx_catchup`——recompute_cp 判定 **cidx 有 pending
+  未刷（入队水位 > 已刷水位）且成为 cp 唯一钉点（水位严格落后于其余有入队历史 CF）** 时，同步
+  触发补刷（open.rs 注册钩子捕获 cidx Arc → `switch_and_flush`；空缓冲不刷防空 L0；AtomicBool
+  防并发/递归）→ cidx 水位随主数据收敛、cp 前进即走 flush_checkpoint_advance 持久化+裁剪。
+  **= "cidx 不钉 cp、随 primary 收敛后裁段"**：WAL 全保真（补刷后才裁，不依赖 task028 全量重建
+  兜底；重建仅保留为 open 期存量补齐）。新增条目数判据 `ColumnFamily::memtable_len` /
+  `MemTableBuffer::len`（与 approx_bytes 正交——cidx 空 value 行字节恒 0）。
+- 单测：p144b_cidx_catchup_unpins_checkpoint（runtime 级：唯一钉点触发一次补刷、cp 前进且持久化、
+  pending 清零后不空转）+ p144b_cidx_composite_catchup_flush_unpins_cp（engine 级：per-CPU +
+  composite 写 3 万行，仅主刷即级联补刷 cidx → cidx SST>0 / 水位>0 / cp>0 已持久化；drop 重开
+  数据完整 + 前缀查询计数一致——裁剪未丢未刷 cidx 键）。lib 800 全绿（seqlock flaky 复绿）。
+- 现状：110 万 composite 旧库（cp 曾持久为 0）首次升级重启仍回放一次完成收敛；此后运行期自动
+  补刷，非干净退出重启回放≈0，测量卫生不再依赖每次 clean 重装（候选①③ 不再实施）。
 
 ## 交接段 · 山水存迹（2026-09-06，develop @ 81d4f45）
 
@@ -2041,15 +2051,15 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 |---|---|---|
 | P140 | #77 txn 快照窗投影流 | scan_range_txn_fields（快照+列投影三合一）+ BETWEEN 窗下推；warm p50 2-2.5×；#77 mean 3316→2459ms |
 | P143 | #77 冷首触 IO | 组读(SCAN_GROUP) 8/64/256 clean A/B 无差异（维持 8）；块尺寸 4→32KB 有效（cold 2524→1701、稳态 179ms，点查无损）→ 宽表推荐 block_size_kb=32（写侧新 SST 生效） |
-| P144 | WAL checkpoint 推进 | 局部修复 flush_checkpoint_advance（cp 前进即持久化+裁剪）+ 单测 p144_checkpoint_persists_after_flush_without_close；composite cidx 钉死 cp 场景待设计 |
+| P144 | WAL checkpoint 推进 | flush_checkpoint_advance（cp 前进即持久化+裁剪）+ cidx 钉死场景 P144-②（唯一钉点自动补刷，随 primary 收敛）——完成 ✅，见 §P144 记录 |
 | P145 | batch_get_at 按块分组 | CF get_many_at（≤S 语义逐 get_bytes_at 等价）；冷 39.2→12.2µs/doc；要点 = 块只解码一次 |
 
 ### 待办队列（development_remain 已登记，均未开发）
 - P141 事务内聚合 MVCC 权威版（RR COUNT/GROUP BY；复用 P134/P135 superset）。
 - P142 Estimate 数量级接口（count_all_docs / count_docs_range 单锁 rank，零 MVCC，标 approx）。
-- P144 残余：cidx 钉死 cp 设计（候选① memtable 刷盘判据含条目数 ② composite cidx 可重建（task028 open 期语义）→ 不钉 cp、随 primary 收敛裁段 ③ approx_bytes 计 key——③ 会破坏 approx==Σvalue 测试契约需同步改测）。
+- P144 已收口 ✅：cidx 钉死场景 = 唯一钉点自动补刷（P144-②，见 §P144 记录；候选①③不再实施）。
 - #77 验收残余：cold 首跑 mean 1613ms 距 ≤1.5s 一步（32KB 档）；block_size_kb 代码默认 4→32 待 Linux A/B 定。
-- 杂项：seqlock flaky 阈值；WAL 回放 checkpoint——新库 110 万 composite 仍全量回放（测量卫生 = clean 重装）。
+- 杂项：seqlock flaky 阈值；WAL 回放 checkpoint——110 万 composite 旧库首次升级重启回放一次完成收敛，此后非干净退出重启回放≈0（P144-②）。
 
 ### 换机 / 远端注意
 - Linux 编译：仓库内 `.cargo/config.toml` 为 Windows 专用（target-dir/linker）——Linux 须删除或用 CARGO_TARGET_DIR 覆盖；`~/.cargo/config.toml` 用 rsproxy.cn 镜像；构建加 `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`（否则 cgu1+LTO 2 核极慢）。

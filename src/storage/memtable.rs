@@ -349,6 +349,13 @@ impl MemTableBuffer {
         let g = self.inner.read().unwrap();
         g.immutable.as_ref().map_or(0, |m| m.approx_bytes())
     }
+
+    /// 双缓冲未刷键数（mutable + immutable `len` 之和）。P144-②：cidx（组合索引）行
+    /// value 恒空 → approx_bytes≈0，刷盘/补刷判定须以条目数而非字节判断是否有待刷数据。
+    pub fn len(&self) -> usize {
+        let g = self.inner.read().unwrap();
+        g.mutable.len() + g.immutable.as_ref().map_or(0, |m| m.len())
+    }
 }
 
 impl Default for MemTableBuffer {

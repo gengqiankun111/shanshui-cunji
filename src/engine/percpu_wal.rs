@@ -510,6 +510,14 @@ pub(crate) struct WalRuntime {
     /// 各 CF 曾入队最大 gseq（submit/回放播种）：从未入队（last=0）的 CF 不约束 cp
     /// （无其条目可回放/丢失 → 视作 +∞，避免空转 CF 把 checkpoint 钉死在 0）。
     pub(crate) last_enqueued: [AtomicU64; 4],
+    /// P144-②：cidx（组合索引 CF）补刷钩子（open.rs 注入，捕获 cidx Arc）——cidx 行 value
+    /// 恒空 → approx_bytes≈0 → 字节刷盘阈值永不达 → 水位恒 0 钉死 cp。cidx 成为 cp 唯一钉点
+    /// 且仍有 pending 未刷时，recompute_cp 同步触发本钩子补刷，令 cp 随主数据收敛
+    /// （等价"cidx 可重建语义不钉 cp"：组合索引由 primary 可派生，补刷只为让裁剪前进，
+    /// 不依赖每次重启全量回放/重建）。
+    cidx_catchup: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 补刷在途防重入/防并发（钩子触发 cidx flush → 其完成回调递归 recompute_cp 收敛）。
+    cidx_catchup_armed: AtomicBool,
     /// 已持久化 checkpoint（重启恢复回放起点）。
     persisted_cp: AtomicU64,
     checkpoint_path: PathBuf,
@@ -531,6 +539,8 @@ impl WalRuntime {
             cp: AtomicU64::new(0),
             cf_watermarks: std::array::from_fn(|_| AtomicU64::new(0)),
             last_enqueued: std::array::from_fn(|_| AtomicU64::new(0)),
+            cidx_catchup: Mutex::new(None),
+            cidx_catchup_armed: AtomicBool::new(false),
             persisted_cp: AtomicU64::new(0),
             checkpoint_path: dir.join("checkpoint.json"),
             trim: TrimState::new(),
@@ -598,7 +608,8 @@ impl WalRuntime {
     /// 重算 cp：`cp = min(各 CF 约束)`，约束 = 有入队历史 CF 的已刷盘水位
     /// （未刷=0 → 钉住 0）；无入队历史 CF 视作 +∞。
     pub fn recompute_cp(&self) {
-        let mut m = u64::MAX;
+        let mut m = u64::MAX; // 全约束 min（含 cidx）
+        let mut m_others = u64::MAX; // 除 cidx 外约束 min（cidx 是否唯一钉点判据）
         for c in 0..4 {
             let l = self.last_enqueued[c].load(Ordering::Relaxed);
             if l == 0 {
@@ -606,8 +617,45 @@ impl WalRuntime {
             }
             let w = self.cf_watermarks[c].load(Ordering::Relaxed);
             m = m.min(w);
+            if c != CF_CIDX as usize {
+                m_others = m_others.min(w);
+            }
         }
-        self.cp.store(if m == u64::MAX { 0 } else { m }, Ordering::Relaxed);
+        let cp = if m == u64::MAX { 0 } else { m };
+        self.cp.store(cp, Ordering::Relaxed);
+        // P144-②：cidx 是 cp 唯一钉点（其余 CF 已刷超前）→ 补刷（先落 cp 值，钩子内 cidx
+        // flush 完成回调递归 recompute 会再次推进，最终以递归结果为收敛值）
+        self.maybe_cidx_catchup(cp, m_others);
+    }
+
+    /// P144-② 注册 cidx 补刷钩子（open.rs 在四 CF 接线后注入；捕获 cidx Arc）。
+    pub(crate) fn set_cidx_catchup(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.cidx_catchup.lock().unwrap() = Some(hook);
+    }
+
+    /// P144-② 触发判定：cidx 有 pending 未刷（入队水位 > 已刷水位）且其水位严格落后于
+    /// 其余有入队历史 CF（`w < m_others`，即它是 cp 唯一钉点）→ 同步补刷。cidx 行 value 恒空
+    /// → approx_bytes≈0 → 字节刷盘阈值永不达，只能靠"被主数据超越"事件驱动收敛；补刷后
+    /// 其完成回调 note_flush(CF_CIDX) → 递归 recompute_cp：pending 清零不再触发，cp 前进。
+    fn maybe_cidx_catchup(&self, cp: u64, m_others: u64) {
+        let cidx = CF_CIDX as usize;
+        let w = self.cf_watermarks[cidx].load(Ordering::Relaxed);
+        let l = self.last_enqueued[cidx].load(Ordering::Relaxed);
+        if l <= w || cp != w || w >= m_others || m_others == u64::MAX {
+            return; // 无 pending / cidx 非钉点 / 无其余 CF 约束可收敛
+        }
+        if self
+            .cidx_catchup_armed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // 补刷在途（递归/并发）——由在途方收敛
+        }
+        let hook = self.cidx_catchup.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h();
+        }
+        self.cidx_catchup_armed.store(false, Ordering::Relaxed);
     }
 
     /// 标记某 CF 不存在（engine 未打开，如 cidx/outbox 关闭）：不参与 checkpoint 约束
@@ -1040,6 +1088,47 @@ mod tests {
         let after = rt.records_after(20).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].gseq, 21);
+    }
+
+    #[test]
+    fn p144b_cidx_catchup_unpins_checkpoint() {
+        // P144-②：cidx（组合索引 CF，行 value 空 → approx_bytes≈0 → 字节刷盘阈值永不达）
+        // 成为 cp 唯一钉点且仍有 pending 时，recompute_cp 触发补刷（钩子模拟真实接线：
+        // cidx.switch_and_flush 完成回调 → note_flush 推进 cidx 水位）→ cp 前进、持久化、
+        // 段裁剪；且不重复/空转触发。
+        let dir = rt_dir();
+        let rt = Arc::new(WalRuntime::build(dir.clone(), 1, 64, 1000));
+        // composite 负载：cidx 与 primary 同 gseq 空间交错入队（cidx 值空，永不自动刷盘）
+        for g in 1..=20u64 {
+            rt.submit(0, vec![WalEntry::put(CF_CIDX, g, vec![g as u8], Vec::new())])
+                .unwrap();
+            rt.submit(0, vec![WalEntry::put(CF_PRIMARY, g, vec![g as u8], format!("v{g}").into_bytes())])
+                .unwrap();
+        }
+        rt.flush_all().unwrap(); // 队列文件落盘（cp 仍 0：无任何 CF 刷盘）
+        assert_eq!(rt.cp.load(Ordering::Relaxed), 0, "未刷盘 → cp 钉 0");
+        let flushes = Arc::new(AtomicU64::new(0));
+        let hook_rt = Arc::clone(&rt);
+        let flushes2 = Arc::clone(&flushes);
+        rt.set_cidx_catchup(Arc::new(move || {
+            flushes2.fetch_add(1, Ordering::Relaxed);
+            hook_rt.note_flush(CF_CIDX, 20); // 模拟 cidx flush 完成回调（补刷全部 pending）
+        }));
+        // 主 CF 刷盘到 20 → recompute：cidx 水位 0 落后且 pending → 触发补刷
+        rt.note_flush(CF_PRIMARY, 20);
+        assert_eq!(flushes.load(Ordering::Relaxed), 1, "cidx 为唯一钉点时补刷一次");
+        assert_eq!(rt.cp.load(Ordering::Relaxed), 20, "补刷后 cp = min(20, 20) = 20");
+        rt.flush_checkpoint_advance();
+        assert_eq!(rt.load_checkpoint(), 20, "cp 已持久化（未调 flush_wal/close）");
+        assert!(rt.records_after(20).unwrap().is_empty(), "已刷记录不回放");
+        // cidx pending 已清（水位 == 入队水位）→ 主 CF 再超前不再触发补刷
+        for g in 21..=40u64 {
+            rt.submit(0, vec![WalEntry::put(CF_PRIMARY, g, vec![g as u8], format!("v{g}").into_bytes())])
+                .unwrap();
+        }
+        rt.flush_all().unwrap();
+        rt.note_flush(CF_PRIMARY, 40);
+        assert_eq!(flushes.load(Ordering::Relaxed), 1, "cidx 无新 pending → 不空转补刷");
     }
 
     #[test]

@@ -836,18 +836,25 @@ Task-033：锁等待超时语义对齐（innodb_lock_wait_timeout → 1205）或
 |---|---|---|
 | **P143 冷首触 IO 收敛（#77 离群）** | **触发**：#77 复测 mean 2459ms 未达 ≤1.5s 验收——n=5 中 1 次**冷首触 7-10s 离群**（100k/≈100MB 窗首次读：页/块缓存全冷 + 装载后 compaction 抖动；warm 迭代 p50 750ms 已达标 = P140 投影收益），IO-bound 与投影无关（服务日志 compaction 恰在探针期）。**目标**：#77 clean n=5 **mean ≤1.5s 且无 >3s 离群**。**归因 demo ✅（2026-09-06，src/demo/p143-cold-io，gitignored，直连 db-wide-scc-p140 真实库 release）**：100k 窗 `scan_range_txn_fields[k,amount]` 各窗首读 **cold_miss ≈ 50002 块**（≈每 2 行 1 个 4KB 块）——**主因 = ~50k 次 4KB 随机盘读（读放大 ≈200MB/100k 行，块缓存全 miss）**；OS 页缓存热区掩蔽（450k+ 窗 1.3-1.5s）冷区暴露（50k 窗 17.2s、250k 窗 9.9s——#77 离群同源）；**warm（块缓存命中）0.24-0.30s**（2.4-3µs/row）；整行对照 warm 1.38s vs fields 0.28s → **P140 投影省解码 ~5×，不省块数**（fields/整行 miss 同为 ~50k）。非 compaction 主导（无后台抖动下冷热差纯缓存所致）。**方案优先级修正**：B 首选——**读路径预取/顺序化 + 块尺寸杠杆**（4KB→64KB 块数 /16 → ~3k 次读；或块序 readahead / 相邻块预读入缓存）；C colstore #79-80 次选（热列瘦行块 → 行/块↑ → 随机读块数↓）；A compaction 收敛仅放大项。**验收**：#77 clean mean ≤1.5s 无 >3s 离群；同族大窗冷读探针首读同步收敛 | 立项（2026-09-06）。**内核 A/B（组读）✅ 否定（2026-09-06）**：SCAN_GROUP 8→64→256 组读放大**无效甚至反效**（污染态下 g256 mean 8.1s/p99 34.6s、compact 后 15.6s/66s——实为 **WAL checkpoint 不推进→重启反复回放 110 万条+重刷叠加 SST** 的污染产物，非杠杆效应）；**干净重装对照**：g8 2523.8/951/7212 vs g64 2645.9/889.7/7526 → **无差异**（warm p50 ~0.9s、冷首触离群 ~7.5s 均不变）——组读合并不改变磁盘冷区总字节/随机度瓶颈 → **SCAN_GROUP 维持 8**。**真候选重排**：① **块尺寸 4KB→64KB（写侧，新 SST）**（~50k 随机小块 → ~1.6k 大块，冷读字节/随机度双减）需 clean 全量重装单变体对照；② colstore #79-80（瘦行块）；③ **前置：WAL checkpoint 推进缺陷（新发现，另登记 P144 候选）**——测量必须先干净重装。**块尺寸变体验证 ✅（2026-09-06，tmp-cfg-p140-b64：`[blockcache] block_size_kb=64`，clean 重装 110 万，单旋钮同驱动写侧块布局+缓存粒度）**：#77 **cold 首跑 mean 1612.9 / p50 452 / max 4692**（4KB 基线 2523.8/951/7212 → mean 1.56×、p50 2.1×、离群 7.2s→4.7s）；**warm 稳态（30s 后）mean 296.9 / p50 186 / p99 594**（4KB 稳态 p50 750-950 + 9.7s 离群 → 64KB 后无 >600ms 离群）；回归探针健康：pk_point_star 0.22ms、pk_in_50 2.17、pk_between_100 1.99、orderby_win_1000 12.3、**pk_between_10000 112（4KB 170→112）**、enum_sel_limit500 2.09、**enum_sel_limit10000 39.6（4KB 58→39.6）**——点查/小窗无退化。**32KB 变体 ✅（同法，block_size_kb=32）**：#77 cold 1700.9/498/4870、稳态 301.9/179/574、回归探针全同（pk_point 0.18/pk_in_50 1.36/pk_between_10000 115/enum 37.2）→ **32KB ≈ 64KB（稳态 179 vs 186ms），拐点在 4→32 之间**。**定论：块尺寸 4KB→32KB 即捕获 ~全部冷首触收益（块数 /15、seek 骤降），碎片/缓存浪费更小 → 采纳 block_size_kb=32 为宽表基准推荐配置**（新写 SST 生效；wide/OLAP 建议 32，点查/小窗经 32/64 两档 + 4KB 基线实测均无退化）。**P143 收口** |
 
-- **P144（立项修复 2026-09-06，局部完成 ✅/composite 场景待设计）：per-CPU WAL checkpoint 推进缺陷**。
+- **P144（立项修复 2026-09-06，完成 ✅：flush_checkpoint_advance + cidx 钉死场景 P144-② 补刷）：per-CPU WAL checkpoint 推进缺陷**。
   根因链：① cp 持久化只在 `flush_all`（flush_wal/正常关闭）→ 非干净退出（强制 kill/崩溃）永不落盘；
   ② 更本质——**cidx（组合索引）CF 行 value 为空 → memtable approx_bytes≈0 → 永不达 256MB 刷盘阈值
   → 其水位恒 0 → cp=min(各 CF)=0 被钉死** → 每次重启（含干净关闭后）都全量回放 ~110 万条 + 重刷
   SST（+40-60s，P143 测量污染源；诊断实证 enq=[1.1M,0,1.1M,0] wm=[1.1M,0,0,∞] cp=0，cidx 回放
-  2.2M 条后 memtable_bytes=0）。**已落**：`WalRuntime::flush_checkpoint_advance`——CF 刷盘使 cp 前进即
+  2.2M 条后 memtable_bytes=0）。**已落 ①**：`WalRuntime::flush_checkpoint_advance`——CF 刷盘使 cp 前进即
   原子持久化 + 段裁剪（open.rs 四 CF 回调接线；运行期安全点收敛，无 composite 或 cidx 达阈负载下
   重启回放≈0、非干净退出丢失 ≤ 最近刷盘尾）；单测 p144_checkpoint_persists_after_flush_without_close
-  （写 + flush_primary 后未 close 即 checkpoint>0）；lib 794 过。**待设计（cidx 钉死）**：候选 ①
-  memtable 刷盘判据含条目数（cidx 2.2M 条即刷）② composite cidx 可重建（task028 open 期重建语义）→
-  不钉 cp、随 primary 收敛裁段 ③ approx_bytes 计入 key。**现状**：110 万 composite 库仍全量回放，
-  基准测量卫生 = clean 重装（既有做法）。
+  （写 + flush_primary 后未 close 即 checkpoint>0）。**已落 ②（cidx 钉死场景，选型方向 ② "cidx 可重建
+  不钉 cp" 落地）**：cidx 字节判据失效 = 无事件驱动其刷盘 → 新增 `WalRuntime::maybe_cidx_catchup`：
+  recompute_cp 判定 cidx 有 pending 未刷且成为 **cp 唯一钉点**（水位严格落后于其余有入队历史 CF）即
+  同步触发补刷（open.rs 钩子捕获 cidx Arc → switch_and_flush，空缓冲不刷防空 L0，AtomicBool 防并发/
+  递归）→ cidx 随主数据收敛、cp 前进即走 flush_checkpoint_advance 持久化+裁剪（"cidx 不钉 cp、随
+  primary 收敛后裁段"；WAL 全保真——补刷后才裁，不依赖 task028 全量重建兜底）。判据新增
+  `ColumnFamily::memtable_len`/`MemTableBuffer::len`（条目数，与 approx_bytes 正交）。单测：
+  p144b_cidx_catchup_unpins_checkpoint（runtime）+ p144b_cidx_composite_catchup_flush_unpins_cp
+  （engine：per-CPU+composite 3 万行，仅主刷即级联补刷，drop 重开前缀计数一致）；lib 800 全绿
+  （seqlock flaky 复绿）。**现状**：110 万 composite 旧库（cp 曾持久 0）首次升级重启回放一次完成收敛；
+  此后自动补刷，非干净退出重启回放≈0，测量卫生不再依赖每次 clean 重装（候选①③不再实施）。
 
 ### SQL 语法面收尾审计（2026-09-05，用户目标：MySQL 语法对齐 + 既定数据结构性能对比）
 

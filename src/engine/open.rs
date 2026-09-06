@@ -462,6 +462,17 @@ impl Engine {
             };
             ob.set_external_wal(CF_OUTBOX, cb);
         }
+        // P144-②：注册 cidx 补刷钩子——cidx 无字节可超阈自动刷盘，须在"被主数据/outbox
+        // 刷盘超越"事件（recompute_cp 判定其成为唯一钉点）时同步补刷；空缓冲不刷（防空 L0）。
+        // 注：须在 cidx `Arc::get_mut`（set_external_wal）之后克隆，否则破坏唯一性。
+        if let Some(c) = cidx.as_ref() {
+            let ccf = Arc::clone(c);
+            rt.set_cidx_catchup(Arc::new(move || {
+                if ccf.memtable_len() > 0 {
+                    let _ = ccf.switch_and_flush();
+                }
+            }));
+        }
         // 迁移收尾：旧自身 WAL 回放进 memtable 的残留 → 强制刷盘落 SST（此后不依赖旧文件；
         // 空 memtable 不刷——空 flush 会产出空 L0 SST，污染紧凑度/GC 调度）
         if primary.memtable_bytes() > 0 {
@@ -507,10 +518,10 @@ impl Engine {
                     rt.note_enqueued(cf, last.gseq);
                 }
             }
-            // P144（局部，保留 flush_checkpoint_advance 钩子于 runtime）：此处不强刷——
-            // composite 场景 cidx 回放后 memtable_bytes=0（组合索引行不在该 CF 可刷缓冲，
-            // 语义待设计澄清，见 P144 记录），强刷仅徒增启动耗时；cidx 水位 0 钉死 cp 的
-            // composite 场景留待设计后再解。
+            // P144（保留 flush_checkpoint_advance 钩子于 runtime）：此处不强刷——composite
+            // 场景 cidx 回放后 memtable_bytes=0（行 value 空，字节判据不可用）。P144-② 已解：
+            // 回放入队的 cidx pending 会在 open 收尾 P130 主刷/运行期任何 CF 刷盘时，经
+            // recompute_cp → maybe_cidx_catchup 触发补刷收敛，无需在此强刷（防空 L0）。
         }
         // global_seq 起点：checkpoint+1 / 队列 max+1 / 旧 WAL next_seq 取大
         let next = cp

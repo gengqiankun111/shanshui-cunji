@@ -45,6 +45,12 @@ impl ColumnFamily {
         self.memtable.mutable_bytes() + self.memtable.immutable_bytes()
     }
 
+    /// 未刷盘键数（双缓冲条目和，与 approx_bytes 正交）。P144-②：cidx 行 value 恒空 → 字节 0，
+    /// 判断"是否有待刷数据"须用条目数（补刷钩子据此避免对空缓冲空刷产空 L0 SST）。
+    pub fn memtable_len(&self) -> usize {
+        self.memtable.len()
+    }
+
     /// 2026-09-05：块缓存当前占用（字节，含元数据粗算，见 blockcache used_bytes）。
     pub fn blockcache_bytes(&self) -> usize {
         self.block_cache.used_bytes()

@@ -2740,6 +2740,58 @@ use crate::optimizer::QuerySpec;
     }
 
     #[test]
+    fn p144b_cidx_composite_catchup_flush_unpins_cp() {
+        // P144-②（cidx 钉死场景）：组合索引行 value 空 → cidx approx_bytes≈0 → 字节刷盘
+        // 阈值永不达 → 修复前 cidx 水位恒 0 → cp=min(各 CF)=0 钉死 → 每次重启全量回放
+        // ~110 万（P144/P143 测量污染源）。修复：cidx 成为 cp 唯一钉点且仍有 pending 时，
+        // recompute_cp 触发同步补刷（随 primary 收敛），cp 前进即 P144 持久化。
+        // 本测：per-CPU + composite 声明下连续写入 + 显式主刷（未对 cidx 任何显式刷盘）→
+        // cidx 应自动补刷落 SST、水位>0、cp>0 且已持久化；drop 重开后数据完整 + 前缀查询
+        // 计数一致（裁剪未丢未刷 cidx 键，cidx 语义由 WAL/补刷保证，不依赖全量重建）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.storage.per_cpu_enabled = true;
+        c.memtable.max_size_mb = 1; // 主 CF 写路径自动刷盘（cidx 永不自动——字节恒 0）
+        c.storage.composite_indexes = vec![vec!["status".into(), "region".into()]];
+        let expected;
+        {
+            let mut e = Engine::open(dir.path(), &c).unwrap();
+            let cidx = e.cidx.clone().unwrap(); // Arc 克隆：跨 put/flush 的可变借用后仍可用
+            assert!(e.percpu.is_some());
+            let mut cnt = 0usize;
+            for i in 1..=30_000u64 {
+                let status = if i % 3 == 0 { "active" } else { "closed" };
+                let region = if i % 2 == 0 { "beijing" } else { "shanghai" };
+                let doc = serde_json::json!({"status": status, "region": region, "k": i});
+                e.put(i, serde_json::to_vec(&doc).unwrap(), &[]).unwrap();
+                if status == "active" && region == "beijing" {
+                    cnt += 1;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(80)); // 等 per-CPU 消费线程落盘
+            e.flush_primary().unwrap(); // 确定性刷盘事件 → 应级联补刷 cidx
+            let rt = e.percpu.as_ref().unwrap();
+            let cw = rt.cf_watermarks[crate::engine::percpu_wal::CF_CIDX as usize]
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let cp = rt.cp.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(cidx.sst_count() > 0, "cidx 应已自动补刷落 SST（未对 cidx 显式刷盘）");
+            assert!(cw > 0, "cidx 刷盘水位应 >0（cw={cw}）");
+            assert!(cp > 0, "cp 应已脱离 0 钉死（cp={cp}）");
+            assert_eq!(rt.load_checkpoint(), cp, "cp 已持久化");
+            expected = cnt;
+        }
+        // drop（停机排空队列、未显式 flush memtable）→ 重开走 >cp 尾部回放 → 数据完整
+        let mut e2 = Engine::open(dir.path(), &c).unwrap();
+        assert!(e2.get(1).unwrap().is_some(), "重开后 docid 1 可见");
+        assert!(e2.get(30_000).unwrap().is_some(), "重开后 docid 30000 可见");
+        let hits = e2
+            .query_by_composite_prefix(&[b"active", b"beijing"])
+            .unwrap();
+        assert_eq!(hits.len(), expected, "回放/裁剪后前缀查询计数一致");
+        let _ = e2;
+    }
+
+    #[test]
     fn p145_batch_get_at_grouped_matches_get_at() {
         // P145：Engine::batch_get_at 改走 CF `get_many_at`（按块分组批量 ≤S 点查）——
         // 语义与逐 docid `get_at`（=逐 get_bytes_at + Delta ≤S 折叠）完全一致：
