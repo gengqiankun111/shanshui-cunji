@@ -36,6 +36,122 @@ pub(crate) fn handle_count(engine: &mut Engine, query: &str) -> (u16, String) {
     }
 }
 
+/// P142 Estimate 数量级估计（A2，2026-09-07）：`GET /estimate`
+///   - 无参 = 全库行数（活跃集 O(1) 增量计数；首次调用懒建基线做全键扫，见 A2-3）
+///   - `range=start-end` = 行窗口闭区间计数（活跃位图 rank 差值，Task-021/P96 快路径）
+///   - `field=f&value=v` = 条件命中估计（倒排 posting ∩ 活跃集；换值旧值残留/非 MVCC 权威
+///     视图 → 按近似语义，不保证与权威 COUNT 逐字节一致）
+///   - `field&value` 可叠加 `range`（posting ∩ [start,end] ∩ 活跃）
+/// 响应 JSON 显式 `approx: true` + `order_of_magnitude` 数量级标注。
+pub(crate) fn handle_estimate(engine: &mut Engine, query: &str) -> (u16, String) {
+    let params = parse_query(query);
+    let p = |k: &str| params.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+    let (field, value, range) = (p("field"), p("value"), p("range"));
+    // `range=start-end` 闭区间（默认表单行域 docid = row id；多表按 docid 高 16 位表号窗口，
+    // 由调用方换算 start/end——引擎 rank 口径全域一致）
+    let win: Option<(u64, u64)> = match &range {
+        Some(r) => match r.trim().split_once('-') {
+            Some((x, y)) => match (x.trim().parse::<u64>(), y.trim().parse::<u64>()) {
+                (Ok(a), Ok(b)) if a <= b => Some((a, b)),
+                _ => {
+                    return (
+                        400,
+                        json!({"error": format!("range 非法（期望 start-end 闭区间）: {r}")})
+                            .to_string(),
+                    )
+                }
+            },
+            None => {
+                return (
+                    400,
+                    json!({"error": format!("range 非法（期望 start-end 闭区间）: {r}")})
+                        .to_string(),
+                )
+            }
+        },
+        None => None,
+    };
+    let err500 = |e: crate::error::Error| (500, json!({"error": e.to_string()}).to_string());
+    let resp = |mode: &str, note: &str, count: u64, extra: Value| {
+        (
+            200,
+            json!({
+                "approx": true,
+                "mode": mode,
+                "count": count,
+                "order_of_magnitude": magnitude_label(count),
+                "note": note,
+                "field": field,
+                "value": value,
+                "range": range,
+                "extra": extra,
+            })
+            .to_string(),
+        )
+    };
+    match (&field, &value, win) {
+        (None, None, None) => match engine.count_all_docs() {
+            Ok(c) => resp("all", "全库：活跃集 O(1) 增量计数（首次懒建基线）", c, json!({})),
+            Err(e) => err500(e),
+        },
+        (None, None, Some((a, b))) => match engine.count_docs_range(a, b) {
+            Ok(c) => resp(
+                "window",
+                "行窗口 [start,end]：活跃位图 rank 差值计数",
+                c,
+                json!({"start": a, "end": b}),
+            ),
+            Err(e) => err500(e),
+        },
+        (Some(f), Some(v), w) => {
+            let term = format!("{f}={v}");
+            let posting = match engine.inverted_posting(&term) {
+                Ok(p) => p,
+                Err(e) => return err500(e),
+            };
+            let (s, e) = match w {
+                Some((a, b)) => (Some(a), Some(b)),
+                None => (None, None),
+            };
+            match engine.live_count_window(&posting, s, e) {
+                Ok(c) => resp(
+                    "field",
+                    "条件命中估计：倒排 posting ∩ 活跃集（当前视图；陈旧残留按近似不修）",
+                    c,
+                    json!({"term": term}),
+                ),
+                Err(e) => err500(e),
+            }
+        }
+        _ => (
+            400,
+            json!({"error": "参数不完整：field 须与 value 成对；其余参数不支持"}).to_string(),
+        ),
+    }
+}
+
+/// 数量级档位标注（幂次量级：0 / 个位 / 十 / 百 / 千 / 万 … 亿+）。
+fn magnitude_label(count: u64) -> String {
+    if count == 0 {
+        return "0".to_string();
+    }
+    if count < 10 {
+        return "个位".to_string();
+    }
+    let e = (count as f64).log10().floor() as i32;
+    match e {
+        1 => "~1e1（十级）".to_string(),
+        2 => "~1e2（百级）".to_string(),
+        3 => "~1e3（千级）".to_string(),
+        4 => "~1e4（万级）".to_string(),
+        5 => "~1e5（十万级）".to_string(),
+        6 => "~1e6（百万级）".to_string(),
+        7 => "~1e7（千万级）".to_string(),
+        8 => "~1e8（亿级）".to_string(),
+        _ => format!("~1e{e}"),
+    }
+}
+
 /// 执行计划推演（development 5.26）：`GET /explain?filter=status%3Dactive` → ExplainPlan JSON。
 pub(crate) fn handle_explain(engine: &mut Engine, query: &str) -> (u16, String) {
     let params = parse_query(query);

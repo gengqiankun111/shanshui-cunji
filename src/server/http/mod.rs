@@ -49,8 +49,9 @@ pub use tokenize::{fulltext_terms, fulltext_terms_seg, tokenize, tokenize_bigram
 // 拆分后路由/入口所需的子模块端点（原同文件私有函数跨文件可见性升至 pub(crate)）
 use self::admin_api::{handle_admin_status, handle_metrics};
 use self::doc_api::{
-    handle_count, handle_delete, handle_explain, handle_fulltext, handle_get, handle_group_by,
-    handle_join, handle_patch, handle_put, handle_range, handle_search, handle_sql,
+    handle_count, handle_delete, handle_estimate, handle_explain, handle_fulltext, handle_get,
+    handle_group_by, handle_join, handle_patch, handle_put, handle_range, handle_search,
+    handle_sql,
 };
 use self::saga_api::{
     handle_saga_compensate, handle_saga_start, handle_saga_status, spawn_reconciler,
@@ -220,6 +221,8 @@ fn route_request(
         ("GET", "/fulltext") => handle_fulltext(engine, query),
         ("GET", "/range") => handle_range(engine, query),
         ("GET", "/count") => handle_count(engine, query),
+        // P142 Estimate（A2，2026-09-07）：数量级估计（approx 标注）
+        ("GET", "/estimate") => handle_estimate(engine, query),
         ("GET", "/groupby") => handle_group_by(engine, query),
         ("GET", "/join") => handle_join(engine, query, broadcast),
         ("GET", "/admin/status") => handle_admin_status(engine),
