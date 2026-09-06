@@ -764,14 +764,24 @@ fn get_many_from_sst_at(
                 cache.put(ck, b.clone());
                 b
             };
-            // 块只读一次；逐目标 ≤S 解析（块已缓存，纯解码成本）
+            // 块只读/解码一次（decode_data_block），逐目标在行集内取 ≤S 最大版本——
+            // 勿用 scan_block_for_key_at 逐目标（每调重解码整块 → 解码放大，P145 实测反效）
+            let fmt = sst.format();
+            let rows = crate::sstable::decode_data_block(&block, fmt)?;
             for &i in &targets {
                 if let Some(&slot) = slot_of.get(&i) {
                     if out[slot].is_none() {
-                        if let Some(cand) =
-                            sst.scan_block_for_key_at(&block, &keys[i], snapshot_seq)?
-                        {
-                            out[slot] = Some(cand);
+                        let k = &keys[i];
+                        let mut cand: Option<(Option<Vec<u8>>, u64)> = None;
+                        for (rk, rv, rseq) in &rows {
+                            if rk == k && *rseq <= snapshot_seq {
+                                if cand.as_ref().map_or(true, |(_, s)| *rseq > *s) {
+                                    cand = Some((rv.clone(), *rseq));
+                                }
+                            }
+                        }
+                        if let Some(c) = cand {
+                            out[slot] = Some(c);
                         }
                     }
                 }
