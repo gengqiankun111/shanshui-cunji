@@ -176,8 +176,10 @@ pub struct Engine {
     /// V 项：io_uring 后端池（Linux + `runtime.io_uring_enabled` 时初始化；Windows 无此字段）。
     /// 按 IoClass 三队列 SQPOLL，read_at/write_at/fsync 经 `io_uring_*` 方法转发；
     /// 已接入热路径——CF 打开时注入（SST 块读 + WAL fsync 走 SQPOLL 队列）。
+    /// pub(crate)：跨 engine 子模块（open.rs 构造 Self 需访问；Windows cfg 移除故此前漏提升，
+    /// Linux 编译 E0451——2026-09-06 换机交接修复）。
     #[cfg(target_os = "linux")]
-    iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
+    pub(crate) iou: Option<std::sync::Arc<crate::io_queue::backend::IoUringPool>>,
     /// X 项：Prometheus 风格指标（读写计数 + 延迟直方图 + Compaction/Flush 次数；
     /// 网络层连接/语句由服务进程写入共享 Metrics）。
     pub metrics: crate::metrics::Metrics,
