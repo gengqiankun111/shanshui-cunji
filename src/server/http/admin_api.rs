@@ -24,6 +24,7 @@ fn engine_runtime_gauges(engine: &Engine) -> Vec<(String, String, u64)> {
         .chain(engine.snapshot_report())
         .chain(engine.bloom_report())
         .chain(engine.blockcache_report())
+        .chain(engine.inverted_report())
         .map(|(n, h, v)| (n.to_string(), h.to_string(), v))
         .collect();
     g.extend(engine.bloom_layer_report());

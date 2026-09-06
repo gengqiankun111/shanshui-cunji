@@ -299,6 +299,7 @@ pub(crate) fn show_memory_response(engine: &Engine) -> QueryResponse {
         .chain(engine.snapshot_report())
         .chain(engine.bloom_report())
         .chain(engine.blockcache_report())
+        .chain(engine.inverted_report())
         .map(|(n, h, v)| (n.to_string(), h.to_string(), v))
         .collect();
     // P0 观测：Bloom 分层 + L0 按表段数（动态行名）

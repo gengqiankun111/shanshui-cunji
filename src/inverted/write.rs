@@ -254,6 +254,9 @@ impl InvertedIndex {
         self.stats_mem.clear(); // 统计已随段落盘（v5 载荷），避免下次 flush 重复累积
         self.mem_docids.reset();
         info!("倒排刷盘完成: {fname}");
+        // P137：段落盘次数 counter（专项监控）
+        self.seg_flush_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // P4-B：刷盘后检查最新 delta 段 FST 是否超限，超限触发后台 GC 合并进 base
         if self.should_delta_gc() {

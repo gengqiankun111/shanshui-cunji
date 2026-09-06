@@ -155,6 +155,9 @@ pub struct Engine {
     /// 删除（复活 put 清除条目 → 绝不误剔，漏剔由快照读 None 兜底 = 正确性不受影响）。
     /// 活跃快照不会跨进程（begin 于 open 后）→ 无需全库基线；purge_all 复位空。
     pub(crate) snapshot_dels: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    /// P137（2026-09-06）：快照读监控计数器——batch_get_at 处理 docid 累计 / 预过滤剔除累计。
+    pub(crate) snapshot_batch_rows: std::sync::atomic::AtomicU64,
+    pub(crate) snapshot_prefilter_saved: std::sync::atomic::AtomicU64,
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     pub(crate) affinity: crate::affinity::CpuPartition,
@@ -409,6 +412,25 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// 2026-09-06（P137）：倒排专项监控 + 快照读监控 gauge——`/metrics` 与 SHOW MEMORY 采集。
+    /// 覆盖：段数 / mem 深度 / 落盘 counter / posting 位图缓存命中·未命中 / GC·delta FST 超限
+    /// 待收敛标志（1/0，运维判断"要不要给倒排 GC 腾资源/写入是否过猛导致段堆积"）+ 快照读
+    /// 批量 docid 累计与预过滤剔除累计（省空回表收益观测）。
+    pub fn inverted_report(&self) -> Vec<(&'static str, &'static str, u64)> {
+        use std::sync::atomic::Ordering;
+        vec![
+            ("shanshui_inv_segment_count", "倒排磁盘段数（读合并代价∝段数）", self.inverted.segment_count() as u64),
+            ("shanshui_inv_mem_docids", "倒排内存累积 docid posting 数（待落盘）", self.inverted_mem_docids()),
+            ("shanshui_inv_seg_flush_total", "倒排段落盘次数（counter）", self.inverted.seg_flush_total.load(Ordering::Relaxed)),
+            ("shanshui_inv_posting_cache_hits_total", "posting 位图缓存命中（重复查询免反序列化）", self.inverted.posting_cache_hits.load(Ordering::Relaxed)),
+            ("shanshui_inv_posting_cache_misses_total", "posting 位图缓存未命中（反序列化重建）", self.inverted.posting_cache_misses.load(Ordering::Relaxed)),
+            ("shanshui_inv_gc_pending", "段总量超 GC 阈值待收敛（1=是）", u64::from(self.inverted.should_gc())),
+            ("shanshui_inv_delta_fst_over_limit", "最新段 delta FST 超限待合并（1=是）", u64::from(self.inverted.should_delta_gc())),
+            ("shanshui_snapshot_batch_rows_total", "batch_get_at 处理 docid 累计（快照批量回表量）", self.snapshot_batch_rows.load(Ordering::Relaxed)),
+            ("shanshui_snapshot_prefilter_saved_total", "快照预过滤剔除候选累计（免空回表行数）", self.snapshot_prefilter_saved.load(Ordering::Relaxed)),
+        ]
     }
 
     /// 2026-09-05（P0 观测 ①）：块缓存 (命中/未命中/容量淘汰) 计数 gauge——

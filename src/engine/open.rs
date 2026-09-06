@@ -325,6 +325,8 @@ impl Engine {
             active_snapshots: RwLock::new(std::collections::BTreeMap::new()),
             live_docids: std::sync::Mutex::new(None),
             snapshot_dels: std::sync::Mutex::new(std::collections::HashMap::new()),
+            snapshot_batch_rows: std::sync::atomic::AtomicU64::new(0),
+            snapshot_prefilter_saved: std::sync::atomic::AtomicU64::new(0),
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,

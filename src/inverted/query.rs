@@ -119,8 +119,12 @@ impl InvertedIndex {
         }
         // ② LRU 缓存命中（Ex-8.8 双区；位图浅拷贝返回）
         if let Some(cached) = self.posting_cache.lock().unwrap().get(term) {
+            self.posting_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(cached.as_ref().clone());
         }
+        self.posting_cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut result = Posting::new();
         // 内存（最新）
         if let Some(docids) = self.mem.get(term) {

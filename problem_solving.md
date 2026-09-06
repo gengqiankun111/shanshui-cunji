@@ -1869,6 +1869,19 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 验证：单测 p136_snapshot_dels_prune（S0 删前全保留 / S1 剔"未复活删除" / S2 复活保留 ×
   per-CPU 开关 × 位图开关 4 组合）；全量 lib **789 通过 + 4 ignored**。
 
+**P137（倒排专项监控 D：inverted_report 9 行 gauge，2026-09-06）**
+- 目标：运维判"要不要给倒排 GC 腾资源 / 写入是否过猛导致段堆积 / posting 缓存收益"。
+- 新增 counters：InvertedIndex `seg_flush_total`（flush_segment 埋点）、`posting_cache_hits/
+  misses`（search 缓存路径命中/未命中埋点）；Engine `snapshot_batch_rows`（batch_get_at 处理
+  docid 累计）、`snapshot_prefilter_saved`（prune_deleted_before_snapshot 剔除数累计，P136 复用）。
+- `Engine.inverted_report()` 9 行：inv_segment_count / inv_mem_docids（存内累积）/ inv_seg_flush_
+  total / inv_posting_cache_hits_total·misses_total / inv_gc_pending（should_gc 1/0）/ inv_delta_
+  fst_over_limit（should_delta_gc 1/0）/ snapshot_batch_rows_total / snapshot_prefilter_saved_total。
+  接入 `/metrics`（admin_api engine_runtime_gauges）与 SHOW MEMORY（query.rs）双链（与 memory/
+  bloom/blockcache/l0_report 同构，改一处两处同步补链）。
+- 验证：单测 p137_inverted_report_rows_and_snapshot_counters（9 行齐全 + 首查 miss→二查 hit +
+  prune 剔 2/批量 3 计数前进）；全量 lib **790 通过 + 4 ignored**。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

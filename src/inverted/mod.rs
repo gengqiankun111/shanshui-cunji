@@ -112,6 +112,10 @@ pub struct InvertedIndex {
     /// posting 随规模线性（5000 万库单次反序列化 ~10-200ms），缓存后 O(1)。
     /// 写路径（add/add_batch/flush_segment/gc/with_bitmap_fields）清空保证一致性。
     posting_cache: std::sync::Mutex<PostingLru>,
+    /// P137（2026-09-06）：倒排专项监控计数器——段落盘次数 / posting 位图缓存命中·未命中。
+    pub(crate) seg_flush_total: std::sync::atomic::AtomicU64,
+    pub(crate) posting_cache_hits: std::sync::atomic::AtomicU64,
+    pub(crate) posting_cache_misses: std::sync::atomic::AtomicU64,
     /// G 补充（design_extension 9.6 候选② / K 项落地）：段数据文件 mmap 化——查询按 FST
     /// offset 直接切片反序列化，免 `fs::read` 全文件读取 + 堆复制（大段文件未命中查询的
     /// 主要 IO 成本），物理页按需缺页加载（P23 只读映射白名单，与 dicts 同模式）。
@@ -276,6 +280,9 @@ impl InvertedIndex {
                 .map(|_| std::sync::Mutex::new(std::collections::HashMap::new()))
                 .collect(),
             posting_cache: std::sync::Mutex::new(PostingLru::new(POSTING_CACHE_CAP)),
+            seg_flush_total: std::sync::atomic::AtomicU64::new(0),
+            posting_cache_hits: std::sync::atomic::AtomicU64::new(0),
+            posting_cache_misses: std::sync::atomic::AtomicU64::new(0),
             data_files: ArcSwap::from(Arc::new(HashMap::new())),
         })
     }

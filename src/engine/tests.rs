@@ -3751,8 +3751,54 @@ use crate::optimizer::QuerySpec;
         format!(r#"{{"k":{k},"note":"{note}"}}"#).into_bytes()
     }
 
-    /// P136：快照活跃预过滤事件表——S 前删剔除 / S 后删保留 / 复活清除 / 非 per-CPU 或
-    /// 位图关 → 不维护（no-op，快照读 None 兜底）。
+    /// P137：倒排专项监控行集 + 快照读/预过滤计数在 batch/prune/缓存查询后前进。
+    #[test]
+    fn p137_inverted_report_rows_and_snapshot_counters() {
+        let dir = tmp();
+        let mut cfg = Config::default();
+        cfg.storage.per_cpu_enabled = true;
+        cfg.storage.deletion_bitmap_enabled = true;
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        let key = |r: &Vec<(&str, &str, u64)>, n: &str| -> u64 {
+            r.iter()
+                .find(|(k, _, _)| *k == n)
+                .map(|(_, _, v)| *v)
+                .unwrap_or_else(|| panic!("缺指标 {n}"))
+        };
+        // 行集完整（9 行）
+        let r0 = e.inverted_report();
+        assert_eq!(r0.len(), 9);
+        for id in 1..=3u64 {
+            e.put(id, mkdoc_kg(id, "n"), &["s=n"]).unwrap();
+        }
+        // posting 缓存：首查 miss、二查 hit
+        let _ = e.inverted_posting("s=n").unwrap();
+        let r1 = e.inverted_report();
+        assert!(key(&r1, "shanshui_inv_posting_cache_misses_total") >= 1);
+        assert_eq!(key(&r1, "shanshui_inv_posting_cache_hits_total"), 0);
+        let _ = e.inverted_posting("s=n").unwrap();
+        let r2 = e.inverted_report();
+        assert!(key(&r2, "shanshui_inv_posting_cache_hits_total") >= 1);
+        // 快照侧：S2 批量 + 预过滤计数前进
+        let s0 = e.begin_snapshot();
+        e.delete(2).unwrap();
+        e.delete(3).unwrap();
+        let s1 = e.begin_snapshot();
+        let mut ids = vec![1u64, 2, 3];
+        assert_eq!(e.prune_deleted_before_snapshot(&mut ids, s0), 0, "S0 删前不剔");
+        assert_eq!(e.prune_deleted_before_snapshot(&mut ids, s1), 2, "S1 剔 2,3");
+        assert_eq!(ids, vec![1]);
+        let _ = e.batch_get_at(&[1, 2, 3], s1).unwrap();
+        let r3 = e.inverted_report();
+        assert!(key(&r3, "shanshui_snapshot_prefilter_saved_total") >= 2);
+        assert!(key(&r3, "shanshui_snapshot_batch_rows_total") >= 3);
+        // 段数/mem/落盘键存在
+        assert!(key(&r0, "shanshui_inv_segment_count") <= 1_000_000);
+        let _ = key(&r0, "shanshui_inv_gc_pending");
+        let _ = key(&r0, "shanshui_inv_delta_fst_over_limit");
+        let _ = key(&r0, "shanshui_inv_seg_flush_total");
+    }
+
     #[test]
     fn p136_snapshot_dels_prune() {
         for per_cpu in [true, false] {

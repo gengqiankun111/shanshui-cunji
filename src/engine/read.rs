@@ -187,13 +187,18 @@ impl Engine {
     /// 未复活"的候选（`snapshot_dels` 由写路径 位图+per-CPU 记账、复活 put 清除；空表/非维护
     /// 模式 = no-op）。**绝不误剔**（删除已提交于 ≤ snap 且此后未复活 → 快照视图确实不可见）；
     /// **漏剔**（历史复活窗口 / 非维护模式）由调用方 `batch_get_at`/`get_at` 的 None 兜底 →
-    /// 本 API 仅为省空回表的优化，不影响正确性。
-    pub(crate) fn prune_deleted_before_snapshot(&self, docids: &mut Vec<u64>, snap: u64) {
+    /// 本 API 仅为省空回表的优化，不影响正确性。返回剔除数（P137 监控累计）。
+    pub(crate) fn prune_deleted_before_snapshot(&self, docids: &mut Vec<u64>, snap: u64) -> u64 {
         let dels = self.snapshot_dels.lock().unwrap();
         if dels.is_empty() {
-            return;
+            return 0;
         }
+        let before = docids.len();
         docids.retain(|d| !dels.get(d).map_or(false, |&s| s <= snap));
+        let removed = (before - docids.len()) as u64;
+        self.snapshot_prefilter_saved
+            .fetch_add(removed, Ordering::Relaxed);
+        removed
     }
 
     /// P135（2026-09-06）：**批量快照取行**——语义与 `get_at` 逐条完全一致
@@ -214,6 +219,8 @@ impl Engine {
             return Ok(out);
         }
         self.metrics.read_ops.fetch_add(n as u64, Ordering::Relaxed);
+        // P137：快照读监控计数（batch_get_at 处理 docid 累计）
+        self.snapshot_batch_rows.fetch_add(n as u64, Ordering::Relaxed);
         // ① 主数据 ≤S（逐 docid 快照版本；不入 HotCache）
         for (i, &d) in docids.iter().enumerate() {
             if let Some((bv, _)) = self
