@@ -183,6 +183,19 @@ impl Engine {
         Ok(out)
     }
 
+    /// P136（2026-09-06）：快照活跃**预过滤**——批量取行前集合级剔除"删除事件 seq ≤ snap 且
+    /// 未复活"的候选（`snapshot_dels` 由写路径 位图+per-CPU 记账、复活 put 清除；空表/非维护
+    /// 模式 = no-op）。**绝不误剔**（删除已提交于 ≤ snap 且此后未复活 → 快照视图确实不可见）；
+    /// **漏剔**（历史复活窗口 / 非维护模式）由调用方 `batch_get_at`/`get_at` 的 None 兜底 →
+    /// 本 API 仅为省空回表的优化，不影响正确性。
+    pub(crate) fn prune_deleted_before_snapshot(&self, docids: &mut Vec<u64>, snap: u64) {
+        let dels = self.snapshot_dels.lock().unwrap();
+        if dels.is_empty() {
+            return;
+        }
+        docids.retain(|d| !dels.get(d).map_or(false, |&s| s <= snap));
+    }
+
     /// P135（2026-09-06）：**批量快照取行**——语义与 `get_at` 逐条完全一致
     /// （≤ snapshot_seq 版本：跳过删除位图、tombstone seq ≤ S → None / > S → 取 S 前旧版、
     /// Delta 增量 ≤ S 折叠不坍缩），但一次处理多个 docid：

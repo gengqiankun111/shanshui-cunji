@@ -160,6 +160,8 @@ impl Engine {
         if let Some(bm) = &self.deletion_bitmap {
             if bm.clear(docid) {
                 self.garbage_marked.fetch_sub(1, Ordering::Relaxed);
+                // P136：复活（已删→put）→ 清除快照预过滤删除事件（此后快照读由版本链判定）
+                self.snapshot_dels.lock().unwrap().remove(&docid);
             }
         }
         // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
@@ -304,6 +306,8 @@ impl Engine {
         }
         // P1-C：purge 后活跃集复位空（后续 put 从 0 增量）
         *self.live_docids.lock().unwrap() = Some(RoaringTreemap::new());
+        // P136：purge 后快照预过滤事件表复位空
+        self.snapshot_dels.lock().unwrap().clear();
         self.pending_inverted.lock().unwrap().clear();
         self.global_seq.store(0, Ordering::Relaxed);
         self.max_docid.store(0, Ordering::Relaxed);
@@ -344,9 +348,15 @@ impl Engine {
                 if bm.mark_deleted(docid) {
                     self.garbage_marked.fetch_add(1, Ordering::Relaxed);
                 }
-                self.primary
+                let dseq = self
+                    .primary
                     .delete_record_mem(encode_docid(docid).to_vec())?;
                 self.delta.delete_prefix(&encode_docid(docid))?;
+                // P136：快照活跃预过滤删除事件（per-CPU 下墓碑 seq = 引擎快照可比上界；
+                // 复活 put 清条目；非 per-CPU/非位图模式不维护 → 预过滤关闭，快照读 None 兜底）
+                if self.percpu.is_some() {
+                    self.snapshot_dels.lock().unwrap().insert(docid, dseq);
+                }
             }
             None => {
                 self.primary.delete(docid)?;
@@ -409,9 +419,14 @@ impl Engine {
                     if bm.mark_deleted(docid) {
                         self.garbage_marked.fetch_add(1, Ordering::Relaxed);
                     }
-                    self.primary
+                    let dseq = self
+                        .primary
                         .delete_record_mem(encode_docid(docid).to_vec())?;
                     self.delta.delete_prefix(&encode_docid(docid))?;
+                    // P136：快照活跃预过滤删除事件（per-CPU 下墓碑 seq 与引擎快照可比）
+                    if self.percpu.is_some() {
+                        self.snapshot_dels.lock().unwrap().insert(docid, dseq);
+                    }
                 }
                 None => {
                     // 位图关闭（传统 Tombstone 路径）：墓碑进版本链（快照语义同 delete），

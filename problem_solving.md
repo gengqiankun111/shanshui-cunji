@@ -1854,6 +1854,21 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   superset 覆盖）。batch_get_at 消费点 = RR 快照语义端（txn superset）+ 未来混合库残余。
 - 全量 lib **787 通过 + 4 ignored**（seqlock 概率型 flaky 单跑复绿）。
 
+**P136（快照活跃预过滤：snapshot_dels 删除事件表 + prune 接线，2026-09-06）**
+- 目标（C）：P135 superset 候选批量取行前集合级剔除"S 前已删" docid（免 batch_get_at 空跑）。
+- 形态（尽力而为、绝不误剔）：`Engine.snapshot_dels: Mutex<HashMap<docid, del_seq>>`——只记录
+  本进程、**删除位图 + per-CPU** 模式发生的删除（delete/delete_batch 位图臂取
+  `delete_record_mem` 返回的墓碑 seq 记入；复活 put（位图 clear 命中）清除条目；purge_all
+  复位；open 空表——活跃快照不跨进程（begin 于 open 后）→ 无需全库基线/无需 add 事件）。
+  `prune_deleted_before_snapshot(ids, S)` = retain !(del≤S)。**绝不误剔**（删于 ≤S 且未复活
+  → 快照视图确实不可见）；**漏剔**（历史"删→复活"窗口条目已清、非 per-CPU/非位图模式不维护）
+  由 `batch_get_at(S)` None 兜底 → 仅省空回表的优化，正确性不受影响（与 P134/135 哲学一致）。
+- 接线：`finish_predicate_superset`（P135）批量取行前调 prune。
+- 局限记录：换值不产生 del 事件（仍需 doc_matches 字段复核）；复活历史窗口漏剔；位图关/
+  per-CPU 关场景不启用预过滤。
+- 验证：单测 p136_snapshot_dels_prune（S0 删前全保留 / S1 剔"未复活删除" / S2 复活保留 ×
+  per-CPU 开关 × 位图开关 4 组合）；全量 lib **789 通过 + 4 ignored**。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

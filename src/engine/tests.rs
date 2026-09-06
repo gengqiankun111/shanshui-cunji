@@ -3751,6 +3751,48 @@ use crate::optimizer::QuerySpec;
         format!(r#"{{"k":{k},"note":"{note}"}}"#).into_bytes()
     }
 
+    /// P136：快照活跃预过滤事件表——S 前删剔除 / S 后删保留 / 复活清除 / 非 per-CPU 或
+    /// 位图关 → 不维护（no-op，快照读 None 兜底）。
+    #[test]
+    fn p136_snapshot_dels_prune() {
+        for per_cpu in [true, false] {
+            for bm in [true, false] {
+                let dir = tmp();
+                let mut cfg = Config::default();
+                cfg.storage.per_cpu_enabled = per_cpu;
+                cfg.storage.deletion_bitmap_enabled = bm;
+                let mut e = Engine::open(&dir, &cfg).unwrap();
+                for id in 1..=4u64 {
+                    e.put(id, mkdoc_kg(id, "n"), &[]).unwrap();
+                }
+                let s0 = e.begin_snapshot(); // 删前
+                e.delete(2).unwrap();
+                e.delete(3).unwrap();
+                let s1 = e.begin_snapshot(); // 删后、复活前
+                e.put(2, mkdoc_kg(2, "r"), &[]).unwrap(); // 复活
+                let s2 = e.begin_snapshot(); // 复活后
+
+                let mut v0 = vec![1u64, 2, 3, 4, 999];
+                e.prune_deleted_before_snapshot(&mut v0, s0);
+                let mut v1 = vec![1u64, 2, 3, 4, 999];
+                e.prune_deleted_before_snapshot(&mut v1, s1);
+                let mut v2 = vec![1u64, 2, 3, 4, 999];
+                e.prune_deleted_before_snapshot(&mut v2, s2);
+                if per_cpu && bm {
+                    assert_eq!(v0, vec![1, 2, 3, 4, 999], "[per_cpu={per_cpu},bm={bm}] S0 删前全保留");
+                    // 3 删除后未复活 → 可预过滤剔除；2 已复活（事件清除）→ 历史"删→复活"窗口
+                    // 无法预过滤（设计局限，batch_get_at None 兜底，不误剔）
+                    assert_eq!(v1, vec![1, 2, 4, 999], "[per_cpu={per_cpu},bm={bm}] S1 剔未复活 3");
+                    assert_eq!(v2, vec![1, 2, 4, 999], "[per_cpu={per_cpu},bm={bm}] S2 复活 2 保留/3 剔");
+                } else {
+                    assert_eq!(v0.len(), 5, "[per_cpu={per_cpu},bm={bm}] 非维护模式不预过滤");
+                    assert_eq!(v1.len(), 5);
+                    assert_eq!(v2.len(), 5);
+                }
+            }
+        }
+    }
+
     #[test]
     fn p131_live_window_ids_matches_keys_only_scan() {
         // P131 定位 v2：live_window_ids（live 位图 ∩ 窗口，纯内存）必须与 keys-only 现存扫描

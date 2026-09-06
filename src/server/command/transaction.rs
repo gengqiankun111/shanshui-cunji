@@ -490,7 +490,9 @@ fn finish_predicate_superset(
 ) -> QueryResponse {
     let early_stop = !order && !is_sum && limit.is_some();
     let need = limit.unwrap_or(usize::MAX);
-    let ids: Vec<u64> = sup.iter().filter(|d| *d <= hi).collect();
+    let mut ids: Vec<u64> = sup.iter().filter(|d| *d <= hi).collect();
+    // P136：批量取行前集合级剔除"S 前已删且未复活"候选（免空回表；漏剔由 batch None 兜底）
+    engine.prune_deleted_before_snapshot(&mut ids, txn.snapshot());
     let vals = match engine.batch_get_at(&ids, txn.snapshot()) {
         Ok(v) => v,
         Err(err) => return QueryResponse::Err(3500, format!("事务谓词读失败: {err}")),

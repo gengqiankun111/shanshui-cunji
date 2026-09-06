@@ -324,6 +324,7 @@ impl Engine {
             dd_min_docs: cfg.storage.delete_density_min_docs,
             active_snapshots: RwLock::new(std::collections::BTreeMap::new()),
             live_docids: std::sync::Mutex::new(None),
+            snapshot_dels: std::sync::Mutex::new(std::collections::HashMap::new()),
             affinity: crate::affinity::plan_partition(&cfg.affinity),
             io_rate_base_bytes: cfg.storage.io_rate_limit_mb * 1024 * 1024,
             memtable_max_bytes: cfg.memtable.max_size_mb * 1024 * 1024,

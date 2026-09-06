@@ -149,6 +149,12 @@ pub struct Engine {
     /// delete 减 / 覆盖不变 / 复活增），purge 复位空集。语义 = 引擎最新视图（删除位图
     /// 与 Tombstone 双路径一致）；跨线程由 db 层读写锁串行化，此处 Mutex 仅保护懒建/读。
     pub(crate) live_docids: std::sync::Mutex<Option<RoaringTreemap>>,
+    /// P136（2026-09-06）：快照活跃**预过滤**删除事件表（docid → 删除提交 seq，上界口径，
+    /// 见 write/read 记账注释）——供 RR 快照读在批量取行前**集合级剔除"快照前已删且未复活"
+    /// 的候选**（免 batch_get_at 空跑）；只记录本进程内、删除位图 + per-CPU 模式下发生的
+    /// 删除（复活 put 清除条目 → 绝不误剔，漏剔由快照读 None 兜底 = 正确性不受影响）。
+    /// 活跃快照不会跨进程（begin 于 open 后）→ 无需全库基线；purge_all 复位空。
+    pub(crate) snapshot_dels: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     /// 三池核分区（Ex-7.2）：network（server 主线程）/ compute（Compaction 并行）/
     /// io（组提交后台）——绑核消除调度抖动；enabled=false 时为空（no-op）。
     pub(crate) affinity: crate::affinity::CpuPartition,
