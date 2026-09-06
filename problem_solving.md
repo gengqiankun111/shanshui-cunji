@@ -1820,11 +1820,14 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   s='a' 仍见旧值、s='b' 为空）、`txn_between_snapshot_sees_deleted_after_snapshot`（BETWEEN SUM
   快照后删不变；旧实现剔位图 → 0）。全量 lib **784 通过 + 4 ignored**（seqlock 低频写重试率
   概率型 flaky 单跑 0.10s 复绿，历史多轮无关）。
-- **另发现两既有缺口（不在 P134，记录待查）**：① autocommit 纯 id 投影（`SELECT id ... WHERE
-  id=N` / BETWEEN 无 ORDER BY）返回空，而 `SELECT *` 同条件正常（row 存在，疑似 P127 家族
-  投影缺线——字段语义求值无 id 字段的形态延伸）；② 同连接快速连续多条 INSERT 后，字段全扫
-  首行不可见（scan 视图与 get 不一致嫌疑；get/SELECT* id 可见而全扫不见）。均已记录
-  development_remain P134 行，待独立排期核实。
+- **另记录两缺口 → 核实撤销（2026-09-06，非缺陷）**：初判"autocommit 纯 id 投影（点查/BETWEEN
+  无 ORDER BY）返空"与"同连接快速连插后字段全扫漏首行"经**引擎级**（put 后 get/scan_range/
+  scan_stream_ids/scan_stream 全见 4 行）与**服务 fn 级**（select_response：`SELECT id` 点查/
+  BETWEEN/字段全扫均返回含首行全 4 行）双决定性验证 = **测试结果解析假象**：测试 row_ids
+  解析按 2 列结果集头偏移 skip(4)（1 列头 + 2 列定义 + EOF = 4 包），而 `SELECT id` 为 1 列
+  （头仅 3 包）→ 首数据行被当作头跳过；单行时整行被丢 → 误报"空/漏首行"。引擎/投影层无此
+  缺陷（既有回归 tests.rs 391-407 同文本点查 1 行即证）。**教训：TCP 结果集解析须按 columns
+  数自适应头偏移**（col_count 包 + columns×列定义包 + EOF 包），测试沿用 SELECT *（2 列）规避。
 
 ## 环境备忘（不入库）
 

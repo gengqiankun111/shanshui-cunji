@@ -2705,8 +2705,8 @@ use crate::multitable::drop_table_range;
         // P134 缺口①：事务内**字段谓词**读（RR 快照）在快照后被并发删除/换值的行必须仍可见，
         // 与点查 get_at（见旧值）自洽——旧路径候选 = 最新态 sqlish（回表位图剔除已删行、
         // 最新值过滤已换值行）→ 快照后删/换值行不在候选 → 谓词读漏行（RR 违反）。
-        // 注：读行用 SELECT *（行首列 = id，避开 id 纯投影既有缺口）；单行/轮（多行快速连续
-        // 插入后全扫首行可见性为既有独立问题，不入本测试）。
+        // 注：读行用 SELECT *（结果集 2 列 → row_ids 头偏移解析正确；SELECT id 为 1 列，
+        // 头包偏移不同，非引擎差异）。单行/轮仅便于断言（引擎/服务层已 fn 级验证多行一致）。
         let engine = test_engine();
         let server = DbServer::new(engine, "root", "secret");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
