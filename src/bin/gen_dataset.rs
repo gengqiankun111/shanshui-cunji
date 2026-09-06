@@ -1,25 +1,74 @@
-//! shanshui-cunji-gen-dataset：异步（分块流式 + 进度输出，可后台运行）构建 Parquet 数据集。
+//! shanshui-cunji-gen-dataset：分块流式构建 Parquet 宽表数据集（与宽表 SQL 基准 25 列同构）。
 //!
-//! 规格：N 条记录 × 23 字段——9 个数值型（Int64×7 / Int32×2 / Float64×1）+ 2 个 256 字符文本
-//! （`big_text_a/b`）+ 8 个短字符串/枚举 + 1 个布尔 + 3 个 fulltext 分词长文本（`title/content/remark`，
-//! 中文 bigram / 英文整词可查），满足「几个整型 + 1-2 个 256 字符字段」+ 倒排/fulltext 基准需求。
+//! 规格：N 条记录 × 25 列——docid 主键 + `k/amount/score/ts/balance`（数值）+ 枚举
+//! `status/region/channel/tag` + `user_id/age/active_days/visit_count/flag` + 定宽文本
+//! `note/title/url/email/phone/ip/desc_a/desc_b/txt_a/txt_b`（列名与值分布对齐
+//! rr-conformance wide_load COLS_FULL / 宽表 SQL 基准 `wide.t`，单行 ≈1KB）。
+//! 确定性 PRNG（SplitMix64）：同 seed 两端生成逐位一致（本机 / Ubuntu 复现）。
 //!
 //! 用法：
-//!   shanshui-cunji-gen-dataset --rows 50000000 --out D:\shanshui-data\ds-50m.parquet
+//!   shanshui-cunji-gen-dataset --rows 500000 --out /path/ds-500k.parquet
 //!   --rows 行数（默认 5000 万）· --batch 批大小（默认 10 万）· --seed 确定性种子 · --out 输出路径
 //!
 //! 特点：
-//! - **分块流式**：每批 10 万条构建 RecordBatch 写入，内存占用恒定（不随 N 增长）；
-//! - **可后台运行**：循环 + 每 100 万条打印进度（普通同步 IO，无异步运行时依赖，保持内核零异步原则）；
-//! - **确定性**：`--seed` 固定生成内容（复现/对账用）。
+//! - 分块流式：每批构建 RecordBatch 写入，内存占用恒定；
+//! - 主键列名 `docid`（int64、自 1 递增）——`shanshui-cunji-import --parquet` 直接识别。
 
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+
+/// 宽表 25 列（docid + 24），列序对齐 rr-conformance wide_load COLS_FULL（id→docid）。
+const ENUM_STATUS: [&str; 5] = ["active", "closed", "pending", "failed", "archived"];
+const ENUM_REGION: [&str; 8] = [
+    "beijing",
+    "shanghai",
+    "shenzhen",
+    "hangzhou",
+    "guangzhou",
+    "chengdu",
+    "wuhan",
+    "nanjing",
+];
+const ENUM_CHANNEL: [&str; 5] = ["web", "app", "api", "mobile", "wechat"];
+const ENUM_TAG: [&str; 5] = ["free", "basic", "gold", "vip", "new"];
+const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// SplitMix64：确定性 PRNG（无外部 rand 依赖；同 seed 同序列）。
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    /// [lo, hi] 闭区间均匀整数。
+    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + self.next() % (hi - lo + 1)
+    }
+    /// [0,1) f64。
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn pick<'a>(&mut self, arr: &'a [&str]) -> &'a str {
+        arr[self.range(0, (arr.len() - 1) as u64) as usize]
+    }
+    fn rs(&mut self, n: u64) -> String {
+        (0..n)
+            .map(|_| ALPHA[self.range(0, (ALPHA.len() - 1) as u64) as usize] as char)
+            .collect()
+    }
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,31 +96,33 @@ fn main() {
         out.display()
     );
 
-    // 20 字段 schema
+    // 25 列 schema（docid 主键列名固定，import --parquet 识别；列序同宽表基准）
     let schema = Arc::new(Schema::new(vec![
         Field::new("docid", DataType::Int64, false),
-        Field::new("user_id", DataType::Int64, false),
-        Field::new("amount", DataType::Int64, false),
-        Field::new("age", DataType::Int32, false),
+        Field::new("k", DataType::Int64, false),
+        Field::new("amount", DataType::Float64, false),
         Field::new("score", DataType::Float64, false),
         Field::new("ts", DataType::Int64, false),
         Field::new("status", DataType::Utf8, false),
-        Field::new("city", DataType::Utf8, false),
-        Field::new("big_text_a", DataType::Utf8, false),
-        Field::new("big_text_b", DataType::Utf8, false),
-        Field::new("tag_a", DataType::Utf8, false),
-        Field::new("tag_b", DataType::Utf8, false),
-        Field::new("note", DataType::Utf8, false),
         Field::new("region", DataType::Utf8, false),
-        Field::new("device", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
-        Field::new("flag", DataType::Boolean, false),
+        Field::new("user_id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, false),
         Field::new("active_days", DataType::Int32, false),
-        Field::new("visit_count", DataType::Int64, false),
-        Field::new("balance", DataType::Int64, false),
+        Field::new("visit_count", DataType::Int32, false),
+        Field::new("balance", DataType::Float64, false),
+        Field::new("flag", DataType::Int32, false),
+        Field::new("tag", DataType::Utf8, false),
+        Field::new("note", DataType::Utf8, false),
         Field::new("title", DataType::Utf8, false),
-        Field::new("content", DataType::Utf8, false),
-        Field::new("remark", DataType::Utf8, false),
+        Field::new("url", DataType::Utf8, false),
+        Field::new("email", DataType::Utf8, false),
+        Field::new("phone", DataType::Utf8, false),
+        Field::new("ip", DataType::Utf8, false),
+        Field::new("desc_a", DataType::Utf8, false),
+        Field::new("desc_b", DataType::Utf8, false),
+        Field::new("txt_a", DataType::Utf8, false),
+        Field::new("txt_b", DataType::Utf8, false),
     ]));
 
     let props = WriterProperties::builder()
@@ -81,12 +132,13 @@ fn main() {
     let mut writer =
         ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("创建 ArrowWriter");
 
+    let mut rng = Rng(seed);
     let t0 = std::time::Instant::now();
     let mut written: u64 = 0;
     while written < rows {
         let n = batch.min(rows - written);
-        let start = written;
-        let rb = build_batch(&schema, start, n, seed);
+        let start = written; // docid 自 1 起
+        let rb = build_batch(&schema, &mut rng, start, n);
         writer.write(&rb).expect("写入批次");
         written += n;
         if written % 1_000_000 == 0 || written == rows {
@@ -110,101 +162,90 @@ fn main() {
     );
 }
 
-/// 构建一个批次（start..start+n 的 20 列数组）。
-fn build_batch(schema: &Arc<Schema>, start: u64, n: u64, seed: u64) -> RecordBatch {
-    let docid: Vec<i64> = (start..start + n).map(|i| i as i64).collect();
-    let user_id: Vec<i64> = docid.iter().map(|&i| 1_000_000 + (i % 9_999_999)).collect();
-    let amount: Vec<i64> = docid
-        .iter()
-        .map(|&i| (i as u64).wrapping_mul(2654435761) % 1_000_000)
-        .map(|v| v as i64)
-        .collect();
-    let age: Vec<i32> = docid.iter().map(|&i| 18 + (i % 60) as i32).collect();
-    let score: Vec<f64> = docid.iter().map(|&i| (i % 1000) as f64 / 10.0).collect();
-    let ts: Vec<i64> = docid
-        .iter()
-        .map(|&i| 1_700_000_000 + (i % 31_536_000))
-        .collect();
-    let status: Vec<String> = docid
-        .iter()
-        .map(|&i| ["active", "inactive", "pending"][(i % 3) as usize].into())
-        .collect();
-    let city: Vec<String> = docid
-        .iter()
-        .map(|&i| {
-            ["beijing", "shanghai", "shenzhen", "hangzhou", "chengdu"][(i % 5) as usize].into()
-        })
-        .collect();
-    let big_text_a: Vec<String> = docid.iter().map(|&i| text256(i as u64, seed)).collect();
-    let big_text_b: Vec<String> = docid
-        .iter()
-        .map(|&i| {
-            text256(
-                (i as u64).wrapping_mul(7).wrapping_add(seed),
-                seed ^ 0x9E3779B9,
-            )
-        })
-        .collect();
-    let tag_a: Vec<String> = docid
-        .iter()
-        .map(|&i| ["A", "B", "C"][(i % 3) as usize].into())
-        .collect();
-    let tag_b: Vec<String> = docid
-        .iter()
-        .map(|&i| ["x", "y"][(i % 2) as usize].into())
-        .collect();
-    let note: Vec<String> = docid.iter().map(|&i| format!("note-{i}")).collect();
-    let region: Vec<String> = docid
-        .iter()
-        .map(|&i| ["east", "west", "south", "north"][(i % 4) as usize].into())
-        .collect();
-    let device: Vec<String> = docid
-        .iter()
-        .map(|&i| ["pc", "mobile", "tablet"][(i % 3) as usize].into())
-        .collect();
-    let channel: Vec<String> = docid
-        .iter()
-        .map(|&i| ["web", "app", "api"][(i % 3) as usize].into())
-        .collect();
-    let flag: Vec<bool> = docid.iter().map(|&i| i % 2 == 0).collect();
-    let active_days: Vec<i32> = docid.iter().map(|&i| (i % 365) as i32).collect();
-    let visit_count: Vec<i64> = docid.iter().map(|&i| i % 10_000).collect();
-    let balance: Vec<i64> = docid.iter().map(|&i| i % 1_000_000).collect();
-
+/// 构建一个批次：docid = start+1 ..= start+n（与 wide_load gen() 相同的列分布，
+/// 每行固定消耗的随机数调用序，同 seed 两端逐位一致）。
+fn build_batch(schema: &Arc<Schema>, rng: &mut Rng, start: u64, n: u64) -> RecordBatch {
+    let mut docid = Vec::with_capacity(n as usize);
+    let mut k = Vec::with_capacity(n as usize);
+    let mut amount = Vec::with_capacity(n as usize);
+    let mut score = Vec::with_capacity(n as usize);
+    let mut ts = Vec::with_capacity(n as usize);
+    let mut status = Vec::with_capacity(n as usize);
+    let mut region = Vec::with_capacity(n as usize);
+    let mut channel = Vec::with_capacity(n as usize);
+    let mut user_id = Vec::with_capacity(n as usize);
+    let mut age = Vec::with_capacity(n as usize);
+    let mut active_days = Vec::with_capacity(n as usize);
+    let mut visit_count = Vec::with_capacity(n as usize);
+    let mut balance = Vec::with_capacity(n as usize);
+    let mut flag = Vec::with_capacity(n as usize);
+    let mut tag = Vec::with_capacity(n as usize);
+    let mut note = Vec::with_capacity(n as usize);
+    let mut title = Vec::with_capacity(n as usize);
+    let mut url = Vec::with_capacity(n as usize);
+    let mut email = Vec::with_capacity(n as usize);
+    let mut phone = Vec::with_capacity(n as usize);
+    let mut ip = Vec::with_capacity(n as usize);
+    let mut desc_a = Vec::with_capacity(n as usize);
+    let mut desc_b = Vec::with_capacity(n as usize);
+    let mut txt_a = Vec::with_capacity(n as usize);
+    let mut txt_b = Vec::with_capacity(n as usize);
+    for i in (start + 1)..=(start + n) {
+        docid.push(i as i64);
+        k.push(rng.range(1, 20_000_000) as i64);
+        amount.push(round2(rng.unit() * 1_000_000.0));
+        score.push(round2(rng.unit() * 100.0));
+        ts.push((1_700_000_000u64 + rng.range(0, 30_000_000)) as i64);
+        status.push(rng.pick(&ENUM_STATUS).to_string());
+        region.push(rng.pick(&ENUM_REGION).to_string());
+        channel.push(rng.pick(&ENUM_CHANNEL).to_string());
+        user_id.push(rng.range(1, 5_000_000) as i32);
+        age.push(rng.range(18, 70) as i32);
+        active_days.push(rng.range(0, 365) as i32);
+        visit_count.push(rng.range(0, 100_000) as i32);
+        balance.push(round2(rng.unit() * 1_000_000.0));
+        flag.push(rng.range(0, 1) as i32);
+        tag.push(rng.pick(&ENUM_TAG).to_string());
+        note.push(rng.rs(35));
+        title.push(rng.rs(50));
+        url.push(rng.rs(80));
+        email.push(rng.rs(28));
+        phone.push(rng.rs(11));
+        ip.push(rng.rs(20));
+        desc_a.push(rng.rs(200));
+        desc_b.push(rng.rs(160));
+        txt_a.push(rng.rs(140));
+        txt_b.push(rng.rs(120));
+    }
     RecordBatch::try_new(
         Arc::clone(schema),
         vec![
             Arc::new(Int64Array::from(docid)) as Arc<dyn arrow::array::Array>,
-            Arc::new(Int64Array::from(user_id)),
-            Arc::new(Int64Array::from(amount)),
-            Arc::new(Int32Array::from(age)),
+            Arc::new(Int64Array::from(k)),
+            Arc::new(Float64Array::from(amount)),
             Arc::new(Float64Array::from(score)),
             Arc::new(Int64Array::from(ts)),
             Arc::new(StringArray::from(status)),
-            Arc::new(StringArray::from(city)),
-            Arc::new(StringArray::from(big_text_a)),
-            Arc::new(StringArray::from(big_text_b)),
-            Arc::new(StringArray::from(tag_a)),
-            Arc::new(StringArray::from(tag_b)),
-            Arc::new(StringArray::from(note)),
             Arc::new(StringArray::from(region)),
-            Arc::new(StringArray::from(device)),
             Arc::new(StringArray::from(channel)),
-            Arc::new(BooleanArray::from(flag)),
+            Arc::new(Int32Array::from(user_id)),
+            Arc::new(Int32Array::from(age)),
             Arc::new(Int32Array::from(active_days)),
-            Arc::new(Int64Array::from(visit_count)),
-            Arc::new(Int64Array::from(balance)),
+            Arc::new(Int32Array::from(visit_count)),
+            Arc::new(Float64Array::from(balance)),
+            Arc::new(Int32Array::from(flag)),
+            Arc::new(StringArray::from(tag)),
+            Arc::new(StringArray::from(note)),
+            Arc::new(StringArray::from(title)),
+            Arc::new(StringArray::from(url)),
+            Arc::new(StringArray::from(email)),
+            Arc::new(StringArray::from(phone)),
+            Arc::new(StringArray::from(ip)),
+            Arc::new(StringArray::from(desc_a)),
+            Arc::new(StringArray::from(desc_b)),
+            Arc::new(StringArray::from(txt_a)),
+            Arc::new(StringArray::from(txt_b)),
         ],
     )
     .expect("构建 RecordBatch")
-}
-
-/// 固定 256 宽文本（尾部空格填充；确定性 + 压缩友好）。
-fn text256(i: u64, salt: u64) -> String {
-    let s = format!(
-        "rec-{i:08}-msg-{}-tag{}",
-        i.wrapping_mul(31).wrapping_add(salt) % 100_000,
-        salt % 100
-    );
-    format!("{s:<256}")
 }

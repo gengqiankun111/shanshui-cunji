@@ -79,6 +79,10 @@ name = "shanshui-cunji-gen-dataset"
 path = "src/bin/gen_dataset.rs"
 
 [[bin]]
+name = "shanshui-cunji-wal-probe"
+path = "src/bin/wal_probe.rs"
+
+[[bin]]
 name = "shanshui-cunji-shard-build"
 path = "src/bin/shard_build.rs"
 

@@ -200,6 +200,23 @@ pub struct PagedRows {
     pub rows: Vec<QueryRow>,
 }
 
+/// P144-②：per-CPU WAL checkpoint 现场（`Engine::wal_replay_report` 返回）。
+#[derive(Debug, Clone, Default)]
+pub struct WalReplayReport {
+    /// per-CPU WAL 是否启用（false = 非 per-CPU 模式，其余字段恒 0）。
+    pub per_cpu: bool,
+    /// checkpoint 文件持久化值（重启回放起点 = 恢复时从该 gseq 之后回放）。
+    pub persisted_cp: u64,
+    /// 运行期 checkpoint（min(各 CF 已刷水位)；≥ persisted_cp）。
+    pub cp: u64,
+    /// cidx（组合索引 CF）已刷水位（P144-②：应随主数据收敛、不再恒 0 钉死 cp）。
+    pub cidx_watermark: u64,
+    /// cidx 已落 SST 数（>0 = 补刷发生过）。
+    pub cidx_ssts: usize,
+    /// 队列文件中 > persisted_cp 的条目数 = 若此刻崩溃，下次重启将回放的行数近似。
+    pub replay_pending: u64,
+}
+
 /// 引擎状态指标（`admin status` 数据源）。
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -233,6 +250,31 @@ impl Engine {
     /// 数据目录（Ex-2.5 网关 SAGA 状态持久化目录据此派生 `{data_dir}/saga`）。
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// P144-② 只读诊断：per-CPU WAL checkpoint 现场（运维/回放验证 bin 用）。
+    /// `replay_pending` = 队列文件中 > 持久化 cp 的条目数——即此刻若崩溃/非干净退出，
+    /// 下次重启将回放的行数近似（cp 推进即持久化后应 ≈ 0）。
+    pub fn wal_replay_report(&self) -> WalReplayReport {
+        use crate::engine::percpu_wal::CF_CIDX;
+        use std::sync::atomic::Ordering as O;
+        let mut rep = WalReplayReport::default();
+        if let Some(rt) = &self.percpu {
+            let persisted = rt.load_checkpoint();
+            let pending = rt
+                .records_after(persisted)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            rep = WalReplayReport {
+                per_cpu: true,
+                persisted_cp: persisted,
+                cp: rt.cp.load(O::Relaxed),
+                cidx_watermark: rt.cf_watermarks[CF_CIDX as usize].load(O::Relaxed),
+                cidx_ssts: self.cidx.as_ref().map_or(0, |c| c.sst_count()),
+                replay_pending: pending,
+            };
+        }
+        rep
     }
 
     /// 更新内存使用率估算（OOM Guardian 输入，由监控/统计层刷新）。
