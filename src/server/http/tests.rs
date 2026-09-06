@@ -336,6 +336,40 @@ fn http_end_to_end_crud_and_search() {
     assert_eq!(st, 200, "count 失败: {body}");
     assert!(body.contains("\"count\":2"), "count 应为 2: {body}");
 
+    // P142 Estimate（A2，2026-09-07）：approx 数量级估计三种形态
+    let (st, body) = http_req(addr, "GET", "/estimate", b"");
+    assert_eq!(st, 200, "estimate 失败: {body}");
+    assert!(body.contains("\"approx\":true"), "应显式 approx: {body}");
+    assert!(body.contains("\"mode\":\"all\""), "全库模式: {body}");
+    assert!(body.contains("\"count\":2"), "全库 count 2: {body}");
+    assert!(body.contains("order_of_magnitude"), "数量级标注: {body}");
+    let (st, body) = http_req(addr, "GET", "/estimate?range=1001-1001", b"");
+    assert_eq!(st, 200, "window 失败: {body}");
+    assert!(body.contains("\"mode\":\"window\""), "窗口模式: {body}");
+    assert!(body.contains("\"count\":1"), "range 窗口 count 1: {body}");
+    let (st, body) = http_req(
+        addr,
+        "GET",
+        "/estimate?field=type&value=view",
+        b"",
+    );
+    assert_eq!(st, 200, "field 失败: {body}");
+    assert!(body.contains("\"mode\":\"field\""), "field 模式: {body}");
+    assert!(body.contains("\"count\":1"), "type=view 估计 1: {body}");
+    let (st, body) = http_req(
+        addr,
+        "GET",
+        "/estimate?field=status&value=active&range=2002-2002",
+        b"",
+    );
+    assert_eq!(st, 200, "field+window 失败: {body}");
+    assert!(body.contains("\"count\":1"), "active∩range 估计 1: {body}");
+    // 非法/不完整参数 → 400
+    let (st, _) = http_req(addr, "GET", "/estimate?field=status", b"");
+    assert_eq!(st, 400);
+    let (st, _) = http_req(addr, "GET", "/estimate?range=abc-def", b"");
+    assert_eq!(st, 400);
+
     // GROUP BY（阶段 1.5 M4 聚合：status 分组 active=2 / view? —— 2002 为 active）
     let (st, body) = http_req(addr, "GET", "/groupby?field=status", b"");
     assert_eq!(st, 200, "groupby 失败: {body}");
