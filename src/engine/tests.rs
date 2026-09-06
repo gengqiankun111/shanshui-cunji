@@ -3799,6 +3799,81 @@ use crate::optimizer::QuerySpec;
         let _ = key(&r0, "shanshui_inv_seg_flush_total");
     }
 
+    /// P139：投影/回表瘦身——纯字段投影路径（pk_range_select / 倒排候选分块消费）返回的子集
+    /// 行与整行基线语义等值（k/status 逐行一致、缺失字段略、note 不出现、墓碑剔除一致）。
+    #[test]
+    fn p139_projection_subset_matches_full() {
+        let dir = tmp();
+        let cfg = Config::default();
+        let mut e = Engine::open(&dir, &cfg).unwrap();
+        for i in 1..=3000u64 {
+            let st = if i % 2 == 0 { "a" } else { "b" };
+            let note = "x".repeat(200);
+            let doc = format!(r#"{{"k":{i},"status":"{st}","note":"{note}"}}"#).into_bytes();
+            let term = format!("status={st}");
+            e.put(i, doc, &[term.as_str()]).unwrap();
+        }
+        e.delete(1234).unwrap(); // 墓碑行：两路径都必须剔除
+        let parse = |b: &[u8]| -> serde_json::Value {
+            serde_json::from_slice(b).unwrap_or(serde_json::Value::Null)
+        };
+        // 路径①：主键区间收敛（无 ORDER BY、id BETWEEN → pk_range_select）
+        let full = crate::sqlish::execute(
+            &e,
+            "SELECT * FROM t WHERE id BETWEEN 1 AND 2000",
+            4000,
+        )
+        .unwrap();
+        assert_eq!(full.len(), 1999, "区间现存 1999（剔除 1234）");
+        let sub = crate::sqlish::execute(
+            &e,
+            "SELECT id,k,status FROM t WHERE id BETWEEN 1 AND 2000",
+            4000,
+        )
+        .unwrap();
+        assert_eq!(sub.len(), 1999);
+        assert!(sub.iter().all(|(d, v)| *d != 1234));
+        let mut mfull: std::collections::HashMap<u64, serde_json::Value> =
+            std::collections::HashMap::new();
+        for (d, v) in &full {
+            mfull.insert(*d, parse(v));
+        }
+        for (d, v) in &sub {
+            let obj = parse(v);
+            assert!(obj.get("note").is_none(), "子集行不得含 note");
+            assert_eq!(obj.get("k"), mfull.get(d).and_then(|x| x.get("k")), "k 等值");
+            assert_eq!(
+                obj.get("status"),
+                mfull.get(d).and_then(|x| x.get("status")),
+                "status 等值"
+            );
+        }
+        // 路径②：倒排候选分块消费（status='a' 非空 posting → 通用非排序分支）
+        let full2 = crate::sqlish::execute(&e, "SELECT * FROM t WHERE status='a' LIMIT 1500", 1500)
+            .unwrap();
+        assert_eq!(full2.len(), 1499, "even 1..3000 剔 1234 后 1499");
+        let sub2 = crate::sqlish::execute(
+            &e,
+            "SELECT id,status FROM t WHERE status='a' LIMIT 1500",
+            1500,
+        )
+        .unwrap();
+        assert_eq!(sub2.len(), 1499);
+        assert!(sub2
+            .iter()
+            .all(|(d, v)| *d != 1234 && parse(v).get("note").is_none()));
+        let mut mf2: std::collections::HashMap<u64, serde_json::Value> =
+            std::collections::HashMap::new();
+        for (d, v) in &full2 {
+            mf2.insert(*d, parse(v));
+        }
+        for (d, v) in &sub2 {
+            let obj = parse(v);
+            assert_eq!(obj.get("status"), mf2.get(d).and_then(|x| x.get("status")));
+            assert!(obj.get("k").is_none() || obj.get("k").is_none(), "仅 status 字段投影");
+        }
+    }
+
     #[test]
     fn p136_snapshot_dels_prune() {
         for per_cpu in [true, false] {

@@ -1898,6 +1898,25 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
 - 结论：**维持"非事务端不改"**（S 路径为 RR 专属：txn superset + 未来混合库残余），无触发项。
   batch_get_at 的 ≤S 归并 + 不入 HotCache 在 latest 语义下无收益且纯增成本（实证）。
 
+**P139（投影/回表瘦身首切片：非事务纯字段回表消费端 fields 下推，2026-09-06）**
+- 目标：收"已知性能族"投影/回表瘦身——候选/窗口回表整 doc（25 列）解码改只解 SELECT 纯字段列。
+- 落地（src/sql/executor/select.rs）：helper `select_projection_fields`（SELECT 列集纯标识符且
+  至少一个非 id/docid 字段才启用；`*`/表达式/别名/id-only 回退整行 `batch_get` 零漂移）+
+  `subset_doc_bytes`（字段值→子集 JSON，缺字段省略）+ `batch_fetch_rows`（fields→
+  `engine.batch_get_fields`，否则整行）。接线两处：`pk_range_select`（主键区间回表）与非
+  sort 通用分支 `collect_limited_rows`（倒排/组合/IN 候选分块消费）。
+- 同态 A/B（脏态 3317，pk_between_10000）：fields 333ms vs 整行 541ms（~1.6×）→ 稠密窗口亦投影优
+  （整行 25 列解码 > fields 逐键开销，推翻"稠密应整块读"直觉——`batch_get_fields` 行式按需
+  提取 + PAX 列解码更便宜）。
+- clean 110 万实测（db-wide-scc-p139 新库 wide-load 67s 立即跑）：#46 enum_sel_limit10000
+  240→58ms（4.1×）、#48 combo_and_limit3000 43.7→7.4ms（5.9×）、#45 enum_sel_limit3000 2-3×、
+  #47 1.51→1.18；pk #43 176→170（±小）、#05 p50 1.9-2.1ms；小窗 500 行级受热缓存噪声（同量级）。
+  #48/#46 对 MySQL 比值降至 2.4×/6.5×（P137 13.7×→ / P137 27×→6.5×）。
+- 验证：单测 p139_projection_subset_matches_full（两路径子集==整行基线 k/status 等值 + note 不
+  出现 + 墓碑剔除一致）；lib **791 通过 + 4 ignored**。
+- 下一片候选：sort 输出期 top-k 整行回表投影、#77 txn 长快照窗快照侧投影流、混合 #79/80 排序列
+  子集、id-only 安全投影（需墓碑剔除保真方案）。
+
 ## 环境备忘（不入库）
 
 - **服务器**：阿里云 Debian 12（106.14.68.116），2 核 / 1.6GB 内存；本机 Windows 通过 plink/pscp（`-hostkey SHA256:LiGhXXWmK3WXg+M6c9iNOs8GpGeKQFII5TmeqL8ZvUw`）非交互访问。

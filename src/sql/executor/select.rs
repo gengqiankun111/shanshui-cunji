@@ -955,6 +955,60 @@ fn extract_pk_docid_range(
     }
 }
 
+/// P139（2026-09-06，投影/回表瘦身族首切片）：SELECT 列 → **纯字段投影集**。
+/// 安全条件：全部列为纯标识符（无 `*`/表达式/别名/字面量）且至少含一个非保留（id/docid）
+/// 字段；否则返回 None（调用方回退整行 `batch_get`，零行为漂移）。
+fn select_projection_fields(sel: &Select) -> Option<Vec<String>> {
+    let mut fs: Vec<String> = Vec::new();
+    for c in &sel.columns {
+        if c.is_empty() || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return None;
+        }
+        if c == "id" || c == "docid" {
+            continue;
+        }
+        if !fs.iter().any(|f| f == c) {
+            fs.push(c.clone());
+        }
+    }
+    if fs.is_empty() {
+        return None; // 纯 id 投影：保守回退（墓碑剔除语义依赖整行取）
+    }
+    Some(fs)
+}
+
+/// P139：字段值字节 → 子集 JSON 文档（缺字段省略；单个值解析失败忽略该字段）。
+fn subset_doc_bytes(fields: &[String], vals: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut obj = serde_json::Map::new();
+    for (f, v) in fields.iter().zip(vals) {
+        if let Some(b) = v {
+            if let Ok(val) = serde_json::from_slice::<Value>(b) {
+                obj.insert(f.clone(), val);
+            }
+        }
+    }
+    serde_json::to_vec(&Value::Object(obj)).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// P139：批量取行（fields Some 且非空 → 投影子集解码 `batch_get_fields`；否则整行
+/// `batch_get`）→ Vec<Option<doc bytes>>（删除位图/墓碑剔除语义与整行一致）。
+fn batch_fetch_rows(
+    engine: &Engine,
+    docids: &[u64],
+    fields: Option<&[String]>,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    match fields {
+        Some(fs) => {
+            let got = engine.batch_get_fields(docids, fs)?;
+            Ok(got
+                .into_iter()
+                .map(|vals| vals.map(|v| subset_doc_bytes(fs, &v)))
+                .collect())
+        }
+        None => engine.batch_get(docids),
+    }
+}
+
 /// P127 分支 B 收敛执行：主键 docid 区间 keys-only 扫描（现存升序）∩ 其余条件集 → 收集
 /// ≤ offset+limit（早停）→ 回表 → 升序行集。非收敛形态（无主键区间 / 其余条件仍含主键
 /// 谓词 / row 越界）→ None（调用方回通用求值路径）。空集 → Some(vec![])。
@@ -1011,9 +1065,13 @@ fn pk_range_select(
     if out_ids.is_empty() {
         return Ok(Some(Vec::new()));
     }
-    let batch = engine.batch_get(&out_ids)?;
+    // P139：投影子集回表（纯字段列集时 batch_get_fields 只解所需列）。
+    // 同态 A/B（2026-09-06 3317 实测，pk_between_10000）：fields 333ms vs 整行 541ms
+    // （~1.6×，整行 25 列解码 > fields 逐键开销）→ 主键区间同样受益，保留投影。
+    let fields = select_projection_fields(sel);
+    let got = batch_fetch_rows(engine, &out_ids, fields.as_deref())?;
     let mut out = Vec::new();
-    for (d, v_opt) in out_ids.into_iter().zip(batch.into_iter()) {
+    for (d, v_opt) in out_ids.into_iter().zip(got.into_iter()) {
         if let Some(doc) = v_opt {
             out.push((d, doc));
         }
@@ -1221,6 +1279,7 @@ pub fn execute_with_tid(
     // 非 sort 分支：DocIdSet 分块迭代消费（P85：LIMIT 早停——Bitmap/SortedList/All
     // 三分支只回表 offset+limit 行即终止，剩余块零拉取；内存 O(chunk)，消除
     // "22 万 posting 全量 batch_get 解码后才切片" 的 LIMIT 未下推瓶颈）。
+    // P139：投影子集回表（纯字段列集 → batch_get_fields 只解所需列）。
     let mut rows = Vec::new();
     if !set.is_empty() {
         let it: Box<dyn Iterator<Item = u64>> = match &set {
@@ -1231,7 +1290,13 @@ pub fn execute_with_tid(
             }
             other => other.iter(),
         };
-        rows = collect_limited_rows(|chunk| engine.batch_get(chunk), it, sel.offset, limit)?;
+        let fields = select_projection_fields(&sel);
+        rows = collect_limited_rows(
+            |chunk| batch_fetch_rows(engine, chunk, fields.as_deref()),
+            it,
+            sel.offset,
+            limit,
+        )?;
     }
     Ok(rows)
 }
