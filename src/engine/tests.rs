@@ -3872,6 +3872,60 @@ use crate::optimizer::QuerySpec;
             assert_eq!(obj.get("status"), mf2.get(d).and_then(|x| x.get("status")));
             assert!(obj.get("k").is_none() || obj.get("k").is_none(), "仅 status 字段投影");
         }
+        // 路径③：top-k（ORDER BY + LIMIT）输出期投影（P139 下一片）
+        let full3 = crate::sqlish::execute(
+            &e,
+            "SELECT * FROM t WHERE status='b' ORDER BY k DESC LIMIT 400",
+            400,
+        )
+        .unwrap();
+        assert_eq!(full3.len(), 400);
+        let sub3 = crate::sqlish::execute(
+            &e,
+            "SELECT id,k,status FROM t WHERE status='b' ORDER BY k DESC LIMIT 400",
+            400,
+        )
+        .unwrap();
+        assert_eq!(sub3.len(), 400);
+        let mf3: std::collections::HashMap<u64, serde_json::Value> = full3
+            .iter()
+            .map(|(d, v)| (*d, parse(v)))
+            .collect();
+        let mut prev_k: i64 = i64::MAX;
+        for (d, v) in &sub3 {
+            let obj = parse(v);
+            assert!(obj.get("note").is_none(), "topk 子集不得含 note");
+            assert_eq!(obj.get("k"), mf3.get(d).and_then(|x| x.get("k")), "topk k 等值");
+            assert_eq!(obj.get("status"), mf3.get(d).and_then(|x| x.get("status")));
+            let k = obj.get("k").and_then(|x| x.as_i64()).unwrap_or(-1);
+            assert!(k <= prev_k, "k 降序");
+            prev_k = k;
+        }
+        // 路径④：无 LIMIT 全排序输出期投影（P139 下一片）——needed=排序键 k ∪ 投影 status
+        let full4 = crate::sqlish::execute(
+            &e,
+            "SELECT * FROM t WHERE status='b' ORDER BY k",
+            500,
+        )
+        .unwrap();
+        let sub4 = crate::sqlish::execute(
+            &e,
+            "SELECT id,status FROM t WHERE status='b' ORDER BY k",
+            500,
+        )
+        .unwrap();
+        assert_eq!(sub4.len(), 500);
+        let mf4: std::collections::HashMap<u64, serde_json::Value> = full4
+            .iter()
+            .map(|(d, v)| (*d, parse(v)))
+            .collect();
+        for (d, v) in &sub4 {
+            let obj = parse(v);
+            assert!(obj.get("note").is_none(), "全排序子集不得含 note");
+            assert_eq!(obj.get("status"), mf4.get(d).and_then(|x| x.get("status")), "全排序 status 等值");
+        }
+        // docid 集与全排序基线一致（排序由内部 needed 含 k 保证，输出多余 k 无碍 server 投影）
+        assert!(full4.iter().all(|(x, _)| sub4.iter().any(|(d, _)| d == x)));
     }
 
     #[test]

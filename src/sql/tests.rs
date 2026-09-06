@@ -1918,7 +1918,7 @@ use super::executor::select::{collect_limited_rows, row_sort_keys, sort_key, top
         assert!(dead.is_expired(), "零超时 guard 应立即到期");
         let bm = full_docids(&e, &guard).unwrap();
         let order_by = vec![("amount".to_string(), false)];
-        let err = topk_sort(&e, &bm, &order_by, 10, 0, 10, &dead).unwrap_err();
+        let err = topk_sort(&e, &bm, &order_by, &[], 10, 0, 10, &dead).unwrap_err();
         assert!(
             matches!(err, Error::QueryTooExpensive(_)),
             "到期 guard 应在分块处熔断，实际 {err:?}"

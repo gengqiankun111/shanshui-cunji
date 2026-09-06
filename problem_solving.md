@@ -1916,6 +1916,13 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   出现 + 墓碑剔除一致）；lib **791 通过 + 4 ignored**。
 - 下一片候选：sort 输出期 top-k 整行回表投影、#77 txn 长快照窗快照侧投影流、混合 #79/80 排序列
   子集、id-only 安全投影（需墓碑剔除保真方案）。
+- **下一片落地（2026-09-06，P139-b sort/top-k 输出期投影）**：`topk_sort` 增 `columns` 参，输出
+  期（P87③ 胜出行整行回表）改 `select_projection_fields` 投影子集解码；无 LIMIT 全排序路径
+  取行集 = 排序键 ∪ SELECT 纯字段投影（`*`/表达式仍整行）；`select_projection_fields` 改列切片
+  入参；sql/tests 直调补 `&[]`。单测扩展路径③④（topk/full 子集==SELECT* 基线 status 等值 +
+  note 不出现 + docid 集一致）。实测（P139 clean 110 万同库）：enum_sel_limit3000 稳定 18.5-18.7ms
+  无回归；#16/#66/#79/#80 波动在状态/噪声内（输出行 ≤ LIMIT 小 → 投影收益受限；排序族主成本 =
+  候选全扫解码，不属本片）。lib **791 通过 + 4 ignored**。
 
 ## 环境备忘（不入库）
 

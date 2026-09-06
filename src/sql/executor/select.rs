@@ -516,6 +516,7 @@ pub(crate) fn topk_sort(
     engine: &Engine,
     bitmap: &RoaringBitmap,
     order_by: &[(String, bool)],
+    columns: &[String],
     k: usize,
     offset: u64,
     limit: u64,
@@ -703,10 +704,12 @@ pub(crate) fn topk_sort(
     if win.is_empty() {
         return Ok(Vec::new());
     }
-    // P87③：仅对胜出行整行回表（SELECT * 消费端需完整文档）
-    let batch = engine.batch_get(&win)?;
+    // P87③ + P139：仅对胜出行回表——SELECT 纯字段列集 → 投影子集解码（batch_get_fields），
+    // 免 25 列整行；`*`/表达式/id-only 保持整行（SELECT * 消费端需完整文档）
+    let proj = select_projection_fields(columns);
+    let got = batch_fetch_rows(engine, &win, proj.as_deref())?;
     let mut out = Vec::new();
-    for (d, v_opt) in win.into_iter().zip(batch.into_iter()) {
+    for (d, v_opt) in win.into_iter().zip(got.into_iter()) {
         let Some(v) = v_opt else { continue };
         out.push((d, v));
     }
@@ -958,9 +961,9 @@ fn extract_pk_docid_range(
 /// P139（2026-09-06，投影/回表瘦身族首切片）：SELECT 列 → **纯字段投影集**。
 /// 安全条件：全部列为纯标识符（无 `*`/表达式/别名/字面量）且至少含一个非保留（id/docid）
 /// 字段；否则返回 None（调用方回退整行 `batch_get`，零行为漂移）。
-fn select_projection_fields(sel: &Select) -> Option<Vec<String>> {
+fn select_projection_fields(columns: &[String]) -> Option<Vec<String>> {
     let mut fs: Vec<String> = Vec::new();
-    for c in &sel.columns {
+    for c in columns {
         if c.is_empty() || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
             return None;
         }
@@ -1068,7 +1071,7 @@ fn pk_range_select(
     // P139：投影子集回表（纯字段列集时 batch_get_fields 只解所需列）。
     // 同态 A/B（2026-09-06 3317 实测，pk_between_10000）：fields 333ms vs 整行 541ms
     // （~1.6×，整行 25 列解码 > fields 逐键开销）→ 主键区间同样受益，保留投影。
-    let fields = select_projection_fields(sel);
+    let fields = select_projection_fields(&sel.columns);
     let got = batch_fetch_rows(engine, &out_ids, fields.as_deref())?;
     let mut out = Vec::new();
     for (d, v_opt) in out_ids.into_iter().zip(got.into_iter()) {
@@ -1234,7 +1237,16 @@ pub fn execute_with_tid(
                     SORT_MAX_ROWS
                 )));
             }
-            return topk_sort(engine, &bitmap, &sel.order_by, k as usize, sel.offset, limit, &guard);
+            return topk_sort(
+                engine,
+                &bitmap,
+                &sel.order_by,
+                &sel.columns,
+                k as usize,
+                sel.offset,
+                limit,
+                &guard,
+            );
         }
         // 无 LIMIT：回退原全排序路径（守卫不变）
         if bitmap.len() as usize > SORT_MAX_ROWS {
@@ -1245,11 +1257,35 @@ pub fn execute_with_tid(
             )));
         }
         // P2-D：batch_get 批量取行替代逐行 get
+        // P139：无 LIMIT 全排序——取行集 = 排序键 ∪ SELECT 纯字段投影（含 `*`/表达式/id-only
+        // 需完整 doc 时回退整行 batch_get；否则 batch_get_fields 子集解码）
         let order_fields: Vec<String> = sel.order_by.iter().map(|(f, _)| f.clone()).collect();
         let docids: Vec<u64> = bitmap.iter().map(|d| d as u64).collect();
-        let batch = engine.batch_get(&docids)?;
+        let need_full = sel
+            .columns
+            .iter()
+            .any(|c| c == "*" || c.is_empty() || !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
+        let mut needed = order_fields.clone();
+        if !need_full {
+            if let Some(fs) = select_projection_fields(&sel.columns) {
+                for f in fs {
+                    if !needed.contains(&f) {
+                        needed.push(f);
+                    }
+                }
+            }
+        }
+        let got = if need_full {
+            engine.batch_get(&docids)?
+        } else {
+            engine
+                .batch_get_fields(&docids, &needed)?
+                .into_iter()
+                .map(|vals| vals.map(|v| subset_doc_bytes(&needed, &v)))
+                .collect::<Vec<_>>()
+        };
         let mut srows: Vec<SortRow> = Vec::with_capacity(docids.len());
-        for (docid, v_opt) in docids.into_iter().zip(batch.into_iter()) {
+        for (docid, v_opt) in docids.into_iter().zip(got.into_iter()) {
             let Some(v) = v_opt else { continue };
             // P86②：单遍按需提取全部排序键（跳其余列 Value 构造；逐字段 serde parse 改为一次轻量扫）
             let keys = row_sort_keys(&v, &order_fields);
@@ -1290,7 +1326,7 @@ pub fn execute_with_tid(
             }
             other => other.iter(),
         };
-        let fields = select_projection_fields(&sel);
+        let fields = select_projection_fields(&sel.columns);
         rows = collect_limited_rows(
             |chunk| batch_fetch_rows(engine, chunk, fields.as_deref()),
             it,
