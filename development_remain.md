@@ -120,10 +120,11 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 - 销项：development_0907.md P141 行「待办：demo/内核 + 探针 + FOR QUICK 对照基线」→ 全部完成后标 ✅
 
 **A2 P142 Estimate 数量级接口（独立非 SQL，零 MVCC 改动）**
-- [ ] A2-1 契约与入口：HTTP `GET /estimate`（无参 = 全库；`field=&value=` = 条件估计；`range=` 可选窗口）→ 响应 JSON 显式 `approx: true` 与数量级标注；复用 route_request（src/server/http/mod.rs），doc_api 新 handle_estimate
-- [ ] A2-2 引擎接线：读锁内 `count_all_docs`（全库）/ `count_docs_range(start,end)`（表窗口 = docid 高 16 位表号；Engine::count_docs_range 已备 P96）返回 approx；条件估计 = bitmap_fields 内存位图 或 inverted posting∩live（当前视图；换值旧值残留按近似语义不修）
-- [ ] A2-3 live 懒建首调尖刺：open 后台预热（live_ensure 懒建 → open 收尾触发）或接口标注首次慢
-- [ ] A2-4 单测 + 量级验证 + 文档：全库/表窗/条件×位图/posting 单测；与权威 COUNT 数量级对照；HTTP 面文档（user_guide/README）回填
+- [x] A2-1 契约与入口：HTTP `GET /estimate`（无参 = 全库；`field=&value=` = 条件估计；`range=` 可选窗口）→ 响应 JSON 显式 `approx: true` 与数量级标注；复用 route_request（src/server/http/mod.rs），doc_api 新 handle_estimate
+- [x] A2-2 引擎接线：读锁内 `count_all_docs`（全库）/ `count_docs_range(start,end)`（表窗口 = docid 高 16 位表号；Engine::count_docs_range 已备 P96）返回 approx；条件估计 = bitmap_fields 内存位图 或 inverted posting∩live（当前视图；换值旧值残留按近似语义不修）
+- [x] A2-3 live 懒建首调尖刺：open 后台预热（live_ensure 懒建 → open 收尾触发）或接口标注首次慢 —— **选标注**（`/estimate` 全库响应 note 已注明首次懒建基线、大库秒级，后续 O(1)）；后台预热开放留触发式（若生产首调尖刺成问题再上）
+- [x] A2-4 单测 + 量级验证 + 文档：全库/表窗/条件×位图/posting 单测；与权威 COUNT 数量级对照；HTTP 面文档（user_guide/README）回填
+  - ✅ 2026-09-07：http 端到端测试覆盖 all/window/field/field+window/400（commit 5716dcb）；量级验证（VM 50 万 SCC 库，est2）：all=501200 精确（权威 COUNT(*) 501200，首调 5.7s 懒建基线）、window 1-1000=1000、field status=active=101149（权威 154437，同 1e5 量级——差值 = 重启后倒排 term 未达内存落盘阈值丢段/陈旧残留，属近似语义 + P144 空心索引已知面，接口 approx 标注兜底）。A2 接线 commit 37fe410，文档 93938cc
 - 销项：development_0907.md P142 行「待办：入口接线 + approx 标注 + 预热 + 量级验证」→ 完成后标 ✅
 
 > 执行顺序建议：A1-1（探针对拍，闭环正确性）→ A2-1~A2-4（独立接口）→ A1-2/A1-3（评估/确认）。
