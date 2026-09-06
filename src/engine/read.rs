@@ -183,6 +183,48 @@ impl Engine {
         Ok(out)
     }
 
+    /// P135（2026-09-06）：**批量快照取行**——语义与 `get_at` 逐条完全一致
+    /// （≤ snapshot_seq 版本：跳过删除位图、tombstone seq ≤ S → None / > S → 取 S 前旧版、
+    /// Delta 增量 ≤ S 折叠不坍缩），但一次处理多个 docid：
+    /// ① 主数据逐 docid `primary.get_bytes_at`（≤S 跨 memtable + 全层最大 seq，
+    ///    `sst_min_seq` 整段剪枝；与 `get_at` 同源）；② Delta 覆盖用**单次范围扫描**
+    ///    `[min..max]` ≤S 批量折叠（`get_at` 逐调用各自做一次 Delta 窗口扫描——批量版把该
+    ///    逐 op 主开销摊薄为一次，见 demo p135-batch-get-at 批量潜力 A/B）。
+    /// 不走 HotCache（快照视图 ≠ 最新态，缓存会污染，同 `get_at`）。
+    /// 输入要求：docids **升序且无重复**（对齐 `batch_get` 契约；倒排 bitmap 迭代天然满足）。
+    /// 返回与输入顺序对齐的 `Vec<Option<value>>`。
+    /// O 项第②步：读路径 `&self`（快照只读并行）。
+    pub fn batch_get_at(&self, docids: &[u64], snapshot_seq: u64) -> Result<Vec<Option<Vec<u8>>>> {
+        let n = docids.len();
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; n];
+        if n == 0 {
+            return Ok(out);
+        }
+        self.metrics.read_ops.fetch_add(n as u64, Ordering::Relaxed);
+        // ① 主数据 ≤S（逐 docid 快照版本；不入 HotCache）
+        for (i, &d) in docids.iter().enumerate() {
+            if let Some((bv, _)) = self
+                .primary
+                .get_bytes_at(&encode_docid(d), snapshot_seq)?
+            {
+                out[i] = Some(bv);
+            }
+        }
+        // ② Delta ≤S 批量折叠（单次窗口扫描；docids 升序 → [min..max]）
+        let (lo, hi) = (docids[0], docids[n - 1]);
+        let overrides = self.delta_overrides_range_at(Some(lo), Some(hi), snapshot_seq)?;
+        if overrides.is_empty() {
+            return Ok(out);
+        }
+        for i in 0..n {
+            let Some(bv) = &out[i] else { continue };
+            if let Some(ov) = overrides.get(&docids[i]) {
+                out[i] = fold_with_overrides(bv, Some(ov)).map(Some)?;
+            }
+        }
+        Ok(out)
+    }
+
     /// Task-023：主键 IN 列表批量取行（稠密/稀疏自适应）——排序去重后：
     /// - **稠密**（跨度 ≤ 4×计数，对齐 P92 稠密判定）→ `scan_range` 区间顺序读 + 集合过滤
     ///   （SST 块顺序读 + BlockCache 局部性，替代逐 id 随机定位；#4 pk_in_50 目标 ≤0.5ms）；

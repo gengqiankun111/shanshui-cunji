@@ -3679,6 +3679,78 @@ use crate::optimizer::QuerySpec;
 
     // ---------- P131（2026-09-06）：Delta CF 增量 UPDATE + 扫描/快照 Merge-on-Read ----------
 
+    /// P135（2026-09-06）：`Engine::batch_get_at(docids, S)` 语义 = 逐 docid `get_at`——
+    /// 位图关/开 × 快照前/后删、覆盖换值、Delta patch ≤S/跨快照、缺失 docid、空集。
+    #[test]
+    fn p135_batch_get_at_matches_get_at() {
+        for b in [false, true] {
+            let dir = tmp();
+            let mut cfg = Config::default();
+            cfg.storage.deletion_bitmap_enabled = b;
+            let mut e = Engine::open(&dir, &cfg).unwrap();
+            for id in 1..=5u64 {
+                e.put(id, mkdoc_kg(id, "n0"), &[]).unwrap();
+            }
+            // Delta patch（≤ S1）：doc 1 note → n1
+            e.patch_batch(&[(1, vec![("note".into(), serde_json::json!("n1"))])])
+                .unwrap();
+            let s1 = e.begin_snapshot();
+            // —— 对 S1 为"未来"写 ——
+            e.delete(2).unwrap(); // 快照后删
+            e.patch_batch(&[
+                (1, vec![("note".into(), serde_json::json!("n2"))]), // doc1 patch2（跨快照）
+                (4, vec![("extra".into(), serde_json::json!("x"))]), // doc4 增量（S1 后）
+            ])
+            .unwrap();
+            e.put(3, mkdoc_kg(3, "n0"), &[]).unwrap(); // 全量覆盖换值（S1 后）
+            let s2 = e.begin_snapshot();
+
+            let ids: Vec<u64> = vec![1, 2, 3, 4, 5, 999];
+            for s in [s1, s2] {
+                let batch = e.batch_get_at(&ids, s).unwrap();
+                assert_eq!(batch.len(), ids.len());
+                for (i, &d) in ids.iter().enumerate() {
+                    let single = e.get_at(d, s).unwrap();
+                    assert_eq!(
+                        batch[i].as_ref().map(|v| v.as_slice()),
+                        single.as_ref().map(|v| v.as_slice()),
+                        "[bitmap={b}] S={s} docid={d} batch_get_at 应等于逐 get_at"
+                    );
+                }
+            }
+            // 显式语义抽查
+            let g = |d: u64, s: u64| {
+                e.batch_get_at(&[d], s)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .map(|v| String::from_utf8_lossy(&v).to_string())
+            };
+            assert_eq!(g(1, s1).as_deref(), Some(r#"{"k":1,"note":"n1"}"#), "S1 见 patch1");
+            assert_eq!(g(1, s2).as_deref(), Some(r#"{"k":1,"note":"n2"}"#), "S2 见 patch2（≤S2 最大）");
+            assert_eq!(g(2, s1).is_some(), true, "快照后删：S1 仍见");
+            assert_eq!(g(2, s2), None, "快照后删：S2 不可见");
+            assert_eq!(g(4, s1).as_deref(), Some(r#"{"k":4,"note":"n0"}"#), "S1 无 extra");
+            assert!(g(4, s2).as_deref().unwrap_or("").contains("\"extra\":\"x\""), "S2 见 extra");
+            assert_eq!(g(3, s1).as_deref(), Some(r#"{"k":3,"note":"n0"}"#));
+            assert_eq!(g(3, s2).as_deref(), Some(r#"{"k":3,"note":"n0"}"#)); // 覆盖后仍可见（值同）
+            assert_eq!(e.batch_get_at(&[], s1).unwrap().len(), 0, "空集");
+            // 跨表 docid（tid=5）隔离
+            let t5 = (5u64 << 48) | 1;
+            e.put(t5, mkdoc_kg(500, "t"), &[]).unwrap();
+            let s3 = e.begin_snapshot();
+            assert_eq!(
+                e.batch_get_at(&[t5], s3).unwrap()[0].as_deref(),
+                Some(br#"{"k":500,"note":"t"}"#.as_slice())
+            );
+        }
+    }
+
+    fn mkdoc_kg(k: u64, note: &str) -> Vec<u8> {
+        format!(r#"{{"k":{k},"note":"{note}"}}"#).into_bytes()
+    }
+
     #[test]
     fn p131_live_window_ids_matches_keys_only_scan() {
         // P131 定位 v2：live_window_ids（live 位图 ∩ 窗口，纯内存）必须与 keys-only 现存扫描
