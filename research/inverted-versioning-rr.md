@@ -1,119 +1,108 @@
-# 倒排索引版本化 + RR 快照读设计（inverted posting MVCC）
+# 倒排索引 RR 快照读设计（posting 无版本，snap_seq 为准）
 
-> 状态：设计/立项（2026-09-06）。**用户确定方向：倒排索引走版本号（posting 版本化），
-> 以该方向为基础做 RR 事务隔离级倒排读**；配合 live_docids（活跃集）版本化与倒排专项监控。
-> 排期入口 = development_remain「倒排 MVCC/RR 专项」（P134 先行）。本档为设计依据。
+> 状态：设计（2026-09-06 立项；同日机制澄清修订）。
+> **用户确定的读法**：走倒排索引时**倒排内不加版本号**；读取顺序 = 先取全局 MVCC seq
+> （快照 S），再读 term 对应的 docid 集合，**所有数据以 MVCC snap_seq 为准**（逐 docid 到
+> 主表裁决可见性/值）。排期入口 = development_remain「倒排 MVCC/RR 专项」（P134 先行）。
 
-## 0. 决策（用户 2026-09-06）
-1. **倒排 posting 走版本号 = 确定方向**（非可选）；目标 = 倒排能独立服务 RR 快照读，
-   不依赖"每次全候选回表 + 行级字段复核"兜正确性。
-2. 范围排序：**P134 事务读快照语义收口（正确性小项）先行** → 版本化大项（demo 先行立项）。
-3. B（倒排排序）**不做独立大项**：Roaring 结构性有序，交集 = 位图 `&`；仅收 mem `Vec<u64>` 排序小修。
-4. C（live_docids 配合）：升格为"版本化活跃集"与 posting 版本化统一成共享原语。
-5. D（监控）：倒排专项计量随版本化各阶段逐步埋点。
+## 0. 决策（2026-09-06，含机制修订）
+1. **倒排 posting 不加版本号**——否决"posting 内每 (term,docid) 维护 add/remove seq"的初案
+   （本档旧版曾以 posting 版本化为方向；经用户机制澄清修订如下）。posting 维持"最新态候选、
+   只加不删"（现状不变，段 v6 不升 v7、无需 term diff/反向索引）。
+2. **RR 一致性全部由主表全局 MVCC（seq / tombstone / 行版本）承担**。
+3. 倒排读固定三步（事务与非事务统一语义）：
+   ① 取快照 seq S——事务 = RR 快照 seq（对齐 MySQL：首条一致性读锚定；现实现注册时机核对，
+     见 P134 核对项）；当前读/autocommit = 语句开始时的全局最新 seq；
+   ② 读 term → docid 集合（posting 候选，含历史/已删/换值离开的 docid，**不做最新态删除预过滤**）；
+   ③ 逐 docid 以 S 到主表裁决：≤S 行版本可见性（跳过删除位图、tombstone seq≤S→None、>S→旧版）
+     与字段值复核——**所有数据以 snap_seq 为准**。
+4. 正确性缺口（P134）先行修复，使上述模型在事务路径成立。
+5. B：排序不做独立项（Roaring 结构性有序）；C：live_docids 升"快照活跃预过滤"可选小项
+   （只滤"S 前已删"，换值仍须回表判值）；D：监控随阶段埋点。
 
 ## 1. 现状速览（2026-09-06 审计）
-- Posting = `RoaringTreemap`（src/inverted/mod.rs `Posting` L58）；全库**无版本、无删除 API、
-  **只加不删**（mem DashMap<term, Vec<u64>> L66；flush/gc 无 remove；delete/UPDATE 不触倒排）。
-- 分层已具：mem → 段链（每段 FST 字典 + v6 posting，SEG_VERSION=6）→ `gc()` 全段合并成 1 段
-  （src/inverted/gc.rs: union L88-105，term 字典序、docid 位图结构性升序）。
-- 读 = `search()` union 全部段一次（src/inverted/query.rs L106-141）；mem Vec<u64> **无序**
-  （merge_distinct k-way 前提"各源升序"隐含依赖）。
+- Posting = `RoaringTreemap`（src/inverted/mod.rs `Posting` L58）；**无版本、无删除 API、
+  只加不删**（mem DashMap<term, Vec<u64>> L66；delete/UPDATE 不触倒排）。
+- 分层已具：mem → 段链（FST 字典 + v6 posting）→ `gc()` 全段合并成 1 段（src/inverted/gc.rs）；
+  读 = `search()` union 全部段（src/inverted/query.rs L106-141）；mem Vec<u64> **无序**。
 - 陈旧 docid 由行级复核兜底（§11.5 模型）：回表 `batch_get` 位图剔除 / `get_at` / WHERE 重算。
-- `live_docids = Mutex<Option<RoaringTreemap>>`（src/engine/engine.rs L151）= **最新态无版本活跃集**
-  （open 空库播种 / 懒建基线 / put·delete·复活·purge 记账）。
+- `live_docids`（src/engine/engine.rs L151）= **最新态无版本活跃集**（put/delete/复活/purge 记账）。
 - 删除双路：删除位图（无 seq，当前态短路）+ 版本化 Tombstone（mem 带 seq）。`get_at` 快照读
   **跳过位图**、按 tombstone seq 裁决（src/engine/mvcc.rs L114-135）。
-- 快路径守卫：仅 `zone_field_aggregate` 检测活跃快照回退（src/engine/read.rs L385）；
-  P-GB/P-GB2/P121/count_* 快路径以最新态 live/posting 为口径，只服务**非事务** SELECT。
+- 快路径守卫：仅 `zone_field_aggregate` 检测活跃快照回退（src/engine/read.rs L385）；其余
+  posting/live 快路径以最新态为口径、只服务非事务 SELECT。
 
-## 2. 正确性缺口（P134 修）
+## 2. 正确性缺口（P134 修，模型前提）
 1. **字段谓词事务读漏行**：`txn_select_by_predicate`（src/server/command/transaction.rs L248-324）
-   候选 = 最新态 sqlish execute（回表 batch_get 位图剔除已删 docid）∪ 事务写集 → 快照后被并发
-   删除的行不在候选 → 同事务重复读消失；同事务点查 `id=N` 走 `get_at` 却见旧值 → RR 不自洽。
-2. **区间事务读与点查不一致**：`scan_range_txn`（src/engine/txn.rs L227-233）快照扫描仍强制按
+   候选 = 最新态 sqlish execute（回表 `batch_get` **删除位图剔除**已删 docid）∪ 事务写集 →
+   快照后被并发删除的行不在候选 → 同事务重复读消失；同事务点查 `id=N` 走 `get_at` 却见旧值
+   → RR 不自洽。**违反"以 snap_seq 为准"**：候选不应做最新态删除预过滤。
+2. **区间事务读与点查不一致**：`scan_range_txn`（src/engine/txn.rs L227-233）快照扫描仍按
    删除位图剔行（位图无 seq）→ 快照后删行被隐藏，与 `get_at` 跳过位图不一致。
-- 修法总则：**候选/扫描不按"最新态删除"预过滤**（posting 只加不删 ⇒ 候选天然含历史 docid），
-  可见性统一交给快照裁决（`txn_get`/`scan_range_at` tombstone seq）；与 zone_field_aggregate
+3. 核对项：快照锚定时机——事务 RR 快照 seq 是 begin 注册（现 src/engine/txn.rs L52-59）还是
+   首条一致性读取全局最新（MySQL 语义）；若需对齐 MySQL 首读锚定，属小改（含测试口径调整）。
+- 修法总则：**候选/扫描不做"最新态删除"预过滤**（posting 只加不删 ⇒ 候选含历史 docid），
+  可见性统一交快照裁决（`txn_get`/`scan_range_at` tombstone seq）；与 zone_field_aggregate
   "活跃快照下宁慢勿错" 哲学一致。
 
-## 3. 版本化倒排总体架构（主线，A+C 统一）
+## 3. 统一读流程与正确性机制（无 posting 版本号）
 
-### 3.1 目标语义
-每 (term, docid) 维护版本事件：`add_seq`（字段值进入该 term）与 `remove_seq`（离开该 term：
-行删除、或字段值变更/覆盖离开旧值）。posting 快照视图：
-
+### 3.1 流程（等值/区间/组合索引命中同构）
 ```
-view(term, S) = { docid | add_seq ≤ S ∧ (remove_seq 不存在 ∨ remove_seq > S) }
+S = 快照 seq（事务 RR 快照 / 当前读语句级全局最新）
+cand = posting(term) ∩ 窗口         // 只加不删 → 含历史 docid；LIMIT 早停沿用 P85 分块
+rows = batch_get_at(cand, S)        // 新 API：批量快照取行（见 3.3）
+→ 逐行以 S 取值：tombstone ≤ S → None（S 前已删，排除）；> S → 返回 S 前旧版（快照后删/覆盖仍可见）
+→ 字段谓词按 S 行值复核（换值陈旧 docid 排除）→ 输出行（列投影照旧）
 ```
 
-字段等值谓词快照答案 = `view(term,S) ∩ table窗口 ∩ 快照活跃` —— **免逐候选回表字段复核**。
-计数/守卫快路径同样以 view(term,S) 为口径。
+### 3.2 为什么无需 posting 版本号
+- **删除/复活可见性**由主表 tombstone seq 裁决；**换值陈旧**由"取 S 行值复核"裁决——两路都
+  要求回表，posting 只承担"缩小候选"职责，内嵌版本号省不下回表。
+- posting 内 add/remove seq 方案代价（term diff、docid→terms 反查、段 v7、写放大）大于收益
+  （只免"快照前已删/换值"候选的空回表——其中删除可用 3.4 的集合级预过滤替代，成本低一个量级）。
+- 前提边界：候选生成必须**不含最新态删除预过滤**（P134 ①）、快照扫描**不按位图剔行**（P134 ②）。
 
-### 3.2 版本粒度与存储形态（demo 选型点）
-RoaringTreemap **无 per-docid payload**，不能直接存 seq。候选形态：
-- **甲：位图 + 旁路 seq**——每 term 维护 added 位图/有序数组 + 对应 add_seq 数组（docid 升序，
-  seq 并排数组/间隔编码），remove 侧同构；快照过滤 = 双指针/游标按 (docid, seq) 滤窗口。
-  好处：读可二分/游标、与 Roaring 迭代共存；代价：seq 编码膨胀（v7 格式设计）。
-- **乙：版本化双位图集合**——(added≤S) 位图与 (removed≤S) 位图（值域编码：add 事件记入
-  "seq 桶"，快照取桶并集）；代价：桶粒度精度、GC 收敛同甲。
-- **丙：段粒度 seq 窗口（推荐先验证）**——版本落在**写入批次/段**：段记 [min_seq, max_seq]，
-  快照剪掉 min_seq > S 的段（对标主表 sst_min_seq 整文件剪枝 src/storage/column_family/read.rs
-  L292-295）；mem 存 (docid, seq)。**换值/删除的 remove 仍需 docid 粒度**（行级事件），
-  但可复用"版本化活跃集"(§3.3) 的 del_seq 原语。
-- demo 目标：量化 3 形态的 写放大 / 读快照过滤成本 / 编码膨胀；收敛到 1 个内核形态 + 段 v7。
+### 3.3 需要的基建（P135，demo 先行）
+- `Engine::batch_get_at(docids, S)` / `get_many_pk_in_at`：批量快照取行，语义 = 逐 `get_at`
+  （跳过删除位图、tombstone seq 裁决、Delta CF 折叠 ≤S、HotCache 语义按 S 或直通），复用
+  P2-D `batch_get` 的分块/缓存骨架。
+- 接线点：`txn_select_by_predicate`（候选 → batch_get_at 复核替代逐行 txn_get，事务写集仍并入）、
+  非事务倒排消费端（select.rs `eval_cond` posting 命中、collect_limited_rows / 回表）统一走
+  `batch_get_at(S)`；区间/组合索引路径同构。
+- autocommit 语义：S = 语句开始全局 seq；与"最新态 + 删除位图短路"结果等价（快照后删不跨语句
+  可见），demo 验证保留位图快路径或统一快照读的成本，选实现。
+- mem `Vec<u64>` flush 前按 docid 排序（闭合 merge_distinct k-way 升序前提，顺手 0.5 天）。
 
-### 3.3 版本化活跃集（live_docids v2，C）
-`live_docids` 从"最新态位图"升级为 docid 级版本事件：
-```
-live_add(docid) @ seq；live_del(docid) @ seq（delete 即记；复活 = 新 add）
-snapshot_live(S) = { docid | add ≤ S ∧ (del 不存在 ∨ del > S) }   // 与 view(term,S) 同构
-```
-统一成"**版本化 docid 集合**"原语：`versioned_set(added_seq, removed_seq) → view(S)`；
-posting(term) 与 live 都是该原语实例 → 过滤、交集、计数、GC 全复用。
-- 与 P1 MVCC 快照生命周期（active_snapshots 注册 + mvcc_keep_floor 保活）联动：
-  版本化集合的旧事件仅在被活跃快照引用时保留，无快照后由 gc/合并收敛（防"864 万版本"堆积）。
+### 3.4 C：快照活跃预过滤（可选，P136）
+- `live_docids` v2 = docid 级 `(add_seq, del_seq)` → `snapshot_live(S) = { add ≤ S ∧ (del 无 ∨ del > S) }`；
+  候选先 ∩ snapshot_live(S)：**集合级剔除 "S 前已删" docid**，免其 batch_get_at 空跑。
+- 局限（明确标注）：换值不产生 del → 换值陈旧不能靠它过滤，字段复核（3.1 末步）仍必要；
+  "S 后删"行仍在 snapshot_live 内（del > S）→ 回表见旧值（RR 正确）。
+- 与 P1 MVCC 快照生命周期（active_snapshots + mvcc_keep_floor）联动防 del 事件堆积。
 
-### 3.4 写路径变化（成本大头，demo 先行验证）
-- put/UPDATE：需要 **term diff**——旧值 terms ∖ 新值 terms 记 remove@seq、new∖old 记 add@seq
-  （现 UPDATE 全量路径经 P89 管道已读旧行，可 diff；非索引列 delta 路径不涉 posting）。
-- delete：docid 离开其所有 term 记 remove@seq —— 需 docid→terms 反查或写期记录（现状无，
-  新增反向索引或把 remove 记到"版本化活跃集"统一处理，posting remove 由快照过滤推导）。
-- flush/gc：mem (docid,seq) 升序编码入段 v7；gc 合并 = 多段版本化 posting 归并（同 key
-  版本折叠：保留 add ≤ 最新 remove 的事件窗，无快照引用时直接折叠旧事件，段窗收敛）。
-
-### 3.5 B：排序结论
-- 磁盘 posting 保持位图/版本化数组形态即结构性有序；交集 = 位图 `&` 或游标双指针；
-  不做独立"排序"项。收尾小修：**mem Vec<u64> flush 前按 docid 排序**（闭合 merge_distinct
-  升序前提，随 P134/P135 顺手带掉）。
-
-## 4. 快路径快照化接线清单（版本化落地后）
-- 事务等值谓词 / 区间：候选 = view(term,S) ∩ snapshot_live(S) ∩ 窗口（免逐行复核）；
-- P-GB/P-GB2/P121/count_distinct_fast/count_all_docs/count_docs_range/live_window_ids：
-  口径从"最新态 live/posting"改为 view(S)/snapshot_live(S)，活跃快照下不再需要"回退扫描"
-  守卫（或守卫改为快照口径比较）；
-- `inverted_group_stats` / stats 载荷：按 view(term,S) 组内 docid 计数重算（防换值陈旧载荷）。
-- zone_field_aggregate 的"活跃快照 → None"门禁在版本化后可按快照口径放行（可选，后续评估）。
+## 4. 快路径守卫/计数口径（版本语义说明）
+- P-GB/P-GB2/P121/count_* /inverted_group_stats 目前只服务**非事务** SELECT（最新态口径，
+  守卫回退保证不误报）；接入快照读前统一改口径为 `posting 候选 ∩ snapshot_live(S)` + 行级
+  抽样复核兜底，或维持"仅非事务 + 活跃快照回退"（同 zone_field_aggregate 门禁）。
+- 本次方向下**不新增倒排内版本结构**，故 §4 主要为"接线时守卫选择"而非新内核。
 
 ## 5. D：倒排专项监控（随阶段埋点）
-- `shanshui_inv_segment_count`、`shanshui_inv_gc_pending_bytes`（积压）、`shanshui_inv_delta_fst_over_bytes`、
-  `shanshui_inv_mem_docids`、`shanshui_inv_posting_cache_{hit,miss}`、`shanshui_inv_flush_segments_total`；
-- 版本化后：`shanshui_inv_*_seq_window`（每段 min/max seq 跨度）、无快照引用可收敛事件数、
-  长快照窗（已有 active_snapshots/oldest）；SHOW MEMORY/STATUS 行集 + 诊断 demo。
+- `shanshui_inv_segment_count`、`shanshui_inv_gc_pending_bytes`、`shanshui_inv_delta_fst_over_bytes`、
+  `shanshui_inv_mem_docids`、`shanshui_inv_posting_cache_{hit,miss}`、`shanshui_inv_flush_segments_total`、
+  快照侧（已有 active_snapshots/oldest）：`shanshui_snapshot_read_{rows,recheck}_total`（batch_get_at 回表率）、
+  删除预过滤省行数；SHOW MEMORY/STATUS 行集 + 诊断 demo。
 
 ## 6. 分阶段排期（P134 起）
 | 项 | 内容 | 量级/依赖 | 验收 |
 |---|---|---|---|
-| **P134 事务读快照语义收口**（§2，先行） | 谓词候选去最新态删除预过滤（可见性交 txn_get）；scan_range_txn 去位图剔行 | ~1.5 天；P0-C 基建 | RR 谓词/区间与点查语义自洽；并发删/换值跨事务测试绿 |
-| **P135 版本化倒排（主线 demo）** | §3.1-3.4 demo：形态甲/乙/丙 A/B + mem 排序收尾 + 段 v7 编码草案 | 依赖 P134；demo 先行 | 量化写放大/读收益/膨胀；选形态并出 v7 内核设计 |
-| **P136 版本化活跃集 + 共享原语（C）** | §3.3 live v2 + versioned_set 原语 + 快照过滤接线 | 依赖 P135 形态定 | snapshot_live/view(S) 语义 = 权威扫描；守卫快路径快照口径 |
-| **P137 倒排专项监控（D）** | §5 gauge + SHOW 行集 + 诊断 demo | 随阶段埋点收口 | 长快照窗/GC 积压/段窗可见；运维可判 |
-| B 结论行 | 不做独立项；mem 排序收尾随 P134/135 | — | 已记录 |
+| **P134 事务读快照语义收口**（先行） | 修 §2 缺口①②（候选去最新态删除预过滤、scan_range_txn 去位图剔行）+ 快照锚定时机核对项③ | ~1.5~2 天；P0-C 基建 | 谓词/区间与点查 RR 语义自洽（快照后删/并发换值跨事务测试）；全量回归绿 |
+| **P135 倒排快照读统一接线**（snapshot-first，demo 先行） | §3.3：batch_get_at + 候选端/区间/组合接线 + autocommit S 语义选型 + mem 排序收尾 | 依赖 P134 | 倒排等值/区间事务读 = get_at 口径（无位图剔除漏行）；LIMIT/分块/墓碑语义回归；A/B 回表成本量化 |
+| **P136 快照活跃预过滤**（C，可选） | §3.4：live v2 (add/del seq) + snapshot_live + 候选预过滤 | 依赖 P135 | S 前已删候选零空回表；快照后删/复活口径 = 权威扫描 |
+| **P137 倒排专项监控**（D） | §5 gauge + SHOW 行集 + 诊断 demo | 随阶段埋点收口 | 回表率/GC 积压/长快照窗可见 |
 
-## 7. 风险与迁移
-- 段格式 v6→v7（posting 版本化/seq 旁路）需迁移与兼容读；v6 段按"无版本（add=0、remove=∞）"
-  等价于任何快照均含 → 快照读自动回退行级复核兜底，可灰度。
-- 写放大：term diff + remove 事件 + 反向索引 → demo 量化 vs 免回表收益。
-- bitmap_fields 值位图 / stats 载荷同受陈旧值影响 → 一并版本化或声明为"仅当前态"路径并加
-  快照门禁（二选一，随 P135 决策）。
-- posting_cache 全清策略不变（段变更全清）；版本化后缓存项须带 S（快照无关不可缓存或按段窗缓存）。
+## 7. 风险与边界
+- 回表成本 = 候选大小：posting 命中大（如低选择性）时 batch_get_at 量大 → 沿用 P85 分块 +
+  LIMIT 早停 + P85/P2-D 块缓存局部性；3.4 预过滤只省"已删"部分。
+- autocommit 从"位图短路"转统一快照读的开销 demo 验证；可保留位图路径（S=当前 seq 等价）。
+- 删除位图仍服务当前态读/写侧，不回退；v6 段格式不动（无版本化字段），零迁移。
