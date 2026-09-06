@@ -2036,6 +2036,19 @@ std::thread::scope 并行 scan_stream_fields，各片独立 top-K 堆 → 全局
   数据完整 + 前缀查询计数一致——裁剪未丢未刷 cidx 键）。lib 800 全绿（seqlock flaky 复绿）。
 - 现状：110 万 composite 旧库（cp 曾持久为 0）首次升级重启仍回放一次完成收敛；此后运行期自动
   补刷，非干净退出重启回放≈0，测量卫生不再依赖每次 clean 重装（候选①③ 不再实施）。
+- **50 万复现验证 ✅（2026-09-06，Windows 本机 + VMware Ubuntu 24.04（gqkdb/123，NAT 192.168.197.130）两端同构）**：
+  工具链 = gen-dataset 25 列宽表 parquet（确定性 seed 42，两端逐位一致）→ `import --parquet` +
+  composite `[["status","ts"],["ts"]]` + per-CPU WAL（memtable 64MB/批窗口 100ms/block 32KB）→
+  `shanshui-cunji-wal-probe`（`Engine::wal_replay_report` 只读诊断：persisted_cp/cp/cidx_wm/
+  replay_pending）。三段对照（数值两端一致）：
+  | 阶段 | Windows | Ubuntu |
+  |---|---|---|
+  | import 50 万 | 30.0s | 20.9s |
+  | open#1 正常重启 | 798ms · persisted=451943 · pending=144171 | 1015ms · 同左 |
+  | resetcp→0 后 open#2（旧库态首启） | 3.5s → cp/cidx_wm=500000 · **pending=0** · count=500000 | 3.3s → 同左 |
+  | writetail 2000 行 + process::exit 崩溃 → open#3 | 523ms · **pending=6000**（=2000×3 条目）· count=502000 | 601ms · 同左 |
+  结论：cidx 全程随 primary 收敛（cidx_wm==cp，9→10 SST）；**旧库态（cp=0）首启一次全量回放即收敛并持久化 cp→500000，此后崩溃/非干净退出重启只回放最近刷盘后的写尾（0.5-0.6s 级）**；对照修复前"每次重启全量回放 110 万 + 45-60s"，P144-② 将启动/重启回放从全量收敛到写尾。注：open#1 pending=144171 = import（<1M 行不尾刷主）留下的写尾，属 loader 现状非缺陷（import 尾刷可进一步归 0，见杂项）。
+- 杂项：import_parquet 结尾未尾刷 primary（FLUSH_EVERY=1M，<1M 行只在结尾 flush_wal）→ 大文件导入后首次 open 需回放尾批；可考虑结尾补 flush_primary 使 import 完成即 cp=满量（未做——避免回归面扩大）。
 
 ## 交接段 · 山水存迹（2026-09-06，develop @ 81d4f45）
 
