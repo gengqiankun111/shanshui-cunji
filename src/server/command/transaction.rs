@@ -283,15 +283,7 @@ pub(crate) fn txn_select_by_predicate(
     // 换值的行仍可见，与点查 get_at 语义自洽；旧路径用最新态 sqlish 候选 → 漏行）。RC 无快照、
     // FOR UPDATE 当前读均见最新已提交，旧候选路径正确，保持不变。
     if !for_update && txn.isolation.uses_snapshot() && engine.auto_watermark() <= (1u64 << 48) {
-        return txn_select_by_predicate_snapshot(
-            engine,
-            txn,
-            &cond_sql,
-            proj,
-            limit,
-            is_sum,
-            upper,
-        );
+        return txn_select_by_predicate_snapshot(engine, txn, &cond_sql, tail, proj, limit, is_sum, upper);
     }
     const CAP: u64 = 200_000;
     let base = match crate::sqlish::execute(engine, &cond_sql, CAP) {
@@ -349,6 +341,7 @@ pub(crate) fn txn_select_by_predicate_snapshot(
     engine: &Engine,
     txn: &mut crate::txn::Transaction,
     cond_sql: &str,
+    tail: &str,
     proj: Option<&[ProjCol]>,
     limit: Option<usize>,
     is_sum: bool,
@@ -358,6 +351,15 @@ pub(crate) fn txn_select_by_predicate_snapshot(
     const SPAN: u64 = 16_384;
     let hi = engine.auto_watermark().saturating_sub(1);
     let order = upper.contains("ORDER BY");
+    // P135（2026-09-06）：**候选 superset 快路径**——WHERE 为倒排等值 AND 链时 posting
+    // 只加不删 = ever-match 超集 → posting∩窗口 → `batch_get_at(S)` 批量快照复核 + 谓词复检，
+    // 替代下方全窗分块扫描（恢复索引加速且 RR 正确：快照后删/换值行仍在 posting → ≤S 版本/
+    // 值裁决）。复杂谓词/空 posting/本事务含未提交写（自写合并复杂）→ 全窗扫描兜底。
+    if txn.ops().is_empty() {
+        if let Some(sup) = inverted_eq_superset(engine, tail) {
+            return finish_predicate_superset(engine, txn, cond_sql, sup, hi, is_sum, proj, limit, order);
+        }
+    }
     let early_stop = !order && !is_sum && limit.is_some();
     let need = limit.unwrap_or(usize::MAX);
     let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(need.min(4096));
@@ -412,6 +414,17 @@ pub(crate) fn txn_select_by_predicate_snapshot(
             }
         }
     }
+    finish_predicate_rows(rows, proj, is_sum, order, limit)
+}
+
+/// P135：谓词结果收尾（SUM 聚合 / build_result_set）——窗口扫描与 superset 快路径共用。
+fn finish_predicate_rows(
+    rows: Vec<(u64, Vec<u8>)>,
+    proj: Option<&[ProjCol]>,
+    is_sum: bool,
+    order: bool,
+    limit: Option<usize>,
+) -> QueryResponse {
     if is_sum {
         let mut sum: i64 = 0;
         for (_, doc) in &rows {
@@ -428,6 +441,72 @@ pub(crate) fn txn_select_by_predicate_snapshot(
         };
     }
     build_result_set(proj, rows, order, limit)
+}
+
+/// P135：WHERE 为"倒排等值 AND 链"→ posting 交集（只加不删 = ever-match **superset**）。
+/// 任一叶非 Eq（非 docid）或空 posting（该 term 从未写入 → 无 ever-match 或非倒排可表达）→
+/// None（调用方回退快照全窗扫描保正确）。term 形态与 eval_cond 一致（`field=value`）。
+fn inverted_eq_superset(engine: &Engine, tail: &str) -> Option<roaring::treemap::RoaringTreemap> {
+    use crate::sql::parser::{Cond, CmpOp, WhereExpr};
+    let we = crate::sqlish::parse_where_expr(tail).ok()?;
+    fn leaf(engine: &Engine, c: &Cond) -> Option<roaring::treemap::RoaringTreemap> {
+        if c.op != CmpOp::Eq || c.field == "docid" {
+            return None;
+        }
+        let p = engine.inverted_posting(&format!("{}={}", c.field, c.value)).ok()?;
+        if p.is_empty() {
+            None // term 从未写入 → 非倒排可表达（数字/未索引/零命中），回退扫描
+        } else {
+            Some(p)
+        }
+    }
+    fn sup(engine: &Engine, e: &WhereExpr) -> Option<roaring::treemap::RoaringTreemap> {
+        match e {
+            WhereExpr::Cond(c) => leaf(engine, c),
+            WhereExpr::And(a, b) => {
+                let m = sup(engine, a)?;
+                Some(m & sup(engine, b)?)
+            }
+            _ => None,
+        }
+    }
+    sup(engine, &we)
+}
+
+/// P135：superset 候选 → `batch_get_at(S)` 批量快照复核 + 谓词复检（免 P134 全窗扫）。
+/// posting∩默认表窗口（docid ≤ hi，已由调用方保证 < 2^48）升序 → 快照批量取行（语义=逐
+/// get_at：跳过位图、tombstone seq 裁决、Delta ≤S 折叠）→ doc_matches_where（换值陈旧排除）。
+/// 仅当本事务无未提交写时使用（自写合并走全窗扫描兜底）。
+fn finish_predicate_superset(
+    engine: &Engine,
+    txn: &mut crate::txn::Transaction,
+    cond_sql: &str,
+    sup: roaring::treemap::RoaringTreemap,
+    hi: u64,
+    is_sum: bool,
+    proj: Option<&[ProjCol]>,
+    limit: Option<usize>,
+    order: bool,
+) -> QueryResponse {
+    let early_stop = !order && !is_sum && limit.is_some();
+    let need = limit.unwrap_or(usize::MAX);
+    let ids: Vec<u64> = sup.iter().filter(|d| *d <= hi).collect();
+    let vals = match engine.batch_get_at(&ids, txn.snapshot()) {
+        Ok(v) => v,
+        Err(err) => return QueryResponse::Err(3500, format!("事务谓词读失败: {err}")),
+    };
+    let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(ids.len().min(4096));
+    for (d, bv) in ids.into_iter().zip(vals) {
+        let Some(bv) = bv else { continue };
+        if !crate::sqlish::doc_matches_where(cond_sql, &bv) {
+            continue;
+        }
+        rows.push((d, bv));
+        if early_stop && rows.len() >= need {
+            break;
+        }
+    }
+    finish_predicate_rows(rows, proj, is_sum, order, limit)
 }
 
 /// 提取 `WHERE id BETWEEN A AND B` 闭区间 → (A, B)；非 id BETWEEN → None。
@@ -500,4 +579,33 @@ pub(crate) fn extract_limit(sql: &str) -> Option<usize> {
     let rest = lower[pos + 5..].trim();
     let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// P135：`inverted_eq_superset` 判定——倒排等值 AND 链 → posting 交集（ever-match，含换值
+    /// 陈旧 docid）；非倒排/空 posting/OR/Ne → None（调用方回退快照全窗扫描保正确）。
+    #[test]
+    fn p135_inverted_eq_superset_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &Config::default()).unwrap();
+        e.put(1, br#"{"s":"a","x":5}"#.to_vec(), &["s=a"]).unwrap();
+        e.put(2, br#"{"s":"b","x":5}"#.to_vec(), &["s=b"]).unwrap();
+        // 单倒排等值 → superset（含 1 不含 2）
+        let sup2 = inverted_eq_superset(&e, "s='a'").unwrap();
+        assert!(sup2.contains(1) && !sup2.contains(2));
+        // AND 链交集
+        let sup = inverted_eq_superset(&e, "s='a' AND s='a'").unwrap();
+        assert_eq!(sup.iter().collect::<Vec<u64>>(), vec![1]);
+        // 非倒排叶（x=5 无 posting）→ None
+        assert!(inverted_eq_superset(&e, "x=5").is_none());
+        // OR / Ne → None（保守回退）
+        assert!(inverted_eq_superset(&e, "s='a' OR s='b'").is_none());
+        assert!(inverted_eq_superset(&e, "s!='a'").is_none());
+        // 空 posting term → None
+        assert!(inverted_eq_superset(&e, "s='never'").is_none());
+    }
 }

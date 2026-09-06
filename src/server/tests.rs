@@ -2852,6 +2852,100 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn txn_predicate_snapshot_inverted_superset_rr() {
+        // P135：RR 事务字段谓词走**倒排候选 superset 快路径**（posting∩窗口 → batch_get_at(S)
+        // 复核）时语义 = 快照窗口扫描（P134）——并发删/换值行仍见（posting 只加不删=ever-match），
+        // SUM/行集一致；s 为 inverted 声明字段（服务端 INSERT 生成 posting → 命中快路径）。
+        let dir = tempfile::tempdir().unwrap();
+        let engine = {
+            let mut cfg = crate::config::Config::default();
+            cfg.inverted.inverted_fields = vec!["s".to_string()];
+            Engine::open(dir.path(), &cfg).unwrap()
+        };
+        let server = DbServer::new(engine, "root", "secret");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _srv = std::thread::spawn(move || {
+            server.serve(&addr.to_string()).expect("serve 失败");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut connect = || {
+            let mut c = TestClient::connect(addr);
+            let (scramble, _) = c.handshake();
+            c.authenticate("root", "secret", &scramble);
+            c
+        };
+        let mut main = connect();
+        let mut aux = connect();
+        let row_ids = |r: &Vec<Vec<u8>>| -> Vec<String> {
+            let mut out = Vec::new();
+            for row in r.iter().skip(4).take(r.len().saturating_sub(5)) {
+                let mut p = 0usize;
+                let n = read_lenenc(row, &mut p).unwrap() as usize;
+                out.push(String::from_utf8(row[p..p + n].to_vec()).unwrap());
+            }
+            out
+        };
+        let sum = |c: &mut TestClient, sql: &str| -> String {
+            let r = c.query(sql);
+            let row = &r[r.len() - 2];
+            let mut p = 0usize;
+            let n = read_lenenc(row, &mut p).unwrap() as usize;
+            String::from_utf8(row[p..p + n].to_vec()).unwrap()
+        };
+        let ins = |c: &mut TestClient, id: u64, k: i64, s: &str| {
+            let doc = format!("{{\"k\":{k},\"s\":\"{s}\"}}");
+            assert_eq!(
+                c.query(&format!(
+                    "INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')"
+                ))[0][0],
+                OK_PACKET
+            );
+        };
+        let pred_a = "SELECT * FROM documents WHERE s='a' ORDER BY id";
+        let pred_b = "SELECT * FROM documents WHERE s='b' ORDER BY id";
+        let sum_a = "SELECT SUM(k) FROM documents WHERE s='a'";
+        // 轮 1：倒排 superset 快路径 + 快照后并发 DELETE → 行集/SUM 不变
+        ins(&mut main, 900501, 1, "a");
+        ins(&mut main, 900502, 2, "a");
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        let first = row_ids(&main.query(pred_a));
+        assert_eq!(first, vec!["900501", "900502"]);
+        assert_eq!(sum(&mut main, sum_a), "3");
+        assert_eq!(
+            aux.query("DELETE FROM documents WHERE id=900502")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(row_ids(&main.query(pred_a)), first, "RR(superset)：谓词读仍见已删行");
+        assert_eq!(sum(&mut main, sum_a), "3", "RR(superset)：SUM 不变");
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+        // 轮 2：快照后并发换值 s:a→b → 谓词读 s='a' 仍见旧值（posting ever-match + batch_get_at(S)）
+        //（900501 仍在（round1 只删 900502）→ 两轮 pred_a 恒含 900501）
+        ins(&mut main, 900601, 9, "a");
+        assert_eq!(main.query("BEGIN")[0][0], OK_PACKET);
+        assert_eq!(row_ids(&main.query(pred_a)), vec!["900501", "900601"]);
+        assert_eq!(
+            aux.query("UPDATE documents SET s='b' WHERE id=900601")[0][0],
+            OK_PACKET
+        );
+        assert_eq!(
+            row_ids(&main.query(pred_a)),
+            vec!["900501", "900601"],
+            "RR(superset)：换值后谓词读 s='a' 仍见旧值行"
+        );
+        assert_eq!(row_ids(&main.query(pred_b)), Vec::<String>::new(), "快照视图 s='b' 为空");
+        assert_eq!(main.query("ROLLBACK")[0][0], OK_PACKET);
+    }
+
+    #[test]
     fn txn_update_delete_where_in_and_predicate() {
         // d txn 路径：事务内 UPDATE/DELETE … WHERE id IN(...) 与字段条件——攒批可见 + 回滚原子
         let engine = test_engine();
