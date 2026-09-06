@@ -229,6 +229,10 @@ where
                 return Ok(());
             }
             // sqlish 候选路径：当前视图命中 ∪ 同事务写集 → 逐候选读行 + 谓词复检。
+            // A1-3（2026-09-07）：尾截断须含 GROUP BY/HAVING——cond_sql 只取 WHERE 条件
+            // （分组累积在 txn_group 行流完成）；旧实现只截 ORDER BY/LIMIT → 字段谓词 +
+            // GROUP BY 走兜底（混合库 wm>2^48 / FOR UPDATE）时 cond 含 "GROUP BY s" →
+            // parse "非分组列 docid" 解析失败。
             let lower = sql.to_lowercase();
             let pos = lower
                 .find("where")
@@ -237,6 +241,8 @@ where
             let ol = rest.to_lowercase();
             let end = [
                 ol.find("order by"),
+                ol.find("group by"),
+                ol.find("having"),
                 ol.find(" limit "),
                 ol.find(" limit)"),
             ]

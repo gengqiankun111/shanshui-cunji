@@ -3060,7 +3060,8 @@ use crate::multitable::drop_table_range;
                             .collect()
                     })
                     .collect(),
-                _ => panic!("应返回结果集响应"),
+                QueryResponse::Ok(n, _) => panic!("应返回结果集响应: Ok({n})"),
+                QueryResponse::Err(c, m) => panic!("应返回结果集响应: Err({c}) {m}"),
             }
         };
         // 基线行 1..5（k 1..5，s=a/b/a/b/c），全 autocommit
@@ -3144,6 +3145,125 @@ use crate::multitable::drop_table_range;
         assert_eq!(
             rows_of(q(&mut e, "SELECT COUNT(*) FROM documents")),
             vec![vec!["5"]]
+        );
+    }
+
+    #[test]
+    fn p141_txn_agg_sqlish_fallback_fu_and_mixed_wm() {
+        // A1-3（2026-09-07）：txn_agg 两条兜底路径可达性/正确性 sanity（txn_agg.rs drive）——
+        // ① sqlish 候选兜底：单表单行库 + FOR UPDATE 字段谓词 → 当前读候选 ∪ 复检
+        //   （sqlish::execute "SELECT docid FROM t WHERE <尾>" + txn_read_current 取值 +
+        //    doc_matches_where 复检：自改离开谓词的行被剔除、仍命中的当前读见新值）；
+        // ② wm>2^48 混合库分支：t_a 高位 docid 推高水位后，快照字段谓词聚合走 sqlish 兜底，
+        //   结果限定默认表（t_a 行无 s 字段不命中），与 nontxn 权威同 SQL 对照一致。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        let auto = std::sync::Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(std::sync::Arc::clone(&auto));
+        let mut q = |e: &mut Engine, sql: &str| super::dispatch_query(e, sql, &mut s);
+        let rows_of = |r: QueryResponse| -> Vec<Vec<String>> {
+            match r {
+                QueryResponse::Set { rows, .. } => rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|c| {
+                                if c == vec![MYSQL_NULL_CELL] {
+                                    "NULL".to_string()
+                                } else {
+                                    String::from_utf8_lossy(&c).into_owned()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                QueryResponse::Ok(n, _) => panic!("应返回结果集响应: Ok({n})"),
+                QueryResponse::Err(c, m) => panic!("应返回结果集响应: Err({c}) {m}"),
+            }
+        };
+        // 基线行 1..5（k=1..5，s=a/b/a/b/c）
+        for (id, k, sval) in
+            [(1, 1, "a"), (2, 2, "b"), (3, 3, "a"), (4, 4, "b"), (5, 5, "c")]
+        {
+            let doc = format!("{{\"k\":{k},\"s\":\"{sval}\"}}");
+            let sql = format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')");
+            assert!(
+                matches!(q(&mut e, &sql), QueryResponse::Ok(..)),
+                "INSERT 未返回 OK"
+            );
+        }
+        // ① FOR UPDATE + 字段谓词 → sqlish 候选兜底（当前读）→ 快照候选 s=a = {id1,id3}
+        assert!(matches!(q(&mut e, "BEGIN"), QueryResponse::Ok(..)));
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT SUM(k) FROM documents WHERE s='a' FOR UPDATE"
+            )),
+            vec![vec!["4"]],
+            "s=a: id1+id3 = 1+3"
+        );
+        // 同事务自改：id1 k→100（当前读见新值计入）；id3 s→x（候选提交态仍 s=a → 当前读
+        // 读出自改 s=x → doc_matches_where 复检剔除 → 不得计入）
+        assert!(matches!(
+            q(&mut e, "UPDATE documents SET k=100 WHERE id=1"),
+            QueryResponse::Ok(..)
+        ));
+        assert!(matches!(
+            q(&mut e, "UPDATE documents SET s='x' WHERE id=3"),
+            QueryResponse::Ok(..)
+        ));
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT SUM(k) FROM documents WHERE s='a' FOR UPDATE"
+            )),
+            vec![vec!["100"]],
+            "doc3 已自改离开谓词 → 复检剔除；doc1 当前读见 k=100"
+        );
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT COUNT(*) FROM documents WHERE s='a' FOR UPDATE"
+            )),
+            vec![vec!["1"]]
+        );
+        assert!(matches!(q(&mut e, "ROLLBACK"), QueryResponse::Ok(..)));
+        // ② 混合库：t_a 高位 docid → wm>2^48
+        let tid_a = super::table_id_for("t_a");
+        assert_ne!(tid_a, 0);
+        for r in 1..=3u64 {
+            let doc = format!("{{\"v\":{r}}}");
+            e.put(super::docid_for(tid_a, r), doc.into_bytes(), &[]).unwrap();
+        }
+        assert!(
+            e.auto_watermark() > (1u64 << 48),
+            "wm 应被 t_a 高位 docid 推过 2^48"
+        );
+        assert!(matches!(q(&mut e, "BEGIN"), QueryResponse::Ok(..)));
+        // 快照字段谓词（非 FU，wm>2^48）→ sqlish 兜底；t_a 行无 s 字段不命中 → 仍 2（id1,id3）
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT COUNT(*) FROM documents WHERE s='a'"
+            )),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*) FROM documents WHERE s='a' GROUP BY s"
+            )),
+            vec![vec!["a", "2"]],
+            "sqlish 兜底分组可达且限定默认表"
+        );
+        assert!(matches!(q(&mut e, "ROLLBACK"), QueryResponse::Ok(..)));
+        // nontxn 权威对照（同混合库态）：t_a 行 s 缺失不匹配 → COUNT 仍 2
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT COUNT(*) FROM documents WHERE s='a'"
+            )),
+            vec![vec!["2"]]
         );
     }
 
