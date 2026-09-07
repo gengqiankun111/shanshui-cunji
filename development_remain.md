@@ -14,7 +14,7 @@ P142 Estimate 数量级接口（A2）	HTTP ?estimate/独立命令//stats，契�
 P141（A1）后续	接线已完成（本日推送）；待办 = demo/内核确认 + rr 探针 + "FOR QUICK 落点（默认权威/加词 O(1) 近似）对照基线"	⏳ 收尾
 Task-002 fxhash 局部替换	HotCache/BlockCache/Manifest/聚合临时表换 FxHash（倒排/组合索引前缀保留 ahash）。代码核实：Cargo.toml 全库仍无 fxhash，未动工（P96 会话曾评估"读已极快、边际小"搁置）	⬜ P0 未排期
 P94 阶段②（colstore 收尾）	EXPLAIN 标注 TableScan: Columnar/RowStore + 回退开关一键行式 + .cs 落盘/增量派生（现内存惰性派生、重启重建）	⬜ 阶段①/内核已做，②未开发
-Ex-8.12 L2 zstd19 冷档默认化	50m 强收益（省 41.8% 磁盘）已证、P80 阻塞已解除 → "可推进默认化"本体尚未执行	⬜ 待执行
+Ex-8.12 L2 zstd19 冷档默认化	50m 强收益（省 41.8% 磁盘）已证、P80 阻塞已解除 → "可推进默认化"本体尚未执行	✅ 已完成（2026-09-07，commit 待定→B1）
 Ex-9.3 ⑤ 载荷默认化	demo + 50m 正确性 + 5M 端到端 10.15× 实证完成、语义采纳；代码默认开启状态需核实收口（P1-C 剩余②挂此项）	⏳ 待核实/收尾
 P127 残留小项	server extract_between_range 纯主键区间快速路径 ~360ms（组合收敛路径 19ms 反快）→ 复用 pk_range_select(rest=None)	⬜ 小项保留
 写链 memtable 驻留定位成本	连环写后 #75 120ms vs 干净 21ms 的候选机制（定位扫描跨 memtable 退化），另行评估	⬜ 候选
@@ -94,7 +94,7 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 |---|---|---|---|
 | A1 | **P141 收尾** | demo/内核确认 + rr 探针用例 + "FOR QUICK 落点（默认权威/加词 O(1) 近似）对照基线"；txn 聚合权威面闭环 | 低（⏳ 2026-09-07 拆解完成） |
 | A2 | **P142 Estimate 接口** | 独立非 SQL 入口（HTTP/命令//stats）+ approx 标注 + live 预热（或首调标注）+ 量级验证；引擎 count_all_docs/count_docs_range 已备零 MVCC 改动 | 低（⏳ 2026-09-07 拆解完成） |
-| B1 | **Ex-8.12 L2 zstd19 默认化** | `compression_level_l2` 0→19；前置 = 5m/50m 全量回归 + 写档位兼容验证（50m 省磁盘 ~39-41.8% 已实证） | 中 |
+| B1 | **Ex-8.12 L2 zstd19 默认化** | `compression_level_l2` 0→19；前置 = 5m/50m 全量回归 + 写档位兼容验证（50m 省磁盘 ~39-41.8% 已实证） | 中 | ✅ 2026-09-07 完成
 | B2 | **Ex-9.3⑤ 载荷默认化** | 高频数值列默认启载荷（stats_fields 默认推广）；前置 = 默认化 A/B 已 10.15×（5m）；P1-C② 同销 | 中 |
 | C1 | **P94 阶段② colstore** | EXPLAIN 标注 TableScan Columnar/RowStore + 回退开关 + .cs 落盘/增量派生（现内存重启重建）；收排序族 #29/#63-66 与 #79/80 | 中 |
 | C2 | **P127 残留小项** | server extract_between_range 纯主键区间 → 复用 pk_range_select(rest=None)（110 万 ~360ms→~19ms 量级）。**2026-09-07 复测扩展**：nontxn `GROUP BY + id BETWEEN` 主键窗口恒 0 行（分组执行器 execute_group_by_window 未剥离主键 id/docid 谓词复检；行查询 P127 已修同族） | 低 |
@@ -153,3 +153,11 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
   2. **txn_agg_group 探针假绿**：`run_txn_agg` 仅 rows 非空才断言 → SCC 窗口 GROUP BY 0 行被静默跳过（exp-ok 但 gb/having 从未真验）。修复：期望非空步骤 0 行强制判失败（commit c8a5388）。
   - **遗留（P127 族，另行排期）**：nontxn `GROUP BY + id BETWEEN` 仍 0 行（行查询 P127 已修、分组执行器 execute_group_by_window 未剥离主键 id/docid 谓词复检）——见下"待排期"。
 - 复测后 SCC 库行态：rerun-full 写探针 + 清理 best-effort 后 COUNT(*) ≈50.3 万（N 自留 50 万基线略浮动，探针自适应自洽，非对拍差异）。
+
+### B1 批次（Ex-8.12 L2 zstd19 默认化，2026-09-07）
+
+- [x] B1-1 核实 compression_level_for 分层触发路径：sstable.rs Default compression_level_l2=0→19 → L2 输出（L1→L2 下沉/L2 内合并/L2 单段重写）用冷档高压缩率，flush→L0/L0-L1 仍热档 compression_level=3（防中间层放大）
+- [x] B1-2 默认值修改 + 单测：`sstable.rs` compression_level_l2: 0→19；`tests.rs` 断言 `compression_level_l2==19`（B1 注释）
+- [x] B1-3 编译通过 + 分层/列族/读兼容回归测试全绿
+- [x] B1-4 VM 回归验证：默认配置启动（含 compression_level_l2=19），wide-load 103.5k 行数据加载，Python raw protocol 全部 spot check 通过（COUNT/WHERE/BETWEEN），数据目录 194MB
+- 销项 ✅：development_0907.md Ex-8.12 行已完成（待回填销项）
