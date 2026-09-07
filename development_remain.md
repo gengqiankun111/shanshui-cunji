@@ -161,3 +161,11 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 - [x] B1-3 编译通过 + 分层/列族/读兼容回归测试全绿
 - [x] B1-4 VM 回归验证：默认配置启动（含 compression_level_l2=19），wide-load 103.5k 行数据加载，Python raw protocol 全部 spot check 通过（COUNT/WHERE/BETWEEN），数据目录 194MB
 - 销项 ✅：development_0907.md Ex-8.12 行已完成（待回填销项）
+
+### B2 批次（Ex-9.3⑤ 载荷默认化，2026-09-07）
+
+- [x] B2-1 配置核实：`InvertedConfig.stats_fields` 默认空 Vec → 写路径 `engine_doc_stats` 跳过，查询路径 `stats_field_pos` 仅查显式声明
+- [x] B2-2 实现默认化：`Engine` 新增 `auto_stats_fields: Mutex<Vec<String>>`；写路径 `stats_fields` 为空时解析 JSON 自动发现所有数值字段并入 auto 集合（单调增长）；`stats_field_pos` 同时查显式集和 auto 集
+- [x] B2-3 测试：更新 `inverted_stats_fields_accumulate_per_term` 验证默认配置下自动检测 `amount` 字段且 `stats_field_pos("amount")==Some(0)`、非数值字段 `stats_field_pos("status")==None`；显式配置 `stats_fields` 时 auto 集不生效（用户声明覆盖默认化）
+- [x] B2-4 全量回归：801 passed / 0 failed / 4 ignored
+- 销项 ✅：development_0907.md Ex-9.3⑤ 行标记 DONE + P1-C② 同销（commit 29bc8ee）
