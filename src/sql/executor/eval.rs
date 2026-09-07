@@ -852,10 +852,51 @@ fn eval_cond(
                 Ok(full - hit)
             }
         }
-        _ => scan_all(engine, &Leaf::Cmp(c), limit, guard),
+        CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le => {
+            // 优先级规则：单字段范围 → 倒排优先（FST 更快）
+            if engine.inverted_has_field_terms(&c.field) {
+                let (low, high) = match c.op {
+                    CmpOp::Gt => (Some(c.value.as_str()), None),
+                    CmpOp::Ge => (Some(c.value.as_str()), None),
+                    CmpOp::Lt => (None, Some(c.value.as_str())),
+                    CmpOp::Le => (None, Some(c.value.as_str())),
+                    _ => unreachable!(),
+                };
+                let candidates = engine.inverted_search_range(&c.field, low, high)?;
+                if !candidates.is_empty() {
+                    return post_filter(engine, candidates, &Leaf::Cmp(c), limit, guard);
+                }
+                // 字段有倒排条目且无匹配 → 正确空结果
+                return Ok(RoaringBitmap::new());
+            }
+            // 倒排不可用 → 尝试单列组合索引范围
+            if has_single_col_composite(engine, &c.field) {
+                let (low_str, high_str) = match c.op {
+                    CmpOp::Gt | CmpOp::Ge => (c.value.as_str(), "\u{10FFFF}"),
+                    CmpOp::Lt | CmpOp::Le => ("", c.value.as_str()),
+                    _ => unreachable!(),
+                };
+                let rows = engine.query_by_composite_range(&c.field, low_str, high_str)?;
+                let mut bm = RoaringBitmap::new();
+                for (docid, _) in rows {
+                    bm.insert(docid);
+                }
+                if !bm.is_empty() {
+                    return post_filter(engine, bm, &Leaf::Cmp(c), limit, guard);
+                }
+                return Ok(RoaringBitmap::new());
+            }
+            // 组合也不可用 → 全扫
+            scan_all(engine, &Leaf::Cmp(c), limit, guard)
+        }
     }
 }
 
+
+fn has_single_col_composite(engine: &Engine, field: &str) -> bool {
+    engine.cidx.is_some() &&
+        engine.composite_indexes.iter().any(|f| f.len() == 1 && &f[0] == field)
+}
 
 /// WHERE 求值 → 命中位图。
 /// AND 快路径：比较/BETWEEN 分支作后过滤（只检查另一分支已命中文档，避免全量扫描）。
@@ -868,6 +909,28 @@ pub(crate) fn eval(
     match e {
         WhereExpr::Cond(c) => eval_cond(engine, c, limit, guard),
         WhereExpr::Between { field, low, high } => {
+            // 优先级规则：单字段范围 → 倒排优先（FST 更快）
+            if engine.inverted_has_field_terms(field) {
+                let candidates = engine.inverted_search_range(field, Some(low), Some(high))?;
+                if !candidates.is_empty() {
+                    return post_filter(engine, candidates, &Leaf::Between { field, low, high }, limit, guard);
+                }
+                // 字段有倒排条目且无匹配 → 正确空结果
+                return Ok(RoaringBitmap::new());
+            }
+            // 倒排不可用 → 尝试单列组合索引范围
+            if has_single_col_composite(engine, field) {
+                let rows = engine.query_by_composite_range(field, low, high)?;
+                let mut bm = RoaringBitmap::new();
+                for (docid, _) in rows {
+                    bm.insert(docid);
+                }
+                if !bm.is_empty() {
+                    return post_filter(engine, bm, &Leaf::Between { field, low, high }, limit, guard);
+                }
+                return Ok(RoaringBitmap::new());
+            }
+            // 组合也不可用 → 全扫
             scan_all(engine, &Leaf::Between { field, low, high }, limit, guard)
         }
         WhereExpr::Like { field, pattern } => {

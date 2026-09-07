@@ -38,6 +38,8 @@ pub enum AccessPath {
     CompositeIndex { fields: Vec<String> },
     /// 倒排列族：term 命中 → 回表主数据（步骤 10 启用）。
     Inverted { term: String },
+    /// 倒排范围查询：利用 FST 字典序范围迭代，合并 posting bitmap。
+    InvertedRange { field: String, low: Option<String>, high: Option<String> },
     /// 全表扫描（无可用索引，兜底）。
     FullScan,
 }

@@ -30,6 +30,17 @@ pub(crate) fn extract_eq_conds(e: &WhereExpr) -> Vec<(String, String)> {
     out
 }
 
+/// 统计 WHERE 树中叶子条件总数（Cond + Between + Like）。
+fn count_leaf_conditions(e: &WhereExpr) -> usize {
+    match e {
+        WhereExpr::Cond(_) | WhereExpr::Between { .. } | WhereExpr::Like { .. } => 1,
+        WhereExpr::Not(x) => count_leaf_conditions(x),
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            count_leaf_conditions(a) + count_leaf_conditions(b)
+        }
+    }
+}
+
 /// P127：WHERE 是否含主键区间叶（`id BETWEEN`/`docid BETWEEN` 数值）——组合路由守卫用。
 /// 主键区间是强约束（= docid 区间），composite 等值前缀路由会先物化大候选再复筛；
 /// eval AND 快路径（post_filter + LIMIT 早停）在区间∩等值上毫秒级 → 命中即回退 eval。
@@ -124,8 +135,17 @@ fn try_composite_index(
             }
         }
     }
-    let Some((_, vals)) = best else { return Ok(None); };
-    // 走组合索引前缀扫描
+    let Some((index_i, vals)) = best else { return Ok(None); };
+    // 检查是否有额外条件需要处理（范围或未匹配的等值）
+    let total_leaf = count_leaf_conditions(sel.where_expr.as_ref().unwrap());
+    if total_leaf > eqs.len() || eqs.len() > vals.len() {
+        // 铁律：匹配前 2 个字段 → 组合优先，额外条件由复筛处理
+        // 只匹配 1 个字段 → 倒排可能更快 → 回退 eval
+        if vals.len() < 2 {
+            return Ok(None);
+        }
+    }
+    // 走组合索引前缀扫描（所有条件都在匹配前缀中，无额外条件）
     let fields: Vec<&[u8]> = vals.iter().map(|v| v.as_bytes()).collect();
     let mut rows = engine.query_by_composite_prefix(&fields)?;
     // review 修复（2026-09-04）stale 键防护：cidx 前缀命中后回表的是**最新**文档值——

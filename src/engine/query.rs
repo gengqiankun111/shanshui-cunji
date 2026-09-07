@@ -199,6 +199,24 @@ impl Engine {
                 }
                 out
             }
+            AccessPath::InvertedRange { field, low, high } => {
+                // 倒排范围查询：候选 bitmap + 回表（精确后过滤由调用方在 eval 中完成）
+                let bitmap = self.inverted_search_range(&field, low.as_deref(), high.as_deref())?;
+                let mut out = Vec::new();
+                for docid in bitmap {
+                    if guard.is_expired() {
+                        return Err(crate::error::Error::QueryTooExpensive(format!(
+                            "查询超时（guard #{} > {}ms），熔断中止",
+                            guard.query_id(),
+                            guard.timeout().as_millis()
+                        )));
+                    }
+                    if let Some(v) = self.get(docid as u64)? {
+                        out.push((docid as u64, v));
+                    }
+                }
+                out
+            }
             AccessPath::FullScan => self.scan_range(None, None)?,
         };
         Ok(rows)
@@ -266,6 +284,24 @@ impl Engine {
     pub fn inverted_posting(&self, term: &str) -> Result<RoaringTreemap> {
         self.flush_inverted_pending();
         self.inverted.search(term)
+    }
+
+    /// 快速检查字段是否有倒排索引条目（用于判断范围查询是否有意义）。
+    pub fn inverted_has_field_terms(&self, field: &str) -> bool {
+        self.inverted.has_field_terms(field)
+    }
+
+    /// 倒排范围查询：给定字段和值的上下界，返回所有匹配 term 的 posting 并集（不回表）。
+    /// `low`/`high` 为 `None` 表示该侧无界，闭区间 [low, high]。
+    /// 
+    /// 实现利用 FST 字典序范围迭代（有 FST 的段）或线性扫描（无 FST 的段），
+    /// 结果是所有匹配 term 的 posting 位图 OR 合并。
+    /// 
+    /// 注意：字符串比较是字典序，数值的字典序可能不匹配数值序，调用方需要在
+    /// 获得 bitmap 后做精确的后过滤确保语义正确。
+    pub fn inverted_search_range(&self, field: &str, low: Option<&str>, high: Option<&str>) -> Result<RoaringTreemap> {
+        self.flush_inverted_pending();
+        self.inverted.search_range(field, low, high)
     }
 
     /// 倒排某词条命中的文档数（COUNT 聚合，<0.1ms）。

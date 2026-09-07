@@ -50,7 +50,7 @@ pub(super) struct SegmentManifest {
 
 /// v5：跳过 term 条目中 doc_count 之后的统计载荷（`varint(fcount)` + `fcount × 32B` 定长
 /// n u64 + sum/min/max f64）。v4 及更早无载荷（游标不动）。
-fn skip_stats_v5(data: &[u8], cur: &mut usize, ver: u16) -> Result<()> {
+pub(super) fn skip_stats_v5(data: &[u8], cur: &mut usize, ver: u16) -> Result<()> {
     if ver >= 5 {
         let fc = decode_varint(data, cur)? as usize;
         let bytes = fc * (8 + 8 + 8 + 8);
@@ -107,7 +107,7 @@ pub(super) fn parse_posting_at(data: &[u8], offset: usize, ver: u16) -> Result<P
 }
 
 /// 按段版本解码 posting：v6 = 64 位 treemap；v3–v5 = 32 位分块；v2 = Roaring 紧凑字节。
-fn decode_posting_bytes(p: &[u8], ver: u16) -> Result<Posting> {
+pub(super) fn decode_posting_bytes(p: &[u8], ver: u16) -> Result<Posting> {
     if ver >= 6 {
         Ok(Posting::deserialize_from(p)
             .map_err(|e| Error::Corrupted(format!("v6 posting 反序列化失败: {e}")))?)

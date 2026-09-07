@@ -5,9 +5,12 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::keys::decode_varlen;
+use fst::IntoStreamer;
+use fst::Streamer;
+use mmap_file::MmapFile;
 
 use super::decode_varint;
-use super::segment::{parse_posting_at, PostingCursor};
+use super::segment::{parse_posting_at, skip_stats_v5, PostingCursor};
 use super::{bitmap_shard, InvertedIndex, Posting};
 
 
@@ -290,6 +293,183 @@ impl InvertedIndex {
             }
         }
         Ok(out)
+    }
+
+    /// 快速检查某字段是否有倒排索引条目（仅检查前 `max_scan` 个 term 即停）。
+    /// 用于判断倒排范围查询是否对该字段有意义——无任何条目的字段（如纯数字字段）
+    /// 应回退全表扫描而非返回空结果。
+    pub fn has_field_terms(&self, field: &str) -> bool {
+        let prefix = format!("{field}=");
+        // 1. 检查内存（最新条目，最热数据）
+        for entry in self.mem.iter() {
+            if entry.key().starts_with(&prefix) {
+                return true;
+            }
+        }
+        // 2. 检查各段前几个 term（每段只检查前 16 个）
+        let segs = self.segments.load();
+        for seg in segs.iter() {
+            let data = match self.read_segment_data(seg) {
+                Some(d) => d,
+                None => continue,
+            };
+            if data.len() < 10 || &data[0..8] != super::segment::SEG_MAGIC {
+                continue;
+            }
+            let ver = Self::seg_ver(&data);
+            let mut cur = 10usize;
+            let count = decode_varint(&data, &mut cur).unwrap_or(0);
+            let scan = (count).min(16) as usize;
+            for _ in 0..scan {
+                if cur >= data.len() {
+                    break;
+                }
+                let t = match decode_varlen(&data, &mut cur) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => break,
+                };
+                if ver >= 4 {
+                    let _ = decode_varint(&data, &mut cur);
+                }
+                let _ = super::segment::skip_stats_v5(&data, &mut cur, ver);
+                let _ = decode_varlen(&data, &mut cur);
+                if String::from_utf8_lossy(&t).starts_with(&prefix) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 范围查询：给定期望 `field` 和值的上下界，返回所有 matching term 的 posting 并集。
+    /// `low` / `high` 为 `None` 表示该侧无界，闭区间 [low, high]。
+    ///
+    /// 实现：
+    /// - 内存中遍历匹配 term，按字符串值比较过滤；
+    /// - 磁盘段：有 FST 的段走 FST range 迭代，其余段线性扫描过滤。
+    ///
+    /// 注意：字符串值比较是字典序，数值的字典序可能不匹配数值序（如"100"<"2"）。
+    /// 调用方应在获得 bitmap 后做精确的 WHERE 过滤（`post_filter` / `scan_row_matches`），
+    /// 确保语义正确。
+    pub fn search_range(&self, field: &str, low: Option<&str>, high: Option<&str>) -> Result<Posting> {
+        let mut result = Posting::new();
+        let prefix = format!("{field}=");
+
+        // 1. 内存（最新）
+        for entry in self.mem.iter() {
+            let term = entry.key();
+            if !term.starts_with(&prefix) {
+                continue;
+            }
+            let value = &term[prefix.len()..];
+            if let Some(l) = low {
+                if value < l {
+                    continue;
+                }
+            }
+            if let Some(h) = high {
+                if value > h {
+                    continue;
+                }
+            }
+            result.extend(entry.value().iter().copied());
+        }
+
+        // 2. 各段（新→旧）
+        let segs = self.segments.load();
+        let dicts = self.dicts.load();
+        for seg in segs.iter() {
+            let seg_posting = if let Some(map) = dicts.get(seg) {
+                // FST 范围迭代
+                let start = format!("{prefix}{}", low.unwrap_or(""));
+                let end = format!("{prefix}{}\u{ffff}", high.unwrap_or("\u{ffff}"));
+                let mut stream = map.range().ge(start.as_bytes()).le(end.as_bytes()).into_stream();
+                let mut seg_bm = Posting::new();
+                while let Some((term_bytes, _offset)) = stream.next() {
+                    let term = String::from_utf8_lossy(&term_bytes);
+                    let posting = self.read_segment_posting(seg, &term)?;
+                    seg_bm |= posting;
+                }
+                seg_bm
+            } else {
+                // 无 FST → 线性扫描
+                let data = self.read_segment_data(seg);
+                let data = match data {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if data.len() < 10 || &data[0..8] != super::segment::SEG_MAGIC {
+                    continue;
+                }
+                let ver = Self::seg_ver(&data);
+                let mut cur = 10usize;
+                let count = decode_varint(&data, &mut cur)?;
+                let mut seg_bm = Posting::new();
+                for _ in 0..count {
+                    let t = decode_varlen(&data, &mut cur)?.to_vec();
+                    let term_str = String::from_utf8_lossy(&t);
+                    if !term_str.starts_with(&prefix) {
+                        // skip posting
+                        if ver >= 4 {
+                            let _c = decode_varint(&data, &mut cur)?;
+                        }
+                        skip_stats_v5(&data, &mut cur, ver)?;
+                        let _p = decode_varlen(&data, &mut cur)?;
+                        continue;
+                    }
+                    let value = &term_str[prefix.len()..];
+                    if let Some(l) = low {
+                        if value < l { // skip posting
+                            if ver >= 4 { let _c = decode_varint(&data, &mut cur)?; }
+                            skip_stats_v5(&data, &mut cur, ver)?;
+                            let _p = decode_varlen(&data, &mut cur)?;
+                            continue;
+                        }
+                    }
+                    if let Some(h) = high {
+                        if value > h { // skip posting
+                            if ver >= 4 { let _c = decode_varint(&data, &mut cur)?; }
+                            skip_stats_v5(&data, &mut cur, ver)?;
+                            let _p = decode_varlen(&data, &mut cur)?;
+                            continue;
+                        }
+                    }
+                    if ver >= 4 {
+                        let _c = decode_varint(&data, &mut cur)?;
+                    }
+                    skip_stats_v5(&data, &mut cur, ver)?;
+                    let p = decode_varlen(&data, &mut cur)?.to_vec();
+                    let bitmap = super::segment::decode_posting_bytes(&p, ver)?;
+                    seg_bm |= bitmap;
+                }
+                seg_bm
+            };
+            result |= seg_posting;
+        }
+
+        Ok(result)
+    }
+
+    /// 读取段数据文件（mmap），不存在时返回 None（后台 GC 已删）。
+    fn read_segment_data(&self, seg: &str) -> Option<Arc<MmapFile>> {
+        let files = self.data_files.load();
+        if let Some(m) = files.get(seg) {
+            return Some(m.clone());
+        }
+        drop(files);
+        match MmapFile::open(&self.dir.join(seg)) {
+            Ok(mm) => {
+                let mm = Arc::new(mm);
+                self.data_files.rcu(|m| {
+                    let mut n = (**m).clone();
+                    n.insert(seg.to_string(), mm.clone());
+                    n
+                });
+                Some(mm)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => None,
+        }
     }
 
     // ============ 预分片 Chunk（design 5.2.1，阶段 2）============
