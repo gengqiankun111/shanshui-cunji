@@ -97,7 +97,7 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 | B1 | **Ex-8.12 L2 zstd19 默认化** | `compression_level_l2` 0→19；前置 = 5m/50m 全量回归 + 写档位兼容验证（50m 省磁盘 ~39-41.8% 已实证） | 中 |
 | B2 | **Ex-9.3⑤ 载荷默认化** | 高频数值列默认启载荷（stats_fields 默认推广）；前置 = 默认化 A/B 已 10.15×（5m）；P1-C② 同销 | 中 |
 | C1 | **P94 阶段② colstore** | EXPLAIN 标注 TableScan Columnar/RowStore + 回退开关 + .cs 落盘/增量派生（现内存重启重建）；收排序族 #29/#63-66 与 #79/80 | 中 |
-| C2 | **P127 残留小项** | server extract_between_range 纯主键区间 → 复用 pk_range_select(rest=None)（110 万 ~360ms→~19ms 量级） | 低 |
+| C2 | **P127 残留小项** | server extract_between_range 纯主键区间 → 复用 pk_range_select(rest=None)（110 万 ~360ms→~19ms 量级）。**2026-09-07 复测扩展**：nontxn `GROUP BY + id BETWEEN` 主键窗口恒 0 行（分组执行器 execute_group_by_window 未剥离主键 id/docid 谓词复检；行查询 P127 已修同族） | 低 |
 | D1 | **M-3 增量备份 CLI + M-4 扩容管理入口** | 全量备份已接 CLI；补 incremental 子命令；scale_out/reshard admin/CLI 状态面（联动 10 亿验收） | 中 |
 | D2 | **M-1/M-2/M-5 评估定夺** | 物化视图/outbox/Redis 缓存链：三选一（接线 or 废弃/归档），避免死代码 | 低 |
 | E1 | **语法面按序小项** | ①子查询 IN/EXISTS → ②UNION 族 → ⑤表达式阶段 B → ⑥窗口函数 → ⑦无 GROUP BY HAVING（④多 JOIN 随 ① 评估）；每项独立可交付 | 逐项小 |
@@ -143,3 +143,13 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 - 销项 ✅：development_0907.md P142 行已完成（A2-1~A2-4 全 [x]，development_0907.md P142 行已标 ✅）
 
 > 执行顺序建议：A1-1（探针对拍，闭环正确性）→ A2-1~A2-4（独立接口）→ A1-2/A1-3（评估/确认）。
+
+### 完整重跑探针复测（2026-09-07，A 批收尾后 rerun-full）
+
+- 方式：rr-conformance `--sql-run` 全量探针（无 `--reps`/`--only`，87 项自带次数）双端先后重跑——SCC（documents 3308，原 50 万库不重建）→ MariaDB（wide.t 3306）。输出 tmp/vm-a11/rerun-{scc,mariadb}-summary.md。
+- 结果：双端 87/87 全 ok、无 FAIL/mismatch；txn_agg 五探针双端 exp-ok。MySQL 锁等待探针 waiter-1205（3s）为预期语义分支。
+- **复测抓到 2 个验收盲区并修复**：
+  1. **SCC `GROUP BY + id BETWEEN`（主键窗口）恒 0 行**（txn 与 nontxn 皆然）——`extract_between_range`/`extract_target_ids` WHERE 尾只截 ORDER BY/LIMIT，`…BETWEEN 1 AND 3 GROUP BY s` 的 b 端解析被 "group by s" 污染失败 → txn 落字段谓词复检（JSON 无 id → 恒假 → 剔光 → 0 组）。修复：尾截断补 GROUP BY/HAVING → 归主键闭窗口直解（commit c8a5388）。回归 `p141_txn_group_by_between_window`（HAVING/ORDER BY 同源，42 txn 绿）。VM 重建 release cjserver 后重验：SCC txn_agg_group 注现含 `gb=[active|2|3;b|2|3;c|1|1];having=[active|2;b|2]` 与 MariaDB 逐字节一致（此前 SCC 该注缺 gb/having = 窗口 GROUP BY 空跑）。
+  2. **txn_agg_group 探针假绿**：`run_txn_agg` 仅 rows 非空才断言 → SCC 窗口 GROUP BY 0 行被静默跳过（exp-ok 但 gb/having 从未真验）。修复：期望非空步骤 0 行强制判失败（commit c8a5388）。
+  - **遗留（P127 族，另行排期）**：nontxn `GROUP BY + id BETWEEN` 仍 0 行（行查询 P127 已修、分组执行器 execute_group_by_window 未剥离主键 id/docid 谓词复检）——见下"待排期"。
+- 复测后 SCC 库行态：rerun-full 写探针 + 清理 best-effort 后 COUNT(*) ≈50.3 万（N 自留 50 万基线略浮动，探针自适应自洽，非对拍差异）。
