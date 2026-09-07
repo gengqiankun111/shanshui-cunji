@@ -25,7 +25,9 @@ impl Default for SstableConfig {
         Self {
             compression: "zstd".into(),
             compression_level: 3,
-            compression_level_l2: 0,
+            // B1（Ex-8.12 默认化，2026-09-07）：L2+ 冷档 zstd19 默认开启——50m 实测省磁盘
+            // ~39-41.8%、P80 阻塞已解除；flush→L0/L0-L1 合并仍热档 3（防中间层放大）。
+            compression_level_l2: 19,
             bloom_fpr: 0.01,
             // Ex-5.1：与 4KB 块联动（块数 ×4），64 粒度保持 L1 摘要内存与 16KB 块×16 相当
             // （demo 实测 4KB+g64 vs 16KB+g16 摘要数比例 0.99）。

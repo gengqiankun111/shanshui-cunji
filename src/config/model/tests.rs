@@ -6,6 +6,8 @@ fn defaults_are_valid() {
     assert!(cfg.validate().is_ok());
     assert_eq!(cfg.hotcache.eviction_policy, "lfu");
     assert_eq!(cfg.sstable.compression, "zstd");
+    assert_eq!(cfg.sstable.compression_level, 3);
+    assert_eq!(cfg.sstable.compression_level_l2, 19, "B1 Ex-8.12：L2+ 冷档 zstd19 默认开启");
     assert_eq!(cfg.storage.l0_stall_threshold, 12);
     assert!(cfg.storage.deletion_bitmap_enabled, "删除位图默认开启（Ex-5.6）");
 }
