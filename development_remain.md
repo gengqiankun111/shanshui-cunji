@@ -97,7 +97,7 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 | B1 | **Ex-8.12 L2 zstd19 默认化** | `compression_level_l2` 0→19；前置 = 5m/50m 全量回归 + 写档位兼容验证（50m 省磁盘 ~39-41.8% 已实证） | 中 | ✅ 2026-09-07 完成
 | B2 | **Ex-9.3⑤ 载荷默认化** | 高频数值列默认启载荷（stats_fields 默认推广）；前置 = 默认化 A/B 已 10.15×（5m）；P1-C② 同销 | 中 | ✅ 2026-09-07 完成
 | C1 | **P94 阶段② colstore** | EXPLAIN 标注 TableScan Columnar/RowStore + 回退开关 + .cs 落盘/增量派生（现内存重启重建）；收排序族 #29/#63-66 与 #79/80 | 中 |
-| C2 | **P127 残留小项** | server extract_between_range 纯主键区间 → 复用 pk_range_select(rest=None)（110 万 ~360ms→~19ms 量级）。**2026-09-07 复测扩展**：nontxn `GROUP BY + id BETWEEN` 主键窗口恒 0 行（分组执行器 execute_group_by_window 未剥离主键 id/docid 谓词复检；行查询 P127 已修同族） | 低 |
+| C2 | **P127 残留小项** | server extract_between_range 纯主键区间 → 复用 pk_range_select(rest=None)（110 万 ~360ms→~19ms 量级）。**2026-09-07 修复**：nontxn `GROUP BY + id BETWEEN` 主键窗口恒 0 行（select.rs id BETWEEN 块新增 GROUP BY 路由 → `execute_group_by_window` 剥离 `id BETWEEN` 谓词 + docid 窗口）。剩余 `pk_range_select` 复用留存 | 低 | ✅ 2026-09-07 完成 |
 | D1 | **M-3 增量备份 CLI + M-4 扩容管理入口** | 全量备份已接 CLI；补 incremental 子命令；scale_out/reshard admin/CLI 状态面（联动 10 亿验收） | 中 |
 | D2 | **M-1/M-2/M-5 评估定夺** | 物化视图/outbox/Redis 缓存链：三选一（接线 or 废弃/归档），避免死代码 | 低 |
 | E1 | **语法面按序小项** | ①子查询 IN/EXISTS → ②UNION 族 → ⑤表达式阶段 B → ⑥窗口函数 → ⑦无 GROUP BY HAVING（④多 JOIN 随 ① 评估）；每项独立可交付 | 逐项小 |

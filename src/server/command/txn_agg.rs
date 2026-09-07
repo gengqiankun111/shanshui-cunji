@@ -463,7 +463,7 @@ impl GroupAgg {
 }
 
 /// 分组结果响应（列类型推断/行列字节组装——对齐 select.rs 非事务 GROUP BY 响应构造）。
-fn group_response(gr: &crate::sql::executor::group_by::GroupResult) -> QueryResponse {
+pub(crate) fn group_response(gr: &crate::sql::executor::group_by::GroupResult) -> QueryResponse {
     let mut columns: Vec<Vec<u8>> = Vec::new();
     for name in &gr.group_cols {
         let Some(level) = gr.group_fields.iter().position(|f| f == name) else {

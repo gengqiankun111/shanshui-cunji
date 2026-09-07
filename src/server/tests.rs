@@ -3341,6 +3341,76 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn p141_nontxn_group_by_between_window() {
+        // C2 修复（2026-09-07）：nontxn GROUP BY + id BETWEEN 在 select_response 的
+        // id BETWEEN 块中被聚合短路拦截（仅对 k 字段求和，忽略 GROUP BY），导致
+        // execute_group_by_window 不执行。修复：id BETWEEN 块新增 GROUP BY 检测，
+        // 剥离 id BETWEEN 谓词后传 docid 窗口给 execute_group_by_window。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        let auto = std::sync::Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(std::sync::Arc::clone(&auto));
+        let mut q = |e: &mut Engine, sql: &str| super::dispatch_query(e, sql, &mut s);
+        let rows_of = |r: QueryResponse| -> Vec<Vec<String>> {
+            match r {
+                QueryResponse::Set { rows, .. } => rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|c| {
+                                if c == vec![MYSQL_NULL_CELL] {
+                                    "NULL".to_string()
+                                } else {
+                                    String::from_utf8_lossy(&c).into_owned()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                other => panic!("非结果集响应: Err/Ok 不应出现"),
+            }
+        };
+        for (id, k, sval) in
+            [(1, 1, "a"), (2, 2, "b"), (3, 3, "a"), (4, 4, "b"), (5, 5, "c")]
+        {
+            let doc = format!("{{\"k\":{k},\"s\":\"{sval}\"}}");
+            assert!(matches!(
+                q(
+                    &mut e,
+                    &format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')")
+                ),
+                QueryResponse::Ok(..)
+            ));
+        }
+        // nontxn GROUP BY + id BETWEEN → 应返回分组结果
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*) FROM documents WHERE id BETWEEN 1 AND 3 GROUP BY s ORDER BY s"
+            )),
+            vec![vec!["a", "2"], vec!["b", "1"]],
+            "nontxn GROUP BY + id BETWEEN 须走 execute_group_by_window（a×2 b×1）"
+        );
+        // HAVING 组合
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*) FROM documents WHERE id BETWEEN 1 AND 3 GROUP BY s HAVING COUNT(*) >= 2 ORDER BY s"
+            )),
+            vec![vec!["a", "2"]],
+            "HAVING 组合同源可达"
+        );
+        // 标量聚合回归（不受影响）
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 3"
+            )),
+            vec![vec!["6"]]
+        );
+    }
+
+    #[test]
     fn txn_update_delete_between_window() {
         // A1-1（2026-09-07）：事务内 UPDATE/DELETE … WHERE id BETWEEN 主键闭窗口直解——
         // 修复：BETWEEN 误走字段候选 + doc 复检（doc JSON 无 id 字段 → 主键谓词恒假 → 窗口恒

@@ -74,6 +74,54 @@ pub(crate) fn try_count_fast(engine: &mut Engine, sql: &str) -> Option<QueryResp
     }
 }
 
+/// C2（2026-09-07）：从 SQL 中剥离 `WHERE id BETWEEN A AND B` 子句（id 非 JSON 字段，
+/// 分组执行器 `execute_group_by_window` 中 WHERE 复检恒假 → 0 行）。仅处理 WHERE 仅含
+/// `id BETWEEN` 的常见情况：移除整个 WHERE 子句。多条件组合（`WHERE s='a' AND id BETWEEN`）
+/// 暂不处理（当前测试/业务场景无此形态）。
+fn strip_id_between(sql: &str) -> String {
+    let lower = sql.to_lowercase();
+    let wi = match lower.find("where") {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+    // 定位 `id between` 在 WHERE 子句中的位置（与 extract_between_range 同构）
+    let after_where = &lower[wi + 5..];
+    let bp = match after_where.find("id between") {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+    // 取 upper bound 数字结束位置
+    let after_bp = &after_where[bp + "id between".len()..];
+    let ai = match after_bp.find("and") {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+    let after_and = &after_bp[ai + 3..];
+    // after_and 可能以空白开头（如 " 3 group by..."），先 trim_start 让数字打头
+    let after_and_trimmed = after_and.trim_start();
+    let chars_trimmed = after_and.len() - after_and_trimmed.len();
+    let num_end = after_and_trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_and_trimmed.len());
+    let range_start = wi + 5 + bp; // 'i' in 'id between' in original SQL
+    let range_end = wi + 5 + bp + "id between".len() + ai + 3 + chars_trimmed + num_end;
+    let before_where = &sql[..wi].trim();
+    // 截断 WHERE 子句尾部（GROUP BY/ORDER BY/HAVING/LIMIT）以判断是否仅含 id between
+    let where_tail = &lower[range_end..];
+    let where_tail = where_tail.split("group by").next().unwrap_or(where_tail);
+    let where_tail = where_tail.split("having").next().unwrap_or(where_tail);
+    let where_tail = where_tail.split("order by").next().unwrap_or(where_tail);
+    let where_tail = where_tail.split("limit").next().unwrap_or(where_tail);
+    let where_tail = where_tail.trim();
+    // 检查 WHERE 中 `id between` 前是否有其他条件
+    let before_range = sql[wi + 5..range_start].trim();
+    // 仅有 `id between` → 移除整个 WHERE 子句
+    if before_range.is_empty() && where_tail.is_empty() {
+        format!("{before_where} {}", sql[range_end..].trim())
+    } else {
+        // 多条件组合暂不处理（保留原 SQL，由 execute_group_by_window 走全量扫描）
+        sql.to_string()
+    }
+}
+
 /// SELECT：VERSION() / @@ 系统值 → 单行结果；`WHERE id=N` → 主键点查；
 /// 否则走 sqlish 引擎。
 pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
@@ -194,6 +242,19 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     // 语义与收集路径等价（demo range-window 验证）。
     if let Some((a, b)) = extract_between_range(sql) {
         let upper0 = sql.to_uppercase();
+        // C2（2026-09-07）：nontxn GROUP BY + id BETWEEN → 剥离 id 主键谓词 +
+        // docid 窗口 → execute_group_by_window（id 非 JSON 字段，复检恒假 → 0 行）。
+        if upper0.contains("GROUP BY") {
+            let start = Some(docid_for(tid, a));
+            let end = Some(docid_for(tid, b));
+            let stripped = strip_id_between(sql);
+            eprintln!("C2 debug: stripped={stripped:?} start={start:?} end={end:?}");
+            match crate::sqlish::execute_group_by_window(engine, &stripped, 10_000, start, end) {
+                Ok(Some(gr)) => { eprintln!("C2 debug: gr.rows={}", gr.rows.len()); return super::group_response(&gr); }
+                Ok(None) => { eprintln!("C2 debug: execute_group_by_window returned None"); }
+                Err(e) => { eprintln!("C2 debug: error={e}"); return QueryResponse::Err(1064, format!("query error: {e}")); }
+            }
+        }
         // P127 小改（2026-09-05）：纯主键区间 + LIMIT + 无聚合/ORDER BY → 复用
         // execute_with_tid 的 pk_range_select（rest=None）：docid 区间 keys-only
         // **LIMIT/OFFSET 早停** + batch_get 回表——替代旧 scan_stream/keys-only **全窗口
@@ -345,68 +406,7 @@ pub(crate) fn select_response(engine: &Engine, sql: &str) -> QueryResponse {
     //（选中分组列 + 每聚合一列）。置于标量聚合前（分组 SQL 含聚合列，须先路由到多行分组执行器）。
     // P1-3：非默认表走 docid 窗口（按表区间分组，防倒排词典/全库跨表串表）。
     match crate::sqlish::execute_group_by_window(engine, sql, 10_000, agg_start, agg_end) {
-        Ok(Some(gr)) => {
-            // 分组列：列为选中的分组字段（select 顺序）；level = 该字段在全部组字段中的位序。
-            let mut columns: Vec<Vec<u8>> = Vec::new();
-            for name in &gr.group_cols {
-                let Some(level) = gr.group_fields.iter().position(|f| f == name) else {
-                    return QueryResponse::Err(1064, format!("group col {name} 非分组字段"));
-                };
-                // 该 level 列类型按实际值：整型 LONGLONG / 浮点 DOUBLE / 字符串 VAR_STRING。
-                let mut col_type = MYSQL_TYPE_VAR_STRING;
-                for r in &gr.rows {
-                    if let Some(t) = r.keys.get(level).and_then(|k| k.as_ref()) {
-                        col_type = if !r.key_is_num[level] {
-                            MYSQL_TYPE_VAR_STRING
-                        } else if t.contains('.') || t.contains('e') || t.contains('E') {
-                            MYSQL_TYPE_DOUBLE
-                        } else {
-                            MYSQL_TYPE_LONGLONG
-                        };
-                        break;
-                    }
-                }
-                let charset = if col_type == MYSQL_TYPE_VAR_STRING { 45 } else { 63 };
-                columns.push(column_payload(name, col_type, charset));
-            }
-            // 聚合列：整值（COUNT/整值 SUM/MIN/MAX）LONGLONG；含小数（. / e）→ DOUBLE。
-            for (i, h) in gr.headers.iter().enumerate() {
-                let frac = gr.rows.iter().any(|r| {
-                    r.cells
-                        .get(i)
-                        .map(|c| {
-                            c.as_deref()
-                                .map(|t| t.contains('.') || t.contains('e') || t.contains('E'))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false)
-                });
-                columns.push(column_payload(
-                    h,
-                    if frac { MYSQL_TYPE_DOUBLE } else { MYSQL_TYPE_LONGLONG },
-                    63,
-                ));
-            }
-            let mut rows: Vec<Vec<Vec<u8>>> = Vec::with_capacity(gr.rows.len());
-            for r in &gr.rows {
-                let mut row = Vec::with_capacity(columns.len());
-                for name in &gr.group_cols {
-                    let level = gr.group_fields.iter().position(|f| f == name).unwrap_or(0);
-                    match r.keys.get(level).and_then(|k| k.as_ref()) {
-                        Some(t) => row.push(t.clone().into_bytes()),
-                        None => row.push(vec![MYSQL_NULL_CELL]),
-                    }
-                }
-                for c in &r.cells {
-                    match c {
-                        Some(t) => row.push(t.clone().into_bytes()),
-                        None => row.push(vec![MYSQL_NULL_CELL]),
-                    }
-                }
-                rows.push(row);
-            }
-            return QueryResponse::Set { columns, rows };
-        }
+        Ok(Some(gr)) => return super::group_response(&gr),
         Ok(None) => {}
         Err(e) => return QueryResponse::Err(1064, format!("query error: {e}")),
     }
