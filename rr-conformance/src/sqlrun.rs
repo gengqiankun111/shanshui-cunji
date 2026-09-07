@@ -817,8 +817,11 @@ fn run_txn_agg(conn: &mut mysql::Conn, name: &str, upd_lo: u64) -> Result<(usize
             rollback(conn);
             return Err(format!("{label}: {e}"));
         }
-        // 聚合读步骤：记录规范化行集签名（有期望则断言）
-        if !r.rows.is_empty() {
+        // 聚合读步骤：记录规范化行集签名（有期望则断言）。
+        // A1-3 完整复测（2026-09-07）：**期望非空但实际 0 行必须判失败**——旧逻辑只在
+        // rows 非空时断言，SCC 窗口 GROUP BY 因主键 BETWEEN 复检剔光返回 0 行被静默跳过 →
+        // txn_agg_group 假绿（exp-ok 但 gb/having 从未真验）。exp=Some 即强制比对（空行→fail）。
+        if !r.rows.is_empty() || exp.is_some() {
             let keys = crate::compare::rows_to_keys(&r.rows);
             sig.push_str(&format!("{label}=[{}];", keys.join(";")));
             last_rows = r.rows.len();

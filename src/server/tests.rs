@@ -3268,6 +3268,79 @@ use crate::multitable::drop_table_range;
     }
 
     #[test]
+    fn p141_txn_group_by_between_window() {
+        // A1-3 完整复测发现（2026-09-07）：GROUP BY + id BETWEEN（主键窗口）在 SCC 恒 0 行——
+        // extract_between_range 尾部只截 ORDER BY/LIMIT，`... BETWEEN 1 AND 3 GROUP BY s` 的
+        // b 端解析被 "group by s" 污染失败 → txn 落字段谓词复检（JSON 无 id → 恒假 → 空）。
+        // 修复（transaction.rs）：WHERE 尾截断补 GROUP BY/HAVING → 归主键闭窗口直解。本测试即回归。
+        // 注：nontxn GROUP BY + id BETWEEN 0 行属 P127 族遗留（行查询已修、分组执行器未剥离主键
+        // 谓词），记录 development_remain 另行排期。
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), &crate::config::Config::default()).unwrap();
+        let auto = std::sync::Arc::new(AtomicU64::new(1));
+        let mut s = super::new_session(std::sync::Arc::clone(&auto));
+        let mut q = |e: &mut Engine, sql: &str| super::dispatch_query(e, sql, &mut s);
+        let rows_of = |r: QueryResponse| -> Vec<Vec<String>> {
+            match r {
+                QueryResponse::Set { rows, .. } => rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|c| {
+                                if c == vec![MYSQL_NULL_CELL] {
+                                    "NULL".to_string()
+                                } else {
+                                    String::from_utf8_lossy(&c).into_owned()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                other => panic!("非结果集响应: Err/Ok 不应出现"),
+            }
+        };
+        for (id, k, sval) in
+            [(1, 1, "a"), (2, 2, "b"), (3, 3, "a"), (4, 4, "b"), (5, 5, "c")]
+        {
+            let doc = format!("{{\"k\":{k},\"s\":\"{sval}\"}}");
+            assert!(matches!(
+                q(
+                    &mut e,
+                    &format!("INSERT INTO documents (id, doc) VALUES ({id}, '{doc}')")
+                ),
+                QueryResponse::Ok(..)
+            ));
+        }
+        assert!(matches!(q(&mut e, "BEGIN"), QueryResponse::Ok(..)));
+        // id BETWEEN 窗口 + GROUP BY（含 ORDER BY/H 形态）→ Between 源权威行流
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*) FROM documents WHERE id BETWEEN 1 AND 3 GROUP BY s ORDER BY s"
+            )),
+            vec![vec!["a", "2"], vec!["b", "1"]],
+            "txn GROUP BY + id BETWEEN 窗口须走主键闭窗口直解（a×2 b×1）"
+        );
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT s, COUNT(*) FROM documents WHERE id BETWEEN 1 AND 3 GROUP BY s HAVING COUNT(*) >= 2 ORDER BY s"
+            )),
+            vec![vec!["a", "2"]],
+            "HAVING 组合同源可达"
+        );
+        // 窗口标量对照不受影响
+        assert_eq!(
+            rows_of(q(
+                &mut e,
+                "SELECT SUM(k) FROM documents WHERE id BETWEEN 1 AND 3"
+            )),
+            vec![vec!["6"]]
+        );
+        assert!(matches!(q(&mut e, "ROLLBACK"), QueryResponse::Ok(..)));
+    }
+
+    #[test]
     fn txn_update_delete_between_window() {
         // A1-1（2026-09-07）：事务内 UPDATE/DELETE … WHERE id BETWEEN 主键闭窗口直解——
         // 修复：BETWEEN 误走字段候选 + doc 复检（doc JSON 无 id 字段 → 主键谓词恒假 → 窗口恒

@@ -493,7 +493,12 @@ pub(crate) fn extract_between_range(sql: &str) -> Option<(u64, u64)> {
     let lower = sql.to_lowercase();
     let w = lower.find("where")?;
     let rest = &lower[w + 5..];
+    // A1-3 复测（2026-09-07）：GROUP BY/HAVING 尾部须截断——旧实现只截 ORDER BY/LIMIT →
+    // `... id BETWEEN 1 AND 3 GROUP BY s` 的 b 端解析被 "group by s" 污染失败 → 落字段谓词
+    // 复检（JSON 无 id → 恒假 → 0 行）；截断后归主键闭窗口直解（txn_agg Between 源权威行流）。
     let rest = rest.split("order by").next()?;
+    let rest = rest.split("group by").next()?;
+    let rest = rest.split("having").next()?;
     let rest = rest.split("limit").next()?;
     let rest = rest.trim();
     // 仅限 `id between`（排除 k/其他列 BETWEEN）
@@ -510,7 +515,10 @@ pub(crate) fn extract_target_ids(sql: &str) -> Option<Vec<u64>> {
     let lower = sql.to_lowercase();
     let w = lower.find("where")?;
     let rest = &lower[w + 5..];
+    // GROUP BY/HAVING 尾部截断（对齐 extract_between_range；防 b 端/IN 后被聚合子句污染）
     let rest = rest.split("order by").next()?;
+    let rest = rest.split("group by").next()?;
+    let rest = rest.split("having").next()?;
     let rest = rest.split("limit").next()?;
     let rest = rest.trim();
     // id = N
