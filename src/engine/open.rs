@@ -269,10 +269,15 @@ impl Engine {
             gc_stop: None,
             gc_thread: None,
             flush_log_at_trx_commit: cfg.storage.flush_log_at_trx_commit,
-            inverted_include: if cfg.inverted.inverted_fields.is_empty() {
-                None
-            } else {
+            inverted_include: if cfg.inverted.declared_only
+                || !cfg.inverted.inverted_fields.is_empty()
+            {
+                // 声明制（P131b）：白名单来自库内 schema / --config；fields 空 = Some(空集)
+                // → 引擎写路径零倒排（不再回退 legacy 全字段）。
                 Some(cfg.inverted.inverted_fields.iter().cloned().collect())
+            } else {
+                // legacy：无任何声明 → None = 全字段建词条（仅引擎内部/旧装载路径）
+                None
             },
             inverted_exclude: cfg.inverted.exclude_fields.iter().cloned().collect(),
             max_term_len: cfg.inverted.max_term_len,
@@ -353,6 +358,9 @@ impl Engine {
         // 旧库无 cidx/崩溃丢键）时 open 期从 primary 回扫重建（正常会话零开销跳过）。
         // 置于 worker 启动前：重建期无并发写，flush 落 SST + 写 cidx.sig 标记幂等。
         engine.ensure_composite_index_backfill()?;
+        // 倒排存量补建（对等 Task-028）：schema 声明 inverted_fields 时，若库为
+        // 存量导入/旧声明 → open 期全量重建倒排词条（幂等，见 ensure_inverted_backfill）。
+        engine.ensure_inverted_backfill()?;
         // P130（2026-09-05）：open 回放后 memtable **超阈** → 主动刷盘落 SST——open 期
         // WAL/队列回放不逐批 flush（回放直接进 memtable，阈值检查只在写路径），只读服务
         // 启动后大 memtable 无限期驻留：区间/全表扫描需跨 memtable+段 k 路归并，实测慢 ~10×

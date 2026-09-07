@@ -2322,6 +2322,45 @@ use crate::optimizer::QuerySpec;
     }
 
     #[test]
+    fn declared_only_empty_is_zero_inverted_then_backfill_rebuilds() {
+        // P131b 声明制（服务入口语义）：空白名单 = 零倒排（不再隐式全字段建）；
+        // 随后声明字段 → open 期 ensure_inverted_backfill 从 primary 重建词条（幂等）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.inverted.declared_only = true;
+        cfg.inverted.inverted_fields = vec![]; // 显式零倒排
+        let mut e = Engine::open(dir.path(), &cfg).unwrap();
+        let doc = json!({"docid": 1, "status": "active", "city": "beijing"});
+        let terms = crate::server::extract_terms(&doc);
+        let t: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        e.put(1, serde_json::to_vec(&doc).unwrap(), &t).unwrap();
+        e.flush_inverted().unwrap();
+        assert_eq!(
+            e.inverted_doc_count("status=active").unwrap_or(0),
+            0,
+            "声明制空白名单 = 不建任何倒排词条"
+        );
+        drop(e);
+        // 二次 open：声明 status/city → 倒排补建（purge 旧段 + 扫 primary 重建）
+        cfg.inverted.inverted_fields = vec!["status".into(), "city".into()];
+        let mut e2 = Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            e2.inverted_doc_count("status=active").unwrap_or(0),
+            1,
+            "open 期倒排补建应重建存量词条"
+        );
+        assert_eq!(e2.inverted_doc_count("city=beijing").unwrap_or(0), 1);
+        drop(e2);
+        // 三次 open：声明未变 → 零开销跳过（幂等，不重复/不 purge）
+        let mut e3 = Engine::open(dir.path(), &cfg).unwrap();
+        assert_eq!(
+            e3.inverted_doc_count("status=active").unwrap_or(0),
+            1,
+            "sig 一致 = 跳过重建，词条保留"
+        );
+    }
+
+    #[test]
     fn put_get_roundtrip() {
         let mut e = Engine::open(&tmp(), &cfg()).unwrap();
         e.put(1, b"doc-1".to_vec(), &["rust"]).unwrap();

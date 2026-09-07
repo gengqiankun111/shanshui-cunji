@@ -241,10 +241,13 @@ impl Engine {
     }
 
 
-    /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 黑名单（排除字段）→ 超长 term 自动跳过。
+    /// 倒排 term 过滤（M8-P4）：白名单（只建声明字段）→ 超长 term 自动跳过。
     /// term 编码 `field=value`，field 为 JSON 字段路径（嵌套用 `.` 连接）。
     /// fulltext 词 term（`ft:{field}:{token}`）与 inverted_fields 白名单正交：是否建索引
-    /// 由 fulltext_fields 声明决定（白名单非空时 ft: term 不被滤掉，否则无法分词检索）。
+    /// 由 fulltext_fields 声明决定（ft: term 不受白名单过滤，否则无法分词检索）。
+    /// P131b 双态（2026-09-07）：`inverted_include = Some(声明集)` = 显式声明制
+    /// （服务入口 cjserver/库内 schema 恒为此态，空集即零倒排）；`None` = legacy 全字段
+    /// （仅供引擎内部 API/单元测试与旧装载路径，产品服务不再进入此态）。
     fn inverted_allowed(&self, term: &str) -> bool {
         // 超长 term（长文本整串）自动跳过：防止误配下字典膨胀
         if self.max_term_len > 0 && term.len() > self.max_term_len {
@@ -255,10 +258,115 @@ impl Engine {
             return self.fulltext_fields.contains(field);
         }
         let field = term.split('=').next().unwrap_or("");
-        if let Some(include) = &self.inverted_include {
-            return include.contains(field);
+        match &self.inverted_include {
+            Some(include) => include.contains(field) && !self.inverted_exclude.contains(field),
+            None => !self.inverted_exclude.contains(field), // legacy 全字段
         }
-        !self.inverted_exclude.contains(field)
+    }
+
+    /// schema 倒排声明补建（open 期，与 ensure_composite_index_backfill 对等）：
+    /// 库以**无倒排声明**装载/导入后，才在 cj.schema.json 声明 `inverted_fields`
+    /// ——存量行从未生成词条（倒排只随写路径累积）。本方法检测声明签名变化后
+    /// **全量重建倒排**（purge 旧段 → 扫 primary 活跃行 → 按当前声明白名单重建词条
+    /// 与显式 stats 载荷 → 落段 → 写 `inverted.sig`），幂等、重启安全。
+    ///
+    /// 说明：
+    /// - `inverted_include = None`（legacy 全字段态，仅引擎内部/旧装载）→ no-op，不补建；
+    /// - Some(声明集)（声明制，含空集）→ 重建：posting 是集合语义（跨段按位图并集合并），
+    ///   全量重建前仍 purge 旧段，避免旧声明字段残留词条与重复 posting 的空间浪费；
+    /// - 显式 `stats_fields` 随重建累积统计载荷；默认 auto 动态统计模式不补
+    ///   （与运行期"新写才累积"行为一致）；
+    /// - fulltext 分词词条不在此重建（token 提取需独立分词，若库需要 fulltext
+    ///   存量索引请按 schema 声明后重新导入）。
+    pub(crate) fn ensure_inverted_backfill(&self) -> Result<()> {
+        let Some(include) = &self.inverted_include else {
+            return Ok(());
+        };
+        // 签名：白名单字段排序 join（声明变化 → 重建）
+        let mut fs: Vec<&str> = include.iter().map(|s| s.as_str()).collect();
+        fs.sort_unstable();
+        let sig = format!("inv:{}", fs.join(","));
+        let marker = self.data_dir.join("inverted.sig");
+        if self.primary.data_empty() {
+            if std::fs::read_to_string(&marker).unwrap_or_default() != sig {
+                let _ = std::fs::write(&marker, &sig);
+            }
+            return Ok(());
+        }
+        let cur = std::fs::read_to_string(&marker).unwrap_or_default();
+        if cur == sig {
+            return Ok(()); // 正常会话 / 已按当前声明重建过 → 零开销跳过
+        }
+        println!(
+            "[engine] 倒排声明变更（{} → {}），全量重建倒排词条（扫 primary）…",
+            if cur.is_empty() { "<无>" } else { cur.as_str() },
+            sig
+        );
+        self.inverted.purge_all()?;
+        let mut n = 0usize;
+        let mut items: Vec<(String, u64)> = Vec::with_capacity(8192);
+        let mut stats_cache: Vec<Option<f64>> = Vec::new();
+        self.primary.scan_stream(None, None, |key, val| {
+            let docid = crate::keys::decode_docid(key).map_err(|_| {
+                crate::error::Error::Corrupted("倒排重建扫描 key 非 docid 编码".into())
+            })?;
+            if self
+                .deletion_bitmap
+                .as_ref()
+                .map(|b| b.is_deleted(docid))
+                .unwrap_or(false)
+            {
+                return Ok(true); // 删除位图已删：不入倒排
+            }
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(val) else {
+                return Ok(true); // 非 JSON 文档：无字段可取（与写路径语义一致）
+            };
+            let Some(obj) = v.as_object() else { return Ok(true) };
+            let stats = if self.stats_fields.is_empty() {
+                Vec::new()
+            } else {
+                stats_cache.clear();
+                for f in &self.stats_fields {
+                    stats_cache.push(obj.get(f).and_then(|x| x.as_f64()));
+                }
+                stats_cache.clone()
+            };
+            for (k, val) in obj {
+                // 与写路径（server extract_terms_filtered）一致：仅字符串值生成倒排词条
+                // （数值/布尔不进倒排——范围语义归组合索引/全扫）；主键 docid 不作词条。
+                if k == "docid" || !include.contains(k) {
+                    continue;
+                }
+                let serde_json::Value::String(s) = val else {
+                    continue;
+                };
+                let term = format!("{k}={s}");
+                if !self.inverted_allowed(&term) {
+                    continue; // 超长 / 排除字段同写路径 gate
+                }
+                if !stats.is_empty() {
+                    self.inverted.add_stats(&term, &stats);
+                }
+                items.push((term, docid));
+                n += 1;
+                if items.len() >= 8192 {
+                    let refs: Vec<(&str, u64)> =
+                        items.iter().map(|(t, d)| (t.as_str(), *d)).collect();
+                    self.inverted.add_batch(&refs);
+                    items.clear();
+                }
+            }
+            Ok(true)
+        })?;
+        if !items.is_empty() {
+            let refs: Vec<(&str, u64)> = items.iter().map(|(t, d)| (t.as_str(), *d)).collect();
+            self.inverted.add_batch(&refs);
+        }
+        self.inverted.flush_segment()?;
+        std::fs::write(&marker, &sig)
+            .map_err(|e| crate::error::Error::Io(std::io::Error::other(format!("写 inverted.sig 失败: {e}"))))?;
+        println!("[engine] 倒排重建完成：{n} 词条已落段");
+        Ok(())
     }
 
     /// Ex-9.1：mysql `COUNT WHERE f='v'` 快路径可路由判定——字段须已建索引且计数是亚毫秒级：

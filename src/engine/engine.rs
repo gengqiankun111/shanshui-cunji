@@ -63,9 +63,11 @@ pub struct Engine {
     pub(crate) gc_stop: Option<Arc<AtomicBool>>,
     /// 组提交后台线程句柄。
     pub(crate) gc_thread: Option<std::thread::JoinHandle<()>>,
-    /// 倒排字段白名单（M8-P4）：Some = 只建声明字段倒排；None = 全部（黑名单仍生效）。
+    /// 倒排字段白名单（M8-P4 / P131b）：Some = 只建声明字段倒排（**空集 = 声明制零倒排**，
+    /// 服务入口 cjserver/库内 schema 恒为 Some）；None = legacy 全字段（黑名单仍生效，
+    /// 仅供引擎内部 API/单元测试与旧装载路径）。
     pub(crate) inverted_include: Option<std::collections::HashSet<String>>,
-    /// 倒排字段黑名单（M8-P4）：这些字段不建倒排（白名单非空时忽略）。
+    /// 倒排字段黑名单（M8-P4）：这些字段不建倒排（对白名单的补充排除；legacy 下排除全字段）。
     pub(crate) inverted_exclude: std::collections::HashSet<String>,
     /// 倒排 term 长度上限（M8-P4）：超过自动跳过（长文本整串不进字典）；0 = 不限。
     pub(crate) max_term_len: usize,

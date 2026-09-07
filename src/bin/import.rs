@@ -96,27 +96,26 @@ fn main() {
     }
 
     // import-schema（design 20）：预注册字段 + 倒排白名单
-    let whitelist: Option<Vec<String>> = if let Some(sp) = &schema_path {
+    let schema_opt: Option<ImportSchema> = if let Some(sp) = &schema_path {
         match ImportSchema::load(sp) {
             Ok(schema) => {
-                match schema.apply() {
-                    Ok(rep) => {
-                        println!(
-                            "✅ schema 应用: 字段 {} 个（倒排白名单 {}，组合索引 {} 个，时间游标 {:?}）",
-                            rep.fields.len(),
-                            rep.inverted_fields
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|| "全部".into()),
-                            rep.composite_keys,
-                            rep.timestamp_field
-                        );
-                    }
+                let rep = match schema.apply() {
+                    Ok(rep) => rep,
                     Err(e) => {
                         eprintln!("❌ schema 应用失败: {e}");
                         std::process::exit(1);
                     }
-                }
-                schema.term_filter()
+                };
+                println!(
+                    "✅ schema 应用: 字段 {} 个（倒排白名单 {}，组合索引 {} 个，时间游标 {:?}）",
+                    rep.fields.len(),
+                    rep.inverted_fields
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "无（零声明）".into()),
+                    rep.composite_keys,
+                    rep.timestamp_field
+                );
+                Some(schema)
             }
             Err(e) => {
                 eprintln!("❌ schema 加载失败: {e}");
@@ -126,6 +125,12 @@ fn main() {
     } else {
         None
     };
+    // 零默认语义（P131b）：schema 声明与引擎 gate 同步——倒排白名单/组合索引以
+    // schema（--schema）为准写进 cfg；未声明 inverted_fields → 空（无倒排）。
+    let whitelist: Option<Vec<String>> = schema_opt.as_ref().map(|s| {
+        let w = s.inverted_fields.clone().unwrap_or_default();
+        w
+    });
 
     let mut cfg = match Config::load(&config_path) {
         Ok(c) => c,
@@ -139,6 +144,13 @@ fn main() {
     }
     if let Some(eng) = &inverted_engine {
         cfg.inverted.engine = eng.clone();
+    }
+    // 引擎 gate 与 schema 声明同步（声明制，无内置默认）：倒排白名单与组合索引声明进入
+    // cfg，open 期 write gate / cidx 写路径按声明工作；--schema 缺省 inverted_fields → 空 = 零倒排。
+    if let Some(is) = &schema_opt {
+        cfg.inverted.declared_only = true;
+        cfg.inverted.inverted_fields = is.inverted_fields.clone().unwrap_or_default();
+        cfg.storage.composite_indexes = is.composite_indexes.clone();
     }
     let data_dir = PathBuf::from(&cfg.storage.data_dir);
     let mut engine = match shanshui_cunji::engine::Engine::open(&data_dir, &cfg) {
@@ -189,6 +201,27 @@ fn main() {
         Err(e) => {
             eprintln!("❌ 导入失败: {e}");
             std::process::exit(1);
+        }
+    }
+    // 库内 schema 落盘（自描述库）：--schema 给出的索引声明写入 <data-dir>/cj.schema.json，
+    // 之后 cjserver 打开库无需 --config 即可按表装配索引。
+    if let Some(is) = &schema_opt {
+        let db_schema = shanshui_cunji::schema_store::DbSchema {
+            tables: vec![shanshui_cunji::schema_store::TableSchema::from_import(
+                "documents", is, &cfg,
+            )],
+        };
+        match db_schema.save_dir(&data_dir) {
+            Ok(()) => println!(
+                "✅ 库内 schema 已写入: {}",
+                data_dir
+                    .join(shanshui_cunji::schema_store::SCHEMA_FILE)
+                    .display()
+            ),
+            Err(e) => {
+                eprintln!("❌ 库内 schema 写入失败: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

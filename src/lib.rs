@@ -61,6 +61,7 @@ pub mod raft_rpc;
 pub mod saga;
 pub mod scale_out;
 pub mod schema;
+pub mod schema_store;
 pub mod sdk_cache;
 pub mod seqlock;
 pub mod shard_build;

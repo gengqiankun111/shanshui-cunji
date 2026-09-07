@@ -78,6 +78,46 @@ fn main() {
             }
         }
     };
+    // 库内 schema（cj.schema.json）：按表的**显式索引声明**（无内置默认）。
+    // schema 是索引声明的权威来源——存在时覆盖 cfg 中的倒排/组合/位图等声明项
+    // （--config 只承载运行参数：缓存/组提交/看门狗等）。引擎当前为单逻辑表，
+    // 目标取 documents，缺失则用首张声明表。
+    match shanshui_cunji::schema_store::DbSchema::load_dir(&data_dir) {
+        Ok(Some(db_schema)) => {
+            let target = db_schema
+                .table("documents")
+                .or_else(|| db_schema.tables.first());
+            match target {
+                Some(t) => {
+                    t.apply_to_cfg(&mut cfg);
+                    println!(
+                        "[cjserver] 库内 schema 装配表 '{}': 倒排 {} 字段, 组合 {} 组, 位图 {} 字段, fulltext {} 字段",
+                        t.name,
+                        t.inverted_fields.len(),
+                        t.composite_indexes.len(),
+                        t.bitmap_fields.len(),
+                        t.fulltext_fields.len()
+                    );
+                }
+                None => println!("[cjserver] cj.schema.json 无表声明 → 零索引模式"),
+            }
+        }
+        Ok(None) => {
+            // 无库内 schema：全凭 --config / 声明制（P131b，缺省 inverted_fields = 零索引，
+            // 绝不回退 legacy 全字段隐式建倒排）。
+            cfg.inverted.declared_only = true;
+            if cfg.inverted.inverted_fields.is_empty() && cfg.storage.composite_indexes.is_empty()
+            {
+                println!(
+                    "[cjserver] 数据目录无 cj.schema.json 且未声明索引 → 零索引模式（可写 cj.schema.json 声明倒排/组合索引）"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ 库内 schema 读取失败: {e}");
+            std::process::exit(1);
+        }
+    }
     // 组提交默认已开（config `storage.group_commit_us` 默认 1000µs，2026-09-05 起）——
     // MySQL 协议接入无需再强制：逐行 put 走组提交窗口一次 fsync（P75 根因修复随默认化生效）。
     // 显式 `group_commit_us = 0` 表示用户选择逐条 fsync 强安全（尊重配置，不再覆盖）。
