@@ -95,7 +95,7 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 | A1 | **P141 收尾** | demo/内核确认 + rr 探针用例 + "FOR QUICK 落点（默认权威/加词 O(1) 近似）对照基线"；txn 聚合权威面闭环 | 低（⏳ 2026-09-07 拆解完成） |
 | A2 | **P142 Estimate 接口** | 独立非 SQL 入口（HTTP/命令//stats）+ approx 标注 + live 预热（或首调标注）+ 量级验证；引擎 count_all_docs/count_docs_range 已备零 MVCC 改动 | 低（⏳ 2026-09-07 拆解完成） |
 | B1 | **Ex-8.12 L2 zstd19 默认化** | `compression_level_l2` 0→19；前置 = 5m/50m 全量回归 + 写档位兼容验证（50m 省磁盘 ~39-41.8% 已实证） | 中 | ✅ 2026-09-07 完成
-| B2 | **Ex-9.3⑤ 载荷默认化** | 高频数值列默认启载荷（stats_fields 默认推广）；前置 = 默认化 A/B 已 10.15×（5m）；P1-C② 同销 | 中 |
+| B2 | **Ex-9.3⑤ 载荷默认化** | 高频数值列默认启载荷（stats_fields 默认推广）；前置 = 默认化 A/B 已 10.15×（5m）；P1-C② 同销 | 中 | ✅ 2026-09-07 完成
 | C1 | **P94 阶段② colstore** | EXPLAIN 标注 TableScan Columnar/RowStore + 回退开关 + .cs 落盘/增量派生（现内存重启重建）；收排序族 #29/#63-66 与 #79/80 | 中 |
 | C2 | **P127 残留小项** | server extract_between_range 纯主键区间 → 复用 pk_range_select(rest=None)（110 万 ~360ms→~19ms 量级）。**2026-09-07 复测扩展**：nontxn `GROUP BY + id BETWEEN` 主键窗口恒 0 行（分组执行器 execute_group_by_window 未剥离主键 id/docid 谓词复检；行查询 P127 已修同族） | 低 |
 | D1 | **M-3 增量备份 CLI + M-4 扩容管理入口** | 全量备份已接 CLI；补 incremental 子命令；scale_out/reshard admin/CLI 状态面（联动 10 亿验收） | 中 |
@@ -168,4 +168,5 @@ Bloom 残余：②每 SST bloom/索引元数据入 memory_report；④886ms 尖�
 - [x] B2-2 实现默认化：`Engine` 新增 `auto_stats_fields: Mutex<Vec<String>>`；写路径 `stats_fields` 为空时解析 JSON 自动发现所有数值字段并入 auto 集合（单调增长）；`stats_field_pos` 同时查显式集和 auto 集
 - [x] B2-3 测试：更新 `inverted_stats_fields_accumulate_per_term` 验证默认配置下自动检测 `amount` 字段且 `stats_field_pos("amount")==Some(0)`、非数值字段 `stats_field_pos("status")==None`；显式配置 `stats_fields` 时 auto 集不生效（用户声明覆盖默认化）
 - [x] B2-4 全量回归：801 passed / 0 failed / 4 ignored
+- [x] B2-5 全量性能测试（SCC 87 项探针，2026-09-07）：全部通过（scc_rc=0），包括 82 项标准探针 + 5 项 P141 A1-1 事务聚合探针。所有探针 ok=100%，无失败项。summary: `/home/gqkdb/results-b2-scc/summary.md`
 - 销项 ✅：development_0907.md Ex-9.3⑤ 行标记 DONE + P1-C② 同销（commit 29bc8ee）
