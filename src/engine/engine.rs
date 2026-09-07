@@ -76,6 +76,9 @@ pub struct Engine {
     pub(crate) use_jieba: bool,
     /// Ex-9.3：倒排统计载荷声明字段（`cfg.inverted.stats_fields`，空 = 关闭）。
     pub(crate) stats_fields: Vec<String>,
+    /// B2（Ex-9.3⑤ 默认化，2026-09-07）：`stats_fields` 为空时自动检测文档中数值字段并累积
+    /// 统计载荷；写路径发现新数值字段追加到此集合，查询路径 `stats_field_pos` 亦查此集。
+    pub(crate) auto_stats_fields: Mutex<Vec<String>>,
     /// 写入 Enrich（design 19 / development 5.21）：Some((fail_policy, from_field, to_field)) =
     /// 启用 local 数据源预连接（server /put 走 join::put_with_enrich）；None = 关闭（零开销）。
     pub(crate) enrich: Option<(String, String, String)>,

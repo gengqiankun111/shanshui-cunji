@@ -279,6 +279,7 @@ impl Engine {
             fulltext_fields: cfg.inverted.fulltext_fields.iter().cloned().collect(),
             use_jieba: cfg!(feature = "cjk-jieba") && cfg.inverted.cjk_segmenter == "jieba",
             stats_fields: cfg.inverted.stats_fields.clone(),
+            auto_stats_fields: Mutex::new(Vec::new()),
             // 写入 Enrich（design 19 / development 5.21）：`[enrich] enabled && source=local` 启用
             enrich: if cfg.enrich.enabled && cfg.enrich.source == "local" {
                 Some((

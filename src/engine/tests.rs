@@ -2934,12 +2934,20 @@ use crate::optimizer::QuerySpec;
         let b = e.inverted_term_stats("status=inactive").unwrap();
         assert_eq!(b[0].n, 1);
         assert_eq!(b[0].sum, 5.0);
-        // 未声明 stats_fields（空）→ 不产生统计
+        // B2（Ex-9.3⑤ 默认化，2026-09-07）：stats_fields 为空时自动检测数值字段
         let dir2 = tempfile::tempdir().unwrap();
         let mut e2 = Engine::open(dir2.path(), &crate::config::Config::default()).unwrap();
         e2.put_nosync(1, br#"{"status":"active","amount":10}"#.to_vec(), &["status=active"])
             .unwrap();
-        assert!(e2.inverted_term_stats("status=active").is_none(), "未配置则无统计");
+        // 自动检测到 amount 数值字段 → 应有统计
+        let a2 = e2.inverted_term_stats("status=active").expect("默认化应自动检测统计");
+        assert_eq!(a2.len(), 1, "auto 单字段 amount");
+        assert_eq!(a2[0].n, 1);
+        assert_eq!(a2[0].sum, 10.0);
+        // 查询路径：stats_field_pos 应可定位自动检测字段
+        assert_eq!(e2.stats_field_pos("amount"), Some(0), "默认化应可定位自动检测字段");
+        // 非数值字段 → 不应有 pos
+        assert!(e2.stats_field_pos("status").is_none(), "非数值字段不应在统计中");
     }
 
     #[test]

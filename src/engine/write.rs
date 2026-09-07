@@ -167,8 +167,28 @@ impl Engine {
         // ③ 倒排（内存字典累积，Ex-5.3 攒批：term 先入缓冲，达阈值/查询/flush 时批量刷入）；
         //    M8-P4：白名单/黑名单/超长 term 过滤（长文本整串不进字典，防膨胀）
         //    Ex-9.3 第①步：配置 stats_fields 时解析本文档数值并随 allowed term 累积
+        //    B2（Ex-9.3⑤ 默认化，2026-09-07）：stats_fields 为空时自动检测文档中数值字段。
         let stats = if self.stats_fields.is_empty() {
-            Vec::new()
+            // 默认化：自动检测文档中所有数值字段
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let mut auto = self.auto_stats_fields.lock().unwrap();
+                // 发现新数值字段：追加到 auto 集合（单调增长，写路径累积）
+                for (key, val) in v.as_object().map(|o| o.iter()).into_iter().flatten() {
+                    if val.is_number() && !auto.contains(key) {
+                        auto.push(key.clone());
+                    }
+                }
+                drop(auto); // 提前释放锁
+                // 用当前 auto 集合提取数值（含刚发现的新字段）
+                let auto = self.auto_stats_fields.lock().unwrap();
+                if !auto.is_empty() {
+                    engine_doc_stats(&auto, &value)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
         } else {
             engine_doc_stats(&self.stats_fields, &value)
         };

@@ -79,8 +79,20 @@ impl Engine {
 
     /// Ex-9.3：字段是否声明为倒排统计载荷字段（返回其在 stats_fields 中的位序，
     /// 用于定位 term 统计的对应聚合列）。
+    /// 
+    /// B2（Ex-9.3⑤ 默认化，2026-09-07）：`stats_fields` 为空时自动检查自动检测集合。
     pub fn stats_field_pos(&self, field: &str) -> Option<usize> {
-        self.stats_fields.iter().position(|x| x == field)
+        // 先查显式配置
+        if let Some(pos) = self.stats_fields.iter().position(|x| x == field) {
+            return Some(pos);
+        }
+        // 显式配置非空 → 不自动追加（用户声明覆盖默认化）
+        if !self.stats_fields.is_empty() {
+            return None;
+        }
+        // 默认化：查自动检测集合
+        let auto = self.auto_stats_fields.lock().ok()?;
+        auto.iter().position(|x| x == field).map(|idx| self.stats_fields.len() + idx)
     }
 
     /// Ex-9.3 第④步：倒排词典枚举 `GROUP BY <field>` 聚合行（值, 组行数, 数值统计）。
