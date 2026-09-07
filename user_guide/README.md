@@ -100,7 +100,6 @@
 ```bash
 # 构建
 sudo apt install rustup
-rustup install nightly
 rustup install nightly          # 安装最新的 nightly
 cargo +nightly build --release  # 使用 nightly 编译
 
@@ -109,10 +108,15 @@ cargo +nightly build --release  # 使用 nightly 编译
 # 原生服务（HTTP/TCP/CLI 于同一二进制）
 shanshui-cunji server --config config.toml
 
-# MySQL 协议服务（生态工具直连：库 scc / 表 documents）
+# MySQL 协议服务（生态工具直连：表 documents / 索引随库声明）
 cjserver --data-dir ./data --bind 0.0.0.0:3307 --user root --password 123456
 # 例：mysql -h127.0.0.1 -P3307 -uroot -p123456 -e "INSERT INTO documents(id,doc) VALUES (1,'{\"city\":\"bj\",\"amount\":10}'); SELECT * FROM documents WHERE amount>5 ORDER BY amount DESC;"
 ```
+
+> **索引声明随库（P131b 声明制，2026-09）**：索引不在 `--config` 里声明，而是数据目录内的
+> `cj.schema.json`（每表显式声明倒排字段/位图字段/组合索引）。启动自动装配；**没有声明 = 零索引**
+> （写入不建任何倒排，不再有"默认全字段建倒排"）。快速入门见 [启动数据库.md](./启动数据库.md)，
+> 完整声明格式与补建机制见 [库内schema索引声明.md](./库内schema索引声明.md)。
 
 ### 数据模型
 
@@ -168,9 +172,13 @@ curl 'http://localhost:8080/estimate?field=status&value=active&range=1-100000'
 全量配置项与默认值见 [design.md](../design.md) 6.5 / 9.8 / 第 13 章；常见模板见
 [config-example/](../config-example/)。最常用项：
 
+> ⚠️ 索引声明**首选随库走 `cj.schema.json`**（服务启动自动装配、目录可迁移）；库内声明
+> 存在时覆盖 `--config` 的索引项。完整说明见 [库内schema索引声明.md](./库内schema索引声明.md)。
+
 | 配置 | 说明 |
 | --- | --- |
-| `[inverted] inverted_fields / bitmap_fields / fulltext_fields / stats_fields` | 倒排/位图/全文/统计载荷声明（枚举低基数走 bitmap，长文本走 fulltext，数字统计字段走 stats_fields，控制索引成本） |
+| 库内 `cj.schema.json`（权威） | 每表索引声明：`inverted_fields / bitmap_fields / fulltext_fields / stats_fields / composite_indexes`（无声明 = 零索引） |
+| `[inverted] inverted_fields / bitmap_fields / fulltext_fields / stats_fields` | 无库内 schema 时经 `--config` 声明的同名单项（索引声明制下空 = 无倒排；低基数走 bitmap、长文本走 fulltext、数字统计走 stats_fields） |
 | `[inverted] max_term_len / flush_threshold` | term 长度保护 / 刷盘阈值 |
 | `[memtable] max_size_mb` | 跳表上限 |
 | `[hotcache]/[blockcache] max_memory_mb` | 缓存上限（隔离） |
@@ -251,4 +259,6 @@ shanshui-cunji export --filter 'updated_at > "…"' --format parquet --checkpoin
 - 发布说明：release_doc/（v0.2.1 ~ v0.8.0 RELEASE / RELEASE-SUMMARY）
 - 专项指南：本目录 join_function.md（关联查询 4 替代方案）、redis-integration-guide.md（Redis 冷热分层）、
   language-selection.md（语言/驱动）
+- 数据库启动与索引声明：本目录 [启动数据库.md](./启动数据库.md)（cjserver 命令/日志）、
+  [库内schema索引声明.md](./库内schema索引声明.md)（cj.schema.json 声明制）、[索引优先级.md](./索引优先级.md)（WHERE 路由）
 - 前沿与选型调研：research/（architecture-selection / frontier-research-2026-08 / group-commit-design）
